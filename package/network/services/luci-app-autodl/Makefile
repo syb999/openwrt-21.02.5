@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-autodl
-PKG_VERSION:=20230219
+PKG_VERSION:=20230407
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -23,7 +23,7 @@ define Package/luci-app-autodl
 	SUBMENU:=3. Applications
 	TITLE:=LuCI Support for auto download video & audio
 	PKGARCH:=all
-	DEPENDS:=+curl +wget-ssl +urlencode \
+	DEPENDS:=+curl +wget +urlencode \
 	+PACKAGE_$(PKG_NAME)_INCLUDE_Online_Server:online_server
 endef
 
@@ -44,6 +44,8 @@ define Package/luci-app-autodl/install
 	$(INSTALL_BIN) ./files/ols/* $(1)/usr/autodl/ols
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/autodl.conf $(1)/etc/config/autodl
+	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
+	$(CP) ./files/luci-app-autodl.json $(1)/usr/share/rpcd/acl.d
 endef
 
 $(eval $(call BuildPackage,luci-app-autodl))
