@@ -24,6 +24,8 @@ export MAKEFLAGS=-j2来锁定2个线程,避免死机。
 测试发现:pip install pandas库时会发生空间不足的报错。请确保.pyenv目录
 所在磁盘有足够空间。
 
+--------------------------------------------------
+安装rust:
 默认直接安装pip install rpds_py会失败(fastapi的依赖包),原因是缺少了rust环境。
 默认rust安装命令:curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 如果使用该命令报错:mktemp: (null): No such file or directory
@@ -31,7 +33,30 @@ export MAKEFLAGS=-j2来锁定2个线程,避免死机。
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sed "s/ensure mktemp -d/ensure env -i mktemp -d/" > rust.sh
 chmod +x rust.sh
 ./rust.sh
-按1后就能完成安装（请确保磁盘有足够的剩余空间）。
+按1后就能完成安装（请确保磁盘有1.5G以上的剩余空间）。
+----------------------------------------------------
+
+关于运行juypter notebook(请先确保已安装rust):
+pip install juypter后直接运行juypter notebook会报错：
+ModuleNotFoundError: No module named '_sqlite3'
+解决方法:cp /usr/lib/python3.9/lib-dynload/_sqlite3.cpython-39.so ~/.pyenv/versions/3.9.17/lib/python3.9/lib-dynload/_sqlite3.cpython-39-aarch64-linux-gnu.so
+
+然后配置登录密码:
+jupyter notebook password
+如果不需要密码(危险)，就直接回车设置密码为空即可。
+启动jupyter notebook:
+jupyter notebook --allow-root --ip=0.0.0.0 --port=8888
+
+
+
+
+
+
+
+
+
+
+
 
 
 

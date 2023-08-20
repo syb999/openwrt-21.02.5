@@ -11,7 +11,8 @@ define Package/pyenv-deps
   DEPENDS:= \
 	+git +gcc +zlib-dev +openssl-dev +libffi-dev \
 	+liblzma-dev +libreadline-dev +libsqlite3-dev \
-	+libbz2-dev +libjpeg-dev +libtiff-dev +make +aria2
+	+libbz2-dev +libjpeg-dev +libtiff-dev +make \
+	+libportaudio-dev
   TITLE:=Pyenv environment dependency
 endef
 
