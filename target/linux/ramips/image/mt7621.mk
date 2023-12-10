@@ -1152,6 +1152,17 @@ define Device/netis_wf2881
 endef
 TARGET_DEVICES += netis_wf2881
 
+define Device/oem_business-router
+  $(Device/dsa-migration)
+  $(Device/uimage-lzma-loader)
+  IMAGE_SIZE := 16064k
+  DEVICE_VENDOR := OEM
+  DEVICE_MODEL := Business-Router
+  SUPPORTED_DEVICES += business-router
+  DEVICE_PACKAGES := -wpad-basic-wolfssl -iwinfo
+endef
+TARGET_DEVICES += oem_business-router
+
 define Device/phicomm_k2p
   $(Device/dsa-migration)
   IMAGE_SIZE := 15744k
