@@ -12,3 +12,5 @@ include distroconfig.txt
 
 [all]
 # Place your custom settings here.
+
+dtparam=audio=on
