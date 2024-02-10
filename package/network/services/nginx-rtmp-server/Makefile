@@ -8,12 +8,12 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=nginx-rtmp-server
-PKG_VERSION:=1.19.6
+PKG_VERSION:=1.25.0
 PKG_RELEASE:=1
 
 PKG_SOURCE:=nginx-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=http://nginx.org/download/
-PKG_HASH:=b11195a02b1d3285ddf2987e02c6b6d28df41bb1b1dd25f33542848ef4fc33b5
+PKG_HASH:=5ed44d45943272a4e8a5bcf4434237210f2de31b903fca5e381c1bbd7eee1e8c
 
 PKG_BUILD_DIR:=$(BUILD_DIR)/nginx-$(PKG_VERSION)
 
@@ -33,7 +33,7 @@ define Package/nginx-rtmp-server
   SUBMENU:=Web Servers/Proxies
   TITLE:=Nginx RTMP server
   URL:=http://nginx.org/
-  DEPENDS:=+libopenssl +libpthread +libpcre +zlib
+  DEPENDS:=+libopenssl +libpthread +libpcre2 +zlib
   MENU:=1
 endef
 
