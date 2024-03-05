@@ -10,7 +10,7 @@ SOURCE="${1:-.}"
 
 try_version() {
 	[ -f "$SOURCE/version.date" ] || return 1
-	SOURCE_DATE_EPOCH=$(cat "$SOURCE/version.date")
+	SOURCE_DATE_EPOCH=$(date +%s)
 	[ -n "$SOURCE_DATE_EPOCH" ]
 }
 
