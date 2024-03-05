@@ -90,6 +90,10 @@ netgear,r6800)
 	ucidef_set_led_netdev "lan3" "LAN3" "white:lan3" "lan3"
 	ucidef_set_led_netdev "lan4" "LAN4" "white:lan4" "lan4"
 	;;
+todaair,in1251y)
+	ucidef_set_led_netdev "wifi" "Wifi" "orange:wifi" "wlan0"
+	ucidef_set_led_netdev "lan" "LAN" "orange:lan" "br-lan"
+	;;
 tplink,archer-a6-v3|\
 tplink,archer-c6u-v1)
 	ucidef_set_led_netdev "lan" "LAN" "green:lan" "br-lan"
@@ -114,6 +118,9 @@ xiaomi,redmi-router-ac2100)
 	;;
 youhua,wr1200js)
 	ucidef_set_led_netdev "internet" "INTERNET" "green:wan" "wan"
+	;;
+zte,e8820s)
+	ucidef_set_led_netdev "system" "system" "white:system" "eth0" "tx rx"
 	;;
 esac
 
