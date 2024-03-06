@@ -163,6 +163,12 @@ detect_mac80211() {
 
 		get_band_defaults "$dev"
 
+		if [ x$mode_band == x"2g" ]; then
+			ssid_wlan="_2.4G"
+		else
+			ssid_wlan="_5G"
+		fi
+
 		path="$(mac80211_phy_to_path "$dev")"
 		if [ -n "$path" ]; then
 			dev_id="set wireless.radio${devidx}.path='$path'"
@@ -185,7 +191,7 @@ detect_mac80211() {
 			set wireless.default_radio${devidx}.device=radio${devidx}
 			set wireless.default_radio${devidx}.network=lan
 			set wireless.default_radio${devidx}.mode=ap
-			set wireless.default_radio${devidx}.ssid=OpenWrt_${ssnm}
+			set wireless.default_radio${devidx}.ssid=OpenWrt${ssid_wlan}${ssnm}
 			set wireless.default_radio${devidx}.encryption=none
 			set wireless.default_radio${devidx}.disassoc_low_ack=0
 			set wireless.default_radio${devidx}.isolate=0
