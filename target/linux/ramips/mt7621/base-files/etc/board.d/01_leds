@@ -90,6 +90,11 @@ netgear,r6800)
 	ucidef_set_led_netdev "lan3" "LAN3" "white:lan3" "lan3"
 	ucidef_set_led_netdev "lan4" "LAN4" "white:lan4" "lan4"
 	;;
+nokia,a-040w-q)
+	ucidef_set_led_usbport "usb" "USB" "blue:usb" "usb1-port2"
+	ucidef_set_led_netdev "wlan2g" "WiFi 2.4GHz" "blue:wlan2g" "wlan0"
+	ucidef_set_led_netdev "wlan5g" "WiFi 5GHz" "blue:wlan5g" "wlan1"
+	;;
 todaair,in1251y)
 	ucidef_set_led_netdev "wifi" "Wifi" "orange:wifi" "wlan0"
 	ucidef_set_led_netdev "lan" "LAN" "orange:lan" "br-lan"
