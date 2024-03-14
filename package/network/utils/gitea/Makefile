@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=gitea
-PKG_VERSION:=1.21.7
+PKG_VERSION:=1.21.8
 PKG_RELEASE:=1
 
 include $(INCLUDE_DIR)/package.mk
@@ -23,21 +23,21 @@ endef
 
 ifeq ($(ARCH),x86_64)
 	gitea_ARCH:=linux-amd64
-	PKG_HASH:=fa88e6404d3d34136bdd50c990a8c390d5e05f4cb2e31641559d14234e022bd6
+	PKG_HASH:=01817c5730d50f5cf2470bbe2a35fceb7e0375903e36b6ebcd496f799a35b0de
 endif
 
 ifeq ($(ARCH),arm)
 	gitea_ARCH:=linux-arm-5
-	PKG_HASH:=8df9d51e611375d4e97e46b57a4a9868790ebd4cd247ffcaba9c3d9aea68b741
+	PKG_HASH:=581fd7f7981d8f95c521adfb395a84bc0b32bf096dd94c4e64cb8d552cd914d1
 endif
 
 ifeq ($(ARCH),aarch64)
 	gitea_ARCH:=linux-arm64
-	PKG_HASH:=508f21e9146409c54b77dfa266bfb29a9f7710e6468f4a7bcd9b9d5e41e4c309
+	PKG_HASH:=d4d2f68b6ac5cdc021b48240dc6aa523389f43fc9a7532c287515f27a62cdfb5
 endif
 
-PKG_SOURCE_URL:=https://dl.gitea.com/gitea/1.21.7/
-PKG_SOURCE:=gitea-1.21.7-$(gitea_ARCH)
+PKG_SOURCE_URL:=https://dl.gitea.com/gitea/1.21.8/
+PKG_SOURCE:=gitea-1.21.8-$(gitea_ARCH)
 
 define Build/Prepare
 	mv $(DL_DIR)/$(PKG_SOURCE) $(PKG_BUILD_DIR)
