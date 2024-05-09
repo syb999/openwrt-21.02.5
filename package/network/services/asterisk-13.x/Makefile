@@ -10,12 +10,12 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=asterisk13
-PKG_VERSION:=13.20.0
-PKG_RELEASE:=6
+PKG_VERSION:=13.24.0
+PKG_RELEASE:=3
 
 PKG_SOURCE:=asterisk-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://downloads.asterisk.org/pub/telephony/asterisk/releases
-PKG_HASH:=a3d6d953f844867ea11e0be22ee6225049cd4f5870df6ab23454623bcfbc94d5
+PKG_HASH:=0ad7761acec4deaf8f157a33f8636995b9179b8462022f42577978ae31383fd8
 
 PKG_BUILD_DIR:=$(BUILD_DIR)/asterisk-$(PKG_VERSION)
 PKG_BUILD_DEPENDS:=libxml2/host
@@ -124,7 +124,6 @@ MODULES_AVAILABLE:= \
 	chan-motif \
 	chan-ooh323 \
 	chan-oss \
-	chan-phone \
 	chan-rtp \
 	chan-sip \
 	chan-skinny \
@@ -312,6 +311,8 @@ PKG_CONFIG_DEPENDS:= \
 include $(INCLUDE_DIR)/uclibc++.mk
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/host-build.mk
+# Needed for res-config-mysql and func-iconv to find iconv
+include $(INCLUDE_DIR)/nls.mk
 
 define Package/asterisk13/install/module
 	$(INSTALL_DIR) $(1)/usr/lib/asterisk/modules
@@ -351,7 +352,7 @@ define BuildAsterisk13Module
   define Package/asterisk13-$(1)
   $$(call Package/asterisk13/Default)
     TITLE:=$(2) support
-    DEPENDS:= asterisk13 $(patsubst +%,+PACKAGE_asterisk13-$(1):%,$(4))
+    DEPENDS:= asterisk13 $(patsubst +%,+PACKAGE_asterisk13-$(1):%,$(4)) $(9)
     ifneq ($$(CONFIG_PACKAGE_asterisk13-$(1)),)
     AST_ENABLE+=$(6)
     endif
@@ -419,7 +420,7 @@ define Package/asterisk13
 $(call Package/asterisk13/Default)
   TITLE:=Complete open source PBX, v$(PKG_VERSION)
   MENU:=1
-  DEPENDS:=$(CXX_DEPENDS) +jansson +libcap +libedit +libncurses +libopenssl +libsqlite3 +libuuid +libxml2 +zlib
+  DEPENDS:=$(CXX_DEPENDS) +jansson +libcap +libedit +libopenssl +libsqlite3 +libuuid +libxml2 +zlib
 endef
 
 define Package/asterisk13/description
@@ -526,7 +527,6 @@ CONFIGURE_ARGS+= \
 	--without-nbs \
 	--with-libedit="$(STAGING_DIR)/usr" \
 	--with-libxml2 \
-	--with-ncurses="$(STAGING_DIR)/usr" \
 	$(if $(CONFIG_PACKAGE_$(PKG_NAME)-res-snmp),--with-netsnmp="$(STAGING_DIR)/usr",--without-netsnmp) \
 	--without-newt \
 	$(if $(CONFIG_PACKAGE_$(PKG_NAME)-format-ogg-vorbis),--with-ogg="$(STAGING_DIR)/usr",--without-ogg) \
@@ -535,7 +535,6 @@ CONFIGURE_ARGS+= \
 	$(if $(CONFIG_PACKAGE_$(PKG_NAME)-pgsql),--with-postgres="$(STAGING_DIR)/usr",--without-postgres) \
 	$(if $(CONFIG_PACKAGE_$(PKG_NAME)-util-smsq),--with-popt="$(STAGING_DIR)/usr",--without-popt) \
 	$(if $(CONFIG_PACKAGE_$(PKG_NAME)-chan-console),--with-portaudio="$(STAGING_DIR)/usr",--without-portaudio) \
-	--without-pwlib \
 	--without-radius \
 	$(if $(CONFIG_PACKAGE_$(PKG_NAME)-res-fax-spandsp),--with-spandsp="$(STAGING_DIR)/usr",--without-spandsp) \
 	--without-sdl \
@@ -712,8 +711,9 @@ $(eval $(call BuildPackage,asterisk13-sounds))
 # 6 - module files
 # 7 - sound files
 # 8 - binary files
-################################
-#$(eval $(call BuildAsterisk13Module,subname,title,module description,module dependencies,conf files,module files,sound files,binary files))
+# 9 - complex depends (passed on as is)
+#######################################
+#$(eval $(call BuildAsterisk13Module,subname,title,module description,module dependencies,conf files,module files,sound files,binary files,complex depends))
 
 $(eval $(call BuildAsterisk13Module,app-adsiprog,ADSI programming,program Asterisk ADSI scripts into phone,+$(PKG_NAME)-res-adsi,adsi.conf asterisk.adsi telcordia-1.adsi,app_adsiprog,,))
 $(eval $(call BuildAsterisk13Module,app-agent-pool,Call center agent pool,call center agent pool,,agents.conf,app_agent_pool,,))
@@ -799,7 +799,6 @@ $(eval $(call BuildAsterisk13Module,chan-mobile,Bluetooth channel,Bluetooth mobi
 $(eval $(call BuildAsterisk13Module,chan-motif,Jingle channel,Motif Jingle Channel Driver,+asterisk13-res-xmpp,motif.conf,chan_motif,,))
 $(eval $(call BuildAsterisk13Module,chan-ooh323,H.323 channel,Objective Systems H.323 channel,,ooh323.conf,chan_ooh323,,))
 $(eval $(call BuildAsterisk13Module,chan-oss,OSS channel,the channel chan_oss,,oss.conf,chan_oss,,))
-$(eval $(call BuildAsterisk13Module,chan-phone,Linux telephony API,generic Linux telephony interface driver,,phone.conf,chan_phone,,))
 $(eval $(call BuildAsterisk13Module,chan-rtp,RTP media channel,RTP [Multicast and Unicast] media channel,,,chan_rtp,,))
 $(eval $(call BuildAsterisk13Module,chan-sip,SIP channel,the channel chan_sip,+asterisk13-app-confbridge,sip.conf sip_notify.conf,chan_sip,,))
 $(eval $(call BuildAsterisk13Module,chan-skinny,Skinny channel,the channel chan_skinny,,skinny.conf,chan_skinny,,))
@@ -854,7 +853,7 @@ $(eval $(call BuildAsterisk13Module,func-global,Global variable,global variable 
 $(eval $(call BuildAsterisk13Module,func-groupcount,Group count,for counting number of channels in the specified group,,,func_groupcount,,))
 $(eval $(call BuildAsterisk13Module,func-hangupcause,HANGUPCAUSE related functions,functions related to retreiving per-channel hangupcause information,,,func_hangupcause,,))
 $(eval $(call BuildAsterisk13Module,func-holdintercept,Hold interception dialplan function,function that intercepts HOLD frames from channels and raises events,,,func_holdintercept,,))
-$(eval $(call BuildAsterisk13Module,func-iconv,Charset conversion,charset conversion,@!USE_UCLIBC,,func_iconv,,))
+$(eval $(call BuildAsterisk13Module,func-iconv,Charset conversion,charset conversion,@!USE_UCLIBC,,func_iconv,,,$(ICONV_DEPENDS)))
 $(eval $(call BuildAsterisk13Module,func-jitterbuffer,Jitter buffer for read side of channel,put a jitterbuffer on the read side of a channel,,,func_jitterbuffer,,))
 $(eval $(call BuildAsterisk13Module,func-lock,Dialplan mutexes,dialplan mutexes,,,func_lock,,))
 $(eval $(call BuildAsterisk13Module,func-math,Math functions,Math functions,,,func_math,,))
