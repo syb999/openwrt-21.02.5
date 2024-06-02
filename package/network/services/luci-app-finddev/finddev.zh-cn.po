@@ -1,0 +1,18 @@
+msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "Find Device"
+msgstr "查找设备"
+
+msgid "Find Device Menu"
+msgstr "主页面"
+
+msgid "Target MAC address"
+msgstr "请输入目标设备的MAC地址"
+
+msgid "Search for the network segment"
+msgstr "搜索网络接口所在的网段"
+
+msgid "Start searching"
+msgstr "开始搜索"
+

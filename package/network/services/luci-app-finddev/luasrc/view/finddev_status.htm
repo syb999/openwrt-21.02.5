@@ -1,0 +1,23 @@
+<script type="text/javascript">//<![CDATA[
+XHR.poll(5, '<%=luci.dispatcher.build_url("admin", "network", "finddev", "status")%>', null,
+	function(x, data) {
+		var tb = document.getElementById('finddev_status');
+		if (data && tb) {
+			if ( data.device != '') {
+				tb.innerHTML = '<font color=green>搜索到的设备IP地址：' + data.device + '</font>';
+			} else if (data.running && data.device == '') {
+				tb.innerHTML = '<font color=green><%:搜索进行中!%></font>';
+			} else {
+				tb.innerHTML = '<font color=red><%:未运行%></font>';
+			}
+		}
+	}
+);
+//]]>
+</script>
+<style>.mar-10 {margin-left: 50px; margin-right: 10px;}</style>
+<fieldset class="cbi-section">
+	<p id="finddev_status">
+		<em><%:Collecting data...%></em>
+	</p>
+</fieldset>
