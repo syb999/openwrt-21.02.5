@@ -12,7 +12,7 @@ define Package/pyenv-deps
 	+git +gcc +zlib-dev +openssl-dev +libffi-dev \
 	+liblzma-dev +libreadline-dev +libsqlite3-dev \
 	+libbz2-dev +libjpeg-dev +libtiff-dev +make \
-	+libportaudio-dev
+	+libportaudio-dev +pkg-config
   TITLE:=Pyenv environment dependency
 endef
 

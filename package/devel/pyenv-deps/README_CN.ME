@@ -4,9 +4,9 @@ pyenv-deps包提供openwrt使用pyenv环境的支持.
 在openwrt使用pyenv环境流程:
 opkg install pyenv-deps
 git clone https://github.com/pyenv/pyenv.git ~/.pyenv
-pyenv install 3.9.17 -v
+pyenv install 3.9.18 -v
 pyenv rehash
-pyenv global 3.9.17
+pyenv global 3.9.18
 重新打开shell即可。
 测试设备1:树莓派3B RAM:1G (openwrt-19.07)
 测试设备2:cm311a-YST RAM:2G (openwrt-21.02)
@@ -34,12 +34,19 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sed "s/ensure mktemp
 chmod +x rust.sh
 ./rust.sh
 按1后就能完成安装（请确保磁盘有1.5G以上的剩余空间）。
+如果/root目录没有足够的空间,可以在挂载盘里创建.cargo和.rustup目录，然后软链接到root目录来完成安装:
+ln -s /mnt/sda1/.cargo /root
+ln -s /mnt/sda1/.rustup /root
+
 ----------------------------------------------------
 
 关于运行juypter notebook(请先确保已安装rust):
 pip install juypter后直接运行juypter notebook会报错：
 ModuleNotFoundError: No module named '_sqlite3'
-解决方法:cp /usr/lib/python3.9/lib-dynload/_sqlite3.cpython-39.so ~/.pyenv/versions/3.9.17/lib/python3.9/lib-dynload/_sqlite3.cpython-39-aarch64-linux-gnu.so
+解决方法(armv8):
+cp /usr/lib/python3.9/lib-dynload/_sqlite3.cpython-39.so ~/.pyenv/versions/3.9.17/lib/python3.9/lib-dynload/_sqlite3.cpython-39-aarch64-linux-gnu.so
+解决方法(x86_64):
+cp /usr/lib/python3.9/lib-dynload/_sqlite3.cpython-39.so ~/.pyenv/versions/3.9.17/lib/python3.9/lib-dynload/_sqlite3.cpython-39-x86_64-linux-gnu.so
 
 然后配置登录密码:
 jupyter notebook password
