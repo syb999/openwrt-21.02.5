@@ -147,7 +147,8 @@ function gmr_baidunetdiskinit(){
 
 function gmr_dirinit(){
 	if [ ! -d "$gmrdir/$thedirname" ]; then
-		mkdir -p $gmrdir/$thedirname
+		mkdir -p "$gmrdir/$thedirname"
+		chmod 777 -R "$gmrdir/$thedirname"
 	fi
 }
 
