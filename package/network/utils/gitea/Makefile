@@ -13,7 +13,7 @@ define Package/$(PKG_NAME)
   CATEGORY:=Network
   SUBMENU:=Version Control Systems
   USERID:=gitea=6801:gitea=6801
-  DEPENDS:=@(TARGET_amlogic||TARGET_rockchip||TARGET_sunxi_cortexa7||TARGET_brcm2708_bcm2710||TARGET_bcm27xx||TARGET_armvirt||TARGET_x86_64) +git-http +sqlite3-cli +shadow-useradd +shadow-su
+  DEPENDS:=@(TARGET_amlogic||TARGET_rockchip||TARGET_sunxi_cortexa7||TARGET_brcm2708_bcm2710||TARGET_bcm27xx||TARGET_armvirt||TARGET_x86_64) +git-http +sqlite3-cli +shadow-utils +shadow-useradd +shadow-su
 endef
 
 define Package/$(PKG_NAME)/description
