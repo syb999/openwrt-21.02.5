@@ -901,6 +901,25 @@ define Device/linksys_re6500
 endef
 TARGET_DEVICES += linksys_re6500
 
+
+define Device/maipu_igw401-100-p
+  $(Device/dsa-migration)
+  $(Device/uimage-lzma-loader)
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
+  KERNEL_SIZE := 4096k
+  IMAGE_SIZE := 120320k
+  UBINIZE_OPTS := -E 5
+  IMAGES += factory.bin
+  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+  IMAGE/factory.bin := append-kernel | pad-to $$(KERNEL_SIZE) | append-ubi | \
+	check-size
+  DEVICE_VENDOR := MAIPU
+  DEVICE_MODEL := IGW401-100-P
+  DEVICE_PACKAGES := -wpad-basic-wolfssl -iwinfo -uboot-envtools
+endef
+TARGET_DEVICES += maipu_igw401-100-p
+
 define Device/mediatek_ap-mt7621a-v60
   $(Device/dsa-migration)
   IMAGE_SIZE := 7872k
