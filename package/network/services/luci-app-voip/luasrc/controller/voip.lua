@@ -8,7 +8,8 @@ function index()
     entry({"admin", "services", "voip", "extensions"}, cbi("voip/extension"), "Extensions", 3)
     entry({"admin", "services", "voip", "peer"}, template("voip/peer"), "Server Peers", 4)
     entry({"admin", "services", "voip", "peer_data"}, call("action_peer_data"), nil)
-    entry({"admin", "services", "voip", "peer_save"}, call("action_peer_save"), nil)
+    entry({"admin", "services", "voip", "peer_update"}, call("action_peer_update"), nil)
+    entry({"admin", "services", "voip", "peer_add"}, call("action_peer_add"), nil)
     entry({"admin", "services", "voip", "peer_delete"}, call("action_peer_delete"), nil)
     entry({"admin", "services", "voip", "record_settings"}, cbi("voip/record_settings"), "Record Settings", 5)
     entry({"admin", "services", "voip", "record_files"}, template("voip/record_files"), "Record Files", 6)
@@ -37,11 +38,14 @@ function action_status_data()
                 in_peer_section = true
             elseif in_peer_section and not line:match("^-") and not line:match("sip peers") then
                 local name = line:match("^(%S+)/")
-                local host = line:match("^%S+%s+(%S+)")
-                local status = line:match("OK") and "OK" or 
-                               line:match("UNKNOWN") and "UNKNOWN" or 
-                               line:match("UNREACHABLE") and "UNREACHABLE" or "Unknown"
+                if not name then
+                    name = line:match("^(%S+)%s+")
+                end
                 if name then
+                    local host = line:match("^%S+%s+(%S+)")
+                    local status = line:match("OK") and "OK" or 
+                                   line:match("UNKNOWN") and "UNKNOWN" or 
+                                   line:match("UNREACHABLE") and "UNREACHABLE" or "Unknown"
                     peer_status[name] = {
                         host = host,
                         status = status
@@ -68,7 +72,7 @@ function action_status_data()
     end)
     
     uci:foreach("voip", "peer", function(p)
-        if p.name and p.name ~= "" and not p.name:match("^%d+$") then
+        if p.name and p.name ~= "" then
             local status_info = peer_status[p.name] or {}
             table.insert(data.server_peers, {
                 name = p.name,
@@ -236,17 +240,19 @@ function action_apply()
     generate_configs()
     
     os.execute("asterisk -rx 'database deltree record' > /dev/null 2>&1 &")
+    os.execute("sleep 1")
     
     uci:foreach("voip", "extension", function(s)
         if s.enabled == "1" then
-            local number = s.number or s[".name"]
+            local number = s.number
             local ext_record = s.record or "0"
-            if number then
+            if number and number ~= "" then
                 os.execute("asterisk -rx 'database put record " .. number .. " " .. ext_record .. "' > /dev/null 2>&1 &")
             end
         end
     end)
     
+    os.execute("sleep 1")
     os.execute("asterisk -rx 'dialplan reload' > /dev/null 2>&1 &")
     
     luci.http.redirect(luci.dispatcher.build_url("admin", "services", "voip", "status"))
@@ -297,41 +303,51 @@ qualifyfreq=60
 
 ]]
     
-    local trunk_enabled = uci:get_first("voip", "trunk", "enabled") or "0"
-    local server = uci:get_first("voip", "trunk", "server") or ""
-    local forward_server = uci:get_first("voip", "trunk", "forward_server") or ""
-    local port = uci:get_first("voip", "trunk", "port") or "5060"
-    local phone = uci:get_first("voip", "trunk", "phone") or ""
-    local password = uci:get_first("voip", "trunk", "password") or ""
-    local nat = uci:get_first("voip", "trunk", "nat") or "1"
-    local use_srtp = uci:get_first("voip", "trunk", "srtp") or "0"
-    local default_extension = uci:get_first("voip", "trunk", "default_extension") or ""
-    
-    if trunk_enabled == "1" and server ~= "" and phone ~= "" and password ~= "" and forward_server ~= "" then
-        sip_content = sip_content .. "register = " .. phone .. "@" .. server .. ":" .. password .. ":" .. phone .. "@" .. server .. "@" .. forward_server .. ":" .. port .. "\n"
-        
-        if use_srtp == "1" then
-            sip_content = sip_content .. "encryption=yes\n"
-            sip_content = sip_content .. "srtp=yes\n"
+    local trunks = {}
+    uci:foreach("voip", "trunk", function(t)
+        if t.enabled == "1" and t.server and t.server ~= "" and t.phone and t.phone ~= "" and t.forward_server and t.forward_server ~= "" then
+            local trunk_name = t.name
+            if not trunk_name or trunk_name == "" then
+                trunk_name = t[".name"]
+            end
+            if not trunk_name or trunk_name == "" then
+                trunk_name = "trunk_" .. t.phone
+            end
+            
+            table.insert(trunks, {
+                name = trunk_name,
+                prefix = t.prefix or "",
+                server = t.server,
+                forward_server = t.forward_server,
+                port = t.port or "5060",
+                phone = t.phone,
+                password = t.password,
+                srtp = t.srtp or "0",
+                weight = tonumber(t.weight) or 1
+            })
+            
+            sip_content = sip_content .. "register = " .. t.phone .. "@" .. t.server .. ":" .. t.password .. ":" .. t.phone .. "@" .. t.server .. "@" .. t.forward_server .. ":" .. t.port .. "\n"
+            
+            sip_content = sip_content .. "\n[" .. trunk_name .. "]\n"
+            sip_content = sip_content .. "host=" .. t.forward_server .. "\n"
+            sip_content = sip_content .. "username=" .. t.phone .. "@" .. t.server .. "\n"
+            sip_content = sip_content .. "secret=" .. t.password .. "\n"
+            sip_content = sip_content .. "type=friend\n"
+            sip_content = sip_content .. "fromdomain=" .. t.server .. "\n"
+            sip_content = sip_content .. "fromuser=" .. t.phone .. "\n"
+            sip_content = sip_content .. "insecure=port,invite\n"
+            sip_content = sip_content .. "dtmfmode=inband\n"
+            sip_content = sip_content .. "context=external\n"
+            sip_content = sip_content .. "nat=force_rport,comedia\n"
+            sip_content = sip_content .. "qualify=yes\n"
+            sip_content = sip_content .. "qualifyfreq=30\n"
+            sip_content = sip_content .. "session-timers=refuse\n"
+            if t.srtp == "1" then
+                sip_content = sip_content .. "encryption=yes\n"
+                sip_content = sip_content .. "srtp=yes\n"
+            end
         end
-        
-        sip_content = sip_content .. "\n[trunk_ims]\n"
-        sip_content = sip_content .. "host=" .. forward_server .. "\n"
-        sip_content = sip_content .. "username=" .. phone .. "@" .. server .. "\n"
-        sip_content = sip_content .. "secret=" .. password .. "\n"
-        sip_content = sip_content .. "type=friend\n"
-        sip_content = sip_content .. "fromdomain=" .. server .. "\n"
-        sip_content = sip_content .. "fromuser=" .. phone .. "\n"
-        sip_content = sip_content .. "insecure=port,invite\n"
-        sip_content = sip_content .. "dtmfmode=inband\n"
-        sip_content = sip_content .. "context=external\n"
-        sip_content = sip_content .. "nat=force_rport,comedia\n"
-        sip_content = sip_content .. "qualify=yes\n"
-        sip_content = sip_content .. "qualifyfreq=30\n"
-        sip_content = sip_content .. "session-timers=refuse\n"
-        sip_content = sip_content .. "register_timeout=30\n"
-        sip_content = sip_content .. "registration_timeout=30\n"
-    end
+    end)
     
     local extensions_info = {}
     uci:foreach("voip", "extension", function(s)
@@ -365,19 +381,15 @@ qualifyfreq=60
     uci:foreach("voip", "peer", function(p)
         if p.name and p.name ~= "" and p.host and p.host ~= "" then
             local peer_name = p.name
+            local context = p.context or "internal"
+            
             sip_content = sip_content .. "\n[" .. peer_name .. "]\n"
             sip_content = sip_content .. "type=" .. (p.type or "friend") .. "\n"
             sip_content = sip_content .. "host=" .. p.host .. "\n"
             if p.port and p.port ~= "" then
                 sip_content = sip_content .. "port=" .. p.port .. "\n"
             end
-            if p.username and p.username ~= "" then
-                sip_content = sip_content .. "username=" .. p.username .. "\n"
-            end
-            if p.password and p.password ~= "" then
-                sip_content = sip_content .. "secret=" .. p.password .. "\n"
-            end
-            sip_content = sip_content .. "context=" .. (p.context or "internal") .. "\n"
+            sip_content = sip_content .. "context=" .. context .. "\n"
             sip_content = sip_content .. "nat=" .. (p.nat == "1" and "yes" or "no") .. "\n"
             sip_content = sip_content .. "qualify=" .. (p.qualify == "1" and "yes" or "no") .. "\n"
             sip_content = sip_content .. "qualifyfreq=60\n"
@@ -388,26 +400,48 @@ qualifyfreq=60
     
     fs.writefile(sip_conf, sip_content)
     
+    local default_extension = nil
+    uci:foreach("voip", "global", function(s)
+        if s.default_extension and s.default_extension ~= "" then
+            default_extension = s.default_extension
+        end
+    end)
+    
+    if not default_extension then
+        default_extension = uci:get("voip", "global", "default_extension") or ""
+    end
+    
+    local all_extensions = {}
+    for _, ext in ipairs(extensions_info) do
+        table.insert(all_extensions, ext.number)
+    end
+    
     local ext_content = [[
 [general]
 
-; Macro for outbound calls with recording
+; Macro for outbound calls with recording (support dynamic target)
 [macro-dialout]
 exten => s,1,Set(CALLER_RAW=${CALLERID(num)})
 exten => s,n,Set(CALLER=${FILTER(0-9,${CALLER_RAW})})
 exten => s,n,Set(CALLEE=${ARG1})
+exten => s,n,Set(TARGET=${ARG2})
 exten => s,n,Set(RECORD_ENABLED=${DB(record/${CALLER})})
 exten => s,n,GotoIf($["${RECORD_ENABLED}" = "1"]?record,1)
-exten => s,n,Dial(SIP/${CALLEE}@trunk_ims,60,r)
+exten => s,n,Dial(SIP/${CALLEE}@${TARGET},60,r)
 exten => s,n,Hangup()
+; Recording section
 exten => record,1,Set(CALLEE=${ARG1})
 exten => record,n,Set(RAW=${SHELL(date +%Y%m%d-%H%M%S)})
 exten => record,n,Set(TIMESTAMP=${FILTER(0-9-,${RAW})})
-exten => record,n,Set(FILE_NAME=/tmp/voip_records/${CALLER}_${CALLEE}_${TIMESTAMP})
-exten => record,n,MixMonitor(${FILE_NAME}.gsm)
-exten => record,n,Dial(SIP/${CALLEE}@trunk_ims,60,r)
+exten => record,n,Set(FILE_NAME=]] .. record_dir .. [[/${CALLER}_${CALLEE}_${TIMESTAMP})
+exten => record,n,MixMonitor(${FILE_NAME}]] .. file_ext_dot .. mixmonitor_opts .. [[)
+exten => record,n,Dial(SIP/${CALLEE}@${TARGET},60,r)
 exten => record,n,StopMixMonitor()
 exten => record,n,Hangup()
+
+[default]
+exten => _.,1,Goto(internal,${EXTEN},1)
+exten => _.,n,Hangup()
 
 [internal]
 ]]
@@ -416,98 +450,175 @@ exten => record,n,Hangup()
         local number = ext.number
         local ext_record = ext.record
         
+        ext_content = ext_content .. "exten => " .. number .. ",1,Set(DB(record/" .. number .. ")=" .. ext_record .. ")\n"
+        
         if record_enabled == "1" and ext_record == "1" then
-            ext_content = ext_content .. "exten => " .. number .. ",1,Set(DB(record/" .. number .. ")=" .. ext_record .. ")\n"
-            ext_content = ext_content .. "exten => " .. number .. ",n,Set(CALLER=${CALLERID(num)})\n"
-            ext_content = ext_content .. "exten => " .. number .. ",n,Set(CALLEE=" .. number .. ")\n"
             ext_content = ext_content .. "exten => " .. number .. ",n,Set(RAW=${SHELL(date +%Y%m%d-%H%M%S)})\n"
             ext_content = ext_content .. "exten => " .. number .. ",n,Set(TIMESTAMP=${FILTER(0-9-,${RAW})})\n"
-            ext_content = ext_content .. "exten => " .. number .. ",n,Set(FILE_NAME=" .. record_dir .. "/${CALLER}_${CALLEE}_${TIMESTAMP})\n"
+            ext_content = ext_content .. "exten => " .. number .. ",n,Set(FILE_NAME=" .. record_dir .. "/${CALLERID(num)}_" .. number .. "_${TIMESTAMP})\n"
             ext_content = ext_content .. "exten => " .. number .. ",n,MixMonitor(${FILE_NAME}" .. file_ext_dot .. mixmonitor_opts .. ")\n"
             ext_content = ext_content .. "exten => " .. number .. ",n,Dial(SIP/" .. number .. ",60)\n"
             ext_content = ext_content .. "exten => " .. number .. ",n,StopMixMonitor()\n"
             ext_content = ext_content .. "exten => " .. number .. ",n,Hangup()\n"
         else
-            ext_content = ext_content .. "exten => " .. number .. ",1,Dial(SIP/" .. number .. ")\n"
+            ext_content = ext_content .. "exten => " .. number .. ",n,Dial(SIP/" .. number .. ",60)\n"
             ext_content = ext_content .. "exten => " .. number .. ",n,Hangup()\n"
         end
     end
     
-    if trunk_enabled == "1" then
-        ext_content = ext_content .. [[
+    if #trunks > 0 then
+        if #trunks == 1 then
+            local t = trunks[1]
+            ext_content = ext_content .. [[
 
-; Outbound dialing rules for PSTN
-exten => _1XX!,1,Macro(dialout,${EXTEN})
-exten => _XXXXX!,1,Macro(dialout,${EXTEN})
-exten => _XXXXXXXX!,1,Macro(dialout,${EXTEN})
-exten => _1XXXXXXXXXX!,1,Macro(dialout,${EXTEN})
+; Outbound dialing rules for PSTN (single trunk)
+exten => _1XX!,1,Macro(dialout,${EXTEN},]] .. t.name .. [[)
+exten => _XXXXX!,1,Macro(dialout,${EXTEN},]] .. t.name .. [[)
+exten => _XXXXXXXX!,1,Macro(dialout,${EXTEN},]] .. t.name .. [[)
+exten => _1XXXXXXXXXX!,1,Macro(dialout,${EXTEN},]] .. t.name .. [[)
 ]]
+        else
+            local dial_strings = {}
+            for _, trunk in ipairs(trunks) do
+                for i = 1, trunk.weight do
+                    table.insert(dial_strings, "SIP/${EXTEN}@" .. trunk.name)
+                end
+            end
+            local dial_all = table.concat(dial_strings, "&")
+            
+            ext_content = ext_content .. [[
+
+; Multi-trunk outbound with load balancing and failover
+[macro-multi_dial]
+exten => s,1,Set(CALLER=${CALLERID(num)})
+exten => s,n,Set(CALLEE=${ARG1})
+exten => s,n,Set(RECORD_ENABLED=${DB(record/${CALLER})})
+exten => s,n,GotoIf($["${RECORD_ENABLED}" = "1"]?record,1)
+exten => s,n,Dial(]] .. dial_all .. [[,60,r)
+exten => s,n,Hangup()
+exten => record,1,Set(CALLER=${CALLERID(num)})
+exten => record,n,Set(RAW=${SHELL(date +%Y%m%d-%H%M%S)})
+exten => record,n,Set(TIMESTAMP=${FILTER(0-9-,${RAW})})
+exten => record,n,Set(FILE_NAME=]] .. record_dir .. [[/${CALLER}_${CALLEE}_${TIMESTAMP})
+exten => record,n,MixMonitor(${FILE_NAME}]] .. file_ext_dot .. mixmonitor_opts .. [[)
+exten => record,n,Dial(]] .. dial_all .. [[,60,r)
+exten => record,n,StopMixMonitor()
+exten => record,n,Hangup()
+
+; Outbound dialing rules for PSTN (multi-trunk)
+exten => _1XX!,1,Macro(multi_dial,${EXTEN})
+exten => _XXXXX!,1,Macro(multi_dial,${EXTEN})
+exten => _XXXXXXXX!,1,Macro(multi_dial,${EXTEN})
+exten => _1XXXXXXXXXX!,1,Macro(multi_dial,${EXTEN})
+]]
+            
+            for _, trunk in ipairs(trunks) do
+                if trunk.prefix and trunk.prefix ~= "" then
+                    ext_content = ext_content .. "\n; Force route to trunk " .. trunk.name .. " (prefix: " .. trunk.prefix .. ")\n"
+                    ext_content = ext_content .. "exten => _" .. trunk.prefix .. ".,1,Verbose(2, Force routing to " .. trunk.name .. ": ${EXTEN:" .. string.len(trunk.prefix) .. "})\n"
+                    ext_content = ext_content .. "exten => _" .. trunk.prefix .. ".,n,Macro(dialout,${EXTEN:" .. string.len(trunk.prefix) .. "}," .. trunk.name .. ")\n"
+                    ext_content = ext_content .. "exten => _" .. trunk.prefix .. ".,n,Hangup()\n"
+                end
+            end
+        end
     end
     
-    local peer_rules_added = {}
     uci:foreach("voip", "peer", function(p)
         if p.name and p.name ~= "" and p.dial_prefix and p.dial_prefix ~= "" then
             local prefix = p.dial_prefix
-            if not peer_rules_added[prefix] then
-                peer_rules_added[prefix] = true
-                ext_content = ext_content .. "\n; Route to server " .. p.name .. " (prefix: " .. prefix .. ")\n"
-                ext_content = ext_content .. "exten => _" .. prefix .. ".,1,Verbose(2, Routing to server " .. p.name .. ": ${EXTEN:" .. string.len(prefix) .. "})\n"
-                ext_content = ext_content .. "exten => _" .. prefix .. ".,n,Dial(SIP/${EXTEN:" .. string.len(prefix) .. "}@" .. p.name .. ",60,r)\n"
-                ext_content = ext_content .. "exten => _" .. prefix .. ".,n,Hangup()\n"
-            end
+            ext_content = ext_content .. "\n; Route to server " .. p.name .. " (prefix: " .. prefix .. ")\n"
+            ext_content = ext_content .. "exten => _" .. prefix .. ".,1,Verbose(2, Routing to server " .. p.name .. ": ${EXTEN:" .. string.len(prefix) .. "})\n"
+            ext_content = ext_content .. "exten => _" .. prefix .. ".,n,Macro(dialout,${EXTEN:" .. string.len(prefix) .. "}," .. p.name .. ")\n"
+            ext_content = ext_content .. "exten => _" .. prefix .. ".,n,Hangup()\n"
         end
     end)
-    
-    local has_prefix = false
-    uci:foreach("voip", "peer", function(p)
-        if p.dial_prefix and p.dial_prefix ~= "" then
-            has_prefix = true
-        end
-    end)
-    if not has_prefix then
-        uci:foreach("voip", "peer", function(p)
-            if p.name and p.name ~= "" then
-                ext_content = ext_content .. "\n; Default route to server " .. p.name .. " (prefix: 8)\n"
-                ext_content = ext_content .. "exten => _8.,1,Verbose(2, Routing to server " .. p.name .. ": ${EXTEN:1})\n"
-                ext_content = ext_content .. "exten => _8.,n,Dial(SIP/${EXTEN:1}@" .. p.name .. ",60,r)\n"
-                ext_content = ext_content .. "exten => _8.,n,Hangup()\n"
-                return false
-            end
-        end)
-    end
     
     ext_content = ext_content .. [[
 
 [external]
 exten => s,1,Progress()
-exten => s,n,Playback(vm-intro)
+exten => s,n,NoOp(Incoming PSTN call)
 ]]
     
-    if trunk_enabled == "1" then
-        if default_extension ~= "" then
-            ext_content = ext_content .. "exten => s,n,Goto(internal," .. default_extension .. ",1)\n"
-        else
-            local ring_all = ""
-            uci:foreach("voip", "extension", function(s)
-                if s.enabled == "1" then
-                    local number = s.number or s[".name"]
-                    if ring_all == "" then
-                        ring_all = "SIP/" .. number
-                    else
-                        ring_all = ring_all .. "&SIP/" .. number
-                    end
+    if #trunks > 0 then
+        if default_extension and default_extension ~= "" then
+            local default_ext_record = "0"
+            for _, ext in ipairs(extensions_info) do
+                if ext.number == default_extension then
+                    default_ext_record = ext.record
+                    break
                 end
-            end)
-            if ring_all ~= "" then
-                ext_content = ext_content .. "exten => s,n,Dial(" .. ring_all .. ",60)\n"
+            end
+            
+            if record_enabled == "1" and default_ext_record == "1" then
+                ext_content = ext_content .. [[
+exten => s,n,Set(CALLER_NUM=${FILTER(0-9,${CALLERID(num)})})
+exten => s,n,GotoIf($["${CALLER_NUM}" = ""]?unknown_caller,1)
+exten => s,n,Goto(do_record,1)
+
+exten => unknown_caller,1,Set(CALLER_NUM=unknown)
+exten => unknown_caller,n,Goto(do_record,1)
+
+exten => do_record,1,Set(RAW=${SHELL(date +%Y%m%d-%H%M%S)})
+exten => do_record,n,Set(TIMESTAMP=${FILTER(0-9-,${RAW})})
+exten => do_record,n,Set(FILE_NAME=]] .. record_dir .. [[/${CALLER_NUM}_]] .. default_extension .. [[_${TIMESTAMP})
+exten => do_record,n,MixMonitor(${FILE_NAME}]] .. file_ext_dot .. mixmonitor_opts .. [[)
+exten => do_record,n,Dial(SIP/]] .. default_extension .. [[,60)
+exten => do_record,n,StopMixMonitor()
+exten => do_record,n,Hangup()
+]]
+            else
+                ext_content = ext_content .. "exten => s,n,NoOp(No recording for " .. default_extension .. ")\n"
+                ext_content = ext_content .. "exten => s,n,Dial(SIP/" .. default_extension .. ",60)\n"
+                ext_content = ext_content .. "exten => s,n,Hangup()\n"
+            end
+        else
+            if #all_extensions > 0 then
+                local ring_all = ""
+                for i, ext in ipairs(all_extensions) do
+                    if i > 1 then
+                        ring_all = ring_all .. "&"
+                    end
+                    ring_all = ring_all .. "SIP/" .. ext
+                end
+                
+                ext_content = ext_content .. [[
+exten => s,n,Set(CALLER_NUM=${FILTER(0-9,${CALLERID(num)})})
+exten => s,n,GotoIf($["${CALLER_NUM}" = ""]?unknown_caller,1)
+exten => s,n,Goto(ring_all,1)
+
+exten => unknown_caller,1,Set(CALLER_NUM=unknown)
+exten => unknown_caller,n,Goto(ring_all,1)
+
+exten => ring_all,1,Set(DIAL_STRING=]] .. ring_all .. [[)
+exten => ring_all,n,Dial(${DIAL_STRING},60,rg(sub_record_check,s,1))
+exten => ring_all,n,Hangup()
+
+[sub_record_check]
+exten => s,1,NoOp(Checking recording for answered extension: ${DIALEDPEERNAME})
+exten => s,n,Set(ANSWERED_EXTEN=${FILTER(0-9,${DIALEDPEERNAME})})
+exten => s,n,Set(RECORD_ENABLED=${DB(record/${ANSWERED_EXTEN})})
+exten => s,n,GotoIf($["${RECORD_ENABLED}" = "1"]?record_start,1)
+exten => s,n,Return()
+
+exten => record_start,1,NoOp(Recording enabled for ${ANSWERED_EXTEN})
+exten => s,n,Set(RAW=${SHELL(date +%Y%m%d-%H%M%S)})
+exten => s,n,Set(TIMESTAMP=${FILTER(0-9-,${RAW})})
+exten => s,n,Set(FILE_NAME=]] .. record_dir .. [[/${CALLER_NUM}_${ANSWERED_EXTEN}_${TIMESTAMP})
+exten => s,n,MixMonitor(${FILE_NAME}]] .. file_ext_dot .. mixmonitor_opts .. [[)
+exten => s,n,Return()
+
+exten => h,1,StopMixMonitor()
+]]
             else
                 ext_content = ext_content .. "exten => s,n,Playback(invalid)\n"
+                ext_content = ext_content .. "exten => s,n,Hangup()\n"
             end
         end
     else
         ext_content = ext_content .. "exten => s,n,Playback(invalid)\n"
+        ext_content = ext_content .. "exten => s,n,Hangup()\n"
     end
-    ext_content = ext_content .. "exten => s,n,Hangup()\n"
     
     fs.writefile(extensions_conf, ext_content)
     
@@ -520,6 +631,16 @@ exten => s,n,Playback(vm-intro)
         end
     end
     
+    os.execute("asterisk -rx 'database deltree record' > /dev/null 2>&1 &")
+    os.execute("sleep 1")
+    
+    for _, ext in ipairs(extensions_info) do
+        if ext.number then
+            os.execute("asterisk -rx 'database put record " .. ext.number .. " " .. ext.record .. "' > /dev/null 2>&1 &")
+        end
+    end
+    
+    os.execute("sleep 1")
     os.execute("/etc/init.d/asterisk reload 2>/dev/null")
 end
 
@@ -535,7 +656,6 @@ function action_peer_data()
             dial_prefix = p.dial_prefix or "",
             host = p.host or "",
             port = p.port or "5060",
-            username = p.username or "",
             type = p.type or "friend",
             context = p.context or "internal",
             nat = p.nat or "1",
@@ -547,78 +667,100 @@ function action_peer_data()
     luci.http.write_json(peers)
 end
 
+function action_peer_add()
+    local uci = require("luci.model.uci").cursor()
+    local http = require("luci.http")
+    
+    local post_data = http.formvalue("data") or ""
+    local data = {}
+    if post_data ~= "" then
+        post_data = post_data:gsub("^%s+", ""):gsub("%s+$", "")
+        for key, value in post_data:gmatch('"([^"]+)"%s*:%s*"([^"]*)"') do
+            data[key] = value
+        end
+        for key, value in post_data:gmatch('"([^"]+)"%s*:%s*([^",][^,}]*)') do
+            if value == "true" then
+                data[key] = "1"
+            elseif value == "false" then
+                data[key] = "0"
+            elseif value:match("^%d+$") then
+                data[key] = value
+            end
+        end
+    end
+    
+    if data and data.name and data.name ~= "" and data.host and data.host ~= "" then
+        local section = "peer_" .. data.name
+        uci:set("voip", section, "peer")
+        uci:set("voip", section, "name", data.name)
+        uci:set("voip", section, "dial_prefix", data.dial_prefix or "")
+        uci:set("voip", section, "host", data.host)
+        uci:set("voip", section, "port", data.port or "5060")
+        uci:set("voip", section, "type", data.type or "friend")
+        uci:set("voip", section, "context", data.context or "internal")
+        uci:set("voip", section, "nat", data.nat or "0")
+        uci:set("voip", section, "qualify", data.qualify or "1")
+        uci:set("voip", section, "dtmfmode", data.dtmf or "rfc2833")
+        uci:commit("voip")
+        generate_configs()
+    end
+    
+    luci.http.status(200, "OK")
+    luci.http.write("")
+end
+
+function action_peer_update()
+    local uci = require("luci.model.uci").cursor()
+    local http = require("luci.http")
+    
+    local post_data = http.formvalue("data") or ""
+    local data = {}
+    if post_data ~= "" then
+        post_data = post_data:gsub("^%s+", ""):gsub("%s+$", "")
+        for key, value in post_data:gmatch('"([^"]+)"%s*:%s*"([^"]*)"') do
+            data[key] = value
+        end
+        for key, value in post_data:gmatch('"([^"]+)"%s*:%s*([^",][^,}]*)') do
+            if value == "true" then
+                data[key] = "1"
+            elseif value == "false" then
+                data[key] = "0"
+            elseif value:match("^%d+$") then
+                data[key] = value
+            end
+        end
+    end
+    
+    if data and data.name then
+        local section = "peer_" .. data.name
+        uci:set("voip", section, "peer")
+        uci:set("voip", section, "name", data.name)
+        uci:set("voip", section, "dial_prefix", data.dial_prefix or "")
+        uci:set("voip", section, "host", data.host or "")
+        uci:set("voip", section, "port", data.port or "5060")
+        uci:set("voip", section, "type", data.type or "friend")
+        uci:set("voip", section, "context", data.context or "internal")
+        uci:set("voip", section, "nat", data.nat or "0")
+        uci:set("voip", section, "qualify", data.qualify or "1")
+        uci:set("voip", section, "dtmfmode", data.dtmf or "rfc2833")
+        uci:commit("voip")
+        generate_configs()
+    end
+    
+    luci.http.status(200, "OK")
+    luci.http.write("")
+end
+
 function action_peer_delete()
     local uci = require("luci.model.uci").cursor()
     local name = luci.http.formvalue("name")
     
     if name and name ~= "" then
-        local found = false
-        uci:foreach("voip", "peer", function(s)
-            if s.name == name and not found then
-                uci:delete("voip", s[".name"])
-                found = true
-            end
-        end)
+        local section = "peer_" .. name
+        uci:delete("voip", section)
         uci:commit("voip")
         generate_configs()
     end
-    
-    luci.http.redirect(luci.dispatcher.build_url("admin", "services", "voip", "peer"))
-end
-
-function action_peer_save()
-    local uci = require("luci.model.uci").cursor()
-    local http = require("luci.http")
-    
-    local data = http.formvalue()
-    
-    local sections = {}
-    uci:foreach("voip", "peer", function(s)
-        table.insert(sections, s[".name"])
-    end)
-    for _, name in ipairs(sections) do
-        uci:delete("voip", name)
-    end
-    
-    local peer_count = tonumber(data.peer_count) or 0
-    for i = 1, peer_count do
-        local name = data["peer_name_" .. i]
-        if name and name ~= "" then
-            local section = "peer_" .. name
-            uci:set("voip", section, "peer")
-            uci:set("voip", section, "name", name)
-            uci:set("voip", section, "dial_prefix", data["peer_prefix_" .. i] or "")
-            uci:set("voip", section, "host", data["peer_host_" .. i] or "")
-            uci:set("voip", section, "port", data["peer_port_" .. i] or "5060")
-            uci:set("voip", section, "username", data["peer_username_" .. i] or "")
-            uci:set("voip", section, "password", data["peer_password_" .. i] or "")
-            uci:set("voip", section, "type", data["peer_type_" .. i] or "friend")
-            uci:set("voip", section, "context", data["peer_context_" .. i] or "internal")
-            uci:set("voip", section, "nat", data["peer_nat_" .. i] or "0")
-            uci:set("voip", section, "qualify", data["peer_qualify_" .. i] or "0")
-            uci:set("voip", section, "dtmfmode", data["peer_dtmf_" .. i] or "rfc2833")
-        end
-    end
-    
-    local new_name = data.new_name
-    if new_name and new_name ~= "" and data.new_host and data.new_host ~= "" then
-        local section = "peer_" .. new_name
-        uci:set("voip", section, "peer")
-        uci:set("voip", section, "name", new_name)
-        uci:set("voip", section, "dial_prefix", data.new_prefix or "")
-        uci:set("voip", section, "host", data.new_host)
-        uci:set("voip", section, "port", data.new_port or "5060")
-        uci:set("voip", section, "username", data.new_username or "")
-        uci:set("voip", section, "password", data.new_password or "")
-        uci:set("voip", section, "type", data.new_type or "friend")
-        uci:set("voip", section, "context", data.new_context or "internal")
-        uci:set("voip", section, "nat", data.new_nat or "0")
-        uci:set("voip", section, "qualify", data.new_qualify or "0")
-        uci:set("voip", section, "dtmfmode", data.new_dtmf or "rfc2833")
-    end
-    
-    uci:commit("voip")
-    generate_configs()
     
     luci.http.redirect(luci.dispatcher.build_url("admin", "services", "voip", "peer"))
 end
