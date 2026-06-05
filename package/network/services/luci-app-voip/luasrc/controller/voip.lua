@@ -16,6 +16,7 @@ function index()
     entry({"admin", "services", "voip", "record_files_data"}, call("action_record_files_data"), nil)
     entry({"admin", "services", "voip", "download_record"}, call("action_download_record"), nil)
     entry({"admin", "services", "voip", "delete_record"}, call("action_delete_record"), nil)
+    entry({"admin", "services", "voip", "pstn_handler"}, cbi("voip/pstn_handler"), "PSTN Incoming", 7)
     entry({"admin", "services", "voip", "restart"}, call("action_restart"), nil)
     entry({"admin", "services", "voip", "apply"}, call("action_apply"), nil)
 end
@@ -264,25 +265,57 @@ function generate_configs()
     
     local sip_conf = "/etc/asterisk/sip.conf"
     local extensions_conf = "/etc/asterisk/extensions.conf"
+    local musiconhold_conf = "/etc/asterisk/musiconhold.conf"
     
     local record_enabled = uci:get_first("voip", "record", "enabled") or "0"
     local record_dir = uci:get_first("voip", "record", "dir") or "/tmp/voip_records"
     local record_format = uci:get_first("voip", "record", "format") or "gsm"
     local auto_clean = uci:get_first("voip", "record", "auto_clean") or "30"
     
+    local pstn_mode = uci:get("voip", "pstn_handler", "mode") or "normal"
+    
+    local playback_enabled = uci:get("voip", "pstn_handler", "playback_enabled") or "0"
+    local playback_dir = uci:get("voip", "pstn_handler", "playback_dir") or "/usr/share/asterisk/sounds"
+    local playback_file = uci:get("voip", "pstn_handler", "playback_file") or "ring"
+    local playback_loop = tonumber(uci:get("voip", "pstn_handler", "playback_loop")) or 1
+    if playback_loop > 6 then
+        playback_loop = 6
+    end
+    
+    local ivr_welcome = uci:get("voip", "pstn_handler", "welcome") or "ivr-welcome"
+    local ivr_timeout = uci:get("voip", "pstn_handler", "timeout") or "10"
+    local ivr_invalid = uci:get("voip", "pstn_handler", "invalid") or "ivr-invalid"
+    
+    local ivr_options = {}
+    uci:foreach("voip", "ivr_option", function(o)
+        if o.digit and o.target and o.digit ~= "" then
+            table.insert(ivr_options, {
+                digit = o.digit,
+                action = o.action or "extension",
+                target = o.target
+            })
+        end
+    end)
+    
     local file_ext_dot = ""
-    local file_ext_plain = ""
     local mixmonitor_opts = ""
     
     if record_format == "wav" then
         file_ext_dot = ".wav"
-        file_ext_plain = "wav"
         mixmonitor_opts = ",a"
     else
         file_ext_dot = ".gsm"
-        file_ext_plain = "gsm"
         mixmonitor_opts = ""
     end
+    
+    fs.mkdir(playback_dir)
+    
+    local playback_path = playback_dir .. "/" .. playback_file
+    local ivr_welcome_path = playback_dir .. "/" .. ivr_welcome
+    local ivr_invalid_path = playback_dir .. "/" .. ivr_invalid
+    
+    local musiconhold_content = "\n[default]\nmode=files\ndirectory=/usr/share/asterisk/moh\n\n"
+    fs.writefile(musiconhold_conf, musiconhold_content)
     
     local sip_content = [[
 [general]
@@ -389,6 +422,12 @@ qualifyfreq=60
             if p.port and p.port ~= "" then
                 sip_content = sip_content .. "port=" .. p.port .. "\n"
             end
+            if p.username and p.username ~= "" then
+                sip_content = sip_content .. "username=" .. p.username .. "\n"
+            end
+            if p.password and p.password ~= "" then
+                sip_content = sip_content .. "secret=" .. p.password .. "\n"
+            end
             sip_content = sip_content .. "context=" .. context .. "\n"
             sip_content = sip_content .. "nat=" .. (p.nat == "1" and "yes" or "no") .. "\n"
             sip_content = sip_content .. "qualify=" .. (p.qualify == "1" and "yes" or "no") .. "\n"
@@ -400,15 +439,17 @@ qualifyfreq=60
     
     fs.writefile(sip_conf, sip_content)
     
-    local default_extension = nil
-    uci:foreach("voip", "global", function(s)
-        if s.default_extension and s.default_extension ~= "" then
-            default_extension = s.default_extension
-        end
-    end)
+    local default_extension = uci:get("voip", "global", "default_extension") or ""
+    if default_extension == "" then
+        uci:foreach("voip", "global", function(s)
+            if s.default_extension and s.default_extension ~= "" then
+                default_extension = s.default_extension
+            end
+        end)
+    end
     
-    if not default_extension then
-        default_extension = uci:get("voip", "global", "default_extension") or ""
+    if default_extension == "" and #extensions_info > 0 then
+        default_extension = extensions_info[1].number
     end
     
     local all_extensions = {}
@@ -417,9 +458,10 @@ qualifyfreq=60
     end
     
     local ext_content = [[
+
 [general]
 
-; Macro for outbound calls with recording (support dynamic target)
+; Macro for outbound calls with recording
 [macro-dialout]
 exten => s,1,Set(CALLER_RAW=${CALLERID(num)})
 exten => s,n,Set(CALLER=${FILTER(0-9,${CALLER_RAW})})
@@ -429,12 +471,13 @@ exten => s,n,Set(RECORD_ENABLED=${DB(record/${CALLER})})
 exten => s,n,GotoIf($["${RECORD_ENABLED}" = "1"]?record,1)
 exten => s,n,Dial(SIP/${CALLEE}@${TARGET},60,r)
 exten => s,n,Hangup()
+
 ; Recording section
 exten => record,1,Set(CALLEE=${ARG1})
 exten => record,n,Set(RAW=${SHELL(date +%Y%m%d-%H%M%S)})
 exten => record,n,Set(TIMESTAMP=${FILTER(0-9-,${RAW})})
 exten => record,n,Set(FILE_NAME=]] .. record_dir .. [[/${CALLER}_${CALLEE}_${TIMESTAMP})
-exten => record,n,MixMonitor(${FILE_NAME}]] .. file_ext_dot .. mixmonitor_opts .. [[)
+exten => record,n,MixMonitor(${FILE_NAME}]] .. file_ext_dot .. [[)
 exten => record,n,Dial(SIP/${CALLEE}@${TARGET},60,r)
 exten => record,n,StopMixMonitor()
 exten => record,n,Hangup()
@@ -450,17 +493,28 @@ exten => _.,n,Hangup()
         local number = ext.number
         local ext_record = ext.record
         
-        ext_content = ext_content .. "exten => " .. number .. ",1,Set(DB(record/" .. number .. ")=" .. ext_record .. ")\n"
+        ext_content = ext_content .. "\nexten => " .. number .. ",1,Set(DB(record/" .. number .. ")=" .. ext_record .. ")\n"
         
         if record_enabled == "1" and ext_record == "1" then
             ext_content = ext_content .. "exten => " .. number .. ",n,Set(RAW=${SHELL(date +%Y%m%d-%H%M%S)})\n"
             ext_content = ext_content .. "exten => " .. number .. ",n,Set(TIMESTAMP=${FILTER(0-9-,${RAW})})\n"
             ext_content = ext_content .. "exten => " .. number .. ",n,Set(FILE_NAME=" .. record_dir .. "/${CALLERID(num)}_" .. number .. "_${TIMESTAMP})\n"
             ext_content = ext_content .. "exten => " .. number .. ",n,MixMonitor(${FILE_NAME}" .. file_ext_dot .. mixmonitor_opts .. ")\n"
+            
+            if pstn_mode == "direct" and playback_enabled == "1" and playback_file ~= "" then
+                for i = 1, playback_loop do
+                    ext_content = ext_content .. "exten => " .. number .. ",n,Playback(" .. playback_path .. ")\n"
+                end
+            end
             ext_content = ext_content .. "exten => " .. number .. ",n,Dial(SIP/" .. number .. ",60)\n"
             ext_content = ext_content .. "exten => " .. number .. ",n,StopMixMonitor()\n"
             ext_content = ext_content .. "exten => " .. number .. ",n,Hangup()\n"
         else
+            if pstn_mode == "direct" and playback_enabled == "1" and playback_file ~= "" then
+                for i = 1, playback_loop do
+                    ext_content = ext_content .. "exten => " .. number .. ",n,Playback(" .. playback_path .. ")\n"
+                end
+            end
             ext_content = ext_content .. "exten => " .. number .. ",n,Dial(SIP/" .. number .. ",60)\n"
             ext_content = ext_content .. "exten => " .. number .. ",n,Hangup()\n"
         end
@@ -488,7 +542,7 @@ exten => _1XXXXXXXXXX!,1,Macro(dialout,${EXTEN},]] .. t.name .. [[)
             
             ext_content = ext_content .. [[
 
-; Multi-trunk outbound with load balancing and failover
+; Multi-trunk outbound with load balancing
 [macro-multi_dial]
 exten => s,1,Set(CALLER=${CALLERID(num)})
 exten => s,n,Set(CALLEE=${ARG1})
@@ -500,7 +554,7 @@ exten => record,1,Set(CALLER=${CALLERID(num)})
 exten => record,n,Set(RAW=${SHELL(date +%Y%m%d-%H%M%S)})
 exten => record,n,Set(TIMESTAMP=${FILTER(0-9-,${RAW})})
 exten => record,n,Set(FILE_NAME=]] .. record_dir .. [[/${CALLER}_${CALLEE}_${TIMESTAMP})
-exten => record,n,MixMonitor(${FILE_NAME}]] .. file_ext_dot .. mixmonitor_opts .. [[)
+exten => record,n,MixMonitor(${FILE_NAME}]] .. file_ext_dot .. [[)
 exten => record,n,Dial(]] .. dial_all .. [[,60,r)
 exten => record,n,StopMixMonitor()
 exten => record,n,Hangup()
@@ -533,25 +587,42 @@ exten => _1XXXXXXXXXX!,1,Macro(multi_dial,${EXTEN})
         end
     end)
     
-    ext_content = ext_content .. [[
+    if pstn_mode == "ivr" and #ivr_options > 0 then
+        ext_content = ext_content .. [[
 
 [external]
 exten => s,1,Progress()
-exten => s,n,NoOp(Incoming PSTN call)
+exten => s,n,NoOp(Incoming PSTN call - IVR)
+exten => s,n,Goto(ivr-menu,s,1)
+
+[ivr-menu]
+exten => s,1,Answer()
+exten => s,n,Playback(]] .. ivr_welcome_path .. [[)
+exten => s,n,Read(digit,]] .. ivr_welcome_path .. [[,1,3,]] .. ivr_timeout .. [[)
+exten => s,n,Goto(ivr-menu,${digit},1)
 ]]
-    
-    if #trunks > 0 then
-        if default_extension and default_extension ~= "" then
-            local default_ext_record = "0"
-            for _, ext in ipairs(extensions_info) do
-                if ext.number == default_extension then
-                    default_ext_record = ext.record
-                    break
-                end
+        
+        for _, opt in ipairs(ivr_options) do
+            if opt.action == "extension" then
+                ext_content = ext_content .. "exten => " .. opt.digit .. ",1,Dial(SIP/" .. opt.target .. ",30)\n"
+            elseif opt.action == "hangup" then
+                ext_content = ext_content .. "exten => " .. opt.digit .. ",1,Hangup()\n"
             end
-            
-            if record_enabled == "1" and default_ext_record == "1" then
-                ext_content = ext_content .. [[
+        end
+        
+        ext_content = ext_content .. [[
+exten => i,1,Playback(]] .. ivr_invalid_path .. [[)
+exten => i,n,Goto(ivr-menu,s,1)
+exten => t,1,Playback(]] .. ivr_invalid_path .. [[)
+exten => t,n,Hangup()
+]]
+        
+    elseif pstn_mode == "direct" then
+        ext_content = ext_content .. [[
+
+[external]
+exten => s,1,Progress()
+exten => s,n,NoOp(Incoming PSTN call - Direct Dial)
 exten => s,n,Set(CALLER_NUM=${FILTER(0-9,${CALLERID(num)})})
 exten => s,n,GotoIf($["${CALLER_NUM}" = ""]?unknown_caller,1)
 exten => s,n,Goto(do_record,1)
@@ -559,7 +630,40 @@ exten => s,n,Goto(do_record,1)
 exten => unknown_caller,1,Set(CALLER_NUM=unknown)
 exten => unknown_caller,n,Goto(do_record,1)
 
-exten => do_record,1,Set(RAW=${SHELL(date +%Y%m%d-%H%M%S)})
+exten => do_record,1,Answer()
+exten => do_record,n,Set(RAW=${SHELL(date +%Y%m%d-%H%M%S)})
+exten => do_record,n,Set(TIMESTAMP=${FILTER(0-9-,${RAW})})
+exten => do_record,n,Set(FILE_NAME=]] .. record_dir .. [[/${CALLER_NUM}_]] .. default_extension .. [[_${TIMESTAMP})
+exten => do_record,n,MixMonitor(${FILE_NAME}]] .. file_ext_dot .. mixmonitor_opts .. [[)
+]]
+        
+        if playback_enabled == "1" and playback_file ~= "" then
+            for i = 1, playback_loop do
+                ext_content = ext_content .. "exten => do_record,n,Playback(" .. playback_path .. ")\n"
+            end
+        end
+        
+        ext_content = ext_content .. [[
+exten => do_record,n,Dial(SIP/]] .. default_extension .. [[,60)
+exten => do_record,n,StopMixMonitor()
+exten => do_record,n,Hangup()
+]]
+        
+    else
+        ext_content = ext_content .. [[
+
+[external]
+exten => s,1,Progress()
+exten => s,n,NoOp(Incoming PSTN call - Normal)
+exten => s,n,Set(CALLER_NUM=${FILTER(0-9,${CALLERID(num)})})
+exten => s,n,GotoIf($["${CALLER_NUM}" = ""]?unknown_caller,1)
+exten => s,n,Goto(do_record,1)
+
+exten => unknown_caller,1,Set(CALLER_NUM=unknown)
+exten => unknown_caller,n,Goto(do_record,1)
+
+exten => do_record,1,Answer()
+exten => do_record,n,Set(RAW=${SHELL(date +%Y%m%d-%H%M%S)})
 exten => do_record,n,Set(TIMESTAMP=${FILTER(0-9-,${RAW})})
 exten => do_record,n,Set(FILE_NAME=]] .. record_dir .. [[/${CALLER_NUM}_]] .. default_extension .. [[_${TIMESTAMP})
 exten => do_record,n,MixMonitor(${FILE_NAME}]] .. file_ext_dot .. mixmonitor_opts .. [[)
@@ -567,22 +671,21 @@ exten => do_record,n,Dial(SIP/]] .. default_extension .. [[,60)
 exten => do_record,n,StopMixMonitor()
 exten => do_record,n,Hangup()
 ]]
-            else
-                ext_content = ext_content .. "exten => s,n,NoOp(No recording for " .. default_extension .. ")\n"
-                ext_content = ext_content .. "exten => s,n,Dial(SIP/" .. default_extension .. ",60)\n"
-                ext_content = ext_content .. "exten => s,n,Hangup()\n"
+    end
+    
+    if default_extension == "" and #all_extensions > 0 then
+        local ring_all = ""
+        for i, ext in ipairs(all_extensions) do
+            if i > 1 then
+                ring_all = ring_all .. "&"
             end
-        else
-            if #all_extensions > 0 then
-                local ring_all = ""
-                for i, ext in ipairs(all_extensions) do
-                    if i > 1 then
-                        ring_all = ring_all .. "&"
-                    end
-                    ring_all = ring_all .. "SIP/" .. ext
-                end
-                
-                ext_content = ext_content .. [[
+            ring_all = ring_all .. "SIP/" .. ext
+        end
+        
+        ext_content = ext_content .. [[
+
+[external]
+exten => s,1,Progress()
 exten => s,n,Set(CALLER_NUM=${FILTER(0-9,${CALLERID(num)})})
 exten => s,n,GotoIf($["${CALLER_NUM}" = ""]?unknown_caller,1)
 exten => s,n,Goto(ring_all,1)
@@ -590,7 +693,17 @@ exten => s,n,Goto(ring_all,1)
 exten => unknown_caller,1,Set(CALLER_NUM=unknown)
 exten => unknown_caller,n,Goto(ring_all,1)
 
-exten => ring_all,1,Set(DIAL_STRING=]] .. ring_all .. [[)
+exten => ring_all,1,Answer()
+]]
+        
+        if pstn_mode == "direct" and playback_enabled == "1" and playback_file ~= "" then
+            for i = 1, playback_loop do
+                ext_content = ext_content .. "exten => ring_all,n,Playback(" .. playback_path .. ")\n"
+            end
+        end
+        
+        ext_content = ext_content .. [[
+exten => ring_all,n,Set(DIAL_STRING=]] .. ring_all .. [[)
 exten => ring_all,n,Dial(${DIAL_STRING},60,rg(sub_record_check,s,1))
 exten => ring_all,n,Hangup()
 
@@ -610,14 +723,6 @@ exten => s,n,Return()
 
 exten => h,1,StopMixMonitor()
 ]]
-            else
-                ext_content = ext_content .. "exten => s,n,Playback(invalid)\n"
-                ext_content = ext_content .. "exten => s,n,Hangup()\n"
-            end
-        end
-    else
-        ext_content = ext_content .. "exten => s,n,Playback(invalid)\n"
-        ext_content = ext_content .. "exten => s,n,Hangup()\n"
     end
     
     fs.writefile(extensions_conf, ext_content)
