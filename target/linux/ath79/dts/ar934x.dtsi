@@ -146,6 +146,18 @@
 
 				status = "disabled";
 			};
+
+			i2s: i2s@180b0000 {
+				compatible = "qca,ar934x-i2s";
+				reg = <0x180b0000 0x18>;
+
+				interrupt-parent = <&miscintc>;
+				interrupts = <7>;    /* ATH79_MISC_IRQ_DMA */
+
+				#sound-dai-cells = <0>;
+
+				status = "disabled";
+			};
 		};
 
 		gmac: gmac@18070000 {

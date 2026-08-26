@@ -15,6 +15,15 @@
 		led-failsafe = &led_wifi;
 		led-running = &led_wifi;
 		led-upgrade = &led_wifi;
+		i2c0 = &i2c;
+	};
+
+	reg_audio: regulator-audio {
+		compatible = "regulator-fixed";
+		regulator-name = "audio-vdd";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
 	};
 
 	i2c {
@@ -31,6 +40,20 @@
 		 */
 		i2c-gpio,scl-output-only;
 		i2c-gpio,scl-open-drain;
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		wm8904: codec@1a {
+			compatible = "wlf,wm8904";
+			reg = <0x1a>;
+			#sound-dai-cells = <0>;
+
+			AVDD-supply = <&reg_audio>;
+			DCVDD-supply = <&reg_audio>;
+			DBVDD-supply = <&reg_audio>;
+			CPVDD-supply = <&reg_audio>;
+		};
 	};
 
 	keys {
@@ -212,4 +235,8 @@
 &wmac {
 	status = "okay";
 	mtd-cal-data = <&art 0x1000>;
+};
+
+&i2s {
+	status = "okay";
 };

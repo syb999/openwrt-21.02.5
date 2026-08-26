@@ -1,0 +1,12 @@
+# sound/soc/ath79/Kconfig
+# SPDX-License-Identifier: GPL-2.0-only
+
+config SND_ATH79_SOC
+	tristate "SoC Audio for the Atheros AR9341 (PISEN WMB001N)"
+	depends on ATH79
+	select SND_SOC_WM8904
+	select REGMAP_I2C
+	help
+	  Say Y to build the AR9341 I2S CPU DAI + WM8918 (WM8904 driver)
+	  machine driver into the kernel. Used by the PISEN WMB001N
+	  (GPIO11-14 I2S, GPIO16/20 bit-banged I2C codec at 0x1a).

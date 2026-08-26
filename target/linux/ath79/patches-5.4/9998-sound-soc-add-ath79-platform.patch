@@ -1,0 +1,20 @@
+--- a/sound/soc/Kconfig
++++ b/sound/soc/Kconfig
+@@ -44,6 +44,7 @@
+ source "sound/soc/adi/Kconfig"
+ source "sound/soc/amd/Kconfig"
+ source "sound/soc/atmel/Kconfig"
++source "sound/soc/ath79/Kconfig"
+ source "sound/soc/au1x/Kconfig"
+ source "sound/soc/bcm/Kconfig"
+ source "sound/soc/cirrus/Kconfig"
+--- a/sound/soc/Makefile
++++ b/sound/soc/Makefile
+@@ -27,6 +27,7 @@
+ obj-$(CONFIG_SND_SOC)	+= adi/
+ obj-$(CONFIG_SND_SOC)	+= amd/
+ obj-$(CONFIG_SND_SOC)	+= atmel/
++obj-$(CONFIG_SND_SOC)	+= ath79/
+ obj-$(CONFIG_SND_SOC)	+= au1x/
+ obj-$(CONFIG_SND_SOC)	+= bcm/
+ obj-$(CONFIG_SND_SOC)	+= cirrus/
