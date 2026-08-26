@@ -321,15 +321,16 @@ static const struct snd_pcm_hardware ar934x_pcm_hardware = {
             SNDRV_PCM_INFO_INTERLEAVED |
             SNDRV_PCM_INFO_BLOCK_TRANSFER,
     .formats = SNDRV_PCM_FMTBIT_S16_BE,
-    .rates = SNDRV_PCM_RATE_48000,
-    .rate_min = 48000,
+    .rates = SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_44100 |
+             SNDRV_PCM_RATE_22050,
+    .rate_min = 22050,
     .rate_max = 48000,
     .channels_min = 2,
     .channels_max = 2,
     .buffer_bytes_max = 65536,
     .period_bytes_min = 64,
     .period_bytes_max = 4095,
-    .periods_min = 16,
+    .periods_min = 2,
     .periods_max = 256,
 };
 
