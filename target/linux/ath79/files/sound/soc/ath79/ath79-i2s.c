@@ -659,18 +659,12 @@ static int ar934x_i2s_set_sysclk(struct snd_soc_dai *dai, int clk_id,
                     AR934X_DPLL_3_SQSUM_DVC_MASK;
         } while (++tries < 100 && sqsum >= 0x40000);
 
-        dev_info(i2s->dev, "Audio PLL meas: tries=%d MEAS_DONE=%s SQSUM=0x%x (%s)\n",
-                 tries, (dpll4 & AR934X_DPLL_4_MEAS_DONE) ? "yes" : "NO",
-                 sqsum, sqsum < 0x40000 ? "LOCKED" : "NOT-LOCKED");
-        dev_info(i2s->dev, "Audio PLL regs: CFG=0x%08x MOD=0x%08x DPLL2=0x%08x DPLL3=0x%08x DPLL4=0x%08x\n",
-                 readl(i2s->pll + AR934X_PLL_AUDIO_CONFIG_REG),
-                 readl(i2s->pll + AR934X_PLL_AUDIO_MOD_REG),
-                 readl(i2s->dpll + AR934X_DPLL_REG_2),
-                 readl(i2s->dpll + AR934X_DPLL_REG_3),
-                 readl(i2s->dpll + AR934X_DPLL_REG_4));
+        if (sqsum >= 0x40000)
+            dev_err(i2s->dev, "Audio PLL NOT-LOCKED: tries=%d SQSUM=0x%x\n",
+                    tries, sqsum);
     }
 
-        return 0;
+    return 0;
 }
 
 static const struct snd_soc_dai_ops ar934x_i2s_dai_ops = {

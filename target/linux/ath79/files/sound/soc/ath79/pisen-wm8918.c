@@ -13,16 +13,23 @@
 #include <sound/wm8904.h>
 
 /*
- * PISEN WMB001N I2S pin mux (GPIO11-14 -> SD/WS/CLK/MCK).
- * AR934x OUT_FUNC registers: 4 GPIOs per register, 8 bits each.
+ * PISEN WMB001N I2S pin assignments (AR9341 GPIO pin numbers),
+ * same mapping as 15.05 mach-pisen-wmb001n.c.
  */
+#define PISEN_GPIO_I2S_SD     11
+#define PISEN_GPIO_I2S_WS     12
+#define PISEN_GPIO_I2S_CLK    13
+#define PISEN_GPIO_I2S_MCLK   14
+
+/* AR934x OUT_FUNC mux select values (128:1 signal mux, see datasheet) */
+#define AR934X_OUT_MUX_I2S_SD    14
+#define AR934X_OUT_MUX_I2S_WS    13
+#define AR934X_OUT_MUX_I2S_CLK   12
+#define AR934X_OUT_MUX_I2S_MCK   15
+
 #define PISEN_GPIO_BASE             0x18040000
 #define PISEN_GPIO_REG_OUT_FUNC2    0x34
 #define PISEN_GPIO_REG_OUT_FUNC3    0x38
-#define PISEN_GPIO_OUT_MUX_I2S_CLK  12
-#define PISEN_GPIO_OUT_MUX_I2S_WS   13
-#define PISEN_GPIO_OUT_MUX_I2S_SD   14
-#define PISEN_GPIO_OUT_MUX_I2S_MCK  15
 
 static void pisen_wm8918_gpio_mux(void)
 {
@@ -33,25 +40,29 @@ static void pisen_wm8918_gpio_mux(void)
     if (!gpio)
         return;
 
-    /* AR934x GPIO (oe_inverted): OE@0x00 (1=input, 0=output), CLEAR@0x10 */
+    /* GPIO11-14 as outputs (AR934x OE inverted: 1=input, 0=output) */
     t = readl(gpio + 0x00);
-    t &= ~(BIT(11) | BIT(12) | BIT(13) | BIT(14));
+    t &= ~(BIT(PISEN_GPIO_I2S_SD) | BIT(PISEN_GPIO_I2S_WS) |
+           BIT(PISEN_GPIO_I2S_CLK) | BIT(PISEN_GPIO_I2S_MCLK));
     writel(t, gpio + 0x00);
-    writel(BIT(11) | BIT(12) | BIT(13) | BIT(14), gpio + 0x10);
+    writel(BIT(PISEN_GPIO_I2S_SD) | BIT(PISEN_GPIO_I2S_WS) |
+           BIT(PISEN_GPIO_I2S_CLK) | BIT(PISEN_GPIO_I2S_MCLK), gpio + 0x10);
     udelay(10);
 
+    /* GPIO11 -> I2S_SD: OUT_FUNC2[24:31] */
     t = readl(gpio + PISEN_GPIO_REG_OUT_FUNC2);
     t &= ~(0xff << 24);
-    t |= (PISEN_GPIO_OUT_MUX_I2S_SD << 24);
+    t |= (AR934X_OUT_MUX_I2S_SD << 24);
     writel(t, gpio + PISEN_GPIO_REG_OUT_FUNC2);
 
+    /* GPIO12-14 -> WS/CLK/MCK: OUT_FUNC3 fields */
     t = readl(gpio + PISEN_GPIO_REG_OUT_FUNC3);
-    t &= ~(0xff << 0);
-    t |= (PISEN_GPIO_OUT_MUX_I2S_WS << 0);
-    t &= ~(0xff << 8);
-    t |= (PISEN_GPIO_OUT_MUX_I2S_CLK << 8);
-    t &= ~(0xff << 16);
-    t |= (PISEN_GPIO_OUT_MUX_I2S_MCK << 16);
+    t &= ~(0xff << 0);   /* GPIO12 */
+    t |= (AR934X_OUT_MUX_I2S_WS << 0);
+    t &= ~(0xff << 8);   /* GPIO13 */
+    t |= (AR934X_OUT_MUX_I2S_CLK << 8);
+    t &= ~(0xff << 16);  /* GPIO14 */
+    t |= (AR934X_OUT_MUX_I2S_MCK << 16);
     writel(t, gpio + PISEN_GPIO_REG_OUT_FUNC3);
 
     iounmap(gpio);
