@@ -6,10 +6,56 @@
 #include <linux/clk.h>
 #include <linux/clk-provider.h>
 #include <linux/clkdev.h>
+#include <linux/io.h>
 #include <sound/core.h>
 #include <sound/soc.h>
 #include <sound/pcm_params.h>
 #include <sound/wm8904.h>
+
+/*
+ * PISEN WMB001N I2S pin mux (GPIO11-14 -> SD/WS/CLK/MCK).
+ * AR934x OUT_FUNC registers: 4 GPIOs per register, 8 bits each.
+ */
+#define PISEN_GPIO_BASE             0x18040000
+#define PISEN_GPIO_REG_OUT_FUNC2    0x34
+#define PISEN_GPIO_REG_OUT_FUNC3    0x38
+#define PISEN_GPIO_OUT_MUX_I2S_CLK  12
+#define PISEN_GPIO_OUT_MUX_I2S_WS   13
+#define PISEN_GPIO_OUT_MUX_I2S_SD   14
+#define PISEN_GPIO_OUT_MUX_I2S_MCK  15
+
+static void pisen_wm8918_gpio_mux(void)
+{
+    void __iomem *gpio;
+    u32 t;
+
+    gpio = ioremap(PISEN_GPIO_BASE, 0x70);
+    if (!gpio)
+        return;
+
+    /* AR934x GPIO (oe_inverted): OE@0x00 (1=input, 0=output), CLEAR@0x10 */
+    t = readl(gpio + 0x00);
+    t &= ~(BIT(11) | BIT(12) | BIT(13) | BIT(14));
+    writel(t, gpio + 0x00);
+    writel(BIT(11) | BIT(12) | BIT(13) | BIT(14), gpio + 0x10);
+    udelay(10);
+
+    t = readl(gpio + PISEN_GPIO_REG_OUT_FUNC2);
+    t &= ~(0xff << 24);
+    t |= (PISEN_GPIO_OUT_MUX_I2S_SD << 24);
+    writel(t, gpio + PISEN_GPIO_REG_OUT_FUNC2);
+
+    t = readl(gpio + PISEN_GPIO_REG_OUT_FUNC3);
+    t &= ~(0xff << 0);
+    t |= (PISEN_GPIO_OUT_MUX_I2S_WS << 0);
+    t &= ~(0xff << 8);
+    t |= (PISEN_GPIO_OUT_MUX_I2S_CLK << 8);
+    t &= ~(0xff << 16);
+    t |= (PISEN_GPIO_OUT_MUX_I2S_MCK << 16);
+    writel(t, gpio + PISEN_GPIO_REG_OUT_FUNC3);
+
+    iounmap(gpio);
+}
 
 static struct clk *mclk;
 static struct clk_lookup *mclk_lookup;
@@ -52,6 +98,10 @@ static int pisen_wm8918_hw_params(struct snd_pcm_substream *substream,
     struct snd_soc_pcm_runtime *rtd = substream->private_data;
     unsigned int mclk_rate;
     int ret;
+
+    /* Re-apply I2S pin mux before every playback (guards against
+     * pinctrl reconfiguring the GPIOs during system init) */
+    pisen_wm8918_gpio_mux();
 
     switch (params_rate(params)) {
     case 48000:
@@ -160,6 +210,9 @@ static int pisen_wm8918_card_probe(struct platform_device *pdev)
     int ret;
 
     dev_info(&pdev->dev, "probing card\n");
+
+    /* PISEN WMB001N: mux GPIO11-14 to I2S before registering the card */
+    pisen_wm8918_gpio_mux();
 
     i2s_np = of_find_compatible_node(NULL, NULL, "qca,ar934x-i2s");
     codec_np = of_find_compatible_node(NULL, NULL, "wlf,wm8904");

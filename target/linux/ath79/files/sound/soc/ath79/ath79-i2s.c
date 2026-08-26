@@ -51,16 +51,6 @@
 #define AR934X_RESET_MBOX              BIT(1)
 #define AR934X_RESET_I2S               BIT(0)
 
-#define AR934X_GPIO_BASE               0x18040000
-#define AR934X_GPIO_REG_OUT_FUNC0      0x2c
-#define AR934X_GPIO_REG_OUT_FUNC2      0x34
-#define AR934X_GPIO_REG_OUT_FUNC3      0x38
-
-#define AR934X_GPIO_OUT_MUX_I2S_CLK    12
-#define AR934X_GPIO_OUT_MUX_I2S_WS     13
-#define AR934X_GPIO_OUT_MUX_I2S_SD     14
-#define AR934X_GPIO_OUT_MUX_I2S_MCK    15
-
 #define AR934X_PLL_BASE                0x18050000
 #define AR934X_PLL_AUDIO_CONFIG_REG    0x30
 #define AR934X_PLL_AUDIO_MOD_REG       0x34
@@ -126,7 +116,6 @@ struct ar934x_i2s {
     void __iomem *reset;
     void __iomem *pll;
     void __iomem *dpll;
-    void __iomem *gpio;
     int irq;
     struct dma_pool *desc_pool;
     struct snd_pcm_substream *playback;
@@ -204,34 +193,6 @@ static void ar934x_module_reset(struct ar934x_i2s *i2s)
     val &= ~AR934X_RESET_I2S;
     writel(val, i2s->reset);
     udelay(100);
-}
-
-static void ar934x_i2s_gpio_mux(struct ar934x_i2s *i2s)
-{
-    u32 t;
-
-    t = readl(i2s->gpio + 0x00);
-    t &= ~(BIT(11) | BIT(12) | BIT(13) | BIT(14));
-    writel(t, i2s->gpio + 0x00);
-    writel(BIT(11) | BIT(12) | BIT(13) | BIT(14),
-           i2s->gpio + 0x10);
-    udelay(10);
-
-    t = readl(i2s->gpio + AR934X_GPIO_REG_OUT_FUNC2);
-    t &= ~(0xff << 24);
-    t |= (AR934X_GPIO_OUT_MUX_I2S_SD << 24);
-    writel(t, i2s->gpio + AR934X_GPIO_REG_OUT_FUNC2);
-
-    t = readl(i2s->gpio + AR934X_GPIO_REG_OUT_FUNC3);
-    t &= ~(0xff << 0);
-    t |= (AR934X_GPIO_OUT_MUX_I2S_WS << 0);
-    t &= ~(0xff << 8);
-    t |= (AR934X_GPIO_OUT_MUX_I2S_CLK << 8);
-    t &= ~(0xff << 16);
-    t |= (AR934X_GPIO_OUT_MUX_I2S_MCK << 16);
-    writel(t, i2s->gpio + AR934X_GPIO_REG_OUT_FUNC3);
-
-    dev_info(i2s->dev, "GPIO11-14 muxed to I2S (SD/WS/CLK/MCK)\n");
 }
 
 static void ar934x_free_descriptors(struct ar934x_i2s *i2s,
@@ -431,8 +392,6 @@ static int ar934x_pcm_prepare(struct snd_pcm_substream *substream)
     struct ar934x_pcm_desc *first;
     u32 val;
 
-    ar934x_i2s_gpio_mux(i2s);
-
     rt->elapsed = 0;
 
     ar934x_mbox_reset(i2s);
@@ -585,7 +544,7 @@ static int ar934x_i2s_set_sysclk(struct snd_soc_dai *dai, int clk_id,
     if (dir == SND_SOC_CLOCK_IN)
         return 0;
 
-        i2s->mclk_rate = freq;
+    i2s->mclk_rate = freq;
 
     switch (freq) {
     case 12288000:
@@ -798,12 +757,6 @@ static int ar934x_i2s_probe(struct platform_device *pdev)
         return -ENOMEM;
     }
 
-    i2s->gpio = devm_ioremap(&pdev->dev, AR934X_GPIO_BASE, 0x70);
-    if (!i2s->gpio) {
-        dev_err(&pdev->dev, "Failed to map GPIO registers\n");
-        return -ENOMEM;
-    }
-
     i2s->desc_pool = dma_pool_create("ar934x-i2s-desc", &pdev->dev,
                                      sizeof(struct ar934x_pcm_desc),
                                      4, 0);
@@ -813,8 +766,6 @@ static int ar934x_i2s_probe(struct platform_device *pdev)
     }
 
     ar934x_module_reset(i2s);
-
-    ar934x_i2s_gpio_mux(i2s);
 
     i2s->irq = platform_get_irq(pdev, 0);
     if (i2s->irq < 0) {
