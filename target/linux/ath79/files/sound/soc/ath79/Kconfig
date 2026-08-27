@@ -4,7 +4,7 @@
 config SND_ATH79_SOC
 	tristate "SoC Audio for the Atheros AR9341 (PISEN WMB001N)"
 	depends on ATH79
-	select SND_SOC_WM8904
+	depends on SND_SOC_WM8904
 	select REGMAP_I2C
 	help
 	  Say Y to build the AR9341 I2S CPU DAI + WM8918 (WM8904 driver)

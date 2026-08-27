@@ -116,9 +116,11 @@ static int pisen_wm8918_hw_params(struct snd_pcm_substream *substream,
 
     switch (params_rate(params)) {
     case 48000:
+    case 96000:
         mclk_rate = 12288000;
         break;
     case 44100:
+    case 88200:
     case 22050:
         mclk_rate = 11289600;
         break;
@@ -162,8 +164,12 @@ static int pisen_wm8918_codec_init(struct snd_soc_pcm_runtime *rtd)
         return ret;
     }
 
-    snd_soc_component_write(component, 0x1E, 0x30);
-    snd_soc_component_write(component, 0x1F, 0x30);
+    /* Set DAC (Digital) volume to 0 dB (0xC0); writing 0x30 here used to
+     * leave the output at 25% which made playback sound very quiet even
+     * with Headphone at 100%. Volume is controlled via the Headphone
+     * control (LuCI "Volume (%)"), not the DAC. */
+    snd_soc_component_write(component, 0x1E, 0xC0);
+    snd_soc_component_write(component, 0x1F, 0xC0);
 
     pr_info("pisen-wm8918: codec initialized in slave mode\n");
     return 0;

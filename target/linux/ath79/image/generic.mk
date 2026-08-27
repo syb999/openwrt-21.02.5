@@ -1854,7 +1854,7 @@ define Device/pisen_wmb001n
   DEVICE_VENDOR := PISEN
   DEVICE_MODEL := WMB001N
   IMAGE_SIZE := 14080k
-  DEVICE_PACKAGES := kmod-i2c-gpio kmod-usb2
+  DEVICE_PACKAGES := kmod-i2c-gpio kmod-usb2 kmod-sound-wm8904 kmod-sound-ath79-soc
   LOADER_TYPE := bin
   LOADER_FLASH_OFFS := 0x20000
   COMPILE := loader-$(1).bin loader-$(1).uImage

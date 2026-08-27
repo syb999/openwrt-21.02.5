@@ -307,8 +307,10 @@ static irqreturn_t ar934x_i2s_irq(int irq, void *data)
     played = ar934x_reown_descs(i2s, rt);
     rt->elapsed += played;
 
-    if (rt->elapsed >= period_bytes) {
-        rt->elapsed %= period_bytes;
+    /* If the IRQ was delayed the DMA may have finished several periods;
+     * report every one of them so userspace stays in sync. */
+    while (rt->elapsed >= period_bytes) {
+        rt->elapsed -= period_bytes;
         snd_pcm_period_elapsed(substream);
     }
 
@@ -322,9 +324,10 @@ static const struct snd_pcm_hardware ar934x_pcm_hardware = {
             SNDRV_PCM_INFO_BLOCK_TRANSFER,
     .formats = SNDRV_PCM_FMTBIT_S16_BE,
     .rates = SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_44100 |
-             SNDRV_PCM_RATE_22050,
+             SNDRV_PCM_RATE_22050 | SNDRV_PCM_RATE_88200 |
+             SNDRV_PCM_RATE_96000,
     .rate_min = 22050,
-    .rate_max = 48000,
+    .rate_max = 96000,
     .channels_min = 2,
     .channels_max = 2,
     .buffer_bytes_max = 65536,
@@ -499,9 +502,11 @@ static int ar934x_i2s_hw_params(struct snd_pcm_substream *substream,
 
     switch (rate) {
     case 48000:
+    case 96000:
         mclk = 12288000;
         break;
     case 44100:
+    case 88200:
     case 22050:
         mclk = 11289600;
         break;
@@ -683,7 +688,8 @@ static struct snd_soc_dai_driver ar934x_i2s_dai = {
         .channels_min = 2,
         .channels_max = 2,
         .rates = SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_44100 |
-                 SNDRV_PCM_RATE_22050,
+                 SNDRV_PCM_RATE_22050 | SNDRV_PCM_RATE_88200 |
+                 SNDRV_PCM_RATE_96000,
         .formats = SNDRV_PCM_FMTBIT_S16_BE,
     },
     .ops = &ar934x_i2s_dai_ops,
