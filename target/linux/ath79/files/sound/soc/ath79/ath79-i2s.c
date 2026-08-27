@@ -25,6 +25,7 @@
 #define AR934X_STEREO_CONFIG_DATA_WORD_SIZE_SHIFT 12
 #define AR934X_STEREO_CONFIG_DATA_WORD_SIZE_MASK 0x03
 #define AR934X_STEREO_CONFIG_DATA_WORD_16    1
+#define AR934X_STEREO_CONFIG_PCM_SWAP        BIT(17)
 #define AR934X_STEREO_CONFIG_SAMPLE_CNT_CLEAR_TYPE BIT(9)
 #define AR934X_STEREO_CONFIG_MASTER          BIT(8)
 #define AR934X_STEREO_CONFIG_POSEDGE_MASK    0xff
@@ -322,7 +323,7 @@ static const struct snd_pcm_hardware ar934x_pcm_hardware = {
             SNDRV_PCM_INFO_MMAP_VALID |
             SNDRV_PCM_INFO_INTERLEAVED |
             SNDRV_PCM_INFO_BLOCK_TRANSFER,
-    .formats = SNDRV_PCM_FMTBIT_S16_BE,
+    .formats = SNDRV_PCM_FMTBIT_S16_BE | SNDRV_PCM_FMTBIT_S16_LE,
     .rates = SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_44100 |
              SNDRV_PCM_RATE_22050 | SNDRV_PCM_RATE_88200 |
              SNDRV_PCM_RATE_96000,
@@ -525,9 +526,12 @@ static int ar934x_i2s_hw_params(struct snd_pcm_substream *substream,
     config &= ~(AR934X_STEREO_CONFIG_DATA_WORD_SIZE_MASK <<
                 AR934X_STEREO_CONFIG_DATA_WORD_SIZE_SHIFT);
     config &= ~AR934X_STEREO_CONFIG_POSEDGE_MASK;
+    config &= ~AR934X_STEREO_CONFIG_PCM_SWAP;
 
     config |= AR934X_STEREO_CONFIG_DATA_WORD_16 <<
               AR934X_STEREO_CONFIG_DATA_WORD_SIZE_SHIFT;
+    if (params_format(params) == SNDRV_PCM_FORMAT_S16_LE)
+        config |= AR934X_STEREO_CONFIG_PCM_SWAP;
     config |= posedge & AR934X_STEREO_CONFIG_POSEDGE_MASK;
     config |= AR934X_STEREO_CONFIG_I2S_ENABLE;
     config |= AR934X_STEREO_CONFIG_MASTER;
@@ -690,7 +694,7 @@ static struct snd_soc_dai_driver ar934x_i2s_dai = {
         .rates = SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_44100 |
                  SNDRV_PCM_RATE_22050 | SNDRV_PCM_RATE_88200 |
                  SNDRV_PCM_RATE_96000,
-        .formats = SNDRV_PCM_FMTBIT_S16_BE,
+        .formats = SNDRV_PCM_FMTBIT_S16_BE | SNDRV_PCM_FMTBIT_S16_LE,
     },
     .ops = &ar934x_i2s_dai_ops,
 };
