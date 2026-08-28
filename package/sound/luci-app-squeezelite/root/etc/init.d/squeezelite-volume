@@ -1,0 +1,23 @@
+#!/bin/sh /etc/rc.common
+# Apply the configured ALSA volume at boot.
+# Reads volume from squeezelite config: /etc/config/squeezelite option volume
+
+START=90
+STOP=10
+
+start() {
+	local volume n
+
+	config_load squeezelite
+	config_get volume options volume "80"
+	[ -n "$volume" ] || volume="80"
+
+	# Wait for the sound card to be ready (audio modules may still be
+	# loading at this point); retry until amixer succeeds.
+	n=0
+	while [ $n -lt 15 ]; do
+		amixer -c 0 sset 'Headphone' "${volume}%" >/dev/null 2>&1 && break
+		sleep 2
+		n=$((n+1))
+	done
+}

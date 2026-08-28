@@ -1,0 +1,119 @@
+msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8"
+
+#: luasrc/controller/squeezelite.lua
+msgid "Squeezelite"
+msgstr "Squeezelite"
+
+#: luasrc/model/cbi/squeezelite.lua
+msgid "Squeezelite Audio Player"
+msgstr "Squeezelite 音频播放器"
+
+msgid "Squeezelite is a small headless squeezeplay emulator for Linux using ALSA audio output."
+msgstr "Squeezelite 是一个使用 ALSA 音频输出的无头 Squeezeplay 模拟器。"
+
+msgid "Setting"
+msgstr "设置"
+
+msgid "Enable"
+msgstr "启用"
+
+msgid "Player Name"
+msgstr "播放器名称"
+
+msgid "LMS Server Address (optional)"
+msgstr "LMS 服务器地址(可选)"
+
+msgid "Leave empty for automatic discovery (default port 3483). Enter IP or IP:port to connect manually."
+msgstr "留空自动发现(默认端口 3483)。填写 IP 或 IP:端口 手动连接。"
+
+msgid "LMS Server Port"
+msgstr "LMS 服务器端口"
+
+msgid "ALSA Device"
+msgstr "ALSA 设备"
+
+msgid "Hardware Device 0,0"
+msgstr "硬件设备 0,0"
+
+msgid "Plug Device 0,0"
+msgstr "插件设备 0,0"
+
+msgid "Default Device"
+msgstr "默认设备"
+
+msgid "Volume (%)"
+msgstr "音量 (%)"
+
+msgid "Headphone output volume applied at boot. 0-100 percent."
+msgstr "耳机输出音量,开机自动应用。0-100 百分比。"
+
+msgid "Extra settings"
+msgstr "附加设置"
+
+msgid "Model Name"
+msgstr "型号名称"
+
+msgid "Maximum Sample Rate (Hz)"
+msgstr "最大采样率 (Hz)"
+
+msgid "Auto"
+msgstr "自动"
+
+msgid "Close Delay (ms)"
+msgstr "关闭延迟 (毫秒)"
+
+msgid "Priority"
+msgstr "优先级"
+
+msgid "ALSA Buffer (ms)"
+msgstr "ALSA 缓冲 (毫秒)"
+
+msgid "ALSA Period (bytes)"
+msgstr "ALSA 周期 (字节)"
+
+msgid "Period size in bytes (>=50). 44100Hz stereo 4ms is about 706 bytes."
+msgstr "周期大小(字节,>=50)。44100Hz 立体声 4ms 约 706 字节。"
+
+msgid "DSD over PCM"
+msgstr "DSD over PCM"
+
+msgid "Disabled"
+msgstr "禁用"
+
+msgid "Enabled"
+msgstr "启用"
+
+msgid "IR Control"
+msgstr "红外遥控"
+
+msgid "Network Interface"
+msgstr "网络接口"
+
+msgid "Codec Support"
+msgstr "解码支持"
+
+msgid "MP3 Decode"
+msgstr "MP3 解码"
+
+msgid "FLAC Decode"
+msgstr "FLAC 解码"
+
+msgid "AAC Decode"
+msgstr "AAC 解码"
+
+msgid "OGG Decode"
+msgstr "OGG 解码"
+
+msgid "WMA/ALAC Decode"
+msgstr "WMA/ALAC 解码"
+
+#: luasrc/view/squeezelite_status.htm
+msgid "RUNNING"
+msgstr "运行中"
+
+msgid "NOT RUNNING"
+msgstr "未运行"
+
+msgid "Collecting data..."
+msgstr "正在收集数据..."
