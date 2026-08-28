@@ -26,7 +26,7 @@
 		regulator-always-on;
 	};
 
-	i2c {
+	i2c: i2c {
 		compatible = "i2c-gpio";
 		pinctrl-names = "default";
 		pinctrl-0 = <&pmx_i2c_gpio &pmx_i2s_spdif>;
