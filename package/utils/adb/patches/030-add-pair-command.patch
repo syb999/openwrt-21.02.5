@@ -1,0 +1,83 @@
+--- a/adb/commandline.c
++++ b/adb/commandline.c
+@@ -27,6 +27,8 @@
+ #include <ctype.h>
+ #include <assert.h>
+ 
++extern int adb_pairing_run(const char *host, int port, const char *code);
++
+ #include "sysdeps.h"
+ 
+ #if !defined(_WIN32)
+@@ -73,7 +75,7 @@
+ }
+ 
+ void version(FILE * out) {
+-    fprintf(out, "Android Debug Bridge version %d.%d.%d\n",
++    fprintf(out, "Android Debug Bridge version %d.%d.%d + adb pair\n",
+          ADB_VERSION_MAJOR, ADB_VERSION_MINOR, ADB_SERVER_VERSION);
+ }
+ 
+@@ -101,6 +103,9 @@
+         " -P                            - Port of adb server (default: 5037)\n"
+         " devices [-l]                  - list all connected devices\n"
+         "                                 ('-l' will also list device qualifiers)\n"
++        " pair HOST[:PORT]            - pair with a device for wireless debugging\n"
++        "                                 (needs the 6-digit code from the device's\n"
++        "                                 wireless debugging screen)\n"
+         " connect <host>[:<port>]       - connect to a device via TCP/IP\n"
+         "                                 Port 5555 is used by default if no port number is specified.\n"
+         " disconnect [<host>[:<port>]]  - disconnect from a TCP/IP device.\n"
+@@ -1290,6 +1295,52 @@
+         }
+     }
+ 
++    if(!strcmp(argv[0], "pair")) {
++        char *host = argv[1];
++        char *portstr = NULL;
++        char *code = NULL;
++        int port;
++        char hostbuf[256];
++
++        /* usage: adb pair HOST[:PORT] [PAIRING CODE] */
++        if (argc < 2 || argc > 3) {
++            fprintf(stderr, "Usage: adb pair HOST[:PORT] [PAIRING CODE]\n");
++            return 1;
++        }
++        portstr = strrchr(host, ':');
++        if (!portstr) {
++            fprintf(stderr, "adb pair: expected HOST:PORT\n");
++            return 1;
++        }
++        *portstr++ = '\0';
++        if (*host == '\0' || *portstr == '\0' ||
++            (port = atoi(portstr)) <= 0 || port > 65535) {
++            fprintf(stderr, "adb pair: invalid address '%s:%s'\n", host, portstr);
++            return 1;
++        }
++        snprintf(hostbuf, sizeof(hostbuf), "%s", host);
++        host = hostbuf;
++
++        if (argc == 3) {
++            code = argv[2];
++        } else {
++            char line[64];
++            fprintf(stderr, "Enter pairing code: ");
++            fflush(stderr);
++            if (!fgets(line, sizeof(line), stdin)) {
++                fprintf(stderr, "adb pair: no pairing code provided\n");
++                return 1;
++            }
++            line[strcspn(line, "\r\n")] = '\0';
++            code = line;
++        }
++        if (*code == '\0') {
++            fprintf(stderr, "adb pair: no pairing code provided\n");
++            return 1;
++        }
++        return adb_pairing_run(host, port, code) == 0 ? 0 : 1;
++    }
++
+     if(!strcmp(argv[0], "connect")) {
+         char *tmp;
+         if (argc != 2) {

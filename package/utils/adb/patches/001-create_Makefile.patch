@@ -1,10 +1,13 @@
 --- /dev/null
 +++ b/adb/Makefile
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,47 @@
 +SRCS+= adb.c
 +SRCS+= adb_auth_host.c
 +SRCS+= adb_client.c
 +SRCS+= commandline.c
++SRCS+= adb_pairing.c
++SRCS+= spake25519.c
++SRCS+= curve25519.c
 +SRCS+= console.c
 +SRCS+= fdevent.c
 +SRCS+= file_sync_client.c
@@ -31,11 +34,12 @@
 +
 +CPPFLAGS+= -DADB_HOST=1
 +CPPFLAGS+= -DHAVE_FORKEXEC=1
++CPPFLAGS+= -std=gnu99
 +CPPFLAGS+= -I.
 +CPPFLAGS+= -I../include
 +CPPFLAGS+= -D_FILE_OFFSET_BITS=64
 +
-+LIBS+= -lcrypto -lpthread -lz
++LIBS+= -lcrypto -lssl -lpthread -lz
 +
 +OBJS= $(SRCS:.c=.o)
 +
@@ -43,3 +47,4 @@
 +
 +adb: $(OBJS)
 +	$(CC) -o $@ $(LDFLAGS) $(OBJS) $(LIBS)
++
