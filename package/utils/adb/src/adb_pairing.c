@@ -120,20 +120,38 @@ static int read_all(int fd, void *buf, size_t len) {
 }
 
 /* ------------------------- key paths ---------------------------------- */
-static int adb_key_path(char *out, size_t outlen, const char *name) {
-    const char *home = getenv("HOME");
-    const char *android_home = getenv("ANDROID_SDK_HOME");
-    if (android_home && *android_home) {
-        home = android_home;
-    }
+static int adb_key_path(char *out, size_t outlen, const char *home,
+                        const char *name) {
     if (!home || !*home) {
         return -1;
     }
-    if (snprintf(out, outlen, "%s/%s/%s", home, ANDROID_PATH, name) >=
-        (int)outlen) {
+    if (snprintf(out, outlen, "%s/.android/%s", home, name) >= (int)outlen) {
         return -1;
     }
     return 0;
+}
+
+/* Try several candidate homes (uhttpd/LuCI runs with HOME=/ so the key
+ * may live under /root or / instead of $HOME). Returns the path of the
+ * first readable key file, or NULL. */
+static const char *adb_key_search(char *out, size_t outlen, const char *name) {
+    const char *home = getenv("ANDROID_SDK_HOME");
+    if (!home || !*home) {
+        home = getenv("HOME");
+    }
+    if (adb_key_path(out, outlen, home, name) == 0 &&
+        access(out, R_OK) == 0) {
+        return out;
+    }
+    if (adb_key_path(out, outlen, "/root", name) == 0 &&
+        access(out, R_OK) == 0) {
+        return out;
+    }
+    if (adb_key_path(out, outlen, "/", name) == 0 &&
+        access(out, R_OK) == 0) {
+        return out;
+    }
+    return NULL;
 }
 
 /* load the adb private key (RSA). Returns EVP_PKEY* or NULL. */
@@ -142,7 +160,7 @@ static EVP_PKEY *adb_load_private_key(void) {
     FILE *f;
     EVP_PKEY *pkey = NULL;
 
-    if (adb_key_path(path, sizeof(path), ADB_KEY_FILE) < 0) {
+    if (adb_key_search(path, sizeof(path), ADB_KEY_FILE) == NULL) {
         return NULL;
     }
     f = fopen(path, "r");
@@ -160,7 +178,7 @@ static int adb_load_public_key(char *out, size_t outlen) {
     FILE *f;
     size_t n;
 
-    if (adb_key_path(path, sizeof(path), ADB_KEY_PUB_FILE) < 0) {
+    if (adb_key_search(path, sizeof(path), ADB_KEY_PUB_FILE) == NULL) {
         return -1;
     }
     f = fopen(path, "r");
