@@ -1,11 +1,12 @@
 --- /dev/null
 +++ b/adb/Makefile
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,48 @@
 +SRCS+= adb.c
 +SRCS+= adb_auth_host.c
 +SRCS+= adb_client.c
 +SRCS+= commandline.c
 +SRCS+= adb_pairing.c
++SRCS+= adb_tls_connect.c
 +SRCS+= spake25519.c
 +SRCS+= curve25519.c
 +SRCS+= console.c

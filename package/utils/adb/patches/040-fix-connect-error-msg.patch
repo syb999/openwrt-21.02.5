@@ -1,0 +1,11 @@
+--- a/adb/services.c
++++ b/adb/services.c
+@@ -534,5 +534,5 @@ static void connect_device(char* host, char* buffer, int buffer_size)
+ 
+     fd = socket_network_client_timeout(hostbuf, port, SOCK_STREAM, 10);
+     if (fd < 0) {
+-        snprintf(buffer, buffer_size, "unable to connect to %s:%d", host, port);
++        snprintf(buffer, buffer_size, "unable to connect to %s:%d", hostbuf, port);
+         return;
+     }
+

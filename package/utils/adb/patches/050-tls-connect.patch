@@ -1,0 +1,51 @@
+--- a/adb/services.c	2025-06-14 13:48:49.000000000 +0800
++++ b/adb/services.c	2026-09-06 23:22:06.260824602 +0800
+@@ -505,6 +505,10 @@
+     D("wait_for_state is done\n");
+ }
+ 
++/* TLS-connect helpers for Android 11+ wireless debugging (adb_tls_connect.c) */
++extern int adb_tls_peek_data(int fd, int ms);
++extern int adb_tls_connect_device(int fd, const char *serial, int port);
++
+ static void connect_device(char* host, char* buffer, int buffer_size)
+ {
+     int port, fd;
+@@ -541,13 +545,32 @@
+     close_on_exec(fd);
+     disable_tcp_nagle(fd);
+ 
+-    ret = register_socket_transport(fd, serial, port, 0);
+-    if (ret < 0) {
+-        adb_close(fd);
+-        snprintf(buffer, buffer_size, "already connected to %s", serial);
+-    } else {
++    /* Android 11+ wireless debugging listens with a TLS server that stays
++     * silent until the host sends CNXN, while legacy adbd speaks first.
++     * Peek briefly: readable = legacy plaintext device, keep the old direct
++     * path.  Silent = try the TLS upgrade path (CNXN -> STLS -> TLS 1.3 with
++     * the adb key as client certificate -> plaintext relay to the regular
++     * transport layer).
++     */
++    if (adb_tls_peek_data(fd, 700) > 0) {
++        ret = register_socket_transport(fd, serial, port, 0);
++        if (ret < 0) {
++            adb_close(fd);
++            snprintf(buffer, buffer_size, "already connected to %s", serial);
++        } else {
++            snprintf(buffer, buffer_size, "connected to %s", serial);
++        }
++        return;
++    }
++
++    ret = adb_tls_connect_device(fd, serial, port);
++    if (ret == 0) {
+         snprintf(buffer, buffer_size, "connected to %s", serial);
++        return;
+     }
++    adb_close(fd);
++    snprintf(buffer, buffer_size,
++             "unable to connect to %s (not an adb/TLS listener)", serial);
+ }
+ 
+ void connect_emulator(char* port_spec, char* buffer, int buffer_size)
