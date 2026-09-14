@@ -33,12 +33,16 @@
 #define AR934X_STEREO_REG_VOLUME        0x04
 
 /*
- * Runtime switch for the STEREO PCM byte swap (BIT17):
- *   echo 0 > /sys/module/snd_soc_ath79_i2s/parameters/pcm_swap
+ * Runtime switch for the STEREO PCM byte swap (BIT17).  Default 0 is the
+ * 15.05 behaviour (swap only for S16_LE input).  Useful for A/B testing
+ * without reflashing:
+ *   echo -1 > /sys/module/snd_soc_ath79_i2s/parameters/pcm_swap   # never
+ *   echo  0 > /sys/module/snd_soc_ath79_i2s/parameters/pcm_swap   # auto (15.05)
+ *   echo  1 > /sys/module/snd_soc_ath79_i2s/parameters/pcm_swap   # always
  */
-static int pcm_swap = 1;
+static int pcm_swap;
 module_param(pcm_swap, int, 0644);
-MODULE_PARM_DESC(pcm_swap, "enable STEREO PCM byte swap (default 1)");
+MODULE_PARM_DESC(pcm_swap, "STEREO PCM byte swap: -1 never, 0 auto (S16_LE only, default), 1 always");
 
 #define AR934X_DMA_REG_MBOX_DMA_POLICY         0x10
 #define AR934X_DMA_MBOX_DMA_POLICY_TX_FIFO_THRESH_SHIFT 4
@@ -337,6 +341,12 @@ static const struct snd_pcm_hardware ar934x_pcm_hardware = {
             SNDRV_PCM_INFO_MMAP_VALID |
             SNDRV_PCM_INFO_INTERLEAVED |
             SNDRV_PCM_INFO_BLOCK_TRANSFER,
+    /*
+     * Match the 15.05 driver: advertise both S16_BE and S16_LE.  The
+     * byte order of the stream is handled in hw_params below (the PCM
+     * swap is applied only for S16_LE, i.e. LE input is converted to the
+     * BE order the codec sits on).
+     */
     .formats = SNDRV_PCM_FMTBIT_S16_BE | SNDRV_PCM_FMTBIT_S16_LE,
     .rates = SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_44100 |
              SNDRV_PCM_RATE_22050 | SNDRV_PCM_RATE_88200 |
@@ -544,7 +554,15 @@ static int ar934x_i2s_hw_params(struct snd_pcm_substream *substream,
 
     config |= AR934X_STEREO_CONFIG_DATA_WORD_16 <<
               AR934X_STEREO_CONFIG_DATA_WORD_SIZE_SHIFT;
-    if (pcm_swap)
+    /*
+     * 15.05 semantics (pcm_swap = 0, the default): only LE input needs
+     * the hardware byte swap, which converts the stream to the BE order
+     * this codec sits on.  S16_BE is already in the right order.
+     * pcm_swap < 0 disables the swap entirely, pcm_swap > 0 forces it -
+     * both only useful for A/B testing at runtime.
+     */
+    if (pcm_swap > 0 ||
+        (pcm_swap == 0 && params_format(params) == SNDRV_PCM_FORMAT_S16_LE))
         config |= AR934X_STEREO_CONFIG_PCM_SWAP;
     config |= posedge & AR934X_STEREO_CONFIG_POSEDGE_MASK;
     config |= AR934X_STEREO_CONFIG_I2S_ENABLE;
@@ -708,7 +726,13 @@ static struct snd_soc_dai_driver ar934x_i2s_dai = {
         .rates = SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_44100 |
                  SNDRV_PCM_RATE_22050 | SNDRV_PCM_RATE_88200 |
                  SNDRV_PCM_RATE_96000,
-        .formats = SNDRV_PCM_FMTBIT_S16_BE | SNDRV_PCM_FMTBIT_S16_LE,
+        /*
+     * Match the 15.05 driver: advertise both S16_BE and S16_LE.  The
+     * byte order of the stream is handled in hw_params below (the PCM
+     * swap is applied only for S16_LE, i.e. LE input is converted to the
+     * BE order the codec sits on).
+     */
+    .formats = SNDRV_PCM_FMTBIT_S16_BE | SNDRV_PCM_FMTBIT_S16_LE,
     },
     .ops = &ar934x_i2s_dai_ops,
 };
