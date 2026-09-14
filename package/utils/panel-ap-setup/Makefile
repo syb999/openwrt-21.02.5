@@ -31,6 +31,11 @@ ifdef CONFIG_TARGET_ath79_generic_DEVICE_100msh_hq65
 	$(INSTALL_DIR) $(1)/etc/rc.button
 	$(INSTALL_BIN) ./files/button/100msh $(1)/etc/rc.button/BTN_1
 endif
+ifdef CONFIG_TARGET_ath79_generic_DEVICE_pisen_wmb001n
+	$(INSTALL_DIR) $(1)/etc/rc.button
+	$(INSTALL_BIN) ./files/button/wmb001n_volumeup $(1)/etc/rc.button/volume_up
+	$(INSTALL_BIN) ./files/button/wmb001n_volumedown $(1)/etc/rc.button/volume_down
+endif
 endef
 
 $(eval $(call BuildPackage,panel-ap-setup))

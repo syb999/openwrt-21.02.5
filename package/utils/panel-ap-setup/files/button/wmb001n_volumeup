@@ -1,0 +1,52 @@
+#!/bin/sh
+# Volume up button handler (ported from the 15.05 panel-ap-setup package).
+# The PISEN WMB001N volume bar is blue:volume1..5 (GPIO0-4); 15.05 used
+# pisen:blue:volum0..4 for the same LEDs.
+
+normal_step=6
+
+volume1=$(amixer -c0 get "Headphone" | tail -n1 | cut -d ' ' -f5)
+
+new_volume=$(expr $volume1 + $normal_step)
+
+if [ "$ACTION" = "released" ];then
+	if [ $new_volume -ge 0 ];then
+		amixer -c0 set "Headphone" $new_volume
+		amixer -c0 set "Line Output" $new_volume
+		amixer -c0 set "Digital" 86
+	fi
+
+	if [ $(amixer -c0 get "Headphone" | tail -n1 | cut -d ' ' -f6 | cut -d '%' -f1 | cut -d '[' -f2) -eq 0 ];then
+		echo 0 > /sys/class/leds/blue:volume1/brightness
+	elif [ $(amixer -c0 get "Headphone" | tail -n1 | cut -d ' ' -f6 | cut -d '%' -f1 | cut -d '[' -f2) -le 20 ];then
+		echo 0 > /sys/class/leds/blue:volume5/brightness
+		echo 0 > /sys/class/leds/blue:volume4/brightness
+		echo 0 > /sys/class/leds/blue:volume3/brightness
+		echo 0 > /sys/class/leds/blue:volume2/brightness
+		echo 1 > /sys/class/leds/blue:volume1/brightness
+	elif [ $(amixer -c0 get "Headphone" | tail -n1 | cut -d ' ' -f6 | cut -d '%' -f1 | cut -d '[' -f2) -le 40 ];then
+		echo 0 > /sys/class/leds/blue:volume5/brightness
+		echo 0 > /sys/class/leds/blue:volume4/brightness
+		echo 0 > /sys/class/leds/blue:volume3/brightness
+		echo 1 > /sys/class/leds/blue:volume2/brightness
+		echo 1 > /sys/class/leds/blue:volume1/brightness
+	elif [ $(amixer -c0 get "Headphone" | tail -n1 | cut -d ' ' -f6 | cut -d '%' -f1 | cut -d '[' -f2) -le 60 ];then
+		echo 0 > /sys/class/leds/blue:volume5/brightness
+		echo 0 > /sys/class/leds/blue:volume4/brightness
+		echo 1 > /sys/class/leds/blue:volume3/brightness
+		echo 1 > /sys/class/leds/blue:volume2/brightness
+		echo 1 > /sys/class/leds/blue:volume1/brightness
+	elif [ $(amixer -c0 get "Headphone" | tail -n1 | cut -d ' ' -f6 | cut -d '%' -f1 | cut -d '[' -f2) -le 80 ];then
+		echo 0 > /sys/class/leds/blue:volume5/brightness
+		echo 1 > /sys/class/leds/blue:volume4/brightness
+		echo 1 > /sys/class/leds/blue:volume3/brightness
+		echo 1 > /sys/class/leds/blue:volume2/brightness
+		echo 1 > /sys/class/leds/blue:volume1/brightness
+	else
+		echo 1 > /sys/class/leds/blue:volume5/brightness
+		echo 1 > /sys/class/leds/blue:volume4/brightness
+		echo 1 > /sys/class/leds/blue:volume3/brightness
+		echo 1 > /sys/class/leds/blue:volume2/brightness
+		echo 1 > /sys/class/leds/blue:volume1/brightness
+	fi
+fi
