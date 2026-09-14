@@ -58,7 +58,6 @@ ath79_setup_interfaces()
 	openmesh,mr1750-v2|\
 	pcs,cap324|\
 	pisen,ts-d084|\
-	pisen,wmb001n|\
 	pisen,wmm003n|\
 	siemens,ws-ap3610|\
 	tplink,cpe210-v2|\
@@ -177,6 +176,7 @@ ath79_setup_interfaces()
 	compex,wpj531-16m|\
 	openmesh,om2p-v4|\
 	openmesh,om2p-hs-v4|\
+	pisen,wmb001n|\
 	plasmacloud,pa300|\
 	plasmacloud,pa300e|\
 	tplink,cpe210-v1|\

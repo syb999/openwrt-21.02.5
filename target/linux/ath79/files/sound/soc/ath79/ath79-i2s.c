@@ -32,6 +32,14 @@
 
 #define AR934X_STEREO_REG_VOLUME        0x04
 
+/*
+ * Runtime switch for the STEREO PCM byte swap (BIT17):
+ *   echo 0 > /sys/module/snd_soc_ath79_i2s/parameters/pcm_swap
+ */
+static int pcm_swap = 1;
+module_param(pcm_swap, int, 0644);
+MODULE_PARM_DESC(pcm_swap, "enable STEREO PCM byte swap (default 1)");
+
 #define AR934X_DMA_REG_MBOX_DMA_POLICY         0x10
 #define AR934X_DMA_MBOX_DMA_POLICY_TX_FIFO_THRESH_SHIFT 4
 #define AR934X_DMA_MBOX_DMA_POLICY_RX_QUANTUM  BIT(1)
@@ -48,6 +56,7 @@
 
 #define AR934X_DMA_REG_MBOX_FIFO_RESET         0x58
 #define AR934X_DMA_MBOX0_FIFO_RESET_RX         BIT(2)
+#define AR934X_DMA_MBOX0_FIFO_RESET_TX         BIT(0)
 
 #define AR934X_RESET_MBOX              BIT(1)
 #define AR934X_RESET_I2S               BIT(0)
@@ -145,6 +154,8 @@ static inline u32 dma_readl(struct ar934x_i2s *i2s, u32 reg)
     return readl(i2s->dma + reg);
 }
 
+static void ar934x_stereo_reset(struct ar934x_i2s *i2s);
+
 static void ar934x_mbox_reset(struct ar934x_i2s *i2s)
 {
     u32 val;
@@ -160,11 +171,14 @@ static void ar934x_mbox_reset(struct ar934x_i2s *i2s)
     writel(0xFFFFFFFF, i2s->dma + AR934X_DMA_REG_MBOX_INT_STATUS);
     udelay(50);
 
-    writel(AR934X_DMA_MBOX0_FIFO_RESET_RX,
+    writel(AR934X_DMA_MBOX0_FIFO_RESET_RX | AR934X_DMA_MBOX0_FIFO_RESET_TX,
            i2s->dma + AR934X_DMA_REG_MBOX_FIFO_RESET);
     udelay(50);
     writel(0, i2s->dma + AR934X_DMA_REG_MBOX_FIFO_RESET);
     udelay(50);
+
+    /* datasheet: reset the stereo controller with the MBOX DMA controller */
+    ar934x_stereo_reset(i2s);
 
     writel(AR934X_DMA_MBOX0_INT_RX_COMPLETE,
            i2s->dma + AR934X_DMA_REG_MBOX_INT_ENABLE);
@@ -530,7 +544,7 @@ static int ar934x_i2s_hw_params(struct snd_pcm_substream *substream,
 
     config |= AR934X_STEREO_CONFIG_DATA_WORD_16 <<
               AR934X_STEREO_CONFIG_DATA_WORD_SIZE_SHIFT;
-    if (params_format(params) == SNDRV_PCM_FORMAT_S16_LE)
+    if (pcm_swap)
         config |= AR934X_STEREO_CONFIG_PCM_SWAP;
     config |= posedge & AR934X_STEREO_CONFIG_POSEDGE_MASK;
     config |= AR934X_STEREO_CONFIG_I2S_ENABLE;
@@ -762,9 +776,10 @@ static int ar934x_i2s_probe(struct platform_device *pdev)
         return -ENOMEM;
     }
 
+    /* the MBOX DMA ignores the low 4 bits of the descriptor address */
     i2s->desc_pool = dma_pool_create("ar934x-i2s-desc", &pdev->dev,
                                      sizeof(struct ar934x_pcm_desc),
-                                     4, 0);
+                                     16, 0);
     if (!i2s->desc_pool) {
         dev_err(&pdev->dev, "Failed to create DMA pool\n");
         return -ENOMEM;

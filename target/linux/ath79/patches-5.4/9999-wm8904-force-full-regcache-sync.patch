@@ -1,0 +1,53 @@
+--- a/sound/soc/codecs/wm8904.c
++++ b/sound/soc/codecs/wm8904.c
+@@ -1910,11 +1910,50 @@
+ 			 * powered up (VMID ramped). Volume registers use the VU
+ 			 * latch which needs a running clock; syncing before
+ 			 * power-on makes the latch fail and volume stays at the
+ 			 * reset default instead of the amixer value.
+ 			 */
++			/*
++			 * Also force a full push: whatever the bootloader left
++			 * in the codec (its register values can differ from the
++			 * power-on defaults) would otherwise be kept, because
++			 * the regcache only writes registers it considers
++			 * changed. Marking everything dirty makes the sync
++			 * overwrite the codec with the driver's own state.
++			 */
++			regcache_mark_dirty(wm8904->regmap);
+ 			regcache_sync(wm8904->regmap);
++
++			/*
++			 * The VU (volume update) and zero-cross bits are volatile
++			 * / write-only, so the regcache does not carry them: the
++			 * probe-time writes to them are lost when the cache is
++			 * only ever replayed. Re-issue them now, with the cache
++			 * off and the codec clock running, otherwise the volume
++			 * never latches (the DAC then stays at its reset default
++			 * of about -32dB, which sounds like complete silence).
++			 */
++			regmap_update_bits(wm8904->regmap, WM8904_ADC_DIGITAL_VOLUME_LEFT,
++					   WM8904_ADC_VU, WM8904_ADC_VU);
++			regmap_update_bits(wm8904->regmap, WM8904_ADC_DIGITAL_VOLUME_RIGHT,
++					   WM8904_ADC_VU, WM8904_ADC_VU);
++			regmap_update_bits(wm8904->regmap, WM8904_DAC_DIGITAL_VOLUME_LEFT,
++					   WM8904_DAC_VU, WM8904_DAC_VU);
++			regmap_update_bits(wm8904->regmap, WM8904_DAC_DIGITAL_VOLUME_RIGHT,
++					   WM8904_DAC_VU, WM8904_DAC_VU);
++			regmap_update_bits(wm8904->regmap, WM8904_ANALOGUE_OUT1_LEFT,
++					   WM8904_HPOUT_VU | WM8904_HPOUTLZC,
++					   WM8904_HPOUT_VU | WM8904_HPOUTLZC);
++			regmap_update_bits(wm8904->regmap, WM8904_ANALOGUE_OUT1_RIGHT,
++					   WM8904_HPOUT_VU | WM8904_HPOUTRZC,
++					   WM8904_HPOUT_VU | WM8904_HPOUTRZC);
++			regmap_update_bits(wm8904->regmap, WM8904_ANALOGUE_OUT2_LEFT,
++					   WM8904_LINEOUT_VU | WM8904_LINEOUTLZC,
++					   WM8904_LINEOUT_VU | WM8904_LINEOUTLZC);
++			regmap_update_bits(wm8904->regmap, WM8904_ANALOGUE_OUT2_RIGHT,
++					   WM8904_LINEOUT_VU | WM8904_LINEOUTRZC,
++					   WM8904_LINEOUT_VU | WM8904_LINEOUTRZC);
+ 		}
+ 
+ 		/* Maintain VMID with 2*250k */
+ 		snd_soc_component_update_bits(component, WM8904_VMID_CONTROL_0,
+ 				    WM8904_VMID_RES_MASK,

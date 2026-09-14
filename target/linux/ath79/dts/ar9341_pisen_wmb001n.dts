@@ -31,15 +31,18 @@
 		pinctrl-names = "default";
 		pinctrl-0 = <&pmx_i2c_gpio &pmx_i2s_spdif>;
 
-		sda-gpios = <&gpio 16 (GPIO_ACTIVE_HIGH|GPIO_OPEN_DRAIN)>;
-		scl-gpios = <&gpio 20 GPIO_ACTIVE_HIGH>;
 		/*
-		 * Pull-up resistor for scl is missing on this board.
-		 * Following settings trick i2c-gpio to use output mode
-		 * instead of open-drain for scl.
+		 * Same settings as the working breed-based build of this
+		 * board: value ("open drain") mode for both lines and a slow
+		 * 10us clock.  SCL has no pull-up here, so the default 5us is
+		 * too fast and the codec loses register reads (the DC servo
+		 * never completes and the DAC stays silent).
 		 */
-		i2c-gpio,scl-output-only;
+		sda-gpios = <&gpio 16 GPIO_ACTIVE_HIGH>;
+		scl-gpios = <&gpio 20 GPIO_ACTIVE_HIGH>;
+		i2c-gpio,sda-open-drain;
 		i2c-gpio,scl-open-drain;
+		i2c-gpio,delay-us = <10>;
 
 		#address-cells = <1>;
 		#size-cells = <0>;
