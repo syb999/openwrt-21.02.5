@@ -158,6 +158,49 @@ static inline u32 dma_readl(struct ar934x_i2s *i2s, u32 reg)
     return readl(i2s->dma + reg);
 }
 
+/*
+ * SoC digital volume of the stereo block (0x180b0004).  The codec volume sits
+ * behind the I2S link, so it can not attenuate the optical output; this one is
+ * in front of both serializers (I2S and S/PDIF) and is therefore the only
+ * hardware volume that also works for S/PDIF.
+ *
+ * One step is 6 dB, sign+magnitude encoded: vol 15 = 0 dB, vol 0 = -90 dB
+ * (register value 0x1f), 0x10/0x00 = 0 dB, values above +7 are not supported.
+ */
+#define AR934X_STEREO_VOLUME_CH0_SHIFT  0
+#define AR934X_STEREO_VOLUME_CH1_SHIFT  8
+#define AR934X_STEREO_VOLUME_MASK       0x1f
+#define AR934X_STEREO_VOLUME_STEPS      15
+
+static struct {
+    u8 vol[2];
+    u8 mute[2];
+} ar934x_volume = { { AR934X_STEREO_VOLUME_STEPS, AR934X_STEREO_VOLUME_STEPS },
+                    { 0, 0 } };
+
+static u8 ar934x_volume_encode(u8 vol)
+{
+    return vol >= AR934X_STEREO_VOLUME_STEPS ? (vol - AR934X_STEREO_VOLUME_STEPS) :
+                                               ((AR934X_STEREO_VOLUME_STEPS - vol) | 0x10);
+}
+
+static void ar934x_volume_apply(struct ar934x_i2s *i2s)
+{
+    u32 val;
+    int ch;
+
+    val = stereo_readl(i2s, AR934X_STEREO_REG_VOLUME);
+    for (ch = 0; ch < 2; ch++) {
+        unsigned int shift = ch ? AR934X_STEREO_VOLUME_CH1_SHIFT :
+                                  AR934X_STEREO_VOLUME_CH0_SHIFT;
+        u8 v = ar934x_volume.mute[ch] ? 0 : ar934x_volume.vol[ch];
+
+        val &= ~(AR934X_STEREO_VOLUME_MASK << shift);
+        val |= (u32)ar934x_volume_encode(v) << shift;
+    }
+    stereo_writel(i2s, AR934X_STEREO_REG_VOLUME, val);
+}
+
 static void ar934x_stereo_reset(struct ar934x_i2s *i2s);
 
 static void ar934x_mbox_reset(struct ar934x_i2s *i2s)
@@ -199,6 +242,9 @@ static void ar934x_stereo_reset(struct ar934x_i2s *i2s)
     val &= ~AR934X_STEREO_CONFIG_RESET;
     stereo_writel(i2s, AR934X_STEREO_REG_CONFIG, val);
     udelay(50);
+
+    /* the block reset restores STEREO_VOLUME to 0 dB: re-apply our value */
+    ar934x_volume_apply(i2s);
 }
 
 static void ar934x_module_reset(struct ar934x_i2s *i2s)
@@ -748,8 +794,100 @@ static int ar934x_pcm_new(struct snd_soc_pcm_runtime *rtd)
     return 0;
 }
 
+/*
+ * Mixer controls for the SoC digital volume.  They are the master volume of
+ * this card: the wm8904 codec controls only affect the headphone output, while
+ * these also change the level of the optical (S/PDIF) output.
+ */
+static int ar934x_volume_info(struct snd_kcontrol *kcontrol,
+                              struct snd_ctl_elem_info *uinfo)
+{
+    uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+    uinfo->count = 2;
+    uinfo->value.integer.min = 0;
+    uinfo->value.integer.max = AR934X_STEREO_VOLUME_STEPS;
+    return 0;
+}
+
+static int ar934x_volume_get(struct snd_kcontrol *kcontrol,
+                             struct snd_ctl_elem_value *ucontrol)
+{
+    ucontrol->value.integer.value[0] = ar934x_volume.vol[0];
+    ucontrol->value.integer.value[1] = ar934x_volume.vol[1];
+    return 0;
+}
+
+static int ar934x_volume_put(struct snd_kcontrol *kcontrol,
+                             struct snd_ctl_elem_value *ucontrol)
+{
+    int ch, changed = 0;
+
+    for (ch = 0; ch < 2; ch++) {
+        unsigned int v = (unsigned int)ucontrol->value.integer.value[ch];
+
+        if (v > AR934X_STEREO_VOLUME_STEPS)
+            v = AR934X_STEREO_VOLUME_STEPS;
+        if (v != ar934x_volume.vol[ch]) {
+            ar934x_volume.vol[ch] = v;
+            changed = 1;
+        }
+    }
+
+    if (changed && global_i2s)
+        ar934x_volume_apply(global_i2s);
+
+    return changed;
+}
+
+static int ar934x_volume_switch_get(struct snd_kcontrol *kcontrol,
+                                    struct snd_ctl_elem_value *ucontrol)
+{
+    ucontrol->value.integer.value[0] = ar934x_volume.mute[0] ? 0 : 1;
+    ucontrol->value.integer.value[1] = ar934x_volume.mute[1] ? 0 : 1;
+    return 0;
+}
+
+static int ar934x_volume_switch_put(struct snd_kcontrol *kcontrol,
+                                    struct snd_ctl_elem_value *ucontrol)
+{
+    int ch, changed = 0;
+
+    for (ch = 0; ch < 2; ch++) {
+        unsigned int mute = ucontrol->value.integer.value[ch] ? 0 : 1;
+
+        if (mute != ar934x_volume.mute[ch]) {
+            ar934x_volume.mute[ch] = mute;
+            changed = 1;
+        }
+    }
+
+    if (changed && global_i2s)
+        ar934x_volume_apply(global_i2s);
+
+    return changed;
+}
+
+static const struct snd_kcontrol_new ar934x_i2s_controls[] = {
+    {
+        .iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+        .name = "Master Playback Volume",
+        .info = ar934x_volume_info,
+        .get = ar934x_volume_get,
+        .put = ar934x_volume_put,
+    },
+    {
+        .iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+        .name = "Master Playback Switch",
+        .info = snd_ctl_boolean_stereo_info,
+        .get = ar934x_volume_switch_get,
+        .put = ar934x_volume_switch_put,
+    },
+};
+
 static const struct snd_soc_component_driver ar934x_i2s_component = {
     .name = "qca-ar934x-i2s",
+    .controls = ar934x_i2s_controls,
+    .num_controls = ARRAY_SIZE(ar934x_i2s_controls),
     .ops = &ar934x_pcm_ops,
     .pcm_new = ar934x_pcm_new,
 };
