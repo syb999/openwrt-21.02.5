@@ -1,0 +1,414 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * HINLINK OPC-H28K (RK3528)
+ *
+ * Board description written against the Rockchip 5.10 BSP SoC bindings,
+ * because the drivers backported into this 5.4 kernel are taken from that
+ * BSP (vendor clock IDs, vendor pinctrl group names, pcie2x1/combphy_pu
+ * labels).  The mainline/LEDE board file was used as the reference for the
+ * board wiring (regulators, LEDs, SD, GMAC, PCIe RTL8168).
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pinctrl/rockchip.h>
+
+#include "rk3528.dtsi"
+
+/ {
+	model = "HINLINK OPC-H28K Board";
+	compatible = "hinlink,opc-h28k", "rockchip,rk3528";
+
+	aliases {
+		mmc0 = &sdhci;
+		mmc1 = &sdmmc;
+		serial0 = &uart0;
+		/*
+		 * RK3528 has GMAC0 (RMII, integrated PHY) and GMAC1 (RGMII,
+		 * external PHY).  The board only wires up GMAC1.
+		 *
+		 * The vendor/ophub firmware that boots this board numbers it
+		 * ethernet0 (verified live on a running unit: ethernet0 ->
+		 * /ethernet@ffbe0000, and its mdio bus comes up as stmmac-0), so
+		 * keep the same numbering here instead of the previous
+		 * ethernet1: that is what the dwmac-rk glue expects for the
+		 * stmmac bus id it derives from this alias.
+		 */
+		ethernet0 = &gmac1;
+		/*
+		 * rk3528.dtsi aliases ethernet1 to gmac1 as well; drop that here so
+		 * only one alias points at the SoC GMAC (the vendor firmware leaves
+		 * ethernet1 for the PCIe NIC instead).
+		 */
+		/delete-property/ ethernet1;
+
+		led-boot = &led_work;
+		led-failsafe = &led_work;
+		led-running = &led_work;
+		led-upgrade = &led_work;
+	};
+
+	chosen {
+		stdout-path = "serial0:1500000n8";
+	};
+
+	leds {
+		compatible = "gpio-leds";
+		pinctrl-names = "default";
+		pinctrl-0 = <&lan_led_en>, <&wan_led_en>, <&work_led_en>;
+
+		lan {
+			label = "amber:lan";
+			gpios = <&gpio4 RK_PC1 GPIO_ACTIVE_LOW>;
+		};
+
+		wan {
+			label = "blue:wan";
+			gpios = <&gpio4 RK_PC0 GPIO_ACTIVE_LOW>;
+		};
+
+		led_work: work {
+			label = "green:work";
+			gpios = <&gpio4 RK_PB7 GPIO_ACTIVE_LOW>;
+			/* heartbeat so a user can see at a glance that Linux is
+			 * running - the board has no UART exposed.  Same trigger
+			 * the working vendor/ophub firmware uses on this pin. */
+			linux,default-trigger = "heartbeat";
+		};
+	};
+
+	vcc5v0_sys: vcc5v0-sys {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc5v0_sys";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+	};
+
+	vcc_3v3: vcc-3v3 {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_3v3";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		vin-supply = <&vcc5v0_sys>;
+	};
+
+	vcc_1v8: vcc-1v8 {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_1v8";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		vin-supply = <&vcc_3v3>;
+	};
+
+	vcc3v3_sd: vcc3v3-sd {
+		compatible = "regulator-fixed";
+		gpios = <&gpio4 RK_PA1 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&sdmmc_pwren_l>;
+		regulator-name = "vcc3v3_sd";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		vin-supply = <&vcc_3v3>;
+	};
+
+	vccio_sd: vccio-sd {
+		compatible = "regulator-gpio";
+		gpios = <&gpio4 RK_PB6 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&sdmmc_vol_ctrl_h>;
+		regulator-name = "vccio_sd";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <3300000>;
+		states = <1800000 0x0>, <3300000 0x1>;
+		vin-supply = <&vcc5v0_sys>;
+	};
+
+	vcc_ddr: vcc-ddr {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_ddr";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <1100000>;
+		regulator-max-microvolt = <1100000>;
+		vin-supply = <&vcc5v0_sys>;
+	};
+
+	vdd_0v9: vdd-0v9 {
+		compatible = "regulator-fixed";
+		regulator-name = "vdd_0v9";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <900000>;
+		regulator-max-microvolt = <900000>;
+		vin-supply = <&vcc5v0_sys>;
+	};
+
+	/*
+	 * vdd_arm / vdd_logic stay fixed at the value the bootloader leaves them
+	 * at (950 mV).  The vendor DT drives them with pwm-regulator, but on this
+	 * tree the mainline pwm-regulator (5.4) has no regulator-init-microvolt
+	 * support, so it comes up at the *minimum* of its range (746 mV) instead
+	 * of the intended 953 mV - a rail we cannot verify from software.  The
+	 * OSS rk3528 support does not do voltage scaling either: it pins the CPU
+	 * clock (see the assigned-clock-rates in the cpu nodes) and leaves the
+	 * rails alone.  950 mV covers every OPP up to 1.2 GHz.
+	 */
+	vdd_arm: vdd-arm {
+		compatible = "regulator-fixed";
+		regulator-name = "vdd_arm";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <950000>;
+		regulator-max-microvolt = <950000>;
+		vin-supply = <&vcc5v0_sys>;
+	};
+
+	vdd_logic: vdd-logic {
+		compatible = "regulator-fixed";
+		regulator-name = "vdd_logic";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <950000>;
+		regulator-max-microvolt = <950000>;
+		vin-supply = <&vcc5v0_sys>;
+	};
+};
+
+&cpu0 {
+	cpu-supply = <&vdd_arm>;
+};
+
+&cpu1 {
+	cpu-supply = <&vdd_arm>;
+};
+
+&cpu2 {
+	cpu-supply = <&vdd_arm>;
+};
+
+&cpu3 {
+	cpu-supply = <&vdd_arm>;
+};
+
+&pinctrl {
+	leds {
+		/*
+		 * The three board LEDs are active low.  They must be pulled up, or
+		 * the pin floats and the LED can never be driven on - the vendor
+		 * 5.10 firmware uses pcfg-pull-up for exactly these pins
+		 * (phandle 0x9a = pcfg-pull-up in its DTB).
+		 */
+		lan_led_en: lan-led-en {
+			rockchip,pins = <4 RK_PC1 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+
+		wan_led_en: wan-led-en {
+			rockchip,pins = <4 RK_PC0 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+
+		work_led_en: led-work-en {
+			rockchip,pins = <4 RK_PB7 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
+
+	pcie {
+		rtl8111_isolate: rtl8111-isolate {
+			rockchip,pins = <4 RK_PA6 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
+
+	sdmmc {
+		sdmmc_pwren_l: sdmmc-pwren-l {
+			rockchip,pins = <4 RK_PA1 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		sdmmc_vol_ctrl_h: sdmmc-vol-ctrl-h {
+			rockchip,pins = <4 RK_PB6 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+};
+
+&sdmmc {
+	bus-width = <4>;
+	cap-sd-highspeed;
+	disable-wp;
+	sd-uhs-sdr104;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sdmmc_bus4>, <&sdmmc_clk>, <&sdmmc_cmd>, <&sdmmc_det>;
+	vmmc-supply = <&vcc3v3_sd>;
+	vqmmc-supply = <&vccio_sd>;
+	status = "okay";
+};
+
+/*
+ * Onboard eMMC (the OPC-H28K boots from here).  Without this the kernel
+ * cannot mount the rootfs of an image flashed to the eMMC, so it is not
+ * optional even when the TF card is used for testing.
+ */
+&sdhci {
+	bus-width = <8>;
+	no-sd;
+	no-sdio;
+	non-removable;
+	cap-mmc-highspeed;
+	mmc-hs200-1_8v;
+	vmmc-supply = <&vcc_3v3>;
+	vqmmc-supply = <&vcc_1v8>;
+	status = "okay";
+};
+
+&uart0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart0m0_xfer>;
+	status = "okay";
+};
+
+/*
+ * GMAC1: RGMII, external gigabit PHY (port 1 of the OPC-H28K).
+ *
+ * The delays below are the values this very board runs with on the working
+ * vendor/ophub 5.10 firmware (its dmesg prints "init for RGMII", "TX
+ * delay(0x36)", "RX delay(0x2d)"): plain rgmii with the *SoC* supplying both
+ * RGMII delays, and the PHY adding none.  Rockchip's RK3528 EVB uses a
+ * different combination (rgmii-rxid + tx_delay 0x30) because its PHY wiring
+ * differs, so do not copy the EVB values here.
+ */
+&gmac1 {
+	status = "okay";
+	clock_in_out = "output";
+	phy-mode = "rgmii";
+	phy-handle = <&rgmii_phy>;
+	phy-supply = <&vcc_3v3>;
+
+	/*
+	 * Measured on this board with the driver's RGMII delay sweep (each combo
+	 * written for 8 s while the host pinged us, counting eth1 rx_packets):
+	 *   0x36/0x2d -> +0      0x36/0x00 -> +210   0x30/0x10 -> +281
+	 *   0x10/0x10 -> +78     0x0f/0x0f -> +71    0x00/0x2d -> +0
+	 * The values copied from the vendor firmware (0x36/0x2d) receive nothing;
+	 * 0x30/0x10 receives the most.  It also matches what Rockchip's RK3528 EVB
+	 * uses (tx_delay 0x30) - the board's PHY wiring wants a TX delay and only
+	 * a small RX delay.
+	 */
+	tx_delay = <0x30>;
+	rx_delay = <0x10>;
+
+	snps,reset-active-low;
+	snps,reset-delays-us = <0 20000 100000>;
+	snps,reset-gpio = <&gpio4 RK_PC2 GPIO_ACTIVE_LOW>;
+
+	pinctrl-names = "default";
+	pinctrl-0 = <&rgmii_miim>, <&rgmii_tx_bus2>, <&rgmii_rx_bus2>,
+		    <&rgmii_rgmii_clk>, <&rgmii_rgmii_bus>, <&eth_pins>;
+};
+
+&mdio1 {
+	rgmii_phy: phy@1 {
+		compatible = "ethernet-phy-ieee802.3-c22";
+		reg = <0x1>;
+		/*
+		 * LED pin mapping for the RTL8211F behind the LAN port, applied
+		 * by the PHY driver into page 0xd04: reg 0x10 = this value and
+		 * reg 0x11 (EEELCR) = 0.  Without it the PHY default maps the
+		 * green jack LED to 10M only and lets EEE drive it, so at
+		 * gigabit the LED stays dark and keeps flickering off.
+		 * 0x6d60 is the value upstream/lede uses on every Rockchip
+		 * board with this PHY, including rk3528-opc-h28k.
+		 */
+		realtek,led-data = <0x6d60>;
+	};
+};
+
+/* SoC thermal sensor.  The CPU sensor feeds the soc-thermal zone defined in
+ * rk3528.dtsi (with its OTP trim cells for calibration); that zone is what the
+ * LuCI overview reports as the chip temperature. */
+&tsadc {
+	status = "okay";
+};
+
+/* Combo PHY feeding the PCIe controller (PE/PCIe lane) */
+&combphy_pu {
+	status = "okay";
+};
+
+/* Port 2 of the OPC-H28K: RTL8168 gigabit NIC behind the PCIe x1 lane */
+&pcie2x1 {
+	status = "okay";
+	reset-gpios = <&gpio4 RK_PA3 GPIO_ACTIVE_HIGH>;
+	vpcie3v3-supply = <&vcc_3v3>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&rtl8111_isolate>;
+
+	bridge@0,0 {
+		reg = <0x00000000 0 0 0 0>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		ethernet@0,0 {
+			compatible = "pci10ec,8168";
+			reg = <0x000000 0 0 0 0>;
+			/*
+			 * LED pin mapping for the RTL8111H on this board, applied
+			 * by the r8168 driver into register 0x18 (CustomLED).
+			 * Without it the chip default (0x0ca9) maps the green pin
+			 * to 10/100M only, so a gigabit link lights only the
+			 * amber pin.  0x870 is the value the vendor firmware uses:
+			 * green = link, amber = activity.
+			 */
+			realtek,led-data = <0x870>;
+		};
+	};
+};
+
+/*
+ * Reserved DRAM window used by pstore/ramoops: the kernel writes its console
+ * log here when it panics, the SoC then warm-resets, and U-Boot copies this
+ * window into the boot partition so it can be read back with no UART and no
+ * working userspace.  Placed high (240 MiB) so neither U-Boot's load area nor
+ * the kernel image can collide with it.
+ */
+/ {
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		ramoops@f000000 {
+			compatible = "ramoops";
+			reg = <0x0 0x0f000000 0x0 0x100000>;
+			console-size = <0x40000>;
+			record-size = <0x10000>;
+			pmsg-size = <0x20000>;
+		};
+	};
+};
+
+/*
+ * USB 2.0: the board has one type-A port wired to the usb2phy host port.
+ * RK3528's SoC dtsi disables the controller, the PHY and both ports, so all
+ * four have to be enabled for the port to come up (the vendor firmware has
+ * exactly the same four nodes as "okay").
+ */
+&usb2phy {
+	status = "okay";
+};
+
+&u2phy_host {
+	status = "okay";
+};
+
+&usb_host0_ehci {
+	status = "okay";
+};
+
+&usb_host0_ohci {
+	status = "okay";
+};

@@ -1,0 +1,23 @@
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-rk.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-rk.c
+@@ -1540,6 +1540,20 @@
+ 	plat_dat->has_gmac = true;
+ 	plat_dat->fix_mac_speed = rk_fix_speed;
+ 
++	/*
++	 * The RK3528 MAC is a DWMAC 4.20a: its DT node carries the
++	 * "snps,dwmac-4.20a" compatible, so the gmac4 register map is the
++	 * correct one.  Leaving has_gmac set as well makes stmmac_hwif_init()
++	 * match no entry at all (it requires exactly one of the two flags),
++	 * and falling back to the gmac3 map reads the version register with
++	 * the wrong layout (it comes back as 0, "Version ID not available")
++	 * and leaves the MDIO engine dead, so the PHY is never found.
++	 */
++	if (of_device_is_compatible(pdev->dev.of_node, "rockchip,rk3528-gmac")) {
++		plat_dat->has_gmac = false;
++		plat_dat->has_gmac4 = true;
++	}
++
+ 	plat_dat->bsp_priv = rk_gmac_setup(pdev, plat_dat, data);
+ 	if (IS_ERR(plat_dat->bsp_priv)) {
+ 		ret = PTR_ERR(plat_dat->bsp_priv);

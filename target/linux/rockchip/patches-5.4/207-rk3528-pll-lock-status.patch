@@ -1,0 +1,40 @@
+--- a/drivers/clk/rockchip/clk.h
++++ b/drivers/clk/rockchip/clk.h
+@@ -320,6 +320,13 @@
+ 
+ #define ROCKCHIP_PLL_SYNC_RATE		BIT(0)
+ #define ROCKCHIP_PLL_FIXED_MODE		BIT(1)
++/*
++ * ROCKCHIP_PLL_NO_GRF_LOCK - the PLL has no lock status register in the GRF
++ * (newer SoCs such as rk3528 report the lock in the PLL's own CON1 register
++ * instead), so the GRF based rockchip_pll_wait_lock() can never succeed and
++ * must be skipped instead of failing every clk_set_rate() with -ETIMEDOUT.
++ */
++#define ROCKCHIP_PLL_NO_GRF_LOCK	BIT(2)
+ 
+ #define PLL(_type, _id, _name, _pnames, _flags, _con, _mode, _mshift,	\
+ 		_lshift, _pflags, _rtable)				\
+--- a/drivers/clk/rockchip/clk-pll.c
++++ b/drivers/clk/rockchip/clk-pll.c
+@@ -223,7 +223,10 @@
+ 	writel_relaxed(pllcon, pll->reg_base + RK3036_PLLCON(2));
+ 
+ 	/* wait for the pll to lock */
+-	ret = rockchip_pll_wait_lock(pll);
++	if (pll->flags & ROCKCHIP_PLL_NO_GRF_LOCK)
++		ret = 0;
++	else
++		ret = rockchip_pll_wait_lock(pll);
+ 	if (ret) {
+ 		pr_warn("%s: pll update unsuccessful, trying to restore old params\n",
+ 			__func__);
+@@ -262,7 +265,8 @@
+ 
+ 	writel(HIWORD_UPDATE(0, RK3036_PLLCON1_PWRDOWN, 0),
+ 	       pll->reg_base + RK3036_PLLCON(1));
+-	rockchip_pll_wait_lock(pll);
++	if (!(pll->flags & ROCKCHIP_PLL_NO_GRF_LOCK))
++		rockchip_pll_wait_lock(pll);
+ 
+ 	return 0;
+ }

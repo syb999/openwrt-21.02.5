@@ -1,0 +1,106 @@
+--- a/drivers/pci/controller/dwc/pcie-designware-host.c
++++ b/drivers/pci/controller/dwc/pcie-designware-host.c
+@@ -77,6 +77,7 @@
+ /* MSI int handler */
+ irqreturn_t dw_handle_msi_irq(struct pcie_port *pp)
+ {
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
+ 	int i, pos, irq;
+ 	unsigned long val;
+ 	u32 status, num_ctrls;
+@@ -85,9 +86,8 @@
+ 	num_ctrls = pp->num_vectors / MAX_MSI_IRQS_PER_CTRL;
+ 
+ 	for (i = 0; i < num_ctrls; i++) {
+-		dw_pcie_rd_own_conf(pp, PCIE_MSI_INTR0_STATUS +
+-					(i * MSI_REG_CTRL_BLOCK_SIZE),
+-				    4, &status);
++		status = dw_pcie_readl_dbi(pci, PCIE_MSI_INTR0_STATUS +
++					   (i * MSI_REG_CTRL_BLOCK_SIZE));
+ 		if (!status)
+ 			continue;
+ 
+@@ -147,6 +147,7 @@
+ static void dw_pci_bottom_mask(struct irq_data *d)
+ {
+ 	struct pcie_port *pp = irq_data_get_irq_chip_data(d);
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
+ 	unsigned int res, bit, ctrl;
+ 	unsigned long flags;
+ 
+@@ -157,8 +158,7 @@
+ 	bit = d->hwirq % MAX_MSI_IRQS_PER_CTRL;
+ 
+ 	pp->irq_mask[ctrl] |= BIT(bit);
+-	dw_pcie_wr_own_conf(pp, PCIE_MSI_INTR0_MASK + res, 4,
+-			    pp->irq_mask[ctrl]);
++	dw_pcie_writel_dbi(pci, PCIE_MSI_INTR0_MASK + res, pp->irq_mask[ctrl]);
+ 
+ 	raw_spin_unlock_irqrestore(&pp->lock, flags);
+ }
+@@ -166,6 +166,7 @@
+ static void dw_pci_bottom_unmask(struct irq_data *d)
+ {
+ 	struct pcie_port *pp = irq_data_get_irq_chip_data(d);
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
+ 	unsigned int res, bit, ctrl;
+ 	unsigned long flags;
+ 
+@@ -176,8 +177,7 @@
+ 	bit = d->hwirq % MAX_MSI_IRQS_PER_CTRL;
+ 
+ 	pp->irq_mask[ctrl] &= ~BIT(bit);
+-	dw_pcie_wr_own_conf(pp, PCIE_MSI_INTR0_MASK + res, 4,
+-			    pp->irq_mask[ctrl]);
++	dw_pcie_writel_dbi(pci, PCIE_MSI_INTR0_MASK + res, pp->irq_mask[ctrl]);
+ 
+ 	raw_spin_unlock_irqrestore(&pp->lock, flags);
+ }
+@@ -185,13 +185,14 @@
+ static void dw_pci_bottom_ack(struct irq_data *d)
+ {
+ 	struct pcie_port *pp  = irq_data_get_irq_chip_data(d);
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
+ 	unsigned int res, bit, ctrl;
+ 
+ 	ctrl = d->hwirq / MAX_MSI_IRQS_PER_CTRL;
+ 	res = ctrl * MSI_REG_CTRL_BLOCK_SIZE;
+ 	bit = d->hwirq % MAX_MSI_IRQS_PER_CTRL;
+ 
+-	dw_pcie_wr_own_conf(pp, PCIE_MSI_INTR0_STATUS + res, 4, BIT(bit));
++	dw_pcie_writel_dbi(pci, PCIE_MSI_INTR0_STATUS + res, BIT(bit));
+ }
+ 
+ static struct irq_chip dw_pci_msi_bottom_irq_chip = {
+@@ -309,10 +310,8 @@
+ 	msi_target = (u64)pp->msi_data;
+ 
+ 	/* Program the msi_data */
+-	dw_pcie_wr_own_conf(pp, PCIE_MSI_ADDR_LO, 4,
+-			    lower_32_bits(msi_target));
+-	dw_pcie_wr_own_conf(pp, PCIE_MSI_ADDR_HI, 4,
+-			    upper_32_bits(msi_target));
++	dw_pcie_writel_dbi(pci, PCIE_MSI_ADDR_LO, lower_32_bits(msi_target));
++	dw_pcie_writel_dbi(pci, PCIE_MSI_ADDR_HI, upper_32_bits(msi_target));
+ }
+ EXPORT_SYMBOL_GPL(dw_pcie_msi_init);
+ 
+@@ -685,12 +684,12 @@
+ 		/* Initialize IRQ Status array */
+ 		for (ctrl = 0; ctrl < num_ctrls; ctrl++) {
+ 			pp->irq_mask[ctrl] = ~0;
+-			dw_pcie_wr_own_conf(pp, PCIE_MSI_INTR0_MASK +
+-					    (ctrl * MSI_REG_CTRL_BLOCK_SIZE),
+-					    4, pp->irq_mask[ctrl]);
+-			dw_pcie_wr_own_conf(pp, PCIE_MSI_INTR0_ENABLE +
+-					    (ctrl * MSI_REG_CTRL_BLOCK_SIZE),
+-					    4, ~0);
++			dw_pcie_writel_dbi(pci, PCIE_MSI_INTR0_MASK +
++						   (ctrl * MSI_REG_CTRL_BLOCK_SIZE),
++					   pp->irq_mask[ctrl]);
++			dw_pcie_writel_dbi(pci, PCIE_MSI_INTR0_ENABLE +
++						   (ctrl * MSI_REG_CTRL_BLOCK_SIZE),
++					   ~0);
+ 		}
+ 	}
+ 

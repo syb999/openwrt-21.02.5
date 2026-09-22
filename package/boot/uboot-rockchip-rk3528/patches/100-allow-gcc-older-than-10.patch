@@ -1,0 +1,13 @@
+--- a/arch/arm/config.mk
++++ b/arch/arm/config.mk
+@@ -73,11 +73,11 @@
+ endif
+ 
+ checkgcc10:
+ 	@if test "$(call cc-name)" = "gcc" -a \
+ 			"$(call cc-version)" -lt "1000"; then \
+-		echo '*** Your GCC is older than 10.0 and is not supported'; \
+-		false; \
++		echo '*** Your GCC is older than 10.0, supported upstream from 10.0 on'; \
++		echo '*** Building anyway: the OpenWrt 21.02 toolchain is GCC 8.4'; \
+ 	fi

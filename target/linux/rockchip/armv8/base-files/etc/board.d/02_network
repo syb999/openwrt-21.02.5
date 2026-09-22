@@ -11,6 +11,14 @@ rockchip_setup_interfaces()
 	friendlyarm,nanopi-r2s)
 		ucidef_set_interfaces_lan_wan 'eth1' 'eth0'
 		;;
+	hinlink,opc-h28k)
+		# eth0 is the on-board GMAC (RTL8211F RGMII PHY) and eth1 the
+		# RTL8111H sitting behind the PCIe x1 lane.  The PCIe NIC is a
+		# loadable module and therefore probes after the built-in GMAC,
+		# which is why the GMAC owns eth0.  These roles match 01_leds
+		# (WAN on eth1, LAN on eth0) and the vendor firmware.
+		ucidef_set_interfaces_lan_wan 'eth0' 'eth1'
+		;;
 	*)
 		ucidef_set_interface_lan 'eth0'
 		;;
@@ -21,6 +29,32 @@ nanopi_r2s_generate_mac()
 {
 	local sd_hash=$(sha256sum /sys/devices/platform/ff500000.dwmmc/mmc_host/mmc0/mmc0:*/cid)
 	local mac_base=$(macaddr_canonicalize "$(echo "${sd_hash}" | dd bs=1 count=12 2>/dev/null)")
+	echo "$(macaddr_unsetbit_mc "$(macaddr_setbit_la "${mac_base}")")"
+}
+
+h28k_generate_mac()
+{
+	# Stable per-box MAC derived from the onboard eMMC CID (mmc1 in the DT
+	# aliases, i.e. /dev/mmcblk1 on this board), falling back to the SD
+	# card and finally to the SoC serial if no CID is readable yet.  The
+	# optional tag mixes in a per-interface string so one board can derive
+	# several *distinct* stable addresses.
+	local tag="$1" seed="" f
+	for f in /sys/class/mmc_host/mmc1/mmc1:*/cid \
+		 /sys/block/mmcblk1/device/cid \
+		 /sys/class/mmc_host/mmc0/mmc0:*/cid \
+		 /sys/block/mmcblk0/device/cid \
+		 /proc/device-tree/serial-number; do
+		[ -r "$f" ] || continue
+		seed=$(cat "$f" 2>/dev/null)
+		[ -n "$seed" ] && break
+	done
+	[ -z "$seed" ] && seed="hinlink-opc-h28k"
+
+	local hash=$(printf '%s-%s' "$seed" "$tag" | sha256sum | cut -c1-12)
+	local mac_base=$(macaddr_canonicalize "$hash")
+	[ -z "$mac_base" ] && mac_base="02:00:00:00:00:01"
+
 	echo "$(macaddr_unsetbit_mc "$(macaddr_setbit_la "${mac_base}")")"
 }
 
@@ -35,6 +69,18 @@ rockchip_setup_macs()
 	friendlyarm,nanopi-r2s)
 		wan_mac=$(nanopi_r2s_generate_mac)
 		lan_mac=$(macaddr_add "$wan_mac" +1)
+		;;
+	hinlink,opc-h28k)
+		# One stable MAC per *port* (same idea as target/linux/realtek).
+		#
+		# Note we must NOT use ucidef_set_interface_macaddr "lan" here: while
+		# both ports sit in the LAN bridge, generate_network() in
+		# bin/config_generate copies that single address onto the bridge AND
+		# onto every member port, and a bridge sharing its address with its
+		# members drops frames - DHCP replies included - so the board looks
+		# perfectly healthy while no client ever gets a lease.
+		ucidef_set_network_device_mac eth0 "$(h28k_generate_mac lan)"
+		ucidef_set_network_device_mac eth1 "$(h28k_generate_mac wan)"
 		;;
 	esac
 

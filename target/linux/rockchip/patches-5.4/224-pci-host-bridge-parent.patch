@@ -1,0 +1,16 @@
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@ -626,6 +626,13 @@
+ 	if (!bridge)
+ 		return NULL;
+ 
++	/*
++	 * Set the parent early: the resource walk below and any OF/DMA setup
++	 * done by the host controller driver needs the bridge to be part of a
++	 * proper device hierarchy.  The vendor 5.10 BSP sets it here too.
++	 */
++	bridge->dev.parent = dev;
++
+ 	ret = devm_add_action_or_reset(dev, devm_pci_alloc_host_bridge_release,
+ 				       bridge);
+ 	if (ret)

@@ -1,0 +1,52 @@
+--- a/drivers/net/phy/realtek.c
++++ b/drivers/net/phy/realtek.c
+@@ -169,6 +169,41 @@
+ 			    CTL1000_ENABLE_MASTER | CTL1000_AS_MASTER);
+ }
+ 
++
++/*
++ * One-shot register dump for bring-up: the PHY's own view of the link, its
++ * RGMII delay configuration (page 0xd08 reg 0x11) and its LED configuration
++ * (page 0xd04 regs 0x10-0x13).  "Link up but no data, 1000M LED dark" cannot
++ * be diagnosed from the MAC side alone - the PHY may be linking at 100M, may
++ * have its own RGMII delays strapped on, or may have the 1000M LED disabled.
++ */
++static void rtl8211f_dump(struct phy_device *phydev)
++{
++	dev_info(&phydev->mdio.dev,
++		 "RTL8211F: BMCR=0x%04x BMSR=0x%04x PHYSR(0x11)=0x%04x ANAR=0x%04x ANLPAR=0x%04x 1000CTRL=0x%04x 1000STAT=0x%04x\n",
++		 phy_read(phydev, 0x00), phy_read(phydev, 0x01),
++		 phy_read(phydev, 0x11), phy_read(phydev, 0x04),
++		 phy_read(phydev, 0x05), phy_read(phydev, 0x09),
++		 phy_read(phydev, 0x0a));
++	dev_info(&phydev->mdio.dev,
++		 "RTL8211F: RGMIIdelay(0xd08/0x11)=0x%04x  LED(0xd04): 10=0x%04x 11=0x%04x 12=0x%04x 13=0x%04x\n",
++		 phy_read_paged(phydev, 0xd08, 0x11),
++		 phy_read_paged(phydev, 0xd04, 0x10), phy_read_paged(phydev, 0xd04, 0x11),
++		 phy_read_paged(phydev, 0xd04, 0x12), phy_read_paged(phydev, 0xd04, 0x13));
++}
++
++static int rtl8211f_read_status(struct phy_device *phydev)
++{
++	static bool dumped;
++	int ret = genphy_read_status(phydev);
++
++	if (!dumped && phydev->link) {
++		dumped = true;
++		rtl8211f_dump(phydev);
++	}
++	return ret;
++}
++
+ static int rtl8211f_config_init(struct phy_device *phydev)
+ {
+ 	struct device *dev = &phydev->mdio.dev;
+@@ -515,6 +550,7 @@
+ 		PHY_ID_MATCH_EXACT(0x001cc916),
+ 		.name		= "RTL8211F Gigabit Ethernet",
+ 		.config_init	= &rtl8211f_config_init,
++		.read_status	= &rtl8211f_read_status,
+ 		.ack_interrupt	= &rtl8211f_ack_interrupt,
+ 		.config_intr	= &rtl8211f_config_intr,
+ 		.suspend	= genphy_suspend,

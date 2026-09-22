@@ -16,7 +16,7 @@ PKG_FLAGS:=nonshared
 PKG_LICENSE:=GPL-2.0 GPL-2.0+
 PKG_LICENSE_FILES:=Licenses/README
 
-PKG_BUILD_PARALLEL:=1
+PKG_BUILD_PARALLEL ?= 1
 
 export GCC_HONOUR_COPTS=s
 
@@ -44,8 +44,13 @@ TARGET_DEP = TARGET_$(BUILD_TARGET)$(if $(BUILD_SUBTARGET),_$(BUILD_SUBTARGET))
 UBOOT_MAKE_FLAGS = \
 	HOSTCC="$(HOSTCC)" \
 	HOSTCFLAGS="$(HOST_CFLAGS) $(HOST_CPPFLAGS) -std=gnu11" \
+	HOSTLDFLAGS="$(HOST_LDFLAGS)" \
 	LOCALVERSION="-OpenWrt-$(REVISION)" \
-	HOSTLDFLAGS="$(HOST_LDFLAGS)"
+	STAGING_PREFIX="$(STAGING_DIR_HOST)" \
+	PKG_CONFIG_PATH="$(STAGING_DIR_HOST)/lib/pkgconfig" \
+	PKG_CONFIG_LIBDIR="$(STAGING_DIR_HOST)/lib/pkgconfig" \
+	PKG_CONFIG_EXTRAARGS="--static" \
+	$(if $(findstring c,$(OPENWRT_VERBOSE)),V=1,V='')
 
 define Build/U-Boot/Target
   $(eval $(call U-Boot/Init,$(1)))
@@ -78,6 +83,9 @@ endef
 
 define Build/Configure/U-Boot
 	+$(MAKE) $(PKG_JOBS) -C $(PKG_BUILD_DIR) $(UBOOT_CONFIGURE_VARS) $(UBOOT_CONFIG)_config
+	$(if $(strip $(UBOOT_CUSTOMIZE_CONFIG)),
+		$(PKG_BUILD_DIR)/scripts/config --file $(PKG_BUILD_DIR)/.config $(UBOOT_CUSTOMIZE_CONFIG)
+		+$(MAKE) $(PKG_JOBS) -C $(PKG_BUILD_DIR) $(UBOOT_CONFIGURE_VARS) oldconfig)
 endef
 
 DTC=$(wildcard $(LINUX_DIR)/scripts/dtc/dtc)

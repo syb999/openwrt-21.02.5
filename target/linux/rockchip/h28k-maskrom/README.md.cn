@@ -1,0 +1,153 @@
+# H28K (RK3528) 引导器：编译与用法
+
+（本文是 `README.md` 的中文版，**命令、变量名、术语一律保持原文**，便于直接复制执行；
+如遇歧义以英文原版为准。）
+
+本目录包含从 maskrom（USB）救砖 / 重刷该板子所需的全部东西。镜像实际引导所用的
+引导器，由 `package/boot/` 下的两个 OpenWrt 包生成。
+
+---
+
+## 1. U-Boot 包：`package/boot/uboot-rockchip-rk3528`
+
+面向 RK3528 板子的 U-Boot **2026.07**，产出设备 **`generic-rk3528`**
+（H28K 的设备定义用 `UBOOT_DEVICE_NAME := generic-rk3528` 选中它）。
+
+它被刻意与 `package/boot/uboot-rockchip` 分开存放，原因：
+
+* `uboot-rockchip` 是 U-Boot **2021.01**，供现有的 RK3328 / RK3399 设备使用，
+  **完全无法编译 RK3528**；
+* 2026.07 需要 `include/u-boot.mk` 里的新钩子：`UBOOT_CUSTOMIZE_CONFIG` 与
+  `ROCKCHIP_TPL`。这些钩子是 `include/u-boot.mk` 中 12 行的改动（同属本次移植）。
+
+### 它依赖什么
+
+`rkbin-rk3528`（由 `package/boot/rockchip-rkbin` 生成，该包内 vendor 了 Rockchip
+rkbin 的相关片段）：
+
+| rkbin 里的文件                       | 作用                            |
+|-------------------------------------|--------------------------------|
+| `rk3528_bl31_v1.17.elf`             | ATF（BL31），被链接进 u-boot.itb  |
+| `rk3528_ddr_1056MHz_v1.10.bin`      | TPL，DDR 初始化                  |
+
+### 它产出什么
+
+| 产物                                        | 落位                                                     |
+|--------------------------------------------|---------------------------------------------------------|
+| `generic-rk3528-idbloader.img`             | `staging_dir/target-*/image/`                            |
+| `generic-rk3528-u-boot.itb`                | `staging_dir/target-*/image/`                            |
+| 同样这两个，在最终刷机镜像里                 | `idbloader` 在**扇区 64**，`u-boot.itb` 在**扇区 0x4000** |
+
+### 怎么编译
+
+```sh
+# 整机固件(通常你要的就是这个)
+make -j4
+
+# 或者只增量编引导链
+make package/boot/rockchip-rkbin/compile V=s
+make package/boot/uboot-rockchip-rk3528/compile V=s
+
+# 查看结果
+ls -l staging_dir/target-*/image/generic-rk3528-*
+strings build_dir/target-*/u-boot-generic-rk3528/u-boot-2026.07/u-boot | grep -m1 U-Boot
+```
+
+### 两个必须知道的细节
+
+1. **dtc 覆盖很关键。** `include/u-boot.mk` 把 `DTC` 指向内核自带的 dtc，而本树里是
+   **1.5.0**，它生成的 DTB **无法引导这块板子**。因此该包在 make 命令行上把 `DTC`
+   覆盖成 U-Boot 自带的 **1.7.2** dtc —— 它生成的 DTB 才是此前能正常工作的镜像所用的那个。
+   命令行上的后一次赋值生效，所以覆盖能起作用。
+
+2. **`CMD_EXT4_WRITE` 是故意打开的。** 这块板没有引出串口，`boot.scr` 用 `ext4write`
+   把"面包屑"文件写进 ext4 引导分区（之后可在 maskrom 模式下读回）。没有这个命令，
+   面包屑就写不进去。
+
+### 如何改 U-Boot 配置
+
+包 Makefile 里的 `UBOOT_CUSTOMIZE_CONFIG` 在 defconfig 之后生效：
+
+```make
+UBOOT_CUSTOMIZE_CONFIG := \
+	--disable TOOLS_MKEFICAPSULE \
+	--set-str MKIMAGE_DTC_PATH $(PKG_BUILD_DIR)/scripts/dtc/dtc \
+	--enable CMD_EXT4_WRITE
+```
+
+要改配置就往这里加 `--enable / --disable / --set-str` 行（U-Boot 自带
+`scripts/config` 的语法），不要直接改 defconfig —— 这样改动集中在一处、一眼可见。
+
+---
+
+## 2. 本目录里的 maskrom loader（**另一回事，别搞混**）
+
+`rk3528_loader_miniall.bin` **不是**上面那个存储上的引导器。它是**maskrom 模式**用的
+loader：BootROM 自身无法初始化 DDR，必须先把 loader（DDR 初始化 + usbplug + SPL）经 USB
+推进 RAM，之后才能往 eMMC 写任何东西。
+
+它由 Rockchip 的 `boot_merger` 依据 `package/boot/rockchip-rkbin/files/` 里的片段
+（`RKBOOT/RK3528MINIALL.ini`）生成。同一套零件可以产出两种容器：
+
+| 容器                                | 谁能接受                                          |
+|------------------------------------|--------------------------------------------------|
+| `rk3528_loader_miniall.bin`（BOOT） | Linux 工具：`rkdeveloptool`、`upgrade_tool`        |
+| `rk3528_spl_loader_*.bin`（LDR / RKNS） | Rockchip 的 Windows RKDevTool                 |
+
+Linux 工具会校验 `BOOT` 标签与自己的 CRC32，**直接拒绝** `LDR ` 容器
+（报 `Open loader failed` / `Opening loader failed`）。
+
+---
+
+## 3. 从 maskrom 刷机
+
+让板子进入 maskrom（上电瞬间按住 maskrom 键 / 短接对应焊盘），然后：
+
+```sh
+./flash-maskrom.sh <image.img>          # 内部使用 upgrade_tool + BOOT 容器 loader
+```
+
+或手工执行：
+
+```sh
+./upgrade_tool LD                        # 期望看到 Mode=Maskrom
+./upgrade_tool DB rk3528_loader_miniall.bin
+./upgrade_tool WL 0 <image.img>          # 整盘，从 LBA 0 开始写
+./upgrade_tool RD
+```
+
+`upgrade_tool` 是静态链接，更稳妥；`rkdeveloptool` 是动态链接，需要 libusb。
+
+**这块板子没有引出串口。** 验证刷机结果靠 ping 它，或者把引导分区读回来：
+
+```sh
+./rkdeveloptool db rk3528_loader_miniall.bin
+./rkdeveloptool rl 65536 32768 bootp.img     # 起始扇区 65536（=32 MiB），长度 32768 扇区（=16 MiB）
+debugfs -R "ls -l /" bootp.img               # 里面应有 kernel.img / rockchip.dtb / boot.scr
+```
+
+在这块板子上，**大镜像一次性整盘写并不可靠**：168 MiB 的镜像会写到中途
+`Write LBA failed!`，而同一个镜像**切成几十 MB 一块**写就每次都能完成。因此
+`flash-maskrom.sh` 会**分块写**（默认每块 **40 MiB**，可用 `CHUNK_MB=<n>` 调整），
+并且某一块失败时**自动重试一次**。厂商工具没有"从文件偏移开始写"的选项，所以每块用
+`dd` 切出来、写到与它偏移对应的 LBA（1 MiB = 2048 扇区）。
+
+在碰板子之前，脚本还会**先校验镜像**，这样刷错文件时能在 eMMC 还完好时就被拦住：
+
+* 扇区 64 必须是 `RKNS` 的 idbloader（即它确实是一份 Rockchip 启动镜像）；
+* 镜像里必须含有这块板子的设备树（`opc-h28k`）；
+* 文件必须放得进这块板 7.28 GiB 的 eMMC。
+
+整个校验在 168 MiB 镜像上约耗时 40 毫秒。设 `SKIP_CHECKS=1` 可跳过
+（例如有意要刷别的东西时）。
+
+---
+
+## 4. 本目录文件清单
+
+```
+flash-maskrom.sh              封装脚本：LD -> DB -> WL 0 -> RD
+rk3528_loader_miniall.bin     maskrom loader，BOOT 容器（461 KB）
+rkdeveloptool                 Linux 刷机工具（动态链接，需要 libusb）
+upgrade_tool                  Linux 刷机工具（静态链接，优先用）
+```

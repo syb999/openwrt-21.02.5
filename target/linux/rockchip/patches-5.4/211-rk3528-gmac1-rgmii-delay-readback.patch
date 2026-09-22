@@ -1,0 +1,65 @@
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-rk.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-rk.c
+@@ -979,6 +979,18 @@
+ #define RK3528_GMAC1_CLK_RGMII_DIV50	(GRF_BIT(11) | GRF_CLR_BIT(10))
+ 
+ /*
++ * Taken from the vendor 5.10 BSP (bsp-5.10/.../dwmac-rk.c): the GMAC1 clock
++ * source select and the RMII clock gate.  The 5.4 glue was missing both, so
++ * GMAC1 kept whatever clock source the bootloader had programmed.  That is
++ * invisible to the PHY (MDIO and link negotiation do not use the RGMII
++ * clocks) yet kills the data path outright.
++ */
++#define RK3528_GMAC1_CLK_SELET_CRU	GRF_CLR_BIT(12)
++#define RK3528_GMAC1_CLK_SELET_IO	GRF_BIT(12)
++#define RK3528_GMAC1_CLK_RMII_GATE	GRF_BIT(9)
++#define RK3528_GMAC1_CLK_RMII_NOGATE	GRF_CLR_BIT(9)
++
++/*
+  * The RK3528 GMAC1 clock source selection register (bit 12) and the RMII
+  * clock gate bits are only used in RMII mode.  This 5.4 driver has no
+  * set_clock_selection callback, so RMII mode is not fully supported here;
+@@ -995,6 +1007,15 @@
+ 		return;
+ 	}
+ 
++	/*
++	 * Clock source first, exactly like the 5.10 BSP's set_clock_selection():
++	 * for this board clock_in_out = "output", so GMAC1 takes its clock from
++	 * the CRU and the RMII gate stays open.
++	 */
++	regmap_write(bsp_priv->grf, RK3528_VPU_GRF_GMAC_CON5,
++		     RK3528_GMAC1_CLK_SELET_CRU |
++		     RK3528_GMAC1_CLK_RMII_NOGATE);
++
+ 	regmap_write(bsp_priv->grf, RK3528_VPU_GRF_GMAC_CON5,
+ 		     RK3528_GMAC1_PHY_INTF_SEL_RGMII);
+ 
+@@ -1071,6 +1092,27 @@
+ 	offset = (id == 1) ? RK3528_VPU_GRF_GMAC_CON5 : RK3528_VO_GRF_GMAC_CON;
+ 	regmap_write(bsp_priv->grf, offset, val);
+ 
++	/*
++	 * Re-apply the RGMII delays here.  set_to_rgmii() programmed them at
++	 * probe time, but this function runs later (when the link speed is
++	 * known) and touches the same CON5 register; if anything cleared the
++	 * enable bits in between, the data path is dead even though the link
++	 * comes up.  Writing them again costs nothing and makes the ordering
++	 * irrelevant.
++	 */
++	regmap_write(bsp_priv->grf, RK3528_VPU_GRF_GMAC_CON5,
++		     DELAY_ENABLE(RK3528, bsp_priv->tx_delay, bsp_priv->rx_delay));
++	regmap_write(bsp_priv->grf, RK3528_VPU_GRF_GMAC_CON6,
++		     DELAY_VALUE(RK3528, bsp_priv->tx_delay, bsp_priv->rx_delay));
++
++	{
++		unsigned int v5 = 0, v6 = 0;
++
++		regmap_read(bsp_priv->grf, RK3528_VPU_GRF_GMAC_CON5, &v5);
++		regmap_read(bsp_priv->grf, RK3528_VPU_GRF_GMAC_CON6, &v6);
++		dev_info(dev, "RGMII delay regs at speed %d: CON5=0x%08x CON6=0x%08x\n",
++			 speed, v5, v6);
++	}
+ 	return;
+ err:
+ 	dev_err(dev, "unknown RMII speed value for GMAC speed=%d", speed);

@@ -1,0 +1,38 @@
+--- a/drivers/pci/controller/dwc/pcie-designware-host.c
++++ b/drivers/pci/controller/dwc/pcie-designware-host.c
+@@ -758,6 +758,35 @@
+ 			dev_warn(pci->dev,
+ 				 "Resources exceed number of ATU entries (%d)\n",
+ 				 pci->num_viewport);
++
++		/* RKPCIE-ATU diagnostic: unroll mode addresses each region at
++		 * atu_base + index*PCIE_ATU_UNROLL_SIZE, so read it that way.
++		 */
++		dev_info(pci->dev,
++			 "RKPCIE-ATU dbi=%px atu=%px unroll=%u nvp=%u viewport=0x%08x\n",
++			 pci->dbi_base, pci->atu_base,
++			 pci->iatu_unroll_enabled, pci->num_viewport,
++			 dw_pcie_readl_dbi(pci, PCIE_ATU_VIEWPORT));
++		for (atu_idx = 0; atu_idx < pci->num_viewport; atu_idx++) {
++			u32 off;
++
++			if (!pci->iatu_unroll_enabled) {
++				dw_pcie_writel_dbi(pci, PCIE_ATU_VIEWPORT,
++						   PCIE_ATU_REGION_OUTBOUND | atu_idx);
++				off = 0;
++			} else {
++				off = (u32)(pci->atu_base - pci->dbi_base) +
++				      atu_idx * 0x200;
++			}
++			dev_info(pci->dev,
++				 "RKPCIE-ATU r%u: ctrl1=0x%08x ctrl2=0x%08x lbase=0x%08x llmt=0x%08x ltgt=0x%08x\n",
++				 atu_idx,
++				 dw_pcie_readl_dbi(pci, off + 0x00),
++				 dw_pcie_readl_dbi(pci, off + 0x04),
++				 dw_pcie_readl_dbi(pci, off + 0x08),
++				 dw_pcie_readl_dbi(pci, off + 0x10),
++				 dw_pcie_readl_dbi(pci, off + 0x14));
++		}
+ 	}
+ 
+ 	dw_pcie_wr_own_conf(pp, PCI_BASE_ADDRESS_0, 4, 0);

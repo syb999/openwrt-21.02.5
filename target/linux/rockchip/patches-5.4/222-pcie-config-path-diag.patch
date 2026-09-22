@@ -1,0 +1,19 @@
+--- a/drivers/pci/controller/dwc/pcie-designware-host.c
++++ b/drivers/pci/controller/dwc/pcie-designware-host.c
+@@ -559,6 +559,16 @@
+ 	dw_pcie_prog_outbound_atu(pci, PCIE_ATU_REGION_INDEX1,
+ 				  type, cpu_addr,
+ 				  busdev, cfg_size);
++	{
++		static int dbg;
++		if (dbg++ < 12)
++			dev_info(pci->dev,
++				 "RKPCIE-CFG bus=%d devfn=%02x where=%03x sz=%d type=%d cpu=0x%llx csize=0x%x va=%px cfg0=0x%llx va0=%px mem=0x%llx\n",
++				 bus->number, devfn, where, size, type,
++				 (u64)cpu_addr, cfg_size, va_cfg_base,
++				 (u64)pp->cfg0_base, pp->va_cfg0_base,
++				 (u64)pp->mem_base);
++	}
+ 	if (write)
+ 		ret = dw_pcie_write(va_cfg_base + where, size, *val);
+ 	else

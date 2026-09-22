@@ -1,0 +1,99 @@
+--- a/drivers/pci/controller/dwc/pcie-designware.h
++++ b/drivers/pci/controller/dwc/pcie-designware.h
+@@ -32,6 +32,7 @@
+ /* Synopsys-specific PCIe configuration registers */
+ #define PCIE_PORT_LINK_CONTROL		0x710
+ #define PORT_LINK_MODE_MASK		GENMASK(21, 16)
++#define PORT_LINK_LPBK_ENABLE		BIT(2)
+ #define PORT_LINK_MODE(n)		FIELD_PREP(PORT_LINK_MODE_MASK, n)
+ #define PORT_LINK_MODE_1_LANES		PORT_LINK_MODE(0x1)
+ #define PORT_LINK_MODE_2_LANES		PORT_LINK_MODE(0x3)
+@@ -81,6 +82,8 @@
+ #define PCIE_ATU_BUS(x)			FIELD_PREP(GENMASK(31, 24), x)
+ #define PCIE_ATU_DEV(x)			FIELD_PREP(GENMASK(23, 19), x)
+ #define PCIE_ATU_FUNC(x)		FIELD_PREP(GENMASK(18, 16), x)
++#define PCIE_ATU_FUNC_NUM(pf)		((pf) << 20)
++#define PCIE_ATU_FUNC_NUM_MATCH_EN	BIT(19)
+ #define PCIE_ATU_UPPER_TARGET		0x91C
+ 
+ #define PCIE_MISC_CONTROL_1_OFF		0x8BC
+@@ -106,6 +109,8 @@
+ #define PCIE_ATU_UNR_LIMIT		0x10
+ #define PCIE_ATU_UNR_LOWER_TARGET	0x14
+ #define PCIE_ATU_UNR_UPPER_TARGET	0x18
++#define PCIE_ATU_UNR_LOWER_LIMIT	0x10
++#define PCIE_ATU_UNR_UPPER_LIMIT	0x20
+ 
+ /*
+  * The default address offset between dbi_base and atu_base. Root controller
+@@ -177,6 +182,7 @@
+ 	phys_addr_t		mem_bus_addr;
+ 	u32			mem_size;
+ 	struct resource		*cfg;
++	struct pci_host_bridge	*bridge;
+ 	struct resource		*io;
+ 	struct resource		*mem;
+ 	struct resource		*busn;
+@@ -243,6 +249,8 @@
+ 
+ struct dw_pcie {
+ 	struct device		*dev;
++	int			link_gen;
++	u8			n_fts[2];
+ 	void __iomem		*dbi_base;
+ 	void __iomem		*dbi_base2;
+ 	/* Used when iatu_unroll_enabled is true */
+--- a/drivers/pci/controller/dwc/pcie-designware-host.c
++++ b/drivers/pci/controller/dwc/pcie-designware-host.c
+@@ -344,6 +344,8 @@
+ 	bridge = devm_pci_alloc_host_bridge(dev, 0);
+ 	if (!bridge)
+ 		return -ENOMEM;
++
++	pp->bridge = bridge;
+ 
+ 	ret = devm_of_pci_get_host_bridge_resources(dev, 0, 0xff,
+ 					&bridge->windows, &pp->io_base);
+@@ -425,6 +427,9 @@
+ 	if (ret)
+ 		pci->num_viewport = 2;
+ 
++	if (pci->link_gen < 1)
++		pci->link_gen = of_pci_get_max_link_speed(np);
++
+ 	if (pci_msi_enabled()) {
+ 		/*
+ 		 * If a specific SoC driver needs to change the
+--- a/include/uapi/linux/pci_regs.h
++++ b/include/uapi/linux/pci_regs.h
+@@ -537,6 +537,8 @@
+ #define  PCI_EXP_LNKCAP_SLS_32_0GB 0x00000005 /* LNKCAP2 SLS Vector bit 4 */
+ #define  PCI_EXP_LNKCAP_MLW	0x000003f0 /* Maximum Link Width */
+ #define  PCI_EXP_LNKCAP_ASPMS	0x00000c00 /* ASPM Support */
++#define  PCI_EXP_LNKCAP_ASPM_L0S 0x00000400 /* ASPM L0s Support */
++#define  PCI_EXP_LNKCAP_ASPM_L1  0x00000800 /* ASPM L1 Support */
+ #define  PCI_EXP_LNKCAP_L0SEL	0x00007000 /* L0s Exit Latency */
+ #define  PCI_EXP_LNKCAP_L1EL	0x00038000 /* L1 Exit Latency */
+ #define  PCI_EXP_LNKCAP_CLKPM	0x00040000 /* Clock Power Management */
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -364,6 +364,7 @@
+ 	struct pcie_link_state	*link_state;	/* ASPM link state */
+ 	unsigned int	ltr_path:1;	/* Latency Tolerance Reporting
+ 					   supported from root to here */
++	int		l1ss;		/* L1SS Capability pointer */
+ #endif
+ 	unsigned int	eetlp_prefix_path:1;	/* End-to-End TLP Prefix */
+ 
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@ -2055,6 +2055,9 @@
+ 	if (!pci_is_pcie(dev))
+ 		return;
+ 
++	/* Read L1 PM substate capabilities */
++	dev->l1ss = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_L1SS);
++
+ 	pcie_capability_read_dword(dev, PCI_EXP_DEVCAP2, &cap);
+ 	if (!(cap & PCI_EXP_DEVCAP2_LTR))
+ 		return;

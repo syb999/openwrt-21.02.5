@@ -1,0 +1,116 @@
+--- a/drivers/clk/rockchip/clk.h
++++ b/drivers/clk/rockchip/clk.h
+@@ -187,6 +187,34 @@
+ #define RK3399_PMU_CLKSEL_CON(x)	((x) * 0x4 + 0x80)
+ #define RK3399_PMU_CLKGATE_CON(x)	((x) * 0x4 + 0x100)
+ #define RK3399_PMU_SOFTRST_CON(x)	((x) * 0x4 + 0x110)
++
++#define RK3528_PMU_CRU_BASE		0x10000
++#define RK3528_PCIE_CRU_BASE		0x20000
++#define RK3528_DDRPHY_CRU_BASE		0x28000
++#define RK3528_VPU_GRF_BASE		0x40000
++#define RK3528_VO_GRF_BASE		0x60000
++#define RK3528_SDMMC_CON0		(RK3528_VO_GRF_BASE + 0x24)
++#define RK3528_SDMMC_CON1		(RK3528_VO_GRF_BASE + 0x28)
++#define RK3528_SDIO0_CON0		(RK3528_VPU_GRF_BASE + 0x4)
++#define RK3528_SDIO0_CON1		(RK3528_VPU_GRF_BASE + 0x8)
++#define RK3528_SDIO1_CON0		(RK3528_VPU_GRF_BASE + 0xc)
++#define RK3528_SDIO1_CON1		(RK3528_VPU_GRF_BASE + 0x10)
++#define RK3528_PLL_CON(x)		RK2928_PLL_CON(x)
++#define RK3528_PCIE_PLL_CON(x)		((x) * 0x4 + RK3528_PCIE_CRU_BASE)
++#define RK3528_DDRPHY_PLL_CON(x)	((x) * 0x4 + RK3528_DDRPHY_CRU_BASE)
++#define RK3528_MODE_CON			0x280
++#define RK3528_CLKSEL_CON(x)		((x) * 0x4 + 0x300)
++#define RK3528_CLKGATE_CON(x)		((x) * 0x4 + 0x800)
++#define RK3528_SOFTRST_CON(x)		((x) * 0x4 + 0xa00)
++#define RK3528_PMU_CLKSEL_CON(x)	((x) * 0x4 + 0x300 + RK3528_PMU_CRU_BASE)
++#define RK3528_PMU_CLKGATE_CON(x)	((x) * 0x4 + 0x800 + RK3528_PMU_CRU_BASE)
++#define RK3528_PCIE_CLKSEL_CON(x)	((x) * 0x4 + 0x300 + RK3528_PCIE_CRU_BASE)
++#define RK3528_PCIE_CLKGATE_CON(x)	((x) * 0x4 + 0x800 + RK3528_PCIE_CRU_BASE)
++#define RK3528_DDRPHY_CLKGATE_CON(x)	((x) * 0x4 + 0x800 + RK3528_DDRPHY_CRU_BASE)
++#define RK3528_DDRPHY_MODE_CON		(0x280 + RK3528_DDRPHY_CRU_BASE)
++#define RK3528_GLB_CNT_TH		0xc00
++#define RK3528_GLB_SRST_FST		0xc08
++#define RK3528_GLB_SRST_SND		0xc0c
+ 
+ enum rockchip_pll_type {
+ 	pll_rk3036,
+@@ -291,6 +319,7 @@
+ };
+ 
+ #define ROCKCHIP_PLL_SYNC_RATE		BIT(0)
++#define ROCKCHIP_PLL_FIXED_MODE		BIT(1)
+ 
+ #define PLL(_type, _id, _name, _pnames, _flags, _con, _mode, _mshift,	\
+ 		_lshift, _pflags, _rtable)				\
+@@ -393,6 +422,7 @@
+ 	branch_divider,
+ 	branch_fraction_divider,
+ 	branch_gate,
++	branch_gate_no_set_rate,
+ 	branch_mmc,
+ 	branch_inverter,
+ 	branch_factor,
+@@ -701,6 +731,19 @@
+ 		.gate_flags	= gf,				\
+ 	}
+ 
++#define GATE_NO_SET_RATE(_id, cname, pname, f, o, b, gf)	\
++	{							\
++		.id		= _id,				\
++		.branch_type	= branch_gate_no_set_rate,	\
++		.name		= cname,			\
++		.parent_names	= (const char *[]){ pname },	\
++		.num_parents	= 1,				\
++		.flags		= f,				\
++		.gate_offset	= o,				\
++		.gate_shift	= b,				\
++		.gate_flags	= gf,				\
++	}
++
+ #define MMC(_id, cname, pname, offset, shift)			\
+ 	{							\
+ 		.id		= _id,				\
+--- a/drivers/clk/rockchip/clk.c
++++ b/drivers/clk/rockchip/clk.c
+@@ -505,6 +505,14 @@
+ 				ctx->reg_base + list->gate_offset,
+ 				list->gate_shift, list->gate_flags, &ctx->lock);
+ 			break;
++		case branch_gate_no_set_rate:
++			flags &= ~CLK_SET_RATE_PARENT;
++
++			clk = clk_register_gate(NULL, list->name,
++				list->parent_names[0], flags,
++				ctx->reg_base + list->gate_offset,
++				list->gate_shift, list->gate_flags, &ctx->lock);
++			break;
+ 		case branch_composite:
+ 			clk = rockchip_clk_register_branch(list->name,
+ 				list->parent_names, list->num_parents,
+--- a/drivers/clk/rockchip/clk-pll.c
++++ b/drivers/clk/rockchip/clk-pll.c
+@@ -193,10 +193,12 @@
+ 	rockchip_rk3036_pll_get_params(pll, &cur);
+ 	cur.rate = 0;
+ 
+-	cur_parent = pll_mux_ops->get_parent(&pll_mux->hw);
+-	if (cur_parent == PLL_MODE_NORM) {
+-		pll_mux_ops->set_parent(&pll_mux->hw, PLL_MODE_SLOW);
+-		rate_change_remuxed = 1;
++	if (!(pll->flags & ROCKCHIP_PLL_FIXED_MODE)) {
++		cur_parent = pll_mux_ops->get_parent(&pll_mux->hw);
++		if (cur_parent == PLL_MODE_NORM) {
++			pll_mux_ops->set_parent(&pll_mux->hw, PLL_MODE_SLOW);
++			rate_change_remuxed = 1;
++		}
+ 	}
+ 
+ 	/* update pll values */
+--- a/drivers/clk/rockchip/Makefile
++++ b/drivers/clk/rockchip/Makefile
+@@ -24,3 +24,4 @@
+ obj-y	+= clk-rk3328.o
+ obj-y	+= clk-rk3368.o
+ obj-y	+= clk-rk3399.o
++obj-y	+= clk-rk3528.o

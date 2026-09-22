@@ -13,6 +13,10 @@ friendlyarm,nanopi-r2s)
 	ucidef_set_led_netdev "wan" "WAN" "$boardname:green:wan" "eth0"
 	ucidef_set_led_netdev "lan" "LAN" "$boardname:green:lan" "eth1"
 	;;
+hinlink,opc-h28k)
+	ucidef_set_led_netdev "lan" "LAN" "amber:lan" "eth0"
+	ucidef_set_led_netdev "wan" "WAN" "blue:wan" "eth1"
+	;;
 esac
 
 board_config_flush

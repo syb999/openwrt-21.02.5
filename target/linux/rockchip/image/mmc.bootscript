@@ -1,8 +1,170 @@
 part uuid mmc ${devnum}:2 uuid
+# Fall back to the known PARTUUID if U-Boot could not derive one (a bad or
+# missing ${devnum} leaves it empty, which makes the kernel look for
+# "PARTUUID=-02" and panic before userspace ever runs).  A marker file records
+# which branch was taken: 'K' = uuid was fine, 'E' = we had to substitute it.
+if test "${uuid}" = ""; then
+	setenv uuid 5452574f-02
+	mw.b 0x03000000 0x45
+else
+	mw.b 0x03000000 0x4B
+fi
+ext4write mmc 0:1 0x03000000 /uuid-state.bin 0x40 || echo skip
+# Read the first sector of the rootfs partition (sector 0x20000 = 64 MiB) and
+# compare its magic against "hsqs" (little-endian 0x68737173).  Marker file
+# /rootfs-magic.bin: 'G' = the squashfs really is on the flash and readable,
+# 'B' = that sector is not a squashfs superblock.
+mmc read 0x03000100 0x20000 0x1 || echo skip
+if itest.l *0x03000100 == 0x73716873; then
+	mw.b 0x03000200 0x47
+else
+	mw.b 0x03000200 0x42
+fi
+ext4write mmc 0:1 0x03000200 /rootfs-magic.bin 0x40 || echo skip
+# The overlay lives right after the squashfs inside the same partition, and
+# ONLY fstools (i.e. userspace) ever formats it.  So reading that area tells us
+# whether userspace ran at all: offset 9850880 bytes into the rootfs partition
+# = sector 131072 + 19240 = 150312, and the fs magic sits at +0x438.
+mmc read 0x03000300 0x24b28 0x2 || echo skip
+ext4write mmc 0:1 0x03000300 /overlay-probe.bin 0x400 || echo skip
+# Copy the pstore/ramoops window (reserved DRAM @240 MiB) into the boot
+# partition.  If the kernel panicked, this is where its console log landed and
+# it is the only way to read it on a board with no UART and no userspace.
+# Two names because ext4write refuses to overwrite: the first boot after a
+# flash writes kernel-log.bin, the boot after a panic writes kernel-log2.bin.
+cp.b 0x0f000000 0x04000000 0x40000 || echo skip
+if load mmc 0:1 0x05000000 /kernel-log.bin; then
+	ext4write mmc 0:1 0x04000000 /kernel-log2.bin 0x40000 || echo skip
+else
+	ext4write mmc 0:1 0x04000000 /kernel-log.bin 0x40000 || echo skip
+fi
 
-setenv bootargs "console=ttyS2,1500000 console=tty1 earlycon=uart8250,mmio32,0xff1a0000 root=PARTUUID=${uuid} rw rootwait"
+if test $soc = 'rk3308'; then
+	serial_addr=',0xff0c0000'; serial_port='ttyS2';
+elif test $soc = 'rk3328'; then
+	serial_addr=',0xff130000'; serial_port='ttyS2';
+elif test $soc = 'rk3399'; then
+	serial_addr=',0xff1a0000'; serial_port='ttyS2';
+elif test $soc = 'rk3528'; then
+	serial_addr=',0xff9f0000'; serial_port='ttyS0';
+elif test $soc = 'rk3568'; then
+	serial_addr=',0xfe660000'; serial_port='ttyS2';
+elif test $soc = 'rk3576'; then
+	serial_addr=',0x2ad40000'; serial_port='ttyS0';
+elif test $soc = 'rk3588'; then
+	serial_addr=',0xfeb50000'; serial_port='ttyS2';
+fi
 
-load mmc ${devnum}:1 ${fdt_addr_r} rockchip.dtb
-load mmc ${devnum}:1 ${kernel_addr_r} kernel.img
+setenv bootargs "console=${serial_port},1500000 earlycon=uart8250,mmio32${serial_addr} root=PARTUUID=${uuid} rw rootwait panic=5 iomem=relaxed r8168.aspm=0 r8168.dynamic_aspm=0 r8168.eee_enable=0 pcie_aspm=off"
+
+if test $soc = 'rk3528'; then
+	# Boot-stage breadcrumbs for a board with no exposed UART.
+	#   1) three quick flashes of green:work (gpio4 PB7, active low, gpio 143)
+	#      right at power-on mean U-Boot ran this script.
+	#   2) marker files in the ext4 boot partition record how far it got:
+	#        uboot-ran.bin        boot script reached this point
+	#        uboot-booti.bin      kernel and DTB loaded, handing over
+	#        uboot-ERR-dtb.bin    the DTB load failed
+	#        uboot-ERR-kernel.bin the kernel load failed
+	# Every command is guarded with "|| echo skip" so that a failure in here can
+	# never abort the boot script.  The scratch address is always one the
+	# following load overwrites (or, for the error markers, one that no longer
+	# matters), so nothing gets corrupted.
+	#
+	# NOTE: remove this block once the board is known good.
+	# --- hardware probe (PLAN B): runs entirely inside U-Boot ---
+	# 1) drive the amber LED (gpio4 pin 17) straight through the v2 registers.
+	#    Pin 17 cannot be expressed in the old v1 layout at all, so if the LED
+	#    lights, the v2 layout is confirmed at the hardware level.
+	mw.l 0xffb2000c 0x00020002 || echo skip
+	mw.l 0xffb20004 0x00000002 || echo skip
+	sleep 3 || echo skip
+	# 2) Raw sector forensics.  U-Boot cannot read squashfs, so "load failed"
+	#    would prove nothing.  Instead copy the raw blocks to the boot
+	#    partition and inspect them on the host:
+	#      mbr.bin        - the on-board partition table (did the flash land?)
+	#      rootfs-head.bin- first 32 KiB of the rootfs partition (expect "hsqs"
+	#                       magic = the squashfs really is there)
+	mmc read 0x03000000 0x0 0x1 || echo skip
+	ext4write mmc 0:1 0x03000000 /mbr.bin 0x200 || echo skip
+	mmc read 0x03000000 0x20000 0x40 || echo skip
+	ext4write mmc 0:1 0x03000000 /rootfs-head.bin 0x8000 || echo skip
+	mmc read 0x03100000 0x40 0x20 || echo skip
+	ext4write mmc 0:1 0x03100000 /uboot-head.bin 0x4000 || echo skip
+	# 3) snapshot the gpio3/gpio4 banks so we can see what the registers hold
+	#    before Linux touches them.
+	cp.b 0xffb20000 0x02000000 0x100 || echo skip
+	cp.b 0xffb10000 0x02000100 0x100 || echo skip
+	ext4write mmc 0:1 0x02000000 /ub-regs.bin 0x200 || echo skip
+# GMAC1 RGMII delay registers, read straight from the GRF with MMIO.
+# Doing this from Linux via the regmap debugfs file hangs (the rk3528 GRF
+# window is 0x90000 bytes and dumping every register is slow enough to wedge
+# the init script), so read just the two words here instead.
+#   0xff340018 = GRF + 0x40018 (CON5): delay enable bits
+#   0xff34001c = GRF + 0x4001c (CON6): TX delay in bits 7:0, RX delay in 15:8
+cp.b 0xff340018 0x02100000 0x8 || echo skip
+ext4write mmc 0:1 0x02100000 /gmac-delay.bin 0x8 || echo skip
+# Apply the GMAC1 RGMII delays ourselves.  Linux is supposed to do this in
+# rk3528_set_to_rgmii(), but the registers read back as all-zero afterwards, so
+# do it here (before the kernel starts) where it is known to stick.
+#   CON5 0xff340018: bit15 = RX clock delay enable, bit14 = TX clock delay enable
+#   CON6 0xff34001c: TX delay in bits 7:0 (0x36), RX delay in bits 15:8 (0x2d)
+# Rockchip GRF writes need the write-mask in the upper 16 bits.
+# CON5 also carries bit12 = GMAC1 clock source (0 = CRU/internal, 1 = IO pin) and
+# bit9 = RMII clock gate.  The vendor 5.10 glue sets both in
+# rk3528_set_clock_selection(); our 5.4 port has no such callback, so unless we
+# do it here nothing ever sets the clock source and the RGMII data path stays
+# dead while the link still negotiates perfectly.  clock_in_out = "output" on
+# this board, so: bit12 -> 0 (CRU), bit9 -> 0 (no gate).
+cp.b 0xff340018 0x02100008 0x8 || echo skip
+ext4write mmc 0:1 0x02100008 /gmac-delay-set.bin 0x8 || echo skip
+# Release the PHY reset line.  gpio4 pin 18 is the RTL8211F reset, wired
+# ACTIVE LOW, and it has been sitting at raw level 0 (= reset asserted) ever
+# since we started: debugfs reports "gpio-146 (|snps,reset) out lo ACTIVE LOW".
+# A PHY held in reset still answers MDIO (so it is detected and "Link is Up"
+# gets reported) but its 1000M path never comes up - exactly the green LED
+# staying dark.  On the new GPIO layout the data register for bits 16..31 is
+# at +0x04 with the write-mask in the upper half, so BIT(2)|BIT(18) sets pin 18 high.
+#   0xffb20004 = GPIO4 DR_H : mask BIT(18) | value BIT(2)
+mw.l 0xffb20004 0x00040004 || echo skip
+cp.b 0xffb20004 0x02100010 0x4 || echo skip
+ext4write mmc 0:1 0x02100010 /gpio4-dr.bin 0x4 || echo skip
+
+	gpio clear 143 || echo skip
+	sleep 1 || echo skip
+	gpio set 143 || echo skip
+	sleep 1 || echo skip
+	gpio clear 143 || echo skip
+	sleep 1 || echo skip
+	gpio set 143 || echo skip
+	sleep 1 || echo skip
+	gpio clear 143 || echo skip
+	sleep 1 || echo skip
+	gpio set 143 || echo skip
+	sleep 1 || echo skip
+
+	mw.b ${fdt_addr_r} 0x55 0x10 || echo skip
+	ext4write mmc ${devnum}:1 ${fdt_addr_r} /uboot-ran.bin 0x10 || echo skip
+
+	if load mmc ${devnum}:1 ${fdt_addr_r} rockchip.dtb; then
+		echo skip
+	else
+		mw.b ${kernel_addr_r} 0x11 0x10 || echo skip
+		ext4write mmc ${devnum}:1 ${kernel_addr_r} /uboot-ERR-dtb.bin 0x10 || echo skip
+	fi
+
+	mw.b ${kernel_addr_r} 0xaa 0x10 || echo skip
+	ext4write mmc ${devnum}:1 ${kernel_addr_r} /uboot-booti.bin 0x10 || echo skip
+
+	if load mmc ${devnum}:1 ${kernel_addr_r} kernel.img; then
+		echo skip
+	else
+		mw.b ${fdt_addr_r} 0x22 0x10 || echo skip
+		ext4write mmc ${devnum}:1 ${fdt_addr_r} /uboot-ERR-kernel.bin 0x10 || echo skip
+	fi
+else
+	load mmc ${devnum}:1 ${fdt_addr_r} rockchip.dtb
+	load mmc ${devnum}:1 ${kernel_addr_r} kernel.img
+fi
 
 booti ${kernel_addr_r} - ${fdt_addr_r}

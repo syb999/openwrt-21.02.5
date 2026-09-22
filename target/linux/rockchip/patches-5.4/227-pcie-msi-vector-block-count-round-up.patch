@@ -1,0 +1,53 @@
+pci: dwc: round up the number of MSI control blocks
+
+Both dw_pcie_setup_rc() and dw_handle_msi_irq() computed the number of
+32-vector MSI control blocks with a plain division:
+
+	num_ctrls = pp->num_vectors / MAX_MSI_IRQS_PER_CTRL;
+
+RK3528 reports 8 MSI vectors (rk_pcie_msi_set_num_vectors()), so the
+division yields 0 and both loops never execute:
+
+ - dw_pcie_setup_rc() does not program PCIE_MSI_INTR0_ENABLE, which then
+   keeps its reset value (all MSI vectors disabled), so the root complex
+   quietly drops every MSI/MSI-X memory write issued by an endpoint;
+ - dw_handle_msi_irq() reads no PCIE_MSI_INTR0_STATUS register at all, so
+   nothing would be dispatched even if the interrupt had fired.
+
+On the HINLINK OPC-H28K (RTL8111H behind the PCIe root complex) this shows
+up as: link up, chip DMAs packets, MSI-X table properly programmed with the
+root complex MSI target, yet the NIC driver never receives a TxOK / RxOK /
+link-change interrupt.  Its tx queue then times out after 5s and the device
+is reset in a loop, and /proc/interrupts never counts a single MSI.
+
+Use DIV_ROUND_UP() so that a partially filled control block is still
+initialised and polled, as the vendor 5.10 BSP does.
+--- a/drivers/pci/controller/dwc/pcie-designware-host.c
++++ b/drivers/pci/controller/dwc/pcie-designware-host.c
+@@ -83,7 +83,11 @@
+ 	u32 status, num_ctrls;
+ 	irqreturn_t ret = IRQ_NONE;
+ 
+-	num_ctrls = pp->num_vectors / MAX_MSI_IRQS_PER_CTRL;
++	/* RK3528 reports 8 MSI vectors, i.e. less than one 32-vector control
++	 * block, so a partially filled block must still be initialised and
++	 * polled.  See dw_pcie_setup_rc().
++	 */
++	num_ctrls = DIV_ROUND_UP(pp->num_vectors, MAX_MSI_IRQS_PER_CTRL);
+ 
+ 	for (i = 0; i < num_ctrls; i++) {
+ 		status = dw_pcie_readl_dbi(pci, PCIE_MSI_INTR0_STATUS +
+@@ -679,7 +683,12 @@
+ 	dw_pcie_setup(pci);
+ 
+ 	if (!pp->ops->msi_host_init) {
+-		num_ctrls = pp->num_vectors / MAX_MSI_IRQS_PER_CTRL;
++		/* DIV_ROUND_UP: see dw_handle_msi_irq().  With fewer than 32
++		 * vectors this loop used to be skipped entirely, leaving
++		 * PCIE_MSI_INTR0_ENABLE at its reset value (all vectors
++		 * disabled), which made the controller drop every MSI.
++		 */
++		num_ctrls = DIV_ROUND_UP(pp->num_vectors, MAX_MSI_IRQS_PER_CTRL);
+ 
+ 		/* Initialize IRQ Status array */
+ 		for (ctrl = 0; ctrl < num_ctrls; ctrl++) {

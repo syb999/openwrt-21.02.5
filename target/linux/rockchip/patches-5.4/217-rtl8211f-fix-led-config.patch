@@ -1,0 +1,64 @@
+RTL8211F LED configuration for the HINLINK OPC-H28K, driven from the DTS.
+
+Replaces the earlier hard-coded 0x617f write: the pin mapping now comes from
+`realtek,led-data` and EEE LED control (page 0xd04 reg 0x11) is cleared, i.e.
+the same sequence mainline/lede uses (see lede's
+102-net-phy-realtek-RTL8211-add-LED-configuration-from-OF.patch).  Boards that
+do not set the property are untouched.
+
+--- a/drivers/net/phy/realtek.c	2026-09-22 09:39:22.618993212 +0800
++++ b/drivers/net/phy/realtek.c	2026-09-22 09:39:51.174992076 +0800
+@@ -9,6 +9,7 @@
+  * Copyright (c) 2004 Freescale Semiconductor, Inc.
+  */
+ #include <linux/bitops.h>
++#include <linux/of.h>
+ #include <linux/phy.h>
+ #include <linux/module.h>
+ 
+@@ -169,6 +170,36 @@
+ 			    CTL1000_ENABLE_MASTER | CTL1000_AS_MASTER);
+ }
+ 
++/*
++ * Configure the RTL8211F LED pins from the board DTS.
++ *
++ * The PHY's power-on default (page 0xd04 reg 0x10) maps the green LED to
++ * "10M link only", so at gigabit it stays dark, and reg 0x11 (EEELCR)
++ * defaults to a non-zero value that lets EEE transitions drive the LEDs, so
++ * the green LED keeps flickering off.  Writing reg 0x10 = <realtek,led-data>
++ * and reg 0x11 = 0 fixes both, which is exactly the sequence mainline/lede
++ * uses (lede's 102-net-phy-realtek-RTL8211-add-LED-configuration-from-OF
++ * patch); the value itself comes from the board DTS (0x6d60 on the H28K and
++ * the other LinkStar/Rockchip boards).
++ */
++static void rtl8211f_led_config_from_of(struct phy_device *phydev)
++{
++	struct device *dev = &phydev->mdio.dev;
++	u32 led_data;
++	int ret;
++
++	ret = of_property_read_u32(dev->of_node, "realtek,led-data", &led_data);
++	if (ret)
++		return;
++
++	phy_write_paged(phydev, 0xd04, 0x10, led_data);
++	phy_write_paged(phydev, 0xd04, 0x11, 0x0);
++
++	dev_info(dev, "RTL8211F LED: LCR=0x%04x EEELCR=0x%04x\n",
++		 phy_read_paged(phydev, 0xd04, 0x10),
++		 phy_read_paged(phydev, 0xd04, 0x11));
++}
++
+ static int rtl8211f_config_init(struct phy_device *phydev)
+ {
+ 	struct device *dev = &phydev->mdio.dev;
+@@ -206,6 +237,8 @@
+ 			val ? "enabled" : "disabled");
+ 	}
+ 
++	rtl8211f_led_config_from_of(phydev);
++
+ 	return 0;
+ }
+ 

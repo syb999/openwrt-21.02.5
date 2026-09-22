@@ -1,0 +1,11 @@
+#!/bin/sh
+# Put your custom commands here that should be executed once
+# the system init finished. By default this file does nothing.
+#
+# Maintenance note: this board (HINLINK OPC-H28K, RK3528) has NO exposed UART.
+# When a new image fails to boot there is no console to look at; the boot
+# partition (p1, ext4, 32 MiB at sector 65536) holds kernel.img, rockchip.dtb
+# and boot.scr, and can be read back over USB in maskrom mode
+# (rkdeveloptool rl 65536 32768 bootp.img) to see what the bootloader did.
+
+exit 0

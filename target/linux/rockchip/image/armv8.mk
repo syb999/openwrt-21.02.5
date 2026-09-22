@@ -30,3 +30,20 @@ define Device/radxa_rock-pi-4
   IMAGE/sysupgrade.img.gz := boot-common | boot-script | pine64-img | gzip | append-metadata
 endef
 TARGET_DEVICES += radxa_rock-pi-4
+
+# RK3528 (HINLINK OPC-H28K): boot chain is TPL/ATF from rkbin + U-Boot 2026.07,
+# see package/boot/uboot-rockchip-rk3528 and package/boot/rockchip-rkbin.
+define Device/hinlink_opc-h28k
+  DEVICE_VENDOR := HINLINK
+  DEVICE_MODEL := OPC-H28K
+  SOC := rk3528
+  DEVICE_DTS := rockchip/rk3528-opc-h28k
+  UBOOT_DEVICE_NAME := generic-rk3528
+  IMAGE/sysupgrade.img.gz := boot-common | boot-script | pine64-img | gzip | append-metadata
+  DEVICE_PACKAGES := kmod-r8168 e2fsprogs mkf2fs \
+    fdisk cfdisk partx-utils block-mount dosfstools \
+    kmod-fs-vfat kmod-fs-msdos kmod-nls-cp437 kmod-nls-utf8 \
+    ntfs-3g kmod-fuse \
+    kmod-usb-storage kmod-usb-storage-uas kmod-usb-storage-extras -urngd
+endef
+TARGET_DEVICES += hinlink_opc-h28k

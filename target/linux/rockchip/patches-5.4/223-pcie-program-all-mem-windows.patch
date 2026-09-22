@@ -1,0 +1,69 @@
+--- a/drivers/pci/controller/dwc/pcie-designware-host.c
++++ b/drivers/pci/controller/dwc/pcie-designware-host.c
+@@ -556,7 +556,16 @@
+ 		va_cfg_base = pp->va_cfg1_base;
+ 	}
+ 
+-	dw_pcie_prog_outbound_atu(pci, PCIE_ATU_REGION_INDEX1,
++	/*
++	 * Use ATU region 0 for config cycles and leave regions 1..n for the
++	 * MEM/IO windows programmed in dw_pcie_setup_rc().  Using region 1 here
++	 * (as this driver did) collides with the 32-bit MEM window that covers
++	 * the endpoint's BARs: the first config access of enumeration rewrote
++	 * that window, so the CPU could no longer reach the RTL8168's BARs, its
++	 * EEPROM read back as garbage and every TX DMA timed out.  The vendor
++	 * 5.10 BSP reserves region 0 for config access the same way.
++	 */
++	dw_pcie_prog_outbound_atu(pci, PCIE_ATU_REGION_INDEX0,
+ 				  type, cpu_addr,
+ 				  busdev, cfg_size);
+ 	{
+@@ -713,14 +722,43 @@
+ 	 * uses its own address translation component rather than ATU, so
+ 	 * we should not program the ATU here.
+ 	 */
++	/*
++	 * RK3528 has two outbound MEM windows (a 32-bit one covering the
++	 * endpoint BARs and a 64-bit prefetchable one) plus an IO window.
++	 * Programming only pp->mem - which is whichever window the resource
++	 * walk saw last, i.e. the 64-bit one - leaves the ATU pointing at
++	 * 0x100000000 while the RTL8168's BARs live at 0xfc200000, so the
++	 * driver cannot read the EEPROM and every TX DMA times out.  Walk the
++	 * windows and give each one its own outbound ATU entry, exactly like
++	 * the vendor 5.10 BSP (pcie-designware-host.c, dw_pcie_setup_rc).
++	 */
+ 	if (!pp->ops->rd_other_conf) {
+-		dw_pcie_prog_outbound_atu(pci, PCIE_ATU_REGION_INDEX0,
+-					  PCIE_ATU_TYPE_MEM, pp->mem_base,
+-					  pp->mem_bus_addr, pp->mem_size);
+-		if (pci->num_viewport > 2)
+-			dw_pcie_prog_outbound_atu(pci, PCIE_ATU_REGION_INDEX2,
++		int atu_idx = 0;
++		struct resource_entry *entry;
++
++		resource_list_for_each_entry(entry, &pp->bridge->windows) {
++			if (resource_type(entry->res) != IORESOURCE_MEM)
++				continue;
++
++			if (pci->num_viewport <= ++atu_idx)
++				break;
++
++			dw_pcie_prog_outbound_atu(pci, atu_idx,
++						  PCIE_ATU_TYPE_MEM,
++						  entry->res->start,
++						  entry->res->start - entry->offset,
++						  resource_size(entry->res));
++		}
++
++		if (pp->io_size && pci->num_viewport > ++atu_idx)
++			dw_pcie_prog_outbound_atu(pci, atu_idx,
+ 						  PCIE_ATU_TYPE_IO, pp->io_base,
+ 						  pp->io_bus_addr, pp->io_size);
++
++		if (pci->num_viewport <= atu_idx)
++			dev_warn(pci->dev,
++				 "Resources exceed number of ATU entries (%d)\n",
++				 pci->num_viewport);
+ 	}
+ 
+ 	dw_pcie_wr_own_conf(pp, PCI_BASE_ADDRESS_0, 4, 0);

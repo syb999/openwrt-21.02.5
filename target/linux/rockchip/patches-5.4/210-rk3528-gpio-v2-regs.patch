@@ -1,0 +1,169 @@
+--- a/drivers/pinctrl/pinctrl-rockchip.c
++++ b/drivers/pinctrl/pinctrl-rockchip.c
+@@ -39,6 +39,20 @@
+ /* GPIO control registers */
+ #define GPIO_SWPORT_DR		0x00
+ #define GPIO_SWPORT_DDR		0x04
++/*
++ * Newer Rockchip GPIO blocks (rk3528 and later, "GPIO v2") moved the data
++ * direction register from 0x04 to 0x08 and expect writes to carry a write
++ * mask in the upper 16 bits.  Writing the v1 way on such a block silently
++ * ends up in the wrong register, which is why every pin stayed an input on
++ * rk3528 no matter what the gpio/led/pinctrl stack did.  Values taken from
++ * mainline's drivers/gpio/gpio-rockchip.c.
++ */
++#define GPIO_V2_SWPORT_DR	0x00
++#define GPIO_V2_SWPORT_DDR	0x08
++#define GPIO_V2_VERSION		0x78
++#define GPIO_TYPE_V2		0x01000C2B
++#define GPIO_TYPE_V2_1		0x0101157C
++#define GPIO_TYPE_V2_2		0x010219C8
+ #define GPIO_INTEN		0x30
+ #define GPIO_INTMASK		0x34
+ #define GPIO_INTTYPE_LEVEL	0x38
+@@ -159,6 +173,7 @@
+ 	struct gpio_chip		gpio_chip;
+ 	struct pinctrl_gpio_range	grange;
+ 	raw_spinlock_t			slock;
++	u32				gpio_type;
+ 	u32				toggle_edge_mode;
+ 	u32				recalced_mask;
+ 	u32				route_mask;
+@@ -2224,6 +2239,46 @@
+ 	return 0;
+ }
+ 
++/* Write one bit of a gpio register, honouring the block's layout */
++static void rk_gpio_writel_bit(struct rockchip_pin_bank *bank, u32 bit,
++			       u32 value, unsigned int offset)
++{
++	void __iomem *reg = bank->reg_base + offset;
++	u32 data;
++
++	if (bank->gpio_type) {
++		if (value)
++			data = BIT(bit % 16) | BIT(bit % 16 + 16);
++		else
++			data = BIT(bit % 16 + 16);
++		writel(data, bit >= 16 ? reg + 0x4 : reg);
++	} else {
++		data = readl(reg);
++		data &= ~BIT(bit);
++		if (value)
++			data |= BIT(bit);
++		writel(data, reg);
++	}
++}
++
++/* Read one bit of a gpio register, honouring the block's layout */
++static u32 rk_gpio_readl_bit(struct rockchip_pin_bank *bank, u32 bit,
++			     unsigned int offset)
++{
++	void __iomem *reg = bank->reg_base + offset;
++	u32 data;
++
++	if (bank->gpio_type) {
++		data = readl(bit >= 16 ? reg + 0x4 : reg);
++		data >>= bit % 16;
++	} else {
++		data = readl(reg);
++		data >>= bit;
++	}
++
++	return data & 0x1;
++}
++
+ static int rockchip_gpio_get_direction(struct gpio_chip *chip, unsigned offset)
+ {
+ 	struct rockchip_pin_bank *bank = gpiochip_get_data(chip);
+@@ -2236,10 +2291,12 @@
+ 			"failed to enable clock for bank %s\n", bank->name);
+ 		return ret;
+ 	}
+-	data = readl_relaxed(bank->reg_base + GPIO_SWPORT_DDR);
++	data = rk_gpio_readl_bit(bank, offset,
++				 bank->gpio_type ?
++				 GPIO_V2_SWPORT_DDR : GPIO_SWPORT_DDR);
+ 	clk_disable(bank->clk);
+ 
+-	return !(data & BIT(offset));
++	return !data;
+ }
+ 
+ /*
+@@ -2264,13 +2321,10 @@
+ 	clk_enable(bank->clk);
+ 	raw_spin_lock_irqsave(&bank->slock, flags);
+ 
+-	data = readl_relaxed(bank->reg_base + GPIO_SWPORT_DDR);
+ 	/* set bit to 1 for output, 0 for input */
+-	if (!input)
+-		data |= BIT(pin);
+-	else
+-		data &= ~BIT(pin);
+-	writel_relaxed(data, bank->reg_base + GPIO_SWPORT_DDR);
++	rk_gpio_writel_bit(bank, pin, input ? 0 : 1,
++			   bank->gpio_type ?
++			   GPIO_V2_SWPORT_DDR : GPIO_SWPORT_DDR);
+ 
+ 	raw_spin_unlock_irqrestore(&bank->slock, flags);
+ 	clk_disable(bank->clk);
+@@ -2719,18 +2773,14 @@
+ static void rockchip_gpio_set(struct gpio_chip *gc, unsigned offset, int value)
+ {
+ 	struct rockchip_pin_bank *bank = gpiochip_get_data(gc);
+-	void __iomem *reg = bank->reg_base + GPIO_SWPORT_DR;
+ 	unsigned long flags;
+-	u32 data;
+ 
+ 	clk_enable(bank->clk);
+ 	raw_spin_lock_irqsave(&bank->slock, flags);
+ 
+-	data = readl(reg);
+-	data &= ~BIT(offset);
+-	if (value)
+-		data |= BIT(offset);
+-	writel(data, reg);
++	rk_gpio_writel_bit(bank, offset, value,
++			   bank->gpio_type ?
++			   GPIO_V2_SWPORT_DR : GPIO_SWPORT_DR);
+ 
+ 	raw_spin_unlock_irqrestore(&bank->slock, flags);
+ 	clk_disable(bank->clk);
+@@ -3274,9 +3324,35 @@
+ 			if (!strcmp(bank->name, np->name)) {
+ 				bank->of_node = np;
+ 
+-				if (!rockchip_get_bank_data(bank, d))
++				if (!rockchip_get_bank_data(bank, d)) {
+ 					bank->valid = true;
+ 
++					/*
++					 * Newer GPIO blocks (rk3528 and later) report their
++					 * version in a dedicated register and use the v2
++					 * layout for the data/direction registers.  Probe it
++					 * here (not inside rockchip_get_bank_data, where
++					 * info->ctrl is still NULL because computing it is
++					 * what this function does) and only for those SoCs,
++					 * so the older ones keep their existing behaviour.
++					 */
++					if (ctrl->type == RK3528) {
++						clk_enable(bank->clk);
++						bank->gpio_type =
++							readl(bank->reg_base + GPIO_V2_VERSION);
++						clk_disable(bank->clk);
++
++						if (bank->gpio_type != GPIO_TYPE_V2 &&
++						    bank->gpio_type != GPIO_TYPE_V2_1 &&
++						    bank->gpio_type != GPIO_TYPE_V2_2)
++							bank->gpio_type = 0;
++
++						dev_info(d->dev,
++							 "bank %s: gpio version 0x%08x\n",
++							 bank->name, bank->gpio_type);
++					}
++				}
++
+ 				break;
+ 			}
+ 		}

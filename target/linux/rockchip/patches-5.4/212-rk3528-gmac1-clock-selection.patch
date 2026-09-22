@@ -1,0 +1,75 @@
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-rk.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-rk.c
+@@ -32,6 +32,8 @@
+ 	void (*set_to_rmii)(struct rk_priv_data *bsp_priv);
+ 	void (*set_rgmii_speed)(struct rk_priv_data *bsp_priv, int speed);
+ 	void (*set_rmii_speed)(struct rk_priv_data *bsp_priv, int speed);
++	void (*set_clock_selection)(struct rk_priv_data *bsp_priv, bool input,
++				    bool enable);
+ 	void (*integrated_phy_powerup)(struct rk_priv_data *bsp_priv);
+ };
+ 
+@@ -989,6 +991,8 @@
+ #define RK3528_GMAC1_CLK_SELET_IO	GRF_BIT(12)
+ #define RK3528_GMAC1_CLK_RMII_GATE	GRF_BIT(9)
+ #define RK3528_GMAC1_CLK_RMII_NOGATE	GRF_CLR_BIT(9)
++#define RK3528_GMAC0_CLK_RMII_GATE	GRF_BIT(2)
++#define RK3528_GMAC0_CLK_RMII_NOGATE	GRF_CLR_BIT(2)
+ 
+ /*
+  * The RK3528 GMAC1 clock source selection register (bit 12) and the RMII
+@@ -1118,11 +1122,37 @@
+ 	dev_err(dev, "unknown RMII speed value for GMAC speed=%d", speed);
+ }
+ 
++/*
++ * Taken from the vendor 5.10 BSP.  This is the piece the 5.4 port was missing:
++ * GMAC1's clock source (bit 12 of CON5) and the RMII clock gate (bit 9) were
++ * never programmed, so the RGMII clock source stayed at whatever the bootloader
++ * had left in the register.  The link then negotiates fine (MDIO does not use
++ * the RGMII clocks) while not a single frame gets through.
++ */
++static void rk3528_set_clock_selection(struct rk_priv_data *bsp_priv,
++				       bool input, bool enable)
++{
++	unsigned int value, id = bsp_priv->bus_id;
++
++	if (id == 1) {
++		value = input ? RK3528_GMAC1_CLK_SELET_IO :
++				RK3528_GMAC1_CLK_SELET_CRU;
++		value |= enable ? RK3528_GMAC1_CLK_RMII_NOGATE :
++				  RK3528_GMAC1_CLK_RMII_GATE;
++		regmap_write(bsp_priv->grf, RK3528_VPU_GRF_GMAC_CON5, value);
++	} else {
++		value = enable ? RK3528_GMAC0_CLK_RMII_NOGATE :
++				 RK3528_GMAC0_CLK_RMII_GATE;
++		regmap_write(bsp_priv->grf, RK3528_VO_GRF_GMAC_CON, value);
++	}
++}
++
+ static const struct rk_gmac_ops rk3528_ops = {
+ 	.set_to_rgmii = rk3528_set_to_rgmii,
+ 	.set_to_rmii = rk3528_set_to_rmii,
+ 	.set_rgmii_speed = rk3528_set_rgmii_speed,
+ 	.set_rmii_speed = rk3528_set_rmii_speed,
++	.set_clock_selection = rk3528_set_clock_selection,
+ };
+ 
+ #define RV1108_GRF_GMAC_CON0		0X0900
+@@ -1483,6 +1513,16 @@
+ 		return ret;
+ 
+ 	/*rmii or rgmii*/
++	/*
++	 * Program the GMAC1 clock source before touching the delays.  The vendor
++	 * 5.10 core does this for us; the 5.4 core has no such callback, so call
++	 * it here explicitly.  clock_in_out = "output" on this board, i.e.
++	 * clock_input == false => the CRU drives the clock.
++	 */
++	if (bsp_priv->ops->set_clock_selection)
++		bsp_priv->ops->set_clock_selection(bsp_priv,
++						   bsp_priv->clock_input, true);
++
+ 	switch (bsp_priv->phy_iface) {
+ 	case PHY_INTERFACE_MODE_RGMII:
+ 		dev_info(dev, "init for RGMII\n");
