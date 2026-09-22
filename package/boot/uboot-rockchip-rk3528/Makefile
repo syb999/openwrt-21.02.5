@@ -52,7 +52,8 @@ UBOOT_CONFIGURE_VARS += USE_PRIVATE_LIBGCC=yes
 UBOOT_CUSTOMIZE_CONFIG := \
 	--disable TOOLS_MKEFICAPSULE \
 	--set-str MKIMAGE_DTC_PATH $(PKG_BUILD_DIR)/scripts/dtc/dtc \
-	--enable CMD_EXT4_WRITE
+	--enable CMD_EXT4_WRITE \
+	--set-val EXT4_MAX_JOURNAL_ENTRIES 100
 
 # CMD_EXT4_WRITE is only needed for the boot-stage breadcrumbs the OPC-H28K
 # board's boot.scr writes into the ext4 boot partition (the board has no UART
