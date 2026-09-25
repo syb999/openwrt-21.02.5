@@ -1,0 +1,801 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Panther X2 (Rockchip RK3566)
+ *
+ * Board description written against the Rockchip 5.10 BSP SoC bindings,
+ * because the drivers backported into this 5.4 kernel are taken from that
+ * BSP (vendor clock IDs, vendor pinctrl group names, RK3568 GRF offsets).
+ * The mainline/armbian board file was used as the reference for the board
+ * wiring (regulators, LEDs, SD, GMAC1, PMIC), and the GMAC1 numbers
+ * (phy-mode/tx_delay/rx_delay) are the ones the vendor firmware actually
+ * runs on this board.
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pinctrl/rockchip.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+
+#include "rk3566.dtsi"
+
+/ {
+	model = "Panther X2";
+	compatible = "panther,x2", "rockchip,rk3566";
+
+	aliases {
+		/*
+		 * Same mapping as the firmware that actually runs on this
+		 * board: mmc0 = micro SD (sdmmc0), mmc1 = on-board eMMC
+		 * (sdhci), mmc2 = WiFi SDIO (sdmmc1).  The eMMC therefore
+		 * shows up as /dev/mmcblk1, which is what this box's current
+		 * image uses for /boot (p1) and the rootfs (p2).
+		 */
+		mmc0 = &sdmmc0;
+		mmc1 = &sdhci;
+		mmc2 = &sdmmc1;
+		serial2 = &uart2;
+		/*
+		 * gmac0/gmac1 keep their vendor aliases: the dwmac-rk glue
+		 * derives its bus id from the "ethernet" alias and uses it to
+		 * pick RK3568_GRF_GMAC1_* over RK3568_GRF_GMAC0_*.
+		 */
+		/delete-property/ ethernet0;
+		/delete-property/ ethernet1;
+		ethernet1 = &gmac1;
+
+		led-boot = &led_status;
+		led-failsafe = &led_status;
+		led-running = &led_status;
+		led-upgrade = &led_status;
+	};
+
+	chosen {
+		stdout-path = "serial2:1500000n8";
+	};
+
+	leds {
+		compatible = "gpio-leds";
+		pinctrl-names = "default";
+		pinctrl-0 = <&led_pwr_en>, <&led_wifi_en>,
+			    <&led_eth_en>, <&led_status_en>;
+
+		led_pwr: pwr {
+			label = "red:power";
+			gpios = <&gpio0 RK_PD4 GPIO_ACTIVE_HIGH>;
+			default-state = "on";
+		};
+
+		led_wifi: wifi {
+			label = "green:wifi";
+			gpios = <&gpio0 RK_PD6 GPIO_ACTIVE_HIGH>;
+		};
+
+		led_eth: eth {
+			label = "green:eth";
+			gpios = <&gpio0 RK_PD5 GPIO_ACTIVE_HIGH>;
+		};
+
+		led_status: status {
+			label = "green:status";
+			gpios = <&gpio0 RK_PD3 GPIO_ACTIVE_HIGH>;
+			linux,default-trigger = "heartbeat";
+		};
+	};
+
+	vbus: vbus-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "vbus";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+	};
+
+	vcc5v0_sys: vcc5v0-sys-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc5v0_sys";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		vin-supply = <&vbus>;
+	};
+
+	vcc3v3_sys: vcc3v3-sys-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc3v3_sys";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		vin-supply = <&vcc5v0_sys>;
+	};
+
+	sdio_pwrseq: sdio-pwrseq {
+		compatible = "mmc-pwrseq-simple";
+		clocks = <&rk809 1>;
+		clock-names = "ext_clock";
+		pinctrl-names = "default";
+		pinctrl-0 = <&wifi_enable_h>;
+		reset-gpios = <&gpio2 RK_PB1 GPIO_ACTIVE_LOW>;
+		post-power-on-delay-ms = <100>;
+	};
+};
+
+&cpu0 {
+	cpu-supply = <&vdd_cpu>;
+};
+
+&cpu1 {
+	cpu-supply = <&vdd_cpu>;
+};
+
+&cpu2 {
+	cpu-supply = <&vdd_cpu>;
+};
+
+&cpu3 {
+	cpu-supply = <&vdd_cpu>;
+};
+
+&gmac1 {
+	/*
+	 * Same combination the vendor firmware runs: the SoC applies both
+	 * the TX and the RX delay (phy-mode "rgmii" keeps the RTL8211F's own
+	 * delay programming out of the picture).
+	 */
+	phy-mode = "rgmii";
+	clock_in_out = "input";
+	assigned-clocks = <&cru SCLK_GMAC1_RX_TX>, <&cru SCLK_GMAC1_RGMII_SPEED>, <&cru SCLK_GMAC1>;
+	assigned-clock-parents = <&cru SCLK_GMAC1_RGMII_SPEED>, <&cru SCLK_GMAC1>, <&gmac1_clkin>;
+	phy-supply = <&vcc_3v3>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&gmac1m0_miim
+		     &gmac1m0_tx_bus2
+		     &gmac1m0_rx_bus2
+		     &gmac1m0_rgmii_clk
+		     &gmac1m0_clkinout
+		     &gmac1m0_rgmii_bus>;
+	snps,reset-gpio = <&gpio3 RK_PA1 GPIO_ACTIVE_LOW>;
+	snps,reset-active-low;
+	/* Reset time is 20ms, 100ms for rtl8211f */
+	snps,reset-delays-us = <0 20000 100000>;
+	tx_delay = <0x30>;
+	rx_delay = <0x10>;
+	phy-handle = <&rgmii_phy1>;
+	status = "okay";
+};
+
+&mdio1 {
+	rgmii_phy1: ethernet-phy@0 {
+		compatible = "ethernet-phy-ieee802.3-c22";
+		reg = <0>;
+	};
+};
+
+&i2c0 {
+	status = "okay";
+
+	vdd_cpu: regulator@1c {
+		compatible = "tcs,tcs4525";
+		reg = <0x1c>;
+		fcs,suspend-voltage-selector = <1>;
+		regulator-name = "vdd_cpu";
+		regulator-min-microvolt = <800000>;
+		regulator-max-microvolt = <1150000>;
+		regulator-ramp-delay = <2300>;
+		regulator-always-on;
+		regulator-boot-on;
+		vin-supply = <&vcc5v0_sys>;
+
+		regulator-state-mem {
+			regulator-off-in-suspend;
+		};
+	};
+
+	rk809: pmic@20 {
+		compatible = "rockchip,rk809";
+		reg = <0x20>;
+		interrupt-parent = <&gpio0>;
+		interrupts = <RK_PA3 IRQ_TYPE_LEVEL_LOW>;
+		#clock-cells = <1>;
+		clock-output-names = "rk808-clkout1", "rk808-clkout2";
+		pinctrl-names = "default";
+		pinctrl-0 = <&pmic_int_l>;
+		rockchip,system-power-controller;
+		wakeup-source;
+
+		vcc1-supply = <&vcc3v3_sys>;
+		vcc2-supply = <&vcc3v3_sys>;
+		vcc3-supply = <&vcc3v3_sys>;
+		vcc4-supply = <&vcc3v3_sys>;
+		vcc5-supply = <&vcc3v3_sys>;
+		vcc6-supply = <&vcc3v3_sys>;
+		vcc7-supply = <&vcc3v3_sys>;
+		vcc8-supply = <&vcc3v3_sys>;
+		vcc9-supply = <&vcc3v3_sys>;
+
+		regulators {
+			vdd_logic: DCDC_REG1 {
+				regulator-name = "vdd_logic";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <1350000>;
+				regulator-init-microvolt = <900000>;
+				regulator-ramp-delay = <6001>;
+				regulator-initial-mode = <0x2>;
+
+				regulator-state-mem {
+					regulator-on-in-suspend;
+					regulator-suspend-microvolt = <900000>;
+				};
+			};
+
+			vdd_gpu: DCDC_REG2 {
+				regulator-name = "vdd_gpu";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <1350000>;
+				regulator-init-microvolt = <900000>;
+				regulator-ramp-delay = <6001>;
+				regulator-initial-mode = <0x2>;
+
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcc_ddr: DCDC_REG3 {
+				regulator-name = "vcc_ddr";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-initial-mode = <0x2>;
+
+				regulator-state-mem {
+					regulator-on-in-suspend;
+				};
+			};
+
+			vdd_npu: DCDC_REG4 {
+				regulator-name = "vdd_npu";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <1350000>;
+				regulator-init-microvolt = <900000>;
+				regulator-initial-mode = <0x2>;
+
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcc_1v8: DCDC_REG5 {
+				regulator-name = "vcc_1v8";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+
+				regulator-state-mem {
+					regulator-on-in-suspend;
+					regulator-suspend-microvolt = <1800000>;
+				};
+			};
+
+			vdda0v9_image: LDO_REG1 {
+				regulator-name = "vdda0v9_image";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <900000>;
+				regulator-max-microvolt = <900000>;
+
+				regulator-state-mem {
+					regulator-on-in-suspend;
+					regulator-suspend-microvolt = <900000>;
+				};
+			};
+
+			vdda_0v9: LDO_REG2 {
+				regulator-name = "vdda_0v9";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <900000>;
+				regulator-max-microvolt = <900000>;
+
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vdda0v9_pmu: LDO_REG3 {
+				regulator-name = "vdda0v9_pmu";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <900000>;
+				regulator-max-microvolt = <900000>;
+
+				regulator-state-mem {
+					regulator-on-in-suspend;
+					regulator-suspend-microvolt = <900000>;
+				};
+			};
+
+			vccio_acodec: LDO_REG4 {
+				regulator-name = "vccio_acodec";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vccio_sd: LDO_REG5 {
+				regulator-name = "vccio_sd";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <3300000>;
+
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcc3v3_pmu: LDO_REG6 {
+				regulator-name = "vcc3v3_pmu";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+
+				regulator-state-mem {
+					regulator-on-in-suspend;
+					regulator-suspend-microvolt = <3300000>;
+				};
+			};
+
+			vcca_1v8: LDO_REG7 {
+				regulator-name = "vcca_1v8";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcca1v8_pmu: LDO_REG8 {
+				regulator-name = "vcca1v8_pmu";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcca1v8_image: LDO_REG9 {
+				regulator-name = "vcca1v8_image";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcc_3v3: SWITCH_REG1 {
+				regulator-name = "vcc_3v3";
+				regulator-always-on;
+				regulator-boot-on;
+
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcc3v3_sd: SWITCH_REG2 {
+				regulator-name = "vcc3v3_sd";
+				status = "disabled";
+
+				regulator-state-mem {
+					regulator-on-in-suspend;
+				};
+			};
+		};
+	};
+};
+
+&pinctrl {
+	sdio-pwrseq {
+		wifi_enable_h: wifi-enable-h {
+			rockchip,pins = <2 RK_PB1 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	leds {
+		led_pwr_en: led-pwr-en {
+			rockchip,pins = <0 RK_PD4 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		led_wifi_en: led-wifi-en {
+			rockchip,pins = <0 RK_PD6 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		led_eth_en: led-eth-en {
+			rockchip,pins = <0 RK_PD5 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		led_status_en: led-status-en {
+			rockchip,pins = <0 RK_PD3 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	pmic {
+		pmic_int_l: pmic-int-l {
+			rockchip,pins = <0 RK_PA3 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
+
+	bt {
+		bt_enable_h: bt-enable-h {
+			rockchip,pins = <2 RK_PB7 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		bt_host_wake_l: bt-host-wake-l {
+			rockchip,pins = <2 RK_PC0 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		bt_wake_l: bt-wake-l {
+			rockchip,pins = <2 RK_PC1 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+};
+
+&pmu_io_domains {
+	status = "okay";
+	pmuio1-supply = <&vcc3v3_pmu>;
+	pmuio2-supply = <&vcc3v3_pmu>;
+	vccio1-supply = <&vcc_3v3>;
+	vccio2-supply = <&vcc_1v8>;
+	vccio3-supply = <&vccio_sd>;
+	vccio4-supply = <&vcc_1v8>;
+	vccio5-supply = <&vcc_3v3>;
+	vccio6-supply = <&vcc_3v3>;
+	vccio7-supply = <&vcc_3v3>;
+};
+
+&sdhci {
+	bus-width = <8>;
+	no-sd;
+	no-sdio;
+	non-removable;
+	mmc-hs200-1_8v;
+	vmmc-supply = <&vcc_3v3>;
+	vqmmc-supply = <&vcc_1v8>;
+	status = "okay";
+};
+
+&sdmmc0 {
+	/*
+	 * The microSD slot works as a card slot - firmware must keep it enabled,
+	 * because the same image also runs on boards whose slot is fine.  On this
+	 * particular unit the slot itself is dead (the card reads fine in a USB
+	 * reader, yet the slot never answers; U-Boot and Linux both report "Card
+	 * did not respond to voltage select"), so no card is ever detected here,
+	 * but nothing about that justifies disabling the controller.
+	 *
+	 * broken-cd because no card-detect pin is wired: the kernel polls.
+	 */
+	broken-cd;
+	bus-width = <4>;
+	cap-sd-highspeed;
+	disable-wp;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sdmmc0_bus4 &sdmmc0_clk &sdmmc0_cmd &sdmmc0_det>;
+	vqmmc-supply = <&vccio_sd>;
+	status = "okay";
+};
+
+&sdmmc1 {
+	bus-width = <4>;
+	cap-sd-highspeed;
+	cap-sdio-irq;
+	keep-power-in-suspend;
+	disable-wp;
+	non-removable;
+	mmc-pwrseq = <&sdio_pwrseq>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sdmmc1_bus4 &sdmmc1_clk &sdmmc1_cmd>;
+	status = "okay";
+};
+
+&uart1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart1m0_xfer &uart1m0_ctsn &uart1m0_rtsn>;
+	status = "okay";
+
+	/*
+	 * AP6212A1 module: BCM43430A1 on UART1 with the usual flow control and
+	 * wake lines.  Only hci_bcm.c matches this compatible, so the kernel
+	 * needs CONFIG_BT_HCIUART_BCM (see armv8/config-5.4, where the whole BT
+	 * core + UART/BCM glue is built in so that no module dependency on
+	 * btbcm.ko is left for kmod-bluetooth to trip over), plus the firmware
+	 * that is vendored next to this board's files:
+	 * brcm/BCM43430A1.hcd is uploaded by btbcm at probe time.
+	 */
+	bluetooth {
+		compatible = "brcm,bcm43438-bt";
+		clocks = <&rk809 1>;
+		clock-names = "lpo";
+		device-wakeup-gpios = <&gpio2 RK_PC1 GPIO_ACTIVE_HIGH>;
+		host-wakeup-gpios = <&gpio2 RK_PC0 GPIO_ACTIVE_HIGH>;
+		shutdown-gpios = <&gpio2 RK_PB7 GPIO_ACTIVE_HIGH>;
+		max-speed = <1500000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&bt_host_wake_l &bt_wake_l &bt_enable_h>;
+		vbat-supply = <&vcc3v3_sys>;
+		vddio-supply = <&vcca1v8_pmu>;
+	};
+};
+
+&uart2 {
+	status = "okay";
+};
+
+/*
+ * USB (u2phy0 / u2phy0_host, plus the USB3 host behind it) is intentionally
+ * left disabled for now: this kernel's phy-rockchip-inno-usb2 has no RK3568
+ * support yet, so leaving the controllers enabled would only produce
+ * deferred probes at boot.  Both USB ports are host-only on this board and
+ * nothing on the boot or network path depends on them.
+ */
+
+/*
+ * NPU (RK3566, 0.8 TOPS).  The vendor driver is back-ported to this 5.4
+ * kernel with two deliberate limitations, both reflected here:
+ *
+ *  - no IOMMU: the vendor rknpu_iommu.c builds on the DMA-IOMMU internals
+ *    that Rockchip patches into their 5.10 tree; mainline 5.4 has none of
+ *    them.  The driver therefore runs in its non-IOMMU mode, so the "iommus"
+ *    phandle is dropped here and the MMU node stays disabled.
+ *  - no DVFS: the vendor OPP/leakage/pvtpll framework is not part of the
+ *    port, so no operating-points table is referenced and the NPU keeps the
+ *    clock rate the SoC dtsi assigns (600 MHz) with vdd_npu as a fixed rail.
+ *
+ * The NPU power domain (VD_NPU, "rockchip,rk3568-power-controller") IS used:
+ * the pm-domain driver now carries the upstream v5.15/v5.16 rk3568 domain
+ * table (domain id 6, pwr/idle/ack bits from the upstream implementation only,
+ * no vendor BSP data) and the PMU bus clock (PCLK_PMU/CLK_PMU) is registered
+ * as CLK_IS_CRITICAL by clk-rk3568.c, so the PMU registers are reachable when
+ * the driver probes at postcore_initcall.  The domain is therefore referenced
+ * here so the NPU is held powered while the driver is bound.
+ *
+ * The SCMI clock from the vendor dtsi is dropped as well - this kernel has no
+ * SCMI clock driver - which leaves the three CRU clocks.
+ */
+&rknpu {
+	/delete-property/ iommus;
+	/delete-property/ operating-points-v2;
+	power-domains = <&power RK3568_PD_NPU>;
+	clocks = <&cru CLK_NPU>, <&cru ACLK_NPU>, <&cru HCLK_NPU>;
+	clock-names = "clk", "aclk", "hclk";
+	rknpu-supply = <&vdd_npu>;
+	status = "okay";
+};
+
+/*
+ * LoRa concentrator (Semtech SX1302 + SX1250) and the SHT2x temperature /
+ * humidity sensor that sits on the same add-on card.
+ *
+ * The concentrator hangs off SPI3, chip select 0, and only answers when the
+ * controller uses its m0 pin group - with m1 selected it reads back 0xff.
+ * The SoC dtsi already defaults to m0, it is spelled out here so that a
+ * future dtsi change cannot silently break the card.  spidev is all the
+ * userspace packet forwarder needs, so no in-kernel driver is involved.
+ *
+ * The module's power enable (GPIO4_1) and reset (GPIO3_24) lines are driven
+ * by the HAL's reset script, exactly like on the reference bring-up, so they
+ * are not described in the DT.
+ *
+ * The sensor is on i2c2 and only answers after the module has been powered;
+ * i2c2 needs the m1 pin group, which the SoC dtsi does not select.
+ */
+&spi3 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&spi3m0_pins>, <&spi3m0_cs0>;
+	num-cs = <1>;
+
+	spidev@0 {
+		compatible = "rohm,dh2228fv";
+		reg = <0>;
+		spi-max-frequency = <2000000>;
+		/* the pad must be GPIO for the HAL's reset script to drive it */
+		pinctrl-names = "default";
+		pinctrl-0 = <&lora_reset>;
+	};
+};
+
+&i2c2 {
+	status = "okay";
+	clock-frequency = <100000>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c2m1_xfer>;
+};
+
+/*
+ * Power the LoRa concentrator add-on card at boot.
+ *
+ * The SX1302/SX1250 card stays invisible until its POWER_EN line goes high
+ * (no SX1302 on SPI3, and no SHT2x on i2c2 either - that sensor sits on the
+ * card too), and driving it from userspace through /sys/class/gpio does not
+ * work: the write is accepted but the pad never moves, because it is not muxed
+ * as GPIO.
+ *
+ * A gpio-hog was tried first and had to be dropped: the hog is claimed while
+ * gpio4 is still being registered, which fails with -EPROBE_DEFER and then
+ * spins (gpio4 never registers, the hog retries forever) - the kernel wedged
+ * at 0.27s with
+ *   requesting hog GPIO lora-power-en (chip gpio4, offset 1) failed, -517
+ *   gpiochip_add_data_with_key: GPIOs 288..319 (gpio4) failed to register, -517
+ *
+ * Modelling the line as an always-on fixed regulator instead is both correct
+ * and safe: the regulator core enables it during probe, which also applies the
+ * pinmux below, and nobody has to request the gpio during gpiochip setup.
+ *
+ * RESET (GPIO3_24) is deliberately left alone: the HAL's reset script drives
+ * it, and holding it deasserted here would take the line away from that script.
+ */
+&pinctrl {
+	lora {
+		lora_power_en: lora-power-en {
+			rockchip,pins = <4 RK_PA1 RK_FUNC_GPIO &pcfg_output_high>;
+		};
+		lora_reset: lora-reset {
+			rockchip,pins = <3 RK_PD0 RK_FUNC_GPIO &pcfg_output_low>;
+		};
+	};
+};
+
+&{/} {
+	lora_vcc: lora-vcc {
+		compatible = "regulator-fixed";
+		regulator-name = "lora_vcc";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&gpio4 RK_PA1 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		regulator-boot-on;
+		regulator-always-on;
+		pinctrl-names = "default";
+		pinctrl-0 = <&lora_power_en>;
+		startup-delay-us = <100000>;
+	};
+};
+
+/*
+ * USB.  The SoC nodes are disabled in the dtsi and this kernel's
+ * phy-rockchip-inno-usb2 had no RK3568 support, which is why patch 313 adds the
+ * RK3568 PHY configuration.
+ *
+ * Exactly the reference board configuration is enabled here - PHY0, its OTG
+ * port and the USB3/XHCI host controller.  The reference does NOT enable the
+ * USB2 host controllers (ehci/ohci) or PHY1 at all, and enabling them made the
+ * board reboot a minute into the boot (only the xhci/otg path is wired on this
+ * board), so they stay disabled.
+ */
+&usb2phy0 {
+	status = "okay";
+};
+
+&u2phy0_otg {
+	/*
+	 * Upstream layout (030-v5.17 arm64 dts rk3568 usb2 nodes + 034-v5.17
+	 * muxed interrupts): the one shared phy interrupt is declared on the
+	 * usb2-phy@fe8a0000 node itself (GIC_SPI 135, see rk3568.dtsi) and the
+	 * port sub-nodes carry no interrupts at all.  The driver requests that
+	 * single muxed irq once from the phy node and fans it out to the otg
+	 * and host port of this phy, so naming it again on the ports is wrong
+	 * and was only a workaround for the old per-port linestate lookup.
+	 */
+	status = "okay";
+};
+
+/* the dwc3 in usbhost30 names the *host* port of phy0 as its usb2-phy */
+&u2phy0_host {
+	status = "okay";
+};
+
+&usbhost30 {
+	status = "okay";
+};
+
+/*
+ * usbhost30's inner dwc3 also names <&combphy1_usq PHY_TYPE_USB3> as its usb3
+ * phy.  combphy0_us is deleted by rk3566.dtsi (that instance does not exist on
+ * this SoC), combphy1_usq does exist, so it has to be enabled too - otherwise
+ * the controller binds but never registers its root hub.
+ */
+&{/syscon@fdc80000} {
+	status = "okay";
+};
+
+&{/phy@fe830000} {
+	status = "okay";
+};
+
+
+
+&usb2phy0 {
+	status = "okay";
+};
+
+/*
+ * The DWC3 core inside usbhost30 has its own status property (disabled in the
+ * dtsi), which enabling the glue node does not touch - that is why the
+ * controller never registered a root hub even though its phy was up.
+ *
+ * power-domains stays dropped: PD_PIPE is now resolvable (the rk3568
+ * power-domain driver is in place and the SoC dtsi defines the domain), but
+ * the USB3 path is kept exactly as it was validated - the DWC3 core does not
+ * need the genpd link, PD_PIPE is powered on unconditionally by the pm-domain
+ * probe anyway, and re-attaching the core to it is a separate change.
+ */
+&usbhost_dwc3 {
+	/delete-property/ power-domains;
+	status = "okay";
+};
+
+/*
+ * The Type-C port is the OTG controller (usbdrd30 / usbdrd_dwc3), which the
+ * reference configuration drives as a plain host.  Its core node is disabled
+ * on its own, names a combphy0_us that rk3566.dtsi deletes, defaults to
+ * dr_mode = "otg" (which would present the port as a device) and references
+ * PD_PIPE, which is left detached here for the same reason as usbhost_dwc3
+ * above (see the note there).
+ */
+&usbdrd30 {
+	status = "okay";
+};
+
+&usbdrd_dwc3 {
+	dr_mode = "host";
+	/* keep the U2 suspend-phy logic out of the picture: with it enabled the
+	 * port fails to re-detect a device after the first disconnect
+	 * (dmesg: usb usb1-port1: connect-debounce failed) */
+	snps,dis_u2_susphy_quirk;
+	/* the USB-A port only has USB2 data lines; without this the controller
+	 * negotiates a SuperSpeed link on every connect and the connect
+	 * debounce fails (vendor DTS has exactly this line) */
+	maximum-speed = "high-speed";
+	quirk-skip-phy-init;
+	phys = <&u2phy0_otg>;
+	phy-names = "usb2-phy";
+	/delete-property/ power-domains;
+	status = "okay";
+};
+
+/*
+ * The vendor dtsi leaves the SoC temperature sensor (tsadc@fe710000) disabled,
+ * which is why thermal_zone0 had no sensor bound and LuCI showed NaN.  The
+ * driver is built in and supports rk3568, so the node only has to be enabled.
+ * (rk3328 works out of the box because its dtsi defaults to okay.)
+ */
+&tsadc {
+	status = "okay";
+};
+

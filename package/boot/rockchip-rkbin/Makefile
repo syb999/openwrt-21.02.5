@@ -17,14 +17,20 @@
 #   RKBOOT/RK3528MINIALL.ini               (recipe for tools/boot_merger)
 #   tools/boot_merger                      (Rockchip packer, x86_64)
 #
+#   bin/rk35/rk3566_ddr_1056MHz_v1.26.bin  (TPL for RK3566)
+#   bin/rk35/rk3568_bl31_v1.46.elf         (ATF, shared by RK3566/RK3568)
+#   bin/rk35/rk356x_spl_v1.14.bin          (loader FlashBoot)
+#   bin/rk35/rk356x_usbplug_v1.17.bin      (loader usbplug)
+#   RKBOOT/RK3566MINIALL.ini               (recipe for tools/boot_merger)
+#
 # boot_merger turns DDR + usbplug + spl into a maskrom loader, which has to be
 # pushed into RAM over USB in maskrom mode before any storage can be written
 # (rkdeveloptool db / upgrade_tool DB / RKDevTool "download loader").
 #
 # Two containers are produced on purpose:
-#   rk3528_spl_loader_*.bin   new "LDR " container with an embedded RKNS idblock
+#   <soc>_spl_loader_*.bin    new "LDR " container with an embedded RKNS idblock
 #                             (what Rockchip's Windows RKDevTool expects)
-#   rk3528_loader_miniall.bin classic "BOOT" container
+#   <soc>_loader_miniall.bin  classic "BOOT" container
 #                             (what the Linux rkdeveloptool/upgrade_tool accept:
 #                              they verify the "BOOT" tag and their own CRC_32 -
 #                              they reject the "LDR " tag outright)
@@ -63,6 +69,17 @@ define rkbin/rk3528
   LOADER_LEGACY:=rk3528_loader_miniall.bin
 endef
 
+# RK3566/RK3568 share the ATF (rk3568_bl31); only the DDR init differs.
+define rkbin/rk3566
+  DEPENDS:=@TARGET_rockchip_armv8
+  ATF:=rk35/rk3568_bl31_v1.46.elf
+  TPL:=rk35/rk3566_ddr_1056MHz_v1.26.bin
+  LOADER_INI:=RKBOOT/RK3566MINIALL.ini
+  LOADER:=rk356x_loader_v1.26.114.bin
+  LOADER_LEGACY_INI:=RKBOOT/RK3566MINIALL-legacy.ini
+  LOADER_LEGACY:=rk356x_loader_miniall.bin
+endef
+
 define Build/rkbin/Target
   $(eval $(call rkbin/$(1)))
 
@@ -87,7 +104,7 @@ endif
   endef
 endef
 
-VARIANTS:=rk3528
+VARIANTS:=rk3528 rk3566
 
 define BuildPackage/rkbin
   $(foreach type,$(if $(DUMP),$(VARIANTS),$(BUILD_VARIANT)), \

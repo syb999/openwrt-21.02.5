@@ -17,6 +17,15 @@ hinlink,opc-h28k)
 	ucidef_set_led_netdev "lan" "LAN" "amber:lan" "eth0"
 	ucidef_set_led_netdev "wan" "WAN" "blue:wan" "eth1"
 	;;
+panther,x2)
+	# Four single-colour LEDs on the front: power, status, network, wifi.
+	# Power stays on (it is the "none" default), status shows the system is
+	# alive, and the two link LEDs follow their interface instead of being
+	# stuck on like in the vendor firmware.
+	ucidef_set_led_heartbeat "status" "STATUS" "green:status"
+	ucidef_set_led_netdev "eth" "ETH" "green:eth" "eth0"
+	ucidef_set_led_netdev "wifi" "WIFI" "green:wifi" "wlan0"
+	;;
 esac
 
 board_config_flush

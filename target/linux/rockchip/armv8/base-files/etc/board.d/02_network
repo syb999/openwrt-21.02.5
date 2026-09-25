@@ -19,6 +19,37 @@ rockchip_setup_interfaces()
 		# (WAN on eth1, LAN on eth0) and the vendor firmware.
 		ucidef_set_interfaces_lan_wan 'eth0' 'eth1'
 		;;
+	panther,x2)
+		# Single Gigabit port (SoC GMAC1 with an RTL8211F RGMII PHY), and it
+		# is the uplink: the board hangs off an existing network and gets
+		# its address by DHCP, so the port is the WAN, not a LAN bridge.
+		# (The "lan" zone is therefore empty; the wan zone is opened right
+		# below so that a freshly flashed headless box stays reachable.)
+		ucidef_set_interface_wan 'eth0' 'dhcp'
+
+		# The wifi AP in the generated wireless config points at the "lan"
+		# network, but a single-port box has no lan interface, so the AP ends
+		# up attached to nothing (no br-lan, no address, no traffic).  Create
+		# the lan bridge on a *non-existent* eth1 purely as a home for the
+		# wireless interface; the physical port stays the wan.
+		ucidef_set_interface_lan 'eth1' 'none'
+
+		# Open the wan zone, because this script is the only place that is
+		# *known* to run for this board (it is what writes the network
+		# config below) - an uci-defaults file proved not to be enough, and
+		# getting locked out of a headless single-port box means a maskrom
+		# reflash.
+		uci -q set firewall.@defaults[0].input='ACCEPT'
+		uci -q set firewall.@defaults[0].forward='ACCEPT'
+		uci -q set firewall.@zone[1].input='ACCEPT'
+		uci -q set firewall.@zone[1].forward='ACCEPT'
+		uci -q set firewall.@zone[1].output='ACCEPT'
+		uci -q commit firewall
+
+		# Note: a static address on the dhcp wan (list ipaddr) is *not*
+		# applied by netifd, so there is no 192.168.9.1 fallback here; the
+		# port carries the upstream lease only.
+		;;
 	*)
 		ucidef_set_interface_lan 'eth0'
 		;;
@@ -29,6 +60,32 @@ nanopi_r2s_generate_mac()
 {
 	local sd_hash=$(sha256sum /sys/devices/platform/ff500000.dwmmc/mmc_host/mmc0/mmc0:*/cid)
 	local mac_base=$(macaddr_canonicalize "$(echo "${sd_hash}" | dd bs=1 count=12 2>/dev/null)")
+	echo "$(macaddr_unsetbit_mc "$(macaddr_setbit_la "${mac_base}")")"
+}
+
+panther_x2_generate_mac()
+{
+	# Stable per-board MAC derived from the onboard eMMC CID (mmc1 in the
+	# DT aliases, i.e. /dev/mmcblk1 on this board), falling back to the SD
+	# card CID and finally to the SoC serial.  The optional tag mixes in a
+	# per-interface string so one board can derive several *distinct*
+	# stable addresses.
+	local tag="$1" seed="" f
+	for f in /sys/class/mmc_host/mmc1/mmc1:*/cid \
+		 /sys/block/mmcblk1/device/cid \
+		 /sys/class/mmc_host/mmc0/mmc0:*/cid \
+		 /sys/block/mmcblk0/device/cid \
+		 /proc/device-tree/serial-number; do
+		[ -r "$f" ] || continue
+		seed=$(cat "$f" 2>/dev/null)
+		[ -n "$seed" ] && break
+	done
+	[ -z "$seed" ] && seed="panther-x2"
+
+	local hash=$(printf '%s-%s' "$seed" "$tag" | sha256sum | cut -c1-12)
+	local mac_base=$(macaddr_canonicalize "$hash")
+	[ -z "$mac_base" ] && mac_base="02:00:00:00:00:01"
+
 	echo "$(macaddr_unsetbit_mc "$(macaddr_setbit_la "${mac_base}")")"
 }
 
@@ -66,6 +123,12 @@ rockchip_setup_macs()
 	local label_mac=""
 
 	case "$board" in
+	panther,x2)
+		# See the note in the h28k case below: a single address must not
+		# be shared between an interface and its members, so set it per
+		# network device.
+		ucidef_set_network_device_mac eth0 "$(panther_x2_generate_mac lan)"
+		;;
 	friendlyarm,nanopi-r2s)
 		wan_mac=$(nanopi_r2s_generate_mac)
 		lan_mac=$(macaddr_add "$wan_mac" +1)

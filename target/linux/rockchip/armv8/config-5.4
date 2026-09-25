@@ -535,3 +535,52 @@ CONFIG_PSTORE_DEFLATE_COMPRESS_DEFAULT=y
 # CONFIG_PSTORE_LZ4HC_COMPRESS is not set
 # CONFIG_PSTORE_842_COMPRESS is not set
 # CONFIG_PSTORE_ZSTD_COMPRESS is not set
+
+# RK3566/RK3568 NPU (rknpu), back-ported from the vendor 5.10 driver.
+# DRM is required because the driver registers itself as a DRM render
+# node (/dev/dri/renderD*), which is what the RKNN userspace looks for.
+CONFIG_DRM=y
+CONFIG_ROCKCHIP_RKNPU=y
+CONFIG_ROCKCHIP_RKNPU_DRM_GEM=y
+CONFIG_ROCKCHIP_RKNPU_DEBUG_FS=y
+
+# The Panther X2's Bluetooth is a BCM43430A1 on UART and needs the BCM
+# protocol driver (btbcm) to upload brcm/BCM43430A1.hcd.  kmod-bluetooth
+# asks for HCIUART_BCM=n in its KCONFIG; whether the target config here
+# wins over that has to be confirmed by checking the generated .config.
+CONFIG_BT_HCIUART_BCM=y
+# NOTE: btbcm cannot be forced to =y here - it is only reachable through
+# selects from BT_HCIUART/BT_HCIBTUSB, which are modules, so kconfig keeps
+# it at =m.  btbcm.ko is therefore packaged by the small kmod-btbcm
+# package in package/kernel/btbcm (selected by the panther_x2 device),
+# which is what makes kmod-bluetooth's hci_uart.ko dependency resolve.
+
+# The BCM43430A1 Bluetooth is on UART and its DT node is
+# "brcm,bcm43438-bt", which only hci_bcm.c matches - so HCIUART_BCM has to
+# be on.  That makes hci_uart link against the btbcm helper, and btbcm can
+# only ever be a *module* here (it is pulled in by selects from BT_HCIUART/
+# BT_HCIBTUSB), which would leave hci_uart.ko with a dependency that
+# kmod-bluetooth does not ship.  Building the BT core and the UART/BCM code
+# into the kernel instead keeps module dependencies empty and still uploads
+# brcm/BCM43430A1.hcd at probe time.  USB Bluetooth dongles are not needed
+# on this board (no USB host at all), hence BT_HCIBTUSB=n.
+CONFIG_BT=y
+CONFIG_BT_BCM=y
+CONFIG_BT_HCIUART=y
+CONFIG_BT_HCIUART_BCM=y
+CONFIG_BT_HCIBTUSB=n
+
+# With the Bluetooth stack built in, hci_bcm probes long before the
+# squashfs root is mounted, so the request_firmware() lookup of
+# brcm/BCM43430A1.hcd fails ("Patch not found") even though the file
+# ships in /lib/firmware.  Embedding it in the kernel image fixes that;
+# the directory is relative to the kernel build tree (target files/ is
+# copied to its root by the kernel prepare step).
+CONFIG_EXTRA_FIRMWARE="brcm/BCM43430A1.hcd"
+CONFIG_EXTRA_FIRMWARE_DIR="firmware"
+
+# Debugging aids kept in the image on purpose: /dev/mem lets us read the
+# USBGRF/PHY registers directly (the USB port stops detecting re-connects),
+# and dynamic debug gives per-driver traces without rebuilding.
+CONFIG_DYNAMIC_DEBUG=y
+# CONFIG_STRICT_DEVMEM is not set
