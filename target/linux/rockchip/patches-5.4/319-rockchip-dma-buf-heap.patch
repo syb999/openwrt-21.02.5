@@ -1,0 +1,1979 @@
+Rockchip vendor dma-buf heap stack (rk_dma_heap + rk-cma-heap) for 5.4.
+
+Back-ported from the Rockchip develop-5.10 vendor tree
+(drivers/dma-buf/rk_heaps/).  Builds rk-dma-heap.ko (the heap framework,
+provides rk_dma_heap_find()) and rk-cma-heap.ko (the CMA heap backend, which
+registers the "rk-dma-heap-cma" heap that drivers/rknpu looks up).
+
+Both are modules (tristate, =m) and stay out of the boot path.
+
+Necessary core changes (a module cannot reference unexported symbols):
+  * mm/cma.c: EXPORT_SYMBOL_GPL(cma_alloc/cma_release)
+  * kernel/dma/contiguous.c: EXPORT_SYMBOL_GPL(dma_contiguous_default_area)
+  * mm/init-mm.c: EXPORT_SYMBOL(init_mm)
+  * mm/vmalloc.c: EXPORT_SYMBOL_GPL(get_vm_area_caller)
+
+Config-5.4 additions (not part of this patch):
+  CONFIG_DMABUF_HEAPS_ROCKCHIP=m
+  CONFIG_DMABUF_HEAPS_ROCKCHIP_CMA_HEAP=m
+  CONFIG_DMABUF_HEAPS_ROCKCHIP_CMA_ALIGNMENT=8
+
+Note: drivers/rknpu is built-in (=y) and links against rk_dma_heap_find(); a
+modular heap can only satisfy it if rknpu is built as a module too
+(CONFIG_ROCKCHIP_RKNPU=m).
+
+--- a/drivers/dma-buf/Kconfig
++++ b/drivers/dma-buf/Kconfig
+@@ -44,4 +44,6 @@
+ 	default n
+ 	depends on DMA_SHARED_BUFFER
+ 
++source "drivers/dma-buf/rk_heaps/Kconfig"
++
+ endmenu
+--- a/drivers/dma-buf/Makefile
++++ b/drivers/dma-buf/Makefile
+@@ -10,3 +10,4 @@
+ 	st-dma-fence.o
+ 
+ obj-$(CONFIG_DMABUF_SELFTESTS)	+= dmabuf_selftests.o
++obj-$(CONFIG_DMABUF_HEAPS_ROCKCHIP) += rk_heaps/
+--- a/kernel/dma/contiguous.c
++++ b/kernel/dma/contiguous.c
+@@ -31,6 +31,12 @@
+ #endif
+ 
+ struct cma *dma_contiguous_default_area;
++/*
++ * rk_dma_heap_cma: the modular Rockchip CMA dma-buf heap binds its heap to
++ * the kernel's default DMA CMA area, so the area pointer has to be visible
++ * to modules.
++ */
++EXPORT_SYMBOL_GPL(dma_contiguous_default_area);
+ 
+ /*
+  * Default global CMA area size can be defined in kernel's .config.
+--- a/mm/cma.c
++++ b/mm/cma.c
+@@ -493,6 +493,12 @@
+ 	pr_debug("%s(): returned %p\n", __func__, page);
+ 	return page;
+ }
++/*
++ * rk_dma_heap_cma: exported so that the modular Rockchip CMA dma-buf heap
++ * can allocate from CMA.  The vendor tree builds that heap into vmlinux,
++ * so its EXPORT_SYMBOLs were not needed there.
++ */
++EXPORT_SYMBOL_GPL(cma_alloc);
+ 
+ /**
+  * cma_release() - release allocated pages
+@@ -526,6 +532,8 @@
+ 
+ 	return true;
+ }
++/* rk_dma_heap_cma: see the comment next to EXPORT_SYMBOL_GPL(cma_alloc). */
++EXPORT_SYMBOL_GPL(cma_release);
+ 
+ int cma_for_each_area(int (*it)(struct cma *cma, void *data), void *data)
+ {
+--- a/mm/init-mm.c
++++ b/mm/init-mm.c
+@@ -6,6 +6,7 @@
+ #include <linux/list.h>
+ #include <linux/cpumask.h>
+ #include <linux/mman.h>
++#include <linux/export.h>
+ 
+ #include <linux/atomic.h>
+ #include <linux/user_namespace.h>
+@@ -39,3 +40,9 @@
+ 	.cpu_bitmap	= CPU_BITS_NONE,
+ 	INIT_MM_CONTEXT(init_mm)
+ };
++/*
++ * rk_dma_heap_cma: rk_vmap_contig_pfn() installs mappings into the kernel
++ * page tables through apply_to_page_range(&init_mm, ...); as a module it
++ * needs init_mm visible.
++ */
++EXPORT_SYMBOL(init_mm);
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@ -2114,6 +2114,8 @@
+ 	return __get_vm_area_node(size, 1, flags, VMALLOC_START, VMALLOC_END,
+ 				  NUMA_NO_NODE, GFP_KERNEL, caller);
+ }
++/* rk_dma_heap_cma: rk_vmap_contig_pfn() needs it as a module. */
++EXPORT_SYMBOL_GPL(get_vm_area_caller);
+ 
+ /**
+  * find_vm_area - find a continuous kernel virtual area
+--- /dev/null
++++ b/drivers/dma-buf/rk_heaps/Kconfig
+@@ -0,0 +1,67 @@
++# SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
++#
++# Rockchip DMA-BUF heap stack, ported from the vendor develop-5.10 tree.
++#
++# The vendor tree builds this stack with "bool" symbols directly into vmlinux
++# and declares a private CMA area named "rk-dma-heap-cma" from early boot code
++# (drivers/dma-buf/rk_heaps/rk-dma-cma.c).  This port keeps the whole stack
++# modular so that it can be loaded after boot and stays out of the boot path;
++# the CMA heap backend therefore attaches itself to the kernel's existing DMA
++# CMA area instead of declaring one (see rk-cma-heap.c).
++menuconfig DMABUF_HEAPS_ROCKCHIP
++	tristate "DMA-BUF Userland Memory Heaps for RockChip"
++	select DMA_SHARED_BUFFER
++	help
++	  Choose this option to enable the RockChip DMA-BUF userland memory
++	  heaps.  This option creates per-heap character devices in
++	  /dev/rk_dma_heap/ which allow userspace to allocate dma-bufs that
++	  can be shared between drivers.
++
++	  The Rockchip NPU driver (rknpu) looks up the "rk-dma-heap-cma"
++	  heap through this framework, so it has to be enabled for the NPU
++	  memory allocation path to work.
++
++config DMABUF_HEAPS_ROCKCHIP_CMA_HEAP
++	tristate "DMA-BUF RockChip CMA Heap"
++	depends on DMABUF_HEAPS_ROCKCHIP && DMA_CMA
++	help
++	  Choose this option to enable the dma-buf RockChip CMA heap.  This
++	  heap is backed by the Contiguous Memory Allocator (CMA) and is
++	  registered under the name "rk-dma-heap-cma", which is the heap the
++	  Rockchip NPU driver allocates its buffers from.
++
++config DMABUF_HEAPS_ROCKCHIP_CMA_ALIGNMENT
++	int "Maximum PAGE_SIZE order of alignment for RockChip CMA Heap"
++	range 0 12
++	depends on DMABUF_HEAPS_ROCKCHIP_CMA_HEAP
++	default 8
++	help
++	  DMA mapping framework by default aligns all buffers to the smallest
++	  PAGE_SIZE order which is greater than or equal to the requested
++	  buffer size.  This works well for buffers up to a few hundreds
++	  kilobytes, but for larger buffers it just a memory waste.  With this
++	  parameter you can specify the maximum PAGE_SIZE order for contiguous
++	  buffers.  Larger buffers will be aligned only to this specified
++	  order.  The order is expressed as a power of two multiplied by the
++	  PAGE_SIZE.
++
++	  For example, if your system defaults to 4KiB pages, the order value
++	  of 8 means that the buffers will be aligned up to 1MiB only.
++
++	  If unsure, leave the default value "8".
++
++config DMABUF_RK_HEAPS_DEBUG
++	bool "DMA-BUF RockChip Heap Debug"
++	depends on DMABUF_HEAPS_ROCKCHIP
++	help
++	  Choose this option to enable dma-buf RockChip heap debug.  It is
++	  only used to name the allocated dma-bufs; the 5.4 kernel has no
++	  kernel-side dma_buf_set_name() helper, so enabling this has no
++	  effect in this port.
++
++config DMABUF_RK_HEAPS_DEBUG_PRINT
++	bool "DMA-BUF RockChip Heap Debug print log enable"
++	depends on DMABUF_HEAPS_ROCKCHIP
++	help
++	  Choose this option to enable the RockChip heap allocation/free
++	  logging (dma_heap_print()).
+--- /dev/null
++++ b/drivers/dma-buf/rk_heaps/Makefile
+@@ -0,0 +1,16 @@
++# SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note
++#
++# Rockchip DMA-BUF heap, back-ported from the develop-5.10 vendor tree.
++#
++# The framework (rk-dma-heap.ko) and the CMA heap (rk-cma-heap.ko) are two
++# modules.  The vendor tree builds both objects into vmlinux, so the framework
++# exports the helpers the CMA heap uses (rk_dma_heap_add(), rk_dma_heap_get_*(),
++# rk_dma_heap_put(), rk_dma_heap_total_inc/dec()).
++#
++# kbuild cannot build a module named rk-cma-heap.ko from several objects when
++# one of them is also named rk-cma-heap.o: the vendor Makefile
++# ("rk-cma-heap-objs := rk-cma-heap.o rk-dma-cma.o") silently drops rk-cma-heap.c.
++# Each module is therefore built from a single source file; the CMA area lookup
++# from rk-dma-cma.c is #included by rk-cma-heap.c.
++obj-$(CONFIG_DMABUF_HEAPS_ROCKCHIP) += rk-dma-heap.o
++obj-$(CONFIG_DMABUF_HEAPS_ROCKCHIP_CMA_HEAP) += rk-cma-heap.o
+--- /dev/null
++++ b/drivers/dma-buf/rk_heaps/rk-dma-heap.c
+@@ -0,0 +1,626 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Framework for userspace DMA-BUF allocations
++ *
++ * Copyright (C) 2011 Google, Inc.
++ * Copyright (C) 2019 Linaro Ltd.
++ * Copyright (C) 2022 Rockchip Electronics Co. Ltd.
++ * Author: Simon Xue <xxm@rock-chips.com>
++ *
++ * Ported from the Rockchip develop-5.10 vendor tree to a 5.4 module.
++ * Deviations from the vendor file are marked with "5.4:" comments below.
++ */
++
++#include <linux/cma.h>
++#include <linux/cdev.h>
++#include <linux/device.h>
++#include <linux/dma-buf.h>
++#include <linux/dma-mapping.h>
++#include <linux/err.h>
++#include <linux/xarray.h>
++#include <linux/list.h>
++#include <linux/module.h>
++#include <linux/proc_fs.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <uapi/linux/rk-dma-heap.h>
++
++#include "rk-dma-heap.h"
++
++/*
++ * 5.4/arm64: arm64's pgtable.h does not define pgprot_nx(), because NX is
++ * handled by the generic permission helpers for kernel mappings.  rknpu does
++ * not use rk_vmap_contig_pfn(), so the identity fallback below is enough to
++ * keep the vendor helper compiling.
++ */
++#ifndef pgprot_nx
++#define pgprot_nx(prot) (prot)
++#endif
++
++#define DEVNAME "rk_dma_heap"
++
++#define NUM_HEAP_MINORS 128
++
++static LIST_HEAD(rk_heap_list);
++static DEFINE_MUTEX(rk_heap_list_lock);
++static dev_t rk_dma_heap_devt;
++static struct class *rk_dma_heap_class;
++static DEFINE_XARRAY_ALLOC(rk_dma_heap_minors);
++static struct proc_dir_entry *proc_rk_dma_heap_dir;
++
++#define K(size) ((unsigned long)((size) >> 10))
++
++static int rk_vmap_pfn_apply(pte_t *pte, unsigned long addr, void *private)
++{
++	struct rk_vmap_pfn_data *data = private;
++
++	*pte = pte_mkspecial(pfn_pte(data->pfn++, data->prot));
++	return 0;
++}
++
++void *rk_vmap_contig_pfn(unsigned long pfn, unsigned int count, pgprot_t prot)
++{
++	struct rk_vmap_pfn_data data = { .pfn = pfn, .prot = pgprot_nx(prot) };
++	struct vm_struct *area;
++
++	area = get_vm_area_caller(count * PAGE_SIZE, VM_MAP,
++			__builtin_return_address(0));
++	if (!area)
++		return NULL;
++	if (apply_to_page_range(&init_mm, (unsigned long)area->addr,
++			count * PAGE_SIZE, rk_vmap_pfn_apply, &data)) {
++		free_vm_area(area);
++		return NULL;
++	}
++	return area->addr;
++}
++/*
++ * 5.4 module port: rk-dma-heap and rk-cma-heap are separate modules, so the
++ * helpers the CMA heap (and external consumers) call have to be exported.
++ */
++EXPORT_SYMBOL_GPL(rk_vmap_contig_pfn);
++
++int rk_dma_heap_set_dev(struct device *heap_dev)
++{
++	int err = 0;
++
++	if (!heap_dev)
++		return -EINVAL;
++
++	dma_coerce_mask_and_coherent(heap_dev, DMA_BIT_MASK(64));
++
++	if (!heap_dev->dma_parms) {
++		heap_dev->dma_parms = devm_kzalloc(heap_dev,
++						   sizeof(*heap_dev->dma_parms),
++						   GFP_KERNEL);
++		if (!heap_dev->dma_parms)
++			return -ENOMEM;
++
++		err = dma_set_max_seg_size(heap_dev, (unsigned int)DMA_BIT_MASK(64));
++		if (err) {
++			devm_kfree(heap_dev, heap_dev->dma_parms);
++			dev_err(heap_dev, "Failed to set DMA segment size, err:%d\n", err);
++			return err;
++		}
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(rk_dma_heap_set_dev);
++
++struct rk_dma_heap *rk_dma_heap_find(const char *name)
++{
++	struct rk_dma_heap *h;
++
++	mutex_lock(&rk_heap_list_lock);
++	list_for_each_entry(h, &rk_heap_list, list) {
++		if (!strcmp(h->name, name)) {
++			kref_get(&h->refcount);
++			mutex_unlock(&rk_heap_list_lock);
++			return h;
++		}
++	}
++	mutex_unlock(&rk_heap_list_lock);
++	return NULL;
++}
++EXPORT_SYMBOL_GPL(rk_dma_heap_find);
++
++void rk_dma_heap_buffer_free(struct dma_buf *dmabuf)
++{
++	dma_buf_put(dmabuf);
++}
++EXPORT_SYMBOL_GPL(rk_dma_heap_buffer_free);
++
++struct dma_buf *rk_dma_heap_buffer_alloc(struct rk_dma_heap *heap, size_t len,
++					 unsigned int fd_flags,
++					 unsigned int heap_flags,
++					 const char *name)
++{
++	struct dma_buf *dmabuf;
++
++	if (fd_flags & ~RK_DMA_HEAP_VALID_FD_FLAGS)
++		return ERR_PTR(-EINVAL);
++
++	if (heap_flags & ~RK_DMA_HEAP_VALID_HEAP_FLAGS)
++		return ERR_PTR(-EINVAL);
++	/*
++	 * Allocations from all heaps have to begin
++	 * and end on page boundaries.
++	 */
++	len = PAGE_ALIGN(len);
++	if (!len)
++		return ERR_PTR(-EINVAL);
++
++	dmabuf = heap->ops->allocate(heap, len, fd_flags, heap_flags, name);
++
++	/*
++	 * 5.4: the vendor code calls dma_buf_set_name() here when
++	 * CONFIG_DMABUF_RK_HEAPS_DEBUG is enabled.  The 5.4 kernel only has a
++	 * static dma_buf_set_name() that copies from userspace, so there is no
++	 * kernel-side rename helper to call; the buffer keeps its exporter
++	 * name instead.
++	 */
++
++	return dmabuf;
++}
++EXPORT_SYMBOL_GPL(rk_dma_heap_buffer_alloc);
++
++int rk_dma_heap_bufferfd_alloc(struct rk_dma_heap *heap, size_t len,
++			       unsigned int fd_flags,
++			       unsigned int heap_flags,
++			       const char *name)
++{
++	struct dma_buf *dmabuf;
++	int fd;
++
++	dmabuf = rk_dma_heap_buffer_alloc(heap, len, fd_flags, heap_flags,
++					  name);
++
++	if (IS_ERR(dmabuf))
++		return PTR_ERR(dmabuf);
++
++	fd = dma_buf_fd(dmabuf, fd_flags);
++	if (fd < 0) {
++		dma_buf_put(dmabuf);
++		/* just return, as put will call release and that will free */
++	}
++
++	return fd;
++}
++EXPORT_SYMBOL_GPL(rk_dma_heap_bufferfd_alloc);
++
++struct page *rk_dma_heap_alloc_contig_pages(struct rk_dma_heap *heap,
++					    size_t len, const char *name)
++{
++	if (!heap->support_cma) {
++		WARN_ON(!heap->support_cma);
++		return ERR_PTR(-EINVAL);
++	}
++
++	len = PAGE_ALIGN(len);
++	if (!len)
++		return ERR_PTR(-EINVAL);
++
++	return heap->ops->alloc_contig_pages(heap, len, name);
++}
++EXPORT_SYMBOL_GPL(rk_dma_heap_alloc_contig_pages);
++
++void rk_dma_heap_free_contig_pages(struct rk_dma_heap *heap,
++				   struct page *pages, size_t len,
++				   const char *name)
++{
++	if (!heap->support_cma) {
++		WARN_ON(!heap->support_cma);
++		return;
++	}
++
++	heap->ops->free_contig_pages(heap, pages, len, name);
++}
++EXPORT_SYMBOL_GPL(rk_dma_heap_free_contig_pages);
++
++void rk_dma_heap_total_inc(struct rk_dma_heap *heap, size_t len)
++{
++	mutex_lock(&rk_heap_list_lock);
++	heap->total_size += len;
++	mutex_unlock(&rk_heap_list_lock);
++}
++EXPORT_SYMBOL_GPL(rk_dma_heap_total_inc);
++
++void rk_dma_heap_total_dec(struct rk_dma_heap *heap, size_t len)
++{
++	mutex_lock(&rk_heap_list_lock);
++	if (WARN_ON(heap->total_size < len))
++		heap->total_size = 0;
++	else
++		heap->total_size -= len;
++	mutex_unlock(&rk_heap_list_lock);
++}
++EXPORT_SYMBOL_GPL(rk_dma_heap_total_dec);
++
++static int rk_dma_heap_open(struct inode *inode, struct file *file)
++{
++	struct rk_dma_heap *heap;
++
++	heap = xa_load(&rk_dma_heap_minors, iminor(inode));
++	if (!heap) {
++		pr_err("dma_heap: minor %d unknown.\n", iminor(inode));
++		return -ENODEV;
++	}
++
++	/* instance data as context */
++	file->private_data = heap;
++	nonseekable_open(inode, file);
++
++	return 0;
++}
++
++static long rk_dma_heap_ioctl_allocate(struct file *file, void *data)
++{
++	struct rk_dma_heap_allocation_data *heap_allocation = data;
++	struct rk_dma_heap *heap = file->private_data;
++	int fd;
++
++	if (heap_allocation->fd)
++		return -EINVAL;
++
++	fd = rk_dma_heap_bufferfd_alloc(heap, heap_allocation->len,
++					heap_allocation->fd_flags,
++					heap_allocation->heap_flags, NULL);
++	if (fd < 0)
++		return fd;
++
++	heap_allocation->fd = fd;
++
++	return 0;
++}
++
++static unsigned int rk_dma_heap_ioctl_cmds[] = {
++	RK_DMA_HEAP_IOCTL_ALLOC,
++};
++
++static long rk_dma_heap_ioctl(struct file *file, unsigned int ucmd,
++			      unsigned long arg)
++{
++	char stack_kdata[128];
++	char *kdata = stack_kdata;
++	unsigned int kcmd;
++	unsigned int in_size, out_size, drv_size, ksize;
++	int nr = _IOC_NR(ucmd);
++	int ret = 0;
++
++	if (nr >= ARRAY_SIZE(rk_dma_heap_ioctl_cmds))
++		return -EINVAL;
++
++	/* Get the kernel ioctl cmd that matches */
++	kcmd = rk_dma_heap_ioctl_cmds[nr];
++
++	/* Figure out the delta between user cmd size and kernel cmd size */
++	drv_size = _IOC_SIZE(kcmd);
++	out_size = _IOC_SIZE(ucmd);
++	in_size = out_size;
++	if ((ucmd & kcmd & IOC_IN) == 0)
++		in_size = 0;
++	if ((ucmd & kcmd & IOC_OUT) == 0)
++		out_size = 0;
++	ksize = max(max(in_size, out_size), drv_size);
++
++	/* If necessary, allocate buffer for ioctl argument */
++	if (ksize > sizeof(stack_kdata)) {
++		kdata = kmalloc(ksize, GFP_KERNEL);
++		if (!kdata)
++			return -ENOMEM;
++	}
++
++	if (copy_from_user(kdata, (void __user *)arg, in_size) != 0) {
++		ret = -EFAULT;
++		goto err;
++	}
++
++	/* zero out any difference between the kernel/user structure size */
++	if (ksize > in_size)
++		memset(kdata + in_size, 0, ksize - in_size);
++
++	switch (kcmd) {
++	case RK_DMA_HEAP_IOCTL_ALLOC:
++		ret = rk_dma_heap_ioctl_allocate(file, kdata);
++		break;
++	default:
++		ret = -ENOTTY;
++		goto err;
++	}
++
++	if (copy_to_user((void __user *)arg, kdata, out_size) != 0)
++		ret = -EFAULT;
++err:
++	if (kdata != stack_kdata)
++		kfree(kdata);
++	return ret;
++}
++
++static const struct file_operations rk_dma_heap_fops = {
++	.owner          = THIS_MODULE,
++	.open		= rk_dma_heap_open,
++	.unlocked_ioctl = rk_dma_heap_ioctl,
++#ifdef CONFIG_COMPAT
++	.compat_ioctl	= rk_dma_heap_ioctl,
++#endif
++};
++
++/**
++ * rk_dma_heap_get_drvdata() - get per-subdriver data for the heap
++ * @heap: DMA-Heap to retrieve private data for
++ *
++ * Returns:
++ * The per-subdriver data for the heap.
++ */
++void *rk_dma_heap_get_drvdata(struct rk_dma_heap *heap)
++{
++	return heap->priv;
++}
++EXPORT_SYMBOL_GPL(rk_dma_heap_get_drvdata);
++
++static void rk_dma_heap_release(struct kref *ref)
++{
++	struct rk_dma_heap *heap = container_of(ref, struct rk_dma_heap, refcount);
++	int minor = MINOR(heap->heap_devt);
++
++	/* Note, we already holding the rk_heap_list_lock here */
++	list_del(&heap->list);
++
++	device_destroy(rk_dma_heap_class, heap->heap_devt);
++	cdev_del(&heap->heap_cdev);
++	xa_erase(&rk_dma_heap_minors, minor);
++
++	kfree(heap);
++}
++
++void rk_dma_heap_put(struct rk_dma_heap *h)
++{
++	/*
++	 * Take the rk_heap_list_lock now to avoid racing with code
++	 * scanning the list and then taking a kref.
++	 */
++	mutex_lock(&rk_heap_list_lock);
++	kref_put(&h->refcount, rk_dma_heap_release);
++	mutex_unlock(&rk_heap_list_lock);
++}
++EXPORT_SYMBOL_GPL(rk_dma_heap_put);
++
++/**
++ * rk_dma_heap_get_dev() - get device struct for the heap
++ * @heap: DMA-Heap to retrieve device struct from
++ *
++ * Returns:
++ * The device struct for the heap.
++ */
++struct device *rk_dma_heap_get_dev(struct rk_dma_heap *heap)
++{
++	return heap->heap_dev;
++}
++EXPORT_SYMBOL_GPL(rk_dma_heap_get_dev);
++
++/**
++ * rk_dma_heap_get_name() - get heap name
++ * @heap: DMA-Heap to retrieve private data for
++ *
++ * Returns:
++ * The char* for the heap name.
++ */
++const char *rk_dma_heap_get_name(struct rk_dma_heap *heap)
++{
++	return heap->name;
++}
++EXPORT_SYMBOL_GPL(rk_dma_heap_get_name);
++
++struct rk_dma_heap *rk_dma_heap_add(const struct rk_dma_heap_export_info *exp_info)
++{
++	struct rk_dma_heap *heap, *err_ret;
++	unsigned int minor;
++	int ret;
++
++	if (!exp_info->name || !strcmp(exp_info->name, "")) {
++		pr_err("rk_dma_heap: Cannot add heap without a name\n");
++		return ERR_PTR(-EINVAL);
++	}
++
++	if (!exp_info->ops || !exp_info->ops->allocate) {
++		pr_err("rk_dma_heap: Cannot add heap with invalid ops struct\n");
++		return ERR_PTR(-EINVAL);
++	}
++
++	/* check the name is unique */
++	heap = rk_dma_heap_find(exp_info->name);
++	if (heap) {
++		pr_err("rk_dma_heap: Already registered heap named %s\n",
++		       exp_info->name);
++		rk_dma_heap_put(heap);
++		return ERR_PTR(-EINVAL);
++	}
++
++	heap = kzalloc(sizeof(*heap), GFP_KERNEL);
++	if (!heap)
++		return ERR_PTR(-ENOMEM);
++
++	kref_init(&heap->refcount);
++	heap->name = exp_info->name;
++	heap->ops = exp_info->ops;
++	heap->priv = exp_info->priv;
++	heap->support_cma = exp_info->support_cma;
++	INIT_LIST_HEAD(&heap->dmabuf_list);
++	INIT_LIST_HEAD(&heap->contig_list);
++	mutex_init(&heap->dmabuf_lock);
++	mutex_init(&heap->contig_lock);
++
++	/* Find unused minor number */
++	ret = xa_alloc(&rk_dma_heap_minors, &minor, heap,
++		       XA_LIMIT(0, NUM_HEAP_MINORS - 1), GFP_KERNEL);
++	if (ret < 0) {
++		pr_err("rk_dma_heap: Unable to get minor number for heap\n");
++		err_ret = ERR_PTR(ret);
++		goto err0;
++	}
++
++	/* Create device */
++	heap->heap_devt = MKDEV(MAJOR(rk_dma_heap_devt), minor);
++
++	cdev_init(&heap->heap_cdev, &rk_dma_heap_fops);
++	ret = cdev_add(&heap->heap_cdev, heap->heap_devt, 1);
++	if (ret < 0) {
++		pr_err("dma_heap: Unable to add char device\n");
++		err_ret = ERR_PTR(ret);
++		goto err1;
++	}
++
++	heap->heap_dev = device_create(rk_dma_heap_class,
++				       NULL,
++				       heap->heap_devt,
++				       NULL,
++				       heap->name);
++	if (IS_ERR(heap->heap_dev)) {
++		pr_err("rk_dma_heap: Unable to create device\n");
++		err_ret = ERR_CAST(heap->heap_dev);
++		goto err2;
++	}
++
++	heap->procfs = proc_rk_dma_heap_dir;
++
++	/* Make sure it doesn't disappear on us */
++	heap->heap_dev = get_device(heap->heap_dev);
++
++	/* Add heap to the list */
++	mutex_lock(&rk_heap_list_lock);
++	list_add(&heap->list, &rk_heap_list);
++	mutex_unlock(&rk_heap_list_lock);
++
++	return heap;
++
++err2:
++	cdev_del(&heap->heap_cdev);
++err1:
++	xa_erase(&rk_dma_heap_minors, minor);
++err0:
++	kfree(heap);
++	return err_ret;
++}
++EXPORT_SYMBOL_GPL(rk_dma_heap_add);
++
++static char *rk_dma_heap_devnode(struct device *dev, umode_t *mode)
++{
++	return kasprintf(GFP_KERNEL, "rk_dma_heap/%s", dev_name(dev));
++}
++
++static ssize_t rk_total_pools_kb_show(struct kobject *kobj,
++				      struct kobj_attribute *attr, char *buf)
++{
++	struct rk_dma_heap *heap;
++	u64 total_pool_size = 0;
++
++	mutex_lock(&rk_heap_list_lock);
++	list_for_each_entry(heap, &rk_heap_list, list)
++		if (heap->ops->get_pool_size)
++			total_pool_size += heap->ops->get_pool_size(heap);
++	mutex_unlock(&rk_heap_list_lock);
++
++	return sysfs_emit(buf, "%llu\n", total_pool_size / 1024);
++}
++
++static struct kobj_attribute rk_total_pools_kb_attr =
++	__ATTR_RO(rk_total_pools_kb);
++
++static struct attribute *rk_dma_heap_sysfs_attrs[] = {
++	&rk_total_pools_kb_attr.attr,
++	NULL,
++};
++
++ATTRIBUTE_GROUPS(rk_dma_heap_sysfs);
++
++static struct kobject *rk_dma_heap_kobject;
++
++static int rk_dma_heap_sysfs_setup(void)
++{
++	int ret;
++
++	rk_dma_heap_kobject = kobject_create_and_add("rk_dma_heap",
++						     kernel_kobj);
++	if (!rk_dma_heap_kobject)
++		return -ENOMEM;
++
++	ret = sysfs_create_groups(rk_dma_heap_kobject,
++				  rk_dma_heap_sysfs_groups);
++	if (ret) {
++		kobject_put(rk_dma_heap_kobject);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void rk_dma_heap_sysfs_teardown(void)
++{
++	kobject_put(rk_dma_heap_kobject);
++}
++
++/*
++ * 5.4: the vendor file also creates a debugfs node and a procfs
++ * dma_heap_info node that dump every dma-buf owned by a heap.  Those dumps use
++ * get_each_dmabuf() and struct dma_buf::dtor, which are Rockchip additions to
++ * drivers/dma-buf/dma-buf.c that do not exist in mainline 5.4.  The dumps are
++ * therefore not ported; the per-heap procfs directory is still created because
++ * the CMA heap registers its alloc_bitmap file below it.
++ */
++static int rk_dma_heap_init_proc(void)
++{
++	proc_rk_dma_heap_dir = proc_mkdir("rk_dma_heap", NULL);
++	if (!proc_rk_dma_heap_dir) {
++		pr_err("create rk_dma_heap proc dir error\n");
++		return -ENOENT;
++	}
++
++	return 0;
++}
++
++static int rk_dma_heap_init(void)
++{
++	int ret;
++
++	ret = rk_dma_heap_sysfs_setup();
++	if (ret)
++		return ret;
++
++	ret = alloc_chrdev_region(&rk_dma_heap_devt, 0, NUM_HEAP_MINORS,
++				  DEVNAME);
++	if (ret)
++		goto err_chrdev;
++
++	rk_dma_heap_class = class_create(THIS_MODULE, DEVNAME);
++	if (IS_ERR(rk_dma_heap_class)) {
++		ret = PTR_ERR(rk_dma_heap_class);
++		goto err_class;
++	}
++	rk_dma_heap_class->devnode = rk_dma_heap_devnode;
++
++	rk_dma_heap_init_proc();
++
++	/*
++	 * The CMA heap is a separate module (rk-cma-heap.ko) which registers the
++	 * "rk-dma-heap-cma" heap from its own module_init().
++	 */
++	return 0;
++
++err_class:
++	unregister_chrdev_region(rk_dma_heap_devt, NUM_HEAP_MINORS);
++err_chrdev:
++	rk_dma_heap_sysfs_teardown();
++	return ret;
++}
++module_init(rk_dma_heap_init);
++
++/*
++ * There is deliberately no module_exit(): heaps are handed out to kernel
++ * consumers (rknpu keeps a reference obtained through rk_dma_heap_find()) and
++ * the vendor driver has no unload path either, so the module stays resident
++ * once loaded.
++ */
++
++MODULE_DESCRIPTION("RockChip DMA-BUF heap framework");
++MODULE_LICENSE("GPL v2");
+--- /dev/null
++++ b/drivers/dma-buf/rk_heaps/rk-dma-heap.h
+@@ -0,0 +1,192 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * DMABUF Heaps Allocation Infrastructure
++ *
++ * Copyright (C) 2011 Google, Inc.
++ * Copyright (C) 2019 Linaro Ltd.
++ * Copyright (C) 2022 Rockchip Electronics Co. Ltd.
++ * Author: Simon Xue <xxm@rock-chips.com>
++ */
++
++#ifndef _RK_DMA_HEAPS_INTERNAL_H
++#define _RK_DMA_HEAPS_INTERNAL_H
++
++#include <linux/cdev.h>
++#include <linux/types.h>
++#include <linux/dma-buf.h>
++#include <linux/rk-dma-heap.h>
++
++#if defined(CONFIG_DMABUF_RK_HEAPS_DEBUG_PRINT)
++#define dma_heap_print(fmt, ...)	\
++	printk(KERN_INFO pr_fmt(fmt), ##__VA_ARGS__)
++#else
++#define dma_heap_print(fmt, ...)	\
++	no_printk(KERN_INFO pr_fmt(fmt), ##__VA_ARGS__)
++#endif
++
++#define RK_DMA_HEAP_NAME_LEN 16
++
++struct rk_vmap_pfn_data {
++	unsigned long	pfn; /* first pfn of contiguous */
++	pgprot_t	prot;
++};
++
++/**
++ * struct rk_dma_heap_ops - ops to operate on a given heap
++ * @allocate:		allocate dmabuf and return struct dma_buf ptr
++ * @get_pool_size:	if heap maintains memory pools, get pool size in bytes
++ *
++ * allocate returns dmabuf on success, ERR_PTR(-errno) on error.
++ */
++struct rk_dma_heap_ops {
++	struct dma_buf *(*allocate)(struct rk_dma_heap *heap,
++			unsigned long len,
++			unsigned long fd_flags,
++			unsigned long heap_flags,
++			const char *name);
++	struct page *(*alloc_contig_pages)(struct rk_dma_heap *heap,
++					   size_t len, const char *name);
++	void (*free_contig_pages)(struct rk_dma_heap *heap,
++				  struct page *pages, size_t len,
++				  const char *name);
++	long (*get_pool_size)(struct rk_dma_heap *heap);
++};
++
++/**
++ * struct rk_dma_heap_export_info - information needed to export a new dmabuf heap
++ * @name:	used for debugging/device-node name
++ * @ops:	ops struct for this heap
++ * @priv:	heap exporter private data
++ *
++ * Information needed to export a new dmabuf heap.
++ */
++struct rk_dma_heap_export_info {
++	const char *name;
++	const struct rk_dma_heap_ops *ops;
++	void *priv;
++	bool support_cma;
++};
++
++/**
++ * struct rk_dma_heap - represents a dmabuf heap in the system
++ * @name:		used for debugging/device-node name
++ * @ops:		ops struct for this heap
++ * @heap_devt		heap device node
++ * @list		list head connecting to list of heaps
++ * @heap_cdev		heap char device
++ * @heap_dev		heap device struct
++ *
++ * Represents a heap of memory from which buffers can be made.
++ */
++struct rk_dma_heap {
++	const char *name;
++	const struct rk_dma_heap_ops *ops;
++	void *priv;
++	dev_t heap_devt;
++	struct list_head list;
++	struct list_head dmabuf_list; /* dmabuf attach to this node */
++	struct mutex dmabuf_lock;
++	struct list_head contig_list; /* contig buffer attach to this node */
++	struct mutex contig_lock;
++	struct cdev heap_cdev;
++	struct kref refcount;
++	struct device *heap_dev;
++	bool support_cma;
++	struct proc_dir_entry *procfs;
++	unsigned long total_size;
++};
++
++struct rk_dma_heap_dmabuf {
++	struct list_head node;
++	struct dma_buf *dmabuf;
++	const char *orig_alloc;
++	phys_addr_t start;
++	phys_addr_t end;
++};
++
++struct rk_dma_heap_contig_buf {
++	struct list_head node;
++	const char *orig_alloc;
++	phys_addr_t start;
++	phys_addr_t end;
++};
++
++/**
++ * rk_dma_heap_get_drvdata() - get per-heap driver data
++ * @heap: DMA-Heap to retrieve private data for
++ *
++ * Returns:
++ * The per-heap data for the heap.
++ */
++void *rk_dma_heap_get_drvdata(struct rk_dma_heap *heap);
++
++/**
++ * rk_dma_heap_get_dev() - get device struct for the heap
++ * @heap: DMA-Heap to retrieve device struct from
++ *
++ * Returns:
++ * The device struct for the heap.
++ */
++struct device *rk_dma_heap_get_dev(struct rk_dma_heap *heap);
++
++/**
++ * rk_dma_heap_get_name() - get heap name
++ * @heap: DMA-Heap to retrieve private data for
++ *
++ * Returns:
++ * The char* for the heap name.
++ */
++const char *rk_dma_heap_get_name(struct rk_dma_heap *heap);
++
++/**
++ * rk_dma_heap_add - adds a heap to dmabuf heaps
++ * @exp_info:		information needed to register this heap
++ */
++struct rk_dma_heap *rk_dma_heap_add(const struct rk_dma_heap_export_info *exp_info);
++
++/**
++ * rk_dma_heap_put - drops a reference to a dmabuf heaps, potentially freeing it
++ * @heap:		heap pointer
++ */
++void rk_dma_heap_put(struct rk_dma_heap *heap);
++
++/**
++ * rk_vmap_contig_pfn - Map contiguous pfn to vm area
++ * @pfn:	indicate the first pfn of contig
++ * @count:	count of pfns
++ * @prot:	for mapping
++ */
++void *rk_vmap_contig_pfn(unsigned long pfn, unsigned int count,
++			 pgprot_t prot);
++/**
++ * rk_dma_heap_total_inc - Increase total buffer size
++ * @heap:	dma_heap to increase
++ * @len:	length to increase
++ */
++void rk_dma_heap_total_inc(struct rk_dma_heap *heap, size_t len);
++/**
++ * rk_dma_heap_total_dec - Decrease total buffer size
++ * @heap:	dma_heap to decrease
++ * @len:	length to decrease
++ */
++void rk_dma_heap_total_dec(struct rk_dma_heap *heap, size_t len);
++/**
++ * rk_dma_heap_get_cma - get cma structure
++ */
++struct cma *rk_dma_heap_get_cma(void);
++
++#if IS_ENABLED(CONFIG_DMABUF_HEAPS_ROCKCHIP_CMA_HEAP)
++/**
++ * rk_cma_heap_init - register the default CMA heap (named "rk-dma-heap-cma")
++ *
++ * Called from the single module_init() of this module, see rk-dma-heap.c.
++ */
++int rk_cma_heap_init(void);
++#else
++static inline int rk_cma_heap_init(void)
++{
++	return 0;
++}
++#endif
++
++#endif /* _RK_DMA_HEAPS_INTERNAL_H */
+--- /dev/null
++++ b/drivers/dma-buf/rk_heaps/rk-cma-heap.c
+@@ -0,0 +1,710 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * DMABUF CMA heap exporter
++ *
++ * Copyright (C) 2012, 2019, 2020 Linaro Ltd.
++ * Author: <benjamin.gaignard@linaro.org> for ST-Ericsson.
++ *
++ * Also utilizing parts of Andrew Davis' SRAM heap:
++ * Copyright (C) 2019 Texas Instruments Incorporated - http://www.ti.com/
++ *	Andrew F. Davis <afd@ti.com>
++ *
++ * Copyright (C) 2022 Rockchip Electronics Co. Ltd.
++ * Author: Simon Xue <xxm@rock-chips.com>
++ *
++ * Ported from the Rockchip develop-5.10 vendor tree to a 5.4 module.
++ * Deviations from the vendor file are marked with "5.4:" comments below.
++ */
++
++#include <linux/cma.h>
++#include <linux/dma-buf.h>
++#include <linux/dma-contiguous.h>
++#include <linux/dma-mapping.h>
++#include <linux/err.h>
++#include <linux/highmem.h>
++#include <linux/io.h>
++#include <linux/mm.h>
++#include <linux/module.h>
++#include <linux/proc_fs.h>
++#include <linux/scatterlist.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/vmalloc.h>
++#include <uapi/linux/rk-dma-heap.h>
++#include "../../../mm/cma.h"
++#include "rk-dma-heap.h"
++
++/*
++ * The CMA area lookup (rk_dma_heap_get_cma()) lives in the vendor's
++ * rk-dma-cma.c.  It is compiled into this module rather than into rk-dma-heap
++ * because kbuild cannot build a module called rk-cma-heap.ko from two objects
++ * when one of them is also named rk-cma-heap.o: the vendor Makefile
++ * ("rk-cma-heap-objs := rk-cma-heap.o rk-dma-cma.o") silently drops rk-cma-heap.c
++ * and the resulting module has no code.  Each module is therefore a single
++ * translation unit.
++ */
++#include "rk-dma-cma.c"
++
++/*
++ * The name rknpu looks up with rk_dma_heap_find(); it is the name the vendor
++ * driver gives the private CMA area it carves out during early boot.
++ */
++#define RK_DMA_HEAP_CMA_NAME "rk-dma-heap-cma"
++
++struct rk_cma_heap {
++	struct rk_dma_heap *heap;
++	struct cma *cma;
++};
++
++struct rk_cma_heap_buffer {
++	struct rk_cma_heap *heap;
++	struct list_head attachments;
++	struct mutex lock;
++	unsigned long len;
++	struct page *cma_pages;
++	struct page **pages;
++	pgoff_t pagecount;
++	int vmap_cnt;
++	void *vaddr;
++	phys_addr_t phys;
++	bool attached;
++};
++
++struct rk_cma_heap_attachment {
++	struct device *dev;
++	struct sg_table table;
++	struct list_head list;
++	bool mapped;
++};
++
++static int rk_cma_heap_attach(struct dma_buf *dmabuf,
++			      struct dma_buf_attachment *attachment)
++{
++	struct rk_cma_heap_buffer *buffer = dmabuf->priv;
++	struct rk_cma_heap_attachment *a;
++	struct sg_table *table;
++	size_t size = buffer->pagecount << PAGE_SHIFT;
++	int ret;
++
++	a = kzalloc(sizeof(*a), GFP_KERNEL);
++	if (!a)
++		return -ENOMEM;
++
++	table = &a->table;
++
++	ret = sg_alloc_table(table, 1, GFP_KERNEL);
++	if (ret) {
++		kfree(a);
++		return ret;
++	}
++	sg_set_page(table->sgl, buffer->cma_pages, PAGE_ALIGN(size), 0);
++
++	a->dev = attachment->dev;
++	INIT_LIST_HEAD(&a->list);
++	a->mapped = false;
++
++	attachment->priv = a;
++
++	buffer->attached = true;
++
++	mutex_lock(&buffer->lock);
++	list_add(&a->list, &buffer->attachments);
++	mutex_unlock(&buffer->lock);
++
++	return 0;
++}
++
++static void rk_cma_heap_detach(struct dma_buf *dmabuf,
++			       struct dma_buf_attachment *attachment)
++{
++	struct rk_cma_heap_buffer *buffer = dmabuf->priv;
++	struct rk_cma_heap_attachment *a = attachment->priv;
++
++	mutex_lock(&buffer->lock);
++	list_del(&a->list);
++	mutex_unlock(&buffer->lock);
++
++	buffer->attached = false;
++
++	sg_free_table(&a->table);
++	kfree(a);
++}
++
++static struct sg_table *rk_cma_heap_map_dma_buf(struct dma_buf_attachment *attachment,
++						enum dma_data_direction direction)
++{
++	struct rk_cma_heap_attachment *a = attachment->priv;
++	struct sg_table *table = &a->table;
++	int nents;
++
++	/*
++	 * 5.4: there is no dma_map_sgtable()/dma_unmap_sgtable() yet.  Use the
++	 * plain scatterlist helpers and remember the number of mapped entries,
++	 * which is what dma_unmap_sg() expects.
++	 */
++	nents = dma_map_sg(attachment->dev, table->sgl, table->nents, direction);
++	if (!nents)
++		return ERR_PTR(-ENOMEM);
++
++	table->nents = nents;
++	a->mapped = true;
++	return table;
++}
++
++static void rk_cma_heap_unmap_dma_buf(struct dma_buf_attachment *attachment,
++				      struct sg_table *table,
++				      enum dma_data_direction direction)
++{
++	struct rk_cma_heap_attachment *a = attachment->priv;
++
++	a->mapped = false;
++	dma_unmap_sg(attachment->dev, table->sgl, table->nents, direction);
++}
++
++static int rk_cma_heap_dma_buf_begin_cpu_access(struct dma_buf *dmabuf,
++						enum dma_data_direction direction)
++{
++	struct rk_cma_heap_buffer *buffer = dmabuf->priv;
++	struct rk_cma_heap_attachment *a;
++	unsigned int len = buffer->pagecount * PAGE_SIZE;
++
++	if (buffer->vmap_cnt)
++		invalidate_kernel_vmap_range(buffer->vaddr, buffer->len);
++
++	mutex_lock(&buffer->lock);
++	list_for_each_entry(a, &buffer->attachments, list) {
++		if (!a->mapped)
++			continue;
++		dma_sync_sg_for_cpu(a->dev, a->table.sgl, a->table.nents,
++				    direction);
++	}
++
++	/* For userspace that did not attach yet */
++	if (buffer->phys && !buffer->attached)
++		dma_sync_single_for_cpu(rk_dma_heap_get_dev(buffer->heap->heap),
++					buffer->phys, len, direction);
++	mutex_unlock(&buffer->lock);
++
++	return 0;
++}
++
++static int rk_cma_heap_dma_buf_end_cpu_access(struct dma_buf *dmabuf,
++					      enum dma_data_direction direction)
++{
++	struct rk_cma_heap_buffer *buffer = dmabuf->priv;
++	struct rk_cma_heap_attachment *a;
++	unsigned int len = buffer->pagecount * PAGE_SIZE;
++
++	if (buffer->vmap_cnt)
++		flush_kernel_vmap_range(buffer->vaddr, buffer->len);
++
++	mutex_lock(&buffer->lock);
++	list_for_each_entry(a, &buffer->attachments, list) {
++		if (!a->mapped)
++			continue;
++		dma_sync_sg_for_device(a->dev, a->table.sgl, a->table.nents,
++				       direction);
++	}
++
++	/* For userspace that did not attach yet */
++	if (buffer->phys && !buffer->attached)
++		dma_sync_single_for_device(rk_dma_heap_get_dev(buffer->heap->heap),
++					   buffer->phys, len, direction);
++	mutex_unlock(&buffer->lock);
++
++	return 0;
++}
++
++static int rk_cma_heap_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
++{
++	struct rk_cma_heap_buffer *buffer = dmabuf->priv;
++	size_t size = vma->vm_end - vma->vm_start;
++	int ret;
++
++	ret = remap_pfn_range(vma, vma->vm_start, __phys_to_pfn(buffer->phys),
++			      size, vma->vm_page_prot);
++	if (ret)
++		return -EAGAIN;
++
++	return 0;
++}
++
++static void *rk_cma_heap_do_vmap(struct rk_cma_heap_buffer *buffer)
++{
++	void *vaddr;
++	pgprot_t pgprot = PAGE_KERNEL;
++
++	vaddr = vmap(buffer->pages, buffer->pagecount, VM_MAP, pgprot);
++	if (!vaddr)
++		return ERR_PTR(-ENOMEM);
++
++	return vaddr;
++}
++
++static void *rk_cma_heap_vmap(struct dma_buf *dmabuf)
++{
++	struct rk_cma_heap_buffer *buffer = dmabuf->priv;
++	void *vaddr;
++
++	mutex_lock(&buffer->lock);
++	if (buffer->vmap_cnt) {
++		buffer->vmap_cnt++;
++		vaddr = buffer->vaddr;
++		goto out;
++	}
++
++	vaddr = rk_cma_heap_do_vmap(buffer);
++	if (IS_ERR(vaddr))
++		goto out;
++
++	buffer->vaddr = vaddr;
++	buffer->vmap_cnt++;
++out:
++	mutex_unlock(&buffer->lock);
++
++	return vaddr;
++}
++
++static void rk_cma_heap_vunmap(struct dma_buf *dmabuf, void *vaddr)
++{
++	struct rk_cma_heap_buffer *buffer = dmabuf->priv;
++
++	mutex_lock(&buffer->lock);
++	if (!--buffer->vmap_cnt) {
++		vunmap(buffer->vaddr);
++		buffer->vaddr = NULL;
++	}
++	mutex_unlock(&buffer->lock);
++}
++
++static void rk_cma_heap_remove_dmabuf_list(struct dma_buf *dmabuf)
++{
++	struct rk_dma_heap_dmabuf *buf;
++	struct rk_cma_heap_buffer *buffer = dmabuf->priv;
++	struct rk_cma_heap *cma_heap = buffer->heap;
++	struct rk_dma_heap *heap = cma_heap->heap;
++
++	mutex_lock(&heap->dmabuf_lock);
++	list_for_each_entry(buf, &heap->dmabuf_list, node) {
++		if (buf->dmabuf == dmabuf) {
++			dma_heap_print("<%s> free dmabuf<ino-%ld>@[%pa-%pa] to heap-<%s>\n",
++				       dmabuf->name,
++				       dmabuf->file->f_inode->i_ino,
++				       &buf->start, &buf->end,
++				       rk_dma_heap_get_name(heap));
++			list_del(&buf->node);
++			kfree(buf);
++			break;
++		}
++	}
++	mutex_unlock(&heap->dmabuf_lock);
++}
++
++static int rk_cma_heap_add_dmabuf_list(struct dma_buf *dmabuf, const char *name)
++{
++	struct rk_dma_heap_dmabuf *buf;
++	struct rk_cma_heap_buffer *buffer = dmabuf->priv;
++	struct rk_cma_heap *cma_heap = buffer->heap;
++	struct rk_dma_heap *heap = cma_heap->heap;
++
++	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	INIT_LIST_HEAD(&buf->node);
++	buf->dmabuf = dmabuf;
++	buf->start = buffer->phys;
++	buf->end = buf->start + buffer->len - 1;
++	mutex_lock(&heap->dmabuf_lock);
++	list_add_tail(&buf->node, &heap->dmabuf_list);
++	mutex_unlock(&heap->dmabuf_lock);
++
++	dma_heap_print("<%s> alloc dmabuf<ino-%ld>@[%pa-%pa] from heap-<%s>\n",
++		       name ? name : "", dmabuf->file->f_inode->i_ino,
++		       &buf->start, &buf->end, rk_dma_heap_get_name(heap));
++
++	return 0;
++}
++
++static int rk_cma_heap_remove_contig_list(struct rk_dma_heap *heap,
++					  struct page *page, const char *name)
++{
++	struct rk_dma_heap_contig_buf *buf;
++
++	mutex_lock(&heap->contig_lock);
++	list_for_each_entry(buf, &heap->contig_list, node) {
++		if (buf->start == page_to_phys(page)) {
++			dma_heap_print("<%s> free contig-buf@[%pa-%pa] to heap-<%s>\n",
++				       buf->orig_alloc, &buf->start, &buf->end,
++				       rk_dma_heap_get_name(heap));
++			list_del(&buf->node);
++			kfree(buf->orig_alloc);
++			kfree(buf);
++			break;
++		}
++	}
++	mutex_unlock(&heap->contig_lock);
++
++	return 0;
++}
++
++static int rk_cma_heap_add_contig_list(struct rk_dma_heap *heap,
++				       struct page *page, unsigned long size,
++				       const char *name)
++{
++	struct rk_dma_heap_contig_buf *buf;
++	const char *name_tmp;
++
++	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	INIT_LIST_HEAD(&buf->node);
++	if (!name)
++		name_tmp = current->comm;
++	else
++		name_tmp = name;
++
++	buf->orig_alloc = kstrndup(name_tmp, RK_DMA_HEAP_NAME_LEN, GFP_KERNEL);
++	if (!buf->orig_alloc) {
++		kfree(buf);
++		return -ENOMEM;
++	}
++
++	buf->start = page_to_phys(page);
++	buf->end = buf->start + size - 1;
++	mutex_lock(&heap->contig_lock);
++	list_add_tail(&buf->node, &heap->contig_list);
++	mutex_unlock(&heap->contig_lock);
++
++	dma_heap_print("<%s> alloc contig-buf@[%pa-%pa] from heap-<%s>\n",
++		       buf->orig_alloc, &buf->start, &buf->end,
++		       rk_dma_heap_get_name(heap));
++
++	return 0;
++}
++
++static void rk_cma_heap_dma_buf_release(struct dma_buf *dmabuf)
++{
++	struct rk_cma_heap_buffer *buffer = dmabuf->priv;
++	struct rk_cma_heap *cma_heap = buffer->heap;
++	struct rk_dma_heap *heap = cma_heap->heap;
++
++	if (buffer->vmap_cnt > 0) {
++		WARN(1, "%s: buffer still mapped in the kernel\n", __func__);
++		vunmap(buffer->vaddr);
++	}
++
++	rk_cma_heap_remove_dmabuf_list(dmabuf);
++
++	/* free page list */
++	kfree(buffer->pages);
++	/* release memory */
++	cma_release(cma_heap->cma, buffer->cma_pages, buffer->pagecount);
++	rk_dma_heap_total_dec(heap, buffer->len);
++
++	kfree(buffer);
++}
++
++static const struct dma_buf_ops rk_cma_heap_buf_ops = {
++	.cache_sgt_mapping = true,
++	.attach = rk_cma_heap_attach,
++	.detach = rk_cma_heap_detach,
++	.map_dma_buf = rk_cma_heap_map_dma_buf,
++	.unmap_dma_buf = rk_cma_heap_unmap_dma_buf,
++	.begin_cpu_access = rk_cma_heap_dma_buf_begin_cpu_access,
++	.end_cpu_access = rk_cma_heap_dma_buf_end_cpu_access,
++	/*
++	 * 5.4: struct dma_buf_ops has no begin_cpu_access_partial/
++	 * end_cpu_access_partial members yet (they arrived with the
++	 * DMABUF_PARTIAL support in 5.6), so those callbacks are not ported.
++	 * Consumers fall back to dma_buf_begin_cpu_access()/end_cpu_access()
++	 * for the whole buffer, which rknpu_mem.c does as well (it only uses
++	 * the partial callbacks under CONFIG_DMABUF_PARTIAL).
++	 */
++	.mmap = rk_cma_heap_mmap,
++	.vmap = rk_cma_heap_vmap,
++	.vunmap = rk_cma_heap_vunmap,
++	.release = rk_cma_heap_dma_buf_release,
++};
++
++static struct dma_buf *rk_cma_heap_allocate(struct rk_dma_heap *heap,
++					    unsigned long len,
++					    unsigned long fd_flags,
++					    unsigned long heap_flags,
++					    const char *name)
++{
++	struct rk_cma_heap *cma_heap = rk_dma_heap_get_drvdata(heap);
++	struct rk_cma_heap_buffer *buffer;
++	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
++	size_t size = PAGE_ALIGN(len);
++	pgoff_t pagecount = size >> PAGE_SHIFT;
++	unsigned long align = get_order(size);
++	struct page *cma_pages;
++	struct dma_buf *dmabuf;
++	pgoff_t pg;
++	int ret = -ENOMEM;
++
++	buffer = kzalloc(sizeof(*buffer), GFP_KERNEL);
++	if (!buffer)
++		return ERR_PTR(-ENOMEM);
++
++	INIT_LIST_HEAD(&buffer->attachments);
++	mutex_init(&buffer->lock);
++	buffer->len = size;
++
++	if (align > CONFIG_DMABUF_HEAPS_ROCKCHIP_CMA_ALIGNMENT)
++		align = CONFIG_DMABUF_HEAPS_ROCKCHIP_CMA_ALIGNMENT;
++
++	/*
++	 * 5.4: cma_alloc() takes a bool no_warn as last argument and the vendor
++	 * tree passes GFP_KERNEL there (which is non-zero, i.e. "do not warn").
++	 * Pass false so a failed allocation still prints the CMA diagnostic.
++	 */
++	cma_pages = cma_alloc(cma_heap->cma, pagecount, align, false);
++	if (!cma_pages)
++		goto free_buffer;
++
++	/* Clear the cma pages */
++	if (PageHighMem(cma_pages)) {
++		unsigned long nr_clear_pages = pagecount;
++		struct page *page = cma_pages;
++
++		while (nr_clear_pages > 0) {
++			void *vaddr = kmap_atomic(page);
++
++			memset(vaddr, 0, PAGE_SIZE);
++			kunmap_atomic(vaddr);
++			/*
++			 * Avoid wasting time zeroing memory if the process
++			 * has been killed by SIGKILL
++			 */
++			if (fatal_signal_pending(current))
++				goto free_cma;
++			page++;
++			nr_clear_pages--;
++		}
++	} else {
++		memset(page_address(cma_pages), 0, size);
++	}
++
++	buffer->pages = kmalloc_array(pagecount, sizeof(*buffer->pages),
++				      GFP_KERNEL);
++	if (!buffer->pages) {
++		ret = -ENOMEM;
++		goto free_cma;
++	}
++
++	for (pg = 0; pg < pagecount; pg++)
++		buffer->pages[pg] = &cma_pages[pg];
++
++	buffer->cma_pages = cma_pages;
++	buffer->heap = cma_heap;
++	buffer->pagecount = pagecount;
++
++	/* create the dmabuf */
++	exp_info.exp_name = rk_dma_heap_get_name(heap);
++	exp_info.ops = &rk_cma_heap_buf_ops;
++	exp_info.size = buffer->len;
++	exp_info.flags = fd_flags;
++	exp_info.priv = buffer;
++	dmabuf = dma_buf_export(&exp_info);
++	if (IS_ERR(dmabuf)) {
++		ret = PTR_ERR(dmabuf);
++		goto free_pages;
++	}
++
++	buffer->phys = page_to_phys(cma_pages);
++	dma_sync_single_for_cpu(rk_dma_heap_get_dev(heap), buffer->phys,
++				buffer->pagecount * PAGE_SIZE,
++				DMA_FROM_DEVICE);
++
++	ret = rk_cma_heap_add_dmabuf_list(dmabuf, name);
++	if (ret)
++		goto fail_dma_buf;
++
++	rk_dma_heap_total_inc(heap, buffer->len);
++
++	return dmabuf;
++
++fail_dma_buf:
++	dma_buf_put(dmabuf);
++free_pages:
++	kfree(buffer->pages);
++free_cma:
++	cma_release(cma_heap->cma, cma_pages, pagecount);
++free_buffer:
++	kfree(buffer);
++
++	return ERR_PTR(ret);
++}
++
++static struct page *rk_cma_heap_allocate_pages(struct rk_dma_heap *heap,
++					       size_t len, const char *name)
++{
++	struct rk_cma_heap *cma_heap = rk_dma_heap_get_drvdata(heap);
++	size_t size = PAGE_ALIGN(len);
++	pgoff_t pagecount = size >> PAGE_SHIFT;
++	unsigned long align = get_order(size);
++	struct page *page;
++	int ret;
++
++	if (align > CONFIG_DMABUF_HEAPS_ROCKCHIP_CMA_ALIGNMENT)
++		align = CONFIG_DMABUF_HEAPS_ROCKCHIP_CMA_ALIGNMENT;
++
++	page = cma_alloc(cma_heap->cma, pagecount, align, false);
++	if (!page)
++		return ERR_PTR(-ENOMEM);
++
++	ret = rk_cma_heap_add_contig_list(heap, page, size, name);
++	if (ret) {
++		cma_release(cma_heap->cma, page, pagecount);
++		return ERR_PTR(-EINVAL);
++	}
++
++	rk_dma_heap_total_inc(heap, size);
++
++	return page;
++}
++
++static void rk_cma_heap_free_pages(struct rk_dma_heap *heap,
++				   struct page *page, size_t len,
++				   const char *name)
++{
++	struct rk_cma_heap *cma_heap = rk_dma_heap_get_drvdata(heap);
++	pgoff_t pagecount = len >> PAGE_SHIFT;
++
++	rk_cma_heap_remove_contig_list(heap, page, name);
++
++	cma_release(cma_heap->cma, page, pagecount);
++
++	rk_dma_heap_total_dec(heap, len);
++}
++
++static const struct rk_dma_heap_ops rk_cma_heap_ops = {
++	.allocate = rk_cma_heap_allocate,
++	.alloc_contig_pages = rk_cma_heap_allocate_pages,
++	.free_contig_pages = rk_cma_heap_free_pages,
++};
++
++static int cma_procfs_show(struct seq_file *s, void *private);
++
++/*
++ * rk_dma_heap_get_cma() (the CMA area the heap binds to) lives in rk-dma-cma.c,
++ * which also documents why this port does not declare a private CMA area.
++ */
++
++static int __rk_add_cma_heap(struct cma *cma, void *data)
++{
++	struct rk_cma_heap *cma_heap;
++	struct rk_dma_heap_export_info exp_info;
++
++	cma_heap = kzalloc(sizeof(*cma_heap), GFP_KERNEL);
++	if (!cma_heap)
++		return -ENOMEM;
++	cma_heap->cma = cma;
++
++	/*
++	 * The vendor tree uses cma_get_name(cma) here, which only yields
++	 * "rk-dma-heap-cma" because of the private CMA declaration mentioned
++	 * above.  The default CMA area is named after the kernel parameter (or
++	 * "reserved"), so use the stable vendor name explicitly.
++	 */
++	exp_info.name = RK_DMA_HEAP_CMA_NAME;
++	exp_info.ops = &rk_cma_heap_ops;
++	exp_info.priv = cma_heap;
++	exp_info.support_cma = true;
++
++	cma_heap->heap = rk_dma_heap_add(&exp_info);
++	if (IS_ERR(cma_heap->heap)) {
++		int ret = PTR_ERR(cma_heap->heap);
++
++		kfree(cma_heap);
++		return ret;
++	}
++
++	if (cma_heap->heap->procfs)
++		proc_create_single_data("alloc_bitmap", 0, cma_heap->heap->procfs,
++					cma_procfs_show, cma);
++
++	return 0;
++}
++
++/**
++ * rk_cma_heap_init - register the Rockchip CMA heap
++ *
++ * Invoked from this module's module_init().  The vendor file is a standalone
++ * built-in object and registers itself the same way.
++ */
++int rk_cma_heap_init(void)
++{
++	struct cma *cma = rk_dma_heap_get_cma();
++
++	if (!cma) {
++		pr_err("rk_dma_heap: no default CMA area available; CMA heap not registered\n");
++		return -ENODEV;
++	}
++
++	return __rk_add_cma_heap(cma, NULL);
++}
++
++static void cma_procfs_format_array(char *buf, size_t bufsize, u32 *array, int array_size)
++{
++	int i = 0;
++
++	while (--array_size >= 0) {
++		size_t len;
++		char term = (array_size && (++i % 8)) ? ' ' : '\n';
++
++		len = snprintf(buf, bufsize, "%08X%c", *array++, term);
++		buf += len;
++		bufsize -= len;
++	}
++}
++
++static void cma_procfs_show_bitmap(struct seq_file *s, struct cma *cma)
++{
++	int elements = DIV_ROUND_UP(cma_bitmap_maxno(cma), BITS_PER_BYTE * sizeof(u32));
++	int size = elements * 9;
++	u32 *array = (u32 *)cma->bitmap;
++	char *buf;
++
++	buf = kmalloc(size + 1, GFP_KERNEL);
++	if (!buf)
++		return;
++
++	buf[size] = 0;
++
++	cma_procfs_format_array(buf, size + 1, array, elements);
++	seq_printf(s, "%s", buf);
++	kfree(buf);
++}
++
++static u64 cma_procfs_used_get(struct cma *cma)
++{
++	unsigned long used;
++
++	mutex_lock(&cma->lock);
++	used = bitmap_weight(cma->bitmap, (int)cma_bitmap_maxno(cma));
++	mutex_unlock(&cma->lock);
++
++	return (u64)used << cma->order_per_bit;
++}
++
++static int cma_procfs_show(struct seq_file *s, void *private)
++{
++	struct cma *cma = s->private;
++	u64 used = cma_procfs_used_get(cma);
++
++	seq_printf(s, "Total: %lu KiB\n", cma->count << (PAGE_SHIFT - 10));
++	seq_printf(s, " Used: %llu KiB\n\n", used << (PAGE_SHIFT - 10));
++
++	cma_procfs_show_bitmap(s, cma);
++
++	return 0;
++}
++
++module_init(rk_cma_heap_init);
++
++MODULE_DESCRIPTION("RockChip DMA-BUF CMA Heap");
++MODULE_LICENSE("GPL v2");
+--- /dev/null
++++ b/drivers/dma-buf/rk_heaps/rk-dma-cma.c
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * CMA area lookup for the Rockchip DMA-BUF CMA heap
++ *
++ * Copyright (C) 2022 Rockchip Electronics Co. Ltd.
++ * Author: Simon Xue <xxm@rock-chips.com>
++ *
++ * In the vendor tree this file also *creates* a private CMA area named
++ * "rk-dma-heap-cma" from early boot code:
++ *
++ *   early_param("rk_dma_heap_cma", early_dma_heap_cma);
++ *   int __init rk_dma_heap_cma_setup(void) { cma_declare_contiguous(...); }
++ *
++ * That part is intentionally not ported here:
++ *
++ *   - cma_declare_contiguous() is __init-only and not exported, so it cannot
++ *     be called from a loadable module, and
++ *   - this port has to stay out of the boot path anyway.
++ *
++ * The board already has a default DMA CMA area (created from the "cma=128M"
++ * kernel parameter or from CONFIG_CMA_SIZE_MBYTES), so the heap binds to that
++ * existing area instead.  rk-cma-heap.c keeps the "rk-dma-heap-cma" heap name
++ * so that rk_dma_heap_find("rk-dma-heap-cma") succeeds (see the comment next to
++ * RK_DMA_HEAP_CMA_NAME there).
++ */
++
++#include <linux/cma.h>
++#include <linux/dma-contiguous.h>
++#include <linux/export.h>
++
++#include "rk-dma-heap.h"
++
++struct cma *rk_dma_heap_get_cma(void)
++{
++	return dma_contiguous_default_area;
++}
+--- /dev/null
++++ b/include/linux/rk-dma-heap.h
+@@ -0,0 +1,143 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * DMABUF Heaps Allocation Infrastructure
++ *
++ * Copyright (C) 2011 Google, Inc.
++ * Copyright (C) 2019 Linaro Ltd.
++ * Copyright (C) 2022 Rockchip Electronics Co. Ltd.
++ * Author: Simon Xue <xxm@rock-chips.com>
++ */
++
++#ifndef _RK_DMA_HEAPS_H_
++#define _RK_DMA_HEAPS_H_
++#include <linux/dma-buf.h>
++
++struct rk_dma_heap;
++
++/*
++ * The vendor header uses "#if defined(CONFIG_DMABUF_HEAPS_ROCKCHIP)", which is
++ * false when the option is built as a module (=m only defines ..._MODULE), so
++ * a modular build would silently fall back to the stubs below.  IS_ENABLED()
++ * covers both =y and =m.
++ */
++#if IS_ENABLED(CONFIG_DMABUF_HEAPS_ROCKCHIP)
++int rk_dma_heap_cma_setup(void);
++
++/**
++ * rk_dma_heap_set_dev - set heap dev dma param
++ * @heap: DMA-Heap to retrieve private data for
++ *
++ * Returns:
++ * Zero on success, ERR_PTR(-errno) on error
++ */
++int rk_dma_heap_set_dev(struct device *heap_dev);
++
++/**
++ * rk_dma_heap_find - Returns the registered dma_heap with the specified name
++ * @name: Name of the heap to find
++ *
++ * NOTE: dma_heaps returned from this function MUST be released
++ * using rk_dma_heap_put() when the user is done.
++ */
++struct rk_dma_heap *rk_dma_heap_find(const char *name);
++
++/** rk_dma_heap_buffer_free - Free dma_buf allocated by rk_dma_heap_buffer_alloc
++ * @dma_buf:	dma_buf to free
++ *
++ * This is really only a simple wrapper to dma_buf_put()
++ */
++void rk_dma_heap_buffer_free(struct dma_buf *dmabuf);
++
++/**
++ * rk_dma_heap_buffer_alloc - Allocate dma-buf from a dma_heap
++ * @heap:	dma_heap to allocate from
++ * @len:	size to allocate
++ * @fd_flags:	flags to set on returned dma-buf fd
++ * @heap_flags:	flags to pass to the dma heap
++ *
++ * This is for internal dma-buf allocations only.
++ */
++struct dma_buf *rk_dma_heap_buffer_alloc(struct rk_dma_heap *heap, size_t len,
++					 unsigned int fd_flags,
++					 unsigned int heap_flags,
++					 const char *name);
++
++/**
++ * rk_dma_heap_bufferfd_alloc - Allocate dma-buf fd from a dma_heap
++ * @heap:	dma_heap to allocate from
++ * @len:	size to allocate
++ * @fd_flags:	flags to set on returned dma-buf fd
++ * @heap_flags:	flags to pass to the dma heap
++ */
++int rk_dma_heap_bufferfd_alloc(struct rk_dma_heap *heap, size_t len,
++			       unsigned int fd_flags,
++			       unsigned int heap_flags,
++			       const char *name);
++
++/**
++ * rk_dma_heap_alloc_contig_pages - Allocate contiguous pages from a dma_heap
++ * @heap:	dma_heap to allocate from
++ * @len:	size to allocate
++ * @name:	the name who allocate
++ */
++struct page *rk_dma_heap_alloc_contig_pages(struct rk_dma_heap *heap,
++					    size_t len, const char *name);
++
++/**
++ * rk_dma_heap_free_contig_pages - Free contiguous pages to a dma_heap
++ * @heap:	dma_heap to free to
++ * @pages:	pages to free to
++ * @len:	size to free
++ * @name:	the name who allocate
++ */
++void rk_dma_heap_free_contig_pages(struct rk_dma_heap *heap, struct page *pages,
++				   size_t len, const char *name);
++
++#else
++static inline int rk_dma_heap_cma_setup(void)
++{
++	return -ENODEV;
++}
++
++static inline int rk_dma_heap_set_dev(struct device *heap_dev)
++{
++	return -ENODEV;
++}
++
++static inline struct rk_dma_heap *rk_dma_heap_find(const char *name)
++{
++	return NULL;
++}
++
++static inline void rk_dma_heap_buffer_free(struct dma_buf *dmabuf)
++{
++}
++
++static inline struct dma_buf *rk_dma_heap_buffer_alloc(struct rk_dma_heap *heap, size_t len,
++						       unsigned int fd_flags,
++						       unsigned int heap_flags,
++						       const char *name)
++{
++	return NULL;
++}
++
++static inline int rk_dma_heap_bufferfd_alloc(struct rk_dma_heap *heap, size_t len,
++					     unsigned int fd_flags,
++					     unsigned int heap_flags,
++					     const char *name)
++{
++	return -ENODEV;
++}
++
++static inline struct page *rk_dma_heap_alloc_contig_pages(struct rk_dma_heap *heap,
++							  size_t len, const char *name)
++{
++	return NULL;
++}
++
++static inline void rk_dma_heap_free_contig_pages(struct rk_dma_heap *heap, struct page *pages,
++						 size_t len, const char *name)
++{
++}
++#endif
++#endif /* _DMA_HEAPS_H_ */
+--- /dev/null
++++ b/include/uapi/linux/rk-dma-heap.h
+@@ -0,0 +1,55 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
++/*
++ * DMABUF Heaps Userspace API
++ *
++ * Copyright (C) 2011 Google, Inc.
++ * Copyright (C) 2019 Linaro Ltd.
++ * Copyright (C) 2022 Rockchip Electronics Co. Ltd.
++ * Author: Simon Xue <xxm@rock-chips.com>
++ */
++#ifndef _UAPI_LINUX_DMABUF_POOL_H
++#define _UAPI_LINUX_DMABUF_POOL_H
++
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++/**
++ * DOC: DMABUF Heaps Userspace API
++ */
++
++/* Valid FD_FLAGS are O_CLOEXEC, O_RDONLY, O_WRONLY, O_RDWR */
++#define RK_DMA_HEAP_VALID_FD_FLAGS (O_CLOEXEC | O_ACCMODE)
++
++/* Currently no heap flags */
++#define RK_DMA_HEAP_VALID_HEAP_FLAGS (0)
++
++/**
++ * struct rk_dma_heap_allocation_data - metadata passed from userspace for
++ *                                      allocations
++ * @len:		size of the allocation
++ * @fd:			will be populated with a fd which provides the
++ *			handle to the allocated dma-buf
++ * @fd_flags:		file descriptor flags used when allocating
++ * @heap_flags:		flags passed to heap
++ *
++ * Provided by userspace as an argument to the ioctl
++ */
++struct rk_dma_heap_allocation_data {
++	__u64 len;
++	__u32 fd;
++	__u32 fd_flags;
++	__u64 heap_flags;
++};
++
++#define RK_DMA_HEAP_IOC_MAGIC		'R'
++
++/**
++ * DOC: RK_DMA_HEAP_IOCTL_ALLOC - allocate memory from pool
++ *
++ * Takes a rk_dma_heap_allocation_data struct and returns it with the fd field
++ * populated with the dmabuf handle of the allocation.
++ */
++#define RK_DMA_HEAP_IOCTL_ALLOC	_IOWR(RK_DMA_HEAP_IOC_MAGIC, 0x0,\
++				      struct rk_dma_heap_allocation_data)
++
++#endif /* _UAPI_LINUX_DMABUF_POOL_H */

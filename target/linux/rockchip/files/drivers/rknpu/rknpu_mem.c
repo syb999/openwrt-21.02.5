@@ -5,6 +5,7 @@
  */
 
 #include <linux/version.h>
+#include <linux/uaccess.h>   /* copy_from_user/copy_to_user: only reached when the DMA-HEAP backend is selected */
 #include <linux/rk-dma-heap.h>
 
 #if KERNEL_VERSION(5, 10, 0) <= LINUX_VERSION_CODE
@@ -141,6 +142,18 @@ int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 	rknpu_obj->size = PAGE_ALIGN(args.size);
 	rknpu_obj->dma_addr = phys;
 	rknpu_obj->sgt = table;
+	/*
+	 * Keep the attachment and its mapping for the whole lifetime of the
+	 * object instead of tearing them down right here.  The sg_table that
+	 * dma_buf_map_attachment() returned (and the dma_addr derived from it)
+	 * is owned by the exporter per attachment: unmapping/detaching now
+	 * would free that sg_table and leave rknpu_obj->sgt dangling.  NPU
+	 * jobs submitted from userspace keep using this dma_addr (written to
+	 * the hardware as the task/base address) for as long as the buffer
+	 * object exists, so the mapping must stay valid until
+	 * rknpu_mem_destroy_ioctl() releases it.
+	 */
+	rknpu_obj->attachment = attachment;
 
 	args.size = rknpu_obj->size;
 	args.obj_addr = (__u64)(uintptr_t)rknpu_obj;
@@ -158,9 +171,6 @@ int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 		ret = -EFAULT;
 		goto err_unmap_kv_addr;
 	}
-
-	dma_buf_unmap_attachment(attachment, table, DMA_BIDIRECTIONAL);
-	dma_buf_detach(dmabuf, attachment);
 
 	spin_lock(&rknpu_dev->lock);
 
@@ -247,6 +257,21 @@ int rknpu_mem_destroy_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 		vunmap(rknpu_obj->kv_addr);
 		rknpu_obj->kv_addr = NULL;
 
+		/*
+		 * Release the mapping and the attachment that were kept alive
+		 * since rknpu_mem_create_ioctl().  Must happen while the
+		 * dmabuf is still referenced below.
+		 */
+		if (rknpu_obj->attachment && rknpu_obj->sgt)
+			dma_buf_unmap_attachment(rknpu_obj->attachment,
+						 rknpu_obj->sgt,
+						 DMA_BIDIRECTIONAL);
+		if (rknpu_obj->attachment)
+			dma_buf_detach(rknpu_obj->dmabuf,
+				       rknpu_obj->attachment);
+		rknpu_obj->attachment = NULL;
+		rknpu_obj->sgt = NULL;
+
 		if (!rknpu_obj->owner)
 			dma_buf_put(rknpu_obj->dmabuf);
 
@@ -257,57 +282,37 @@ int rknpu_mem_destroy_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 }
 
 /*
- * begin cpu access => for_cpu = true
- * end cpu access => for_cpu = false
+ * Sync is delegated to the dma-buf exporter.
+ *
+ * This file used to contain an sg_table based helper
+ * (rknpu_dma_buf_sync()) that pushed rknpu_obj->sgt / sg_dma_address()
+ * into dma_sync_single_range_for_cpu()/dma_sync_single_range_for_device().
+ * At the time that was unsafe, because rknpu_mem_create_ioctl() unmapped
+ * and detached the dma_buf attachment right after importing the buffer:
+ * exporters keep the mapping in a per-attachment sg_table (mainline
+ * system_heap, rockchip rk_cma_heap) which is released by ->detach(), so
+ * rknpu_obj->sgt was a dangling pointer and the stale sg_dma_address()
+ * made dma_direct_sync_single_for_device() run cache maintenance on a
+ * phys_to_virt() address that is not mapped, oopsing in
+ * __clean_dcache_area_poc() ("Unable to handle kernel paging request") as
+ * soon as RKNN synced a buffer allocated from /dev/dma_heap/system.
+ *
+ * The attachment is now kept alive for the whole object lifetime (see
+ * rknpu_mem_create_ioctl()/rknpu_mem_destroy_ioctl()), so rknpu_obj->sgt
+ * would be usable again.  Sync nevertheless goes through
+ * dmabuf->ops->begin_cpu_access()/end_cpu_access() (vendor 5.10 uses the
+ * ..._partial() variants): the exporter itself knows whether the buffer
+ * needs cache maintenance and how it is mapped, so buffers that have no
+ * NPU DMA mapping (mainline dma-heap) as well as the rockchip cma heap
+ * path are both handled correctly, and it does not depend on the device
+ * mapping being kept around.
  */
-static void __maybe_unused rknpu_dma_buf_sync(
-	struct rknpu_device *rknpu_dev, struct rknpu_mem_object *rknpu_obj,
-	u32 offset, u32 length, enum dma_data_direction dir, bool for_cpu)
-{
-	struct device *dev = rknpu_dev->dev;
-	struct sg_table *sgt = rknpu_obj->sgt;
-	struct scatterlist *sg = sgt->sgl;
-	dma_addr_t sg_dma_addr = sg_dma_address(sg);
-	unsigned int len = 0;
-	int i;
-
-	for_each_sgtable_sg(sgt, sg, i) {
-		unsigned int sg_offset, sg_left, size = 0;
-
-		len += sg->length;
-		if (len <= offset) {
-			sg_dma_addr += sg->length;
-			continue;
-		}
-
-		sg_left = len - offset;
-		sg_offset = sg->length - sg_left;
-
-		size = (length < sg_left) ? length : sg_left;
-
-		if (for_cpu)
-			dma_sync_single_range_for_cpu(dev, sg_dma_addr,
-						      sg_offset, size, dir);
-		else
-			dma_sync_single_range_for_device(dev, sg_dma_addr,
-							 sg_offset, size, dir);
-
-		offset += size;
-		length -= size;
-		sg_dma_addr += sg->length;
-
-		if (length == 0)
-			break;
-	}
-}
 
 int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, unsigned long data)
 {
 	struct rknpu_mem_object *rknpu_obj = NULL;
 	struct rknpu_mem_sync args;
-#ifdef CONFIG_DMABUF_PARTIAL
 	struct dma_buf *dmabuf;
-#endif
 	int ret = -EFAULT;
 
 	if (unlikely(copy_from_user(&args, (struct rknpu_mem_sync *)data,
@@ -326,17 +331,31 @@ int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, unsigned long data)
 
 	rknpu_obj = (struct rknpu_mem_object *)(uintptr_t)args.obj_addr;
 
-#ifndef CONFIG_DMABUF_PARTIAL
-	if (args.flags & RKNPU_MEM_SYNC_TO_DEVICE) {
-		rknpu_dma_buf_sync(rknpu_dev, rknpu_obj, args.offset, args.size,
-				   DMA_TO_DEVICE, false);
-	}
-	if (args.flags & RKNPU_MEM_SYNC_FROM_DEVICE) {
-		rknpu_dma_buf_sync(rknpu_dev, rknpu_obj, args.offset, args.size,
-				   DMA_FROM_DEVICE, true);
-	}
-#else
 	dmabuf = rknpu_obj->dmabuf;
+	if (!dmabuf) {
+		LOG_ERROR("%s: no dmabuf for obj_addr: %#llx\n", __func__,
+			  (__u64)(uintptr_t)args.obj_addr);
+		return -EINVAL;
+	}
+
+#ifndef CONFIG_DMABUF_PARTIAL
+	/*
+	 * 5.4 has no dma_buf_ops->begin_cpu_access_partial()/
+	 * end_cpu_access_partial() (they arrived with the DMABUF_PARTIAL
+	 * support, see 319-rockchip-dma-buf-heap.patch), so use the
+	 * whole-buffer cpu access callbacks instead. They end up in the
+	 * exporter of the buffer (rockchip cma heap, mainline
+	 * /dev/dma_heap/system, ...) and are safe for buffers that are not
+	 * DMA mapped to the NPU device. Without partial support
+	 * args.offset/args.size cannot be expressed, so the buffer is synced
+	 * as a whole.
+	 */
+	if (args.flags & RKNPU_MEM_SYNC_TO_DEVICE)
+		dma_buf_end_cpu_access(dmabuf, DMA_TO_DEVICE);
+
+	if (args.flags & RKNPU_MEM_SYNC_FROM_DEVICE)
+		dma_buf_begin_cpu_access(dmabuf, DMA_FROM_DEVICE);
+#else
 	if (args.flags & RKNPU_MEM_SYNC_TO_DEVICE) {
 		dmabuf->ops->end_cpu_access_partial(dmabuf, DMA_TO_DEVICE,
 						    args.offset, args.size);

@@ -5,6 +5,7 @@
  */
 
 #include <linux/slab.h>
+#include <linux/uaccess.h>   /* copy_from_user/copy_to_user: only reached when the DMA-HEAP backend is selected */
 #include <linux/delay.h>
 #include <linux/syscalls.h>
 #include <linux/debugfs.h>

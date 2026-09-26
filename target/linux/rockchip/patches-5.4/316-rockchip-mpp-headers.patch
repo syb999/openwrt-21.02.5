@@ -1,0 +1,343 @@
+Rockchip vendor video codec (MPP) stack: headers.
+
+Back-ported from the Rockchip develop-5.10 vendor tree.  Adds the
+kernel-internal and uapi headers the MPP driver needs but which are
+not present in mainline 5.4.215:
+  * include/soc/rockchip/pm_domains.h
+  * include/soc/rockchip/rockchip_dmc.h
+  * include/linux/rockchip/rockchip_sip.h
+  * include/linux/dma-buf-cache.h
+  * include/uapi/linux/rk-mpp.h
+
+The matching driver code lives in 317-rockchip-mpp-drivers.patch.
+
+--- /dev/null
++++ b/include/linux/dma-buf-cache.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (c) 2021 Rockchip Electronics Co. Ltd.
++ */
++#ifndef _LINUX_DMA_BUF_CACHE_H
++#define _LINUX_DMA_BUF_CACHE_H
++
++#include <linux/dma-buf.h>
++
++extern void dma_buf_cache_detach(struct dma_buf *dmabuf,
++				 struct dma_buf_attachment *attach);
++
++extern void dma_buf_cache_unmap_attachment(struct dma_buf_attachment *attach,
++					   struct sg_table *sg_table,
++					   enum dma_data_direction direction);
++
++extern struct dma_buf_attachment *
++dma_buf_cache_attach(struct dma_buf *dmabuf, struct device *dev);
++
++extern struct sg_table *
++dma_buf_cache_map_attachment(struct dma_buf_attachment *attach,
++			     enum dma_data_direction direction);
++
++#ifdef CONFIG_DMABUF_CACHE
++/* Replace dma-buf apis to cached apis */
++#define dma_buf_attach dma_buf_cache_attach
++#define dma_buf_detach dma_buf_cache_detach
++#define dma_buf_map_attachment dma_buf_cache_map_attachment
++#define dma_buf_unmap_attachment dma_buf_cache_unmap_attachment
++#endif
++
++#endif /* _LINUX_DMA_BUF_CACHE_H */
+--- /dev/null
++++ b/include/linux/rockchip/rockchip_sip.h
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Minimal stand-in for the vendor include/linux/rockchip/rockchip_sip.h.
++ *
++ * The vendor tree declares sip_smc_vpu_reset() here and implements it in
++ * arch/arm64/kernel/rockchip_sip.c, a file that is not part of this kernel.
++ * The MPP rkvdec2 driver only needs the VPU reset SMC, so provide an
++ * equivalent minimal implementation inline instead of porting the whole
++ * vendor SiP glue.  The SMC id and argument layout are unchanged from the
++ * vendor header, so a loaded module talks to the same ATF/OP-TEE service.
++ */
++#ifndef __ROCKCHIP_SIP_H
++#define __ROCKCHIP_SIP_H
++
++#include <linux/arm-smccc.h>
++#include <linux/types.h>
++
++/* SMC function id for the VPU reset service (vendor value, unchanged). */
++#define PSCI_SIP_VPU_RESET		0x8200000c
++
++static inline struct arm_smccc_res
++sip_smc_vpu_reset(u32 arg0, u32 arg1, u32 arg2)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(PSCI_SIP_VPU_RESET, arg0, arg1, arg2, 0, 0, 0, 0, &res);
++
++	return res;
++}
++
++#endif /* __ROCKCHIP_SIP_H */
+--- /dev/null
++++ b/include/soc/rockchip/pm_domains.h
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Minimal stand-in for the vendor include/soc/rockchip/pm_domains.h.
++ *
++ * The vendor pm_domains driver exports a couple of power-domain helpers that
++ * the MPP stack uses (idle request and QoS save/restore).  This kernel only
++ * carries the mainline Rockchip power-domain driver, which has none of them,
++ * so provide no-op / always-succeeding equivalents here instead of porting the
++ * whole vendor power-domain driver.
++ *
++ * The MPP module is loaded on demand and only calls these helpers after its
++ * own device is up, so a no-op is the safe minimum: the peripheral power
++ * domains are still switched on demand by the genpd core through the
++ * "power-domains" phandle in DT.
++ */
++#ifndef __SOC_ROCKCHIP_PM_DOMAINS_H
++#define __SOC_ROCKCHIP_PM_DOMAINS_H
++
++#include <linux/errno.h>
++#include <linux/types.h>
++
++struct device;
++
++static inline int rockchip_pmu_idle_request(struct device *dev, bool idle)
++{
++	return 0;
++}
++
++static inline int rockchip_save_qos(struct device *dev)
++{
++	return 0;
++}
++
++static inline int rockchip_restore_qos(struct device *dev)
++{
++	return 0;
++}
++
++#endif /* __SOC_ROCKCHIP_PM_DOMAINS_H */
+--- /dev/null
++++ b/include/soc/rockchip/rockchip_dmc.h
+@@ -0,0 +1,131 @@
++/*
++ * Copyright (c) 2017, Fuzhou Rockchip Electronics Co., Ltd
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++#ifndef __SOC_ROCKCHIP_DMC_H
++#define __SOC_ROCKCHIP_DMC_H
++
++#include <linux/devfreq.h>
++
++/* for lcdc_type */
++#define SCREEN_NULL		0
++#define SCREEN_RGB		1
++#define SCREEN_LVDS		2
++#define SCREEN_DUAL_LVDS	3
++#define SCREEN_MCU		4
++#define SCREEN_TVOUT		5
++#define SCREEN_HDMI		6
++#define SCREEN_MIPI		7
++#define SCREEN_DUAL_MIPI	8
++#define SCREEN_EDP		9
++#define SCREEN_TVOUT_TEST	10
++#define SCREEN_LVDS_10BIT	11
++#define SCREEN_DUAL_LVDS_10BIT	12
++#define SCREEN_DP		13
++
++#define DMCFREQ_TABLE_END	~1u
++
++struct freq_map_table {
++	unsigned int min;
++	unsigned int max;
++	unsigned long freq;
++};
++
++struct rl_map_table {
++	unsigned int pn; /* panel number */
++	unsigned int rl; /* readlatency */
++};
++
++struct dmcfreq_common_info {
++	struct device *dev;
++	struct devfreq *devfreq;
++	struct freq_map_table *vop_bw_tbl;
++	struct freq_map_table *vop_frame_bw_tbl;
++	struct rl_map_table *vop_pn_rl_tbl;
++	struct delayed_work msch_rl_work;
++	unsigned long vop_4k_rate;
++	unsigned long vop_req_rate;
++	unsigned int read_latency;
++	unsigned int auto_freq_en;
++	unsigned int stall_time_ns;
++	bool is_msch_rl_work_started;
++	int (*set_msch_readlatency)(unsigned int rl);
++};
++
++struct dmcfreq_vop_info {
++	unsigned int line_bw_mbyte;
++	unsigned int frame_bw_mbyte;
++	unsigned int plane_num;
++	unsigned int plane_num_4k;
++};
++
++#if IS_REACHABLE(CONFIG_ARM_ROCKCHIP_DMC_DEVFREQ)
++void rockchip_dmcfreq_lock(void);
++void rockchip_dmcfreq_lock_nested(void);
++void rockchip_dmcfreq_unlock(void);
++int rockchip_dmcfreq_write_trylock(void);
++void rockchip_dmcfreq_write_unlock(void);
++int rockchip_dmcfreq_wait_complete(void);
++int rockchip_dmcfreq_vop_bandwidth_init(struct dmcfreq_common_info *info);
++int rockchip_dmcfreq_vop_bandwidth_request(struct dmcfreq_vop_info *vop_info);
++void rockchip_dmcfreq_vop_bandwidth_update(struct dmcfreq_vop_info *vop_info);
++unsigned int rockchip_dmcfreq_get_stall_time_ns(void);
++#else
++static inline void rockchip_dmcfreq_lock(void)
++{
++}
++
++static inline void rockchip_dmcfreq_lock_nested(void)
++{
++}
++
++static inline void rockchip_dmcfreq_unlock(void)
++{
++}
++
++static inline int rockchip_dmcfreq_write_trylock(void)
++{
++	return 0;
++}
++
++static inline void rockchip_dmcfreq_write_unlock(void)
++{
++}
++
++static inline int rockchip_dmcfreq_wait_complete(void)
++{
++	return 0;
++}
++
++static inline int
++rockchip_dmcfreq_vop_bandwidth_request(struct dmcfreq_vop_info *vop_info)
++{
++	return 0;
++}
++
++static inline void
++rockchip_dmcfreq_vop_bandwidth_update(struct dmcfreq_vop_info *vop_info)
++{
++}
++
++static inline void
++rockchip_dmcfreq_vop_bandwidth_init(struct dmcfreq_common_info *info)
++{
++}
++
++static inline unsigned int
++rockchip_dmcfreq_get_stall_time_ns(void)
++{
++	return 0;
++}
++#endif
++
++#endif
+--- /dev/null
++++ b/include/uapi/linux/rk-mpp.h
+@@ -0,0 +1,82 @@
++/* SPDX-License-Identifier: ((GPL-2.0+ WITH Linux-syscall-note) OR MIT) */
++/*
++ * Rockchip mpp driver
++ * Copyright (C) 2023 Rockchip Electronics Co., Ltd.
++ */
++
++#ifndef _UAPI_RK_MPP_H
++#define _UAPI_RK_MPP_H
++
++#include <linux/types.h>
++
++/* Use 'v' as magic number */
++#define MPP_IOC_MAGIC			'v'
++
++#define MPP_IOC_CFG_V1			_IOW(MPP_IOC_MAGIC, 1, unsigned int)
++#define MPP_IOC_CFG_V2			_IOW(MPP_IOC_MAGIC, 2, unsigned int)
++
++/**
++ * Command type: keep the same as user space
++ */
++enum MPP_DEV_COMMAND_TYPE {
++	MPP_CMD_QUERY_BASE		= 0,
++	MPP_CMD_QUERY_HW_SUPPORT	= MPP_CMD_QUERY_BASE + 0,
++	MPP_CMD_QUERY_HW_ID		= MPP_CMD_QUERY_BASE + 1,
++	MPP_CMD_QUERY_CMD_SUPPORT	= MPP_CMD_QUERY_BASE + 2,
++	MPP_CMD_QUERY_BUTT,
++
++	MPP_CMD_INIT_BASE		= 0x100,
++	MPP_CMD_INIT_CLIENT_TYPE	= MPP_CMD_INIT_BASE + 0,
++	MPP_CMD_INIT_DRIVER_DATA	= MPP_CMD_INIT_BASE + 1,
++	MPP_CMD_INIT_TRANS_TABLE	= MPP_CMD_INIT_BASE + 2,
++	MPP_CMD_INIT_BUTT,
++
++	MPP_CMD_SEND_BASE		= 0x200,
++	MPP_CMD_SET_REG_WRITE		= MPP_CMD_SEND_BASE + 0,
++	MPP_CMD_SET_REG_READ		= MPP_CMD_SEND_BASE + 1,
++	MPP_CMD_SET_REG_ADDR_OFFSET	= MPP_CMD_SEND_BASE + 2,
++	MPP_CMD_SET_RCB_INFO		= MPP_CMD_SEND_BASE + 3,
++	MPP_CMD_SET_SESSION_FD		= MPP_CMD_SEND_BASE + 4,
++	MPP_CMD_SEND_BUTT,
++
++	MPP_CMD_POLL_BASE		= 0x300,
++	MPP_CMD_POLL_HW_FINISH		= MPP_CMD_POLL_BASE + 0,
++	MPP_CMD_POLL_HW_IRQ		= MPP_CMD_POLL_BASE + 1,
++	MPP_CMD_POLL_BUTT,
++
++	MPP_CMD_CONTROL_BASE		= 0x400,
++	MPP_CMD_RESET_SESSION		= MPP_CMD_CONTROL_BASE + 0,
++	MPP_CMD_TRANS_FD_TO_IOVA	= MPP_CMD_CONTROL_BASE + 1,
++	MPP_CMD_RELEASE_FD		= MPP_CMD_CONTROL_BASE + 2,
++	MPP_CMD_SEND_CODEC_INFO		= MPP_CMD_CONTROL_BASE + 3,
++	MPP_CMD_CONTROL_BUTT,
++
++	MPP_CMD_BUTT,
++};
++
++/* define flags for mpp_request */
++#define MPP_FLAGS_MULTI_MSG		(0x00000001)
++#define MPP_FLAGS_LAST_MSG		(0x00000002)
++#define MPP_FLAGS_REG_FD_NO_TRANS	(0x00000004)
++#define MPP_FLAGS_SCL_FD_NO_TRANS	(0x00000008)
++#define MPP_FLAGS_REG_NO_OFFSET		(0x00000010)
++#define MPP_FLAGS_SECURE_MODE		(0x00010000)
++
++/* data common struct for parse out */
++struct mpp_request {
++	__u32 cmd;
++	__u32 flags;
++	__u32 size;
++	__u32 offset;
++	void __user *data;
++};
++
++#define MPP_BAT_MSG_DONE		(0x00000001)
++
++struct mpp_bat_msg {
++	__u64 flag;
++	__u32 fd;
++	__s32 ret;
++};
++
++#endif /* _UAPI_RK_MPP_H */

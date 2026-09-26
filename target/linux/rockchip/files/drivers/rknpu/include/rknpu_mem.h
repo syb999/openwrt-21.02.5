@@ -21,7 +21,10 @@
  *	- this address could be physical address without IOMMU and
  *	device address with IOMMU.
  * @pages: Array of backing pages.
- * @sgt: Imported sg_table.
+ * @sgt: Imported sg_table, valid for the whole object lifetime.
+ * @attachment: dma_buf attachment this object was mapped through. Kept
+ *	alive until rknpu_mem_destroy_ioctl() so that @sgt (and hence
+ *	@dma_addr) stay valid while the NPU can still access the buffer.
  * @dmabuf: buffer for this attachment.
  * @owner: Is this memory internally allocated.
  */
@@ -32,6 +35,7 @@ struct rknpu_mem_object {
 	dma_addr_t dma_addr;
 	struct page **pages;
 	struct sg_table *sgt;
+	struct dma_buf_attachment *attachment;
 	struct dma_buf *dmabuf;
 	struct list_head head;
 	unsigned int owner;

@@ -12,8 +12,11 @@
  *
  * In that mode the vendor code only ever needs the two trivial halves of its
  * mapping helpers - it literally falls back to dma_map_sg()/dma_unmap_sg()
- * whenever the caller asks for an aligned IOVA - plus a set of domain helpers
- * that the driver guards with rknpu_dev->iommu_en and therefore never calls.
+ * whenever the caller asks for an aligned IOVA - plus a set of domain helpers.
+ * Most of those are guarded with rknpu_dev->iommu_en and therefore never run
+ * here; rknpu_iommu_domain_get_and_switch() is the exception, it is called
+ * unconditionally from the submit path and must succeed as a no-op (see the
+ * comment on its definition).
  *
  * Reintegrating the IOMMU path later means porting the vendor's dma-iommu
  * changes and dropping this file in favour of drivers/rknpu/rknpu_iommu.c.
@@ -74,7 +77,25 @@ void rknpu_iommu_free_domains(struct rknpu_device *rknpu_dev)
 int rknpu_iommu_domain_get_and_switch(struct rknpu_device *rknpu_dev,
 				      int domain_id)
 {
-	return -EOPNOTSUPP;
+	/*
+	 * This round-trip is needed to acquire a reference on the IOMMU
+	 * domain a job wants to run against, which only exists in IOMMU mode.
+	 *
+	 * It is *not* IOMMU-specific: rknpu_job_schedule() calls it
+	 * unconditionally and treats a non-zero return value as a fatal
+	 * submission error, and rknpu_drv.c's RKNPU_SET_IOMMU_DOMAIN_ID action
+	 * calls it as well.  The vendor's own non-IOMMU build
+	 * (drivers/rknpu/rknpu_iommu.c, "#else" branch) just returns 0 here
+	 * for exactly that reason.  Returning -EOPNOTSUPP instead made
+	 * rknpu_job_schedule() bail out with job->ret = -EINVAL before the
+	 * job was ever queued or committed, so the commit never ran, the
+	 * driver logged "job commit failed"/"job abort, ret: -22" and RKNN
+	 * surfaced the failure as "rknn run error -1".
+	 *
+	 * Without an IOMMU there is nothing to switch to; the caller's
+	 * matching rknpu_iommu_domain_put() is a no-op too.
+	 */
+	return 0;
 }
 
 int rknpu_iommu_domain_put(struct rknpu_device *rknpu_dev)

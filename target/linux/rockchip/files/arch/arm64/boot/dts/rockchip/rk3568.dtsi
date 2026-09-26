@@ -1103,6 +1103,18 @@
 		compatible = "rockchip,rk3568-pmu", "syscon", "simple-mfd";
 		reg = <0x0 0xfdd90000 0x0 0x1000>;
 
+		/*
+		 * The PMU register block itself is only reachable while its
+		 * clocks are running.  The vendor bootloader used to leave them
+		 * on, but nothing guarantees that, and the power-domain driver
+		 * probes before the CRU clock driver has registered anything -
+		 * the first regmap_write() then triggers a synchronous external
+		 * abort.  Reference the clocks here so the driver can enable
+		 * them itself before touching any register.
+		 */
+		clocks = <&pmucru PCLK_PMU>, <&pmucru CLK_PMU>;
+		clock-names = "pclk_pmu", "clk_pmu";
+
 		power: power-controller {
 			compatible = "rockchip,rk3568-power-controller";
 			#power-domain-cells = <1>;

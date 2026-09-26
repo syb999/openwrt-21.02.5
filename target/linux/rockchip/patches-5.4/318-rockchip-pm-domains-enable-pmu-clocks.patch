@@ -1,0 +1,34 @@
+--- a/drivers/soc/rockchip/pm_domains.c
++++ b/drivers/soc/rockchip/pm_domains.c
+@@ -658,6 +658,31 @@
+ 		return -ENOMEM;
+ 
+ 	pmu->dev = &pdev->dev;
++
++	/*
++	 * The power-domain registers live inside the PMU block, which is only
++	 * accessible while its own clocks are running.  Nothing guarantees the
++	 * bootloader left them enabled (and this driver probes before the CRU
++	 * driver registers its clocks), so a regmap_write() below would take a
++	 * synchronous external abort.  Enable them explicitly here.
++	 */
++	{
++		struct clk_bulk_data pmu_clks[] = {
++			{ .id = "pclk_pmu" },
++			{ .id = "clk_pmu" },
++		};
++		int clk_ret;
++
++		clk_ret = devm_clk_bulk_get_optional(&pdev->dev,
++						     ARRAY_SIZE(pmu_clks), pmu_clks);
++		if (clk_ret)
++			dev_warn(&pdev->dev, "failed to get pmu clocks: %d\n", clk_ret);
++		else {
++			clk_ret = clk_bulk_prepare_enable(ARRAY_SIZE(pmu_clks), pmu_clks);
++			if (clk_ret)
++				dev_warn(&pdev->dev, "failed to enable pmu clocks: %d\n", clk_ret);
++		}
++	}
+ 	mutex_init(&pmu->mutex);
+ 
+ 	pmu->info = pmu_info;

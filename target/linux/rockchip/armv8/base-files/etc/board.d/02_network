@@ -32,7 +32,7 @@ rockchip_setup_interfaces()
 		# up attached to nothing (no br-lan, no address, no traffic).  Create
 		# the lan bridge on a *non-existent* eth1 purely as a home for the
 		# wireless interface; the physical port stays the wan.
-		ucidef_set_interface_lan 'eth1' 'none'
+		ucidef_set_interface_lan 'eth1' 'static' '192.168.9.1' '255.255.255.0'
 
 		# Open the wan zone, because this script is the only place that is
 		# *known* to run for this board (it is what writes the network

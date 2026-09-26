@@ -569,6 +569,20 @@ static int rknpu_release(struct inode *inode, struct file *file)
 		vunmap(entry->kv_addr);
 		entry->kv_addr = NULL;
 
+		/*
+		 * rknpu_mem_destroy_ioctl() is not necessarily called before
+		 * the fd is closed, so release the mapping/attachment that
+		 * rknpu_mem_create_ioctl() kept alive here as well.  This has
+		 * to happen before the final dma_buf_put().
+		 */
+		if (entry->attachment && entry->sgt)
+			dma_buf_unmap_attachment(entry->attachment, entry->sgt,
+						 DMA_BIDIRECTIONAL);
+		if (entry->attachment)
+			dma_buf_detach(entry->dmabuf, entry->attachment);
+		entry->attachment = NULL;
+		entry->sgt = NULL;
+
 		if (!entry->owner)
 			dma_buf_put(entry->dmabuf);
 

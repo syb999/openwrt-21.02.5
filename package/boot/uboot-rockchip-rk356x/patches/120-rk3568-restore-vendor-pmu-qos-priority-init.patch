@@ -1,0 +1,121 @@
+--- a/arch/arm/mach-rockchip/rk3568/rk3568.c
++++ b/arch/arm/mach-rockchip/rk3568/rk3568.c
+@@ -7,6 +7,7 @@
+ 
+ #include <dm.h>
+ #include <misc.h>
++#include <linux/delay.h>
+ #include <asm/armv8/mmu.h>
+ #include <asm/arch-rockchip/bootrom.h>
+ #include <asm/arch-rockchip/grf_rk3568.h>
+@@ -30,6 +31,10 @@
+ #define PMU_NOC_AUTO_CON0	(0x70)
+ #define PMU_NOC_AUTO_CON1	(0x74)
+ #define PMU_PWR_GATE_SFTCON	(0xa0)
++#define PMU_PWR_DWN_ST		(0x98)
++#define PMU_BUS_IDLE_SFTCON0	(0x50)
++#define PMU_BUS_IDLE_ST		(0x68)
++#define PMU_BUS_IDLE_ACK	(0x60)
+ #define PMU_PD_VO_DWN_ENA	BIT(7)
+ #define EDP_PHY_GRF_BASE	0xfdcb0000
+ #define EDP_PHY_GRF_CON0	(EDP_PHY_GRF_BASE + 0x00)
+@@ -114,6 +119,75 @@
+ 		     GPIO0D0_UART2_RXM0 << GPIO0D0_SHIFT);
+ }
+ 
++#if defined(CONFIG_XPL_BUILD) && !defined(CONFIG_TPL_BUILD)
++/*
++ * PMU pre-initialisation, restored from the vendor SPL.
++ *
++ * On the vendor RK3568 SPL arch_cpu_init() calls this before the non-secure
++ * world is entered.  It brings the PMU power-gate and bus-idle state machines
++ * into a known, fully settled state: every power domain except NPU/GPU is
++ * enabled and every idle request except NPU/GPU is released, after which the
++ * power-down status (PMU_PWR_DWN_ST) and the bus-idle ack/status registers
++ * (PMU_BUS_IDLE_ACK / PMU_BUS_IDLE_ST) are polled until they settle.
++ *
++ * The generic upstream SPL only performed the single "enable VO domain"
++ * write (PMU_PWR_GATE_SFTCON = 0x00800000).  With only that write the PMU is
++ * left in a half-initialised state; the non-secure world (Linux) is then the
++ * first to touch PMU_PWR_GATE_SFTCON (0xa0) after hand-off, and that first NS
++ * access faults with an SError on the bus.  Restoring the vendor sequence
++ * (PMU_PWR_GATE_SFTCON = 0xfffc0000 plus the bus-idle release and the
++ * settlement polling) is what keeps the first NS write to 0xa0 safe.
++ *
++ * This version intentionally does NOT hang() on a polling timeout like the
++ * vendor code does: a stuck PMU must never brick the bootloader, so a
++ * diagnostic is printed and boot continues.
++ */
++static void qos_priority_init(void)
++{
++	u32 delay;
++
++	/* Enable all power domains except NPU (bit 0) and GPU (bit 1). */
++	writel(0xffff0000 & ~(BIT(0 + 16) | BIT(1 + 16)),
++	       PMU_BASE_ADDR + PMU_PWR_GATE_SFTCON);
++
++	delay = 1000;
++	do {
++		udelay(1);
++		delay--;
++		if (delay == 0) {
++			printf("Fail to set domain.\n");
++			break;
++		}
++	} while (readl(PMU_BASE_ADDR + PMU_PWR_DWN_ST) & ~(BIT(0) | BIT(1)));
++
++	/* Release all idle requests except NPU (bit 1) and GPU (bit 2). */
++	writel(0xffff0000 & ~(BIT(1 + 16) | BIT(2 + 16)),
++	       PMU_BASE_ADDR + PMU_BUS_IDLE_SFTCON0);
++
++	delay = 1000;
++	/* Wait for the bus-idle acknowledge. */
++	do {
++		udelay(1);
++		delay--;
++		if (delay == 0) {
++			printf("Fail to get ack on domain.\n");
++			break;
++		}
++	} while (readl(PMU_BASE_ADDR + PMU_BUS_IDLE_ACK) & ~(BIT(1) | BIT(2)));
++
++	delay = 1000;
++	/* Wait for the bus-idle status to settle. */
++	do {
++		udelay(1);
++		delay--;
++		if (delay == 0) {
++			printf("Fail to set idle on domain.\n");
++			break;
++		}
++	} while (readl(PMU_BASE_ADDR + PMU_BUS_IDLE_ST) & ~(BIT(1) | BIT(2)));
++}
++#endif
++
+ int arch_cpu_init(void)
+ {
+ #ifdef CONFIG_XPL_BUILD
+@@ -142,9 +216,20 @@
+ 	writel(0x3f3f0707, GRF_BASE + GRF_GPIO1C_DS_2);
+ 	writel(0x3f3f0707, GRF_BASE + GRF_GPIO1C_DS_3);
+ 
+-	/* Enable VO power domain for display */
+-	writel((PMU_PD_VO_DWN_ENA << 16),
+-	       PMU_BASE_ADDR + PMU_PWR_GATE_SFTCON);
++	/*
++	 * PMU power-gate / bus-idle pre-initialisation (vendor SPL parity).
++	 *
++	 * The vendor SPL has no separate "enable VO" write: qos_priority_init()
++	 * enables every power domain except NPU/GPU, so it covers the VO domain
++	 * the upstream code used to enable on its own, and it is the only
++	 * writer of PMU_PWR_GATE_SFTCON.  It leaves 0xfffc0000 (the exact value
++	 * the vendor SPL programs) in that register for the non-secure world to
++	 * inherit; that settled state is what makes the first NS write to 0xa0
++	 * safe.
++	 */
++#if !defined(CONFIG_TPL_BUILD)
++	qos_priority_init();
++#endif
+ #endif
+ 	return 0;
+ }

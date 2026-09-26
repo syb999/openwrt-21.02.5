@@ -5,6 +5,7 @@
  */
 
 #include <linux/slab.h>
+#include <linux/uaccess.h>   /* copy_from_user/copy_to_user (include chain changed with the DMA-HEAP backend) */
 #include <linux/delay.h>
 #include <linux/sync_file.h>
 #include <linux/io.h>
