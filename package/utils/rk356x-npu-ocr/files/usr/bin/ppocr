@@ -1,0 +1,38 @@
+#!/bin/sh
+#
+# ppocr - RK356x NPU OCR entry point.
+#
+# Prints ONLY the recognized text, one line per detected text line.
+# No coordinates, no scores, no TIMING, no debug output.
+#
+#   ppocr <image>              normal use
+#   ppocr <image> --verbose    keep the engine's full debug output
+#
+# The engine is a glibc binary while OpenWrt is musl, so a small glibc
+# bundle is shipped in /opt/glibc and the loader is invoked explicitly.
+
+IMG="$1"
+[ -z "$IMG" ] && { echo "usage: ppocr <image> [--verbose]" >&2; exit 2; }
+shift
+
+LOADER=/opt/glibc/ld-linux-aarch64.so.1
+LIBPATH=/opt/glibc:/opt/rknpu
+ENGINE=/opt/ppocr/ppocr_engine_t
+DET=/opt/ppocr/models/ppocrv4_det.rknn
+REC=/opt/ppocr/models/ppocrv4_rec.rknn
+
+run() {
+	"$LOADER" --library-path "$LIBPATH" "$ENGINE" \
+		--det "$DET" --rec "$REC" --image "$IMG" \
+		--tile --pre-upscale 2.0 --unclip-ratio 2.0 --box-threshold 0.4 "$@"
+}
+
+if [ "$1" = "--verbose" ]; then
+	run "$1"
+	exit $?
+fi
+
+# Engine output lines look like:
+#   TEXT x1 y1 x2 y2 x3 y3 x4 y4 score <text>
+# Keep only <text>.  TIMING/debug lines go to stderr and are dropped.
+run "$@" 2>/dev/null | sed -n 's/^TEXT \([^ ]* \)\{9\}//p'

@@ -1,0 +1,71 @@
+rk356x-npu-ocr - Rockchip RK356x (RK3566/RK3568) NPU PP-OCR engine for musl OpenWrt
+====================================================================================
+
+Supported hardware
+------------------
+  Supported:     RK3566 / RK3568  (RK356x family, RKNPU1 NPU generation)
+  NOT supported: RK3588 / RK3576  (different NPU generation, needs different
+                                  .rknn models and a different librknnrt build)
+
+  Reasons the package is RK356x-only:
+    * the engine is compiled with -DTARGET_SOC=rk356x;
+    * the shipped .rknn models are RK3566/RK3568 (RKNPU1-compatible) blobs;
+    * the bundled librknnrt.so is the RKNPU2 runtime matching the RK356x
+      driver (v0.9.8, non-iommu mode).
+  Loading these models on RK3588/RK3576 will fail.  For those SoCs build the
+  RK3588 example of rknn_model_zoo with its RK3588 models instead.
+
+What it installs
+----------------
+  /opt/ppocr/ppocr_demo              PP-OCR demo (glibc ELF)
+  /opt/ppocr/models/ppocrv4_det.rknn PP-OCRv4 detection model (RK356x)
+  /opt/ppocr/models/ppocrv4_rec.rknn PP-OCRv4 recognition model (RK356x)
+  /opt/ppocr/keys/ppocr_keys_v1.txt  recognition dictionary
+  /opt/ppocr/dict/ppocr_keys_v1.txt  same dictionary (compat path)
+  /opt/ppocr/test.jpg                sample image for a smoke test
+  /opt/rknpu/librknnrt.so            RKNN runtime 2.3.2 (Rockchip blob)
+  /opt/glibc/                        glibc 2.35 loader + shared libraries
+  /usr/bin/ppocr                     wrapper script
+  /usr/bin/rk356x-npu-ocr            alias for the wrapper script
+
+  The install paths under /opt (ppocr, rknpu, glibc) are deliberately kept
+  unchanged so existing callers and the LuCI app keep working.
+
+Usage
+-----
+  Single image:
+      ppocr /opt/ppocr/test.jpg
+
+  The wrapper runs the glibc engine through the bundled loader, equivalent to:
+      /opt/glibc/ld-linux-aarch64.so.1 \
+          --library-path /opt/glibc:/opt/rknpu \
+          /opt/ppocr/ppocr_demo \
+          /opt/ppocr/models/ppocrv4_det.rknn \
+          /opt/ppocr/models/ppocrv4_rec.rknn <image>
+
+  Multi-mode CLI (photo / screen / doc / table / video), when the CLI package or
+  script is present at /opt/ppocr/ppocr:
+      ppocr photo <image>
+      ppocr screen <image>
+      ppocr doc <image>
+      ppocr table <image>
+      ppocr video <clip>
+  Override the CLI path with the PPOCR_CLI environment variable.
+
+  The engine is quiet by default: it prints only the recognition result lines
+  ("TEXT ...").  Pass --verbose (or -v) to restore the full diagnostics
+  (model/tensor dumps, per-tile progress, IMAGE and TIMING lines).
+
+Why a glibc bundle
+------------------
+The userland is musl, but librknnrt.so (Rockchip NPU runtime, proprietary
+binary) and the OCR engine are glibc objects.  A small glibc runtime is bundled
+under /opt/glibc so the engine can start on musl.  No musl libc/libstdcpp
+dependency is needed.
+
+License notes
+-------------
+  ppocr_demo, .rknn models, dictionary : Apache-2.0 (rknn_model_zoo, PaddleOCR)
+  librknnrt.so                         : Rockchip proprietary, redistributable
+  /opt/glibc/*                         : glibc (LGPL-2.1-or-later /
+                                         GPL-2.0-or-later / GPL-3.0-GCC-exc)
