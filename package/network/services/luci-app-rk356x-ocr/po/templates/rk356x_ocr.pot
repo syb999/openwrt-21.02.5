@@ -1,0 +1,49 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: luci-app-rk356x-ocr\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: \n"
+
+msgid "NPU OCR Status"
+msgstr ""
+
+msgid "Recognise an image"
+msgstr ""
+
+msgid "Image file (jpg / png / bmp / webp)"
+msgstr ""
+
+msgid "Output mode"
+msgstr ""
+
+msgid "Text only"
+msgstr ""
+
+msgid "Text + table"
+msgstr ""
+
+msgid "Recognise"
+msgstr ""
+
+msgid "Recognised text"
+msgstr ""
+
+msgid "Copy text"
+msgstr ""
+
+msgid "Table view"
+msgstr ""
+
+msgid "rows ×"
+msgstr ""
+
+msgid "cols,"
+msgstr ""
+
+msgid "cells"
+msgstr ""
+
+msgid "mode"
+msgstr ""
+

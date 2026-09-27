@@ -1,0 +1,10 @@
+#!/bin/sh
+# luci-app-rk356x-ocr first-run setup.
+#
+# Work areas live on tmpfs so uploaded images and job outputs never touch
+# flash.  The engine at /opt/ppocr is provided by the rk356x-npu-ocr package
+# and is never modified here.
+
+mkdir -p /tmp/rk356x-ocr/uploads /tmp/rk356x-ocr/jobs /tmp/rk356x-ocr/old 2>/dev/null
+
+exit 0
