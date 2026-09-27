@@ -1,0 +1,10 @@
+prefix=/usr
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: librga
+Description: Rockchip RGA 2D Raster Graphic Acceleration library
+Version: 1.10.5
+Libs: -L${libdir} -lrga
+Cflags: -I${includedir}
