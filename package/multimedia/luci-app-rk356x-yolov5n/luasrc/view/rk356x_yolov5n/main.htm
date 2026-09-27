@@ -1,0 +1,380 @@
+<%+header%>
+<% local rk_lang = (luci.http.getenv("HTTP_ACCEPT_LANGUAGE") or "") .. " " ..
+        (luci.sys.exec("uci -q get luci.main.lang 2>/dev/null") or "") %>
+<% local rk_zh = (rk_lang:lower():find("zh") ~= nil) %>
+<% local T = function(en, zhs) if rk_zh then return zhs end return en end %>
+
+<style type="text/css">
+.rk-wrap { max-width: 1000px; }
+.rk-card { border: 1px solid #d4d4d4; border-radius: 6px; padding: 10px 12px; margin: 10px 0; background: #fff; }
+.rk-card > h3 { margin: 0 0 8px 0; font-size: 15px; }
+.rk-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+.rk-row > div { flex: 1 1 220px; min-width: 160px; }
+.rk-row label { display: block; font-size: 12px; color: #555; margin-bottom: 3px; }
+.rk-row input[type=file], .rk-row input[type=number], .rk-row input[type=text] { width: 100%; box-sizing: border-box; padding: 5px; }
+.rk-btn { cursor: pointer; padding: 6px 12px; margin: 2px 2px 2px 0; border: 1px solid #aaa; border-radius: 4px; background: #f5f5f5; font-size: 13px; }
+.rk-btn:hover { background: #e8e8e8; }
+.rk-btn-primary { background: #2d70b3; border-color: #24598f; color: #fff; font-weight: bold; }
+.rk-btn-primary:hover { background: #24598f; }
+.rk-btn:disabled { opacity: .5; cursor: not-allowed; }
+.rk-st { width: 100%; border-collapse: collapse; font-size: 13px; }
+.rk-st td { border-bottom: 1px solid #eee; padding: 4px 6px; vertical-align: top; }
+.rk-st td:first-child { width: 170px; color: #555; }
+.rk-ok { color: #0a0; font-weight: bold; }
+.rk-err { color: #c00; font-weight: bold; }
+.rk-warn { color: #e67e22; font-weight: bold; }
+.rk-dim { color: #888; font-size: 12px; }
+.rk-banner { border-left: 4px solid #e67e22; background: #fdf3e7; padding: 8px 12px; border-radius: 4px; margin: 10px 0; font-size: 13px; }
+.rk-banner.ok { border-left-color: #2d9c4f; background: #eef8f0; }
+.rk-banner.bad { border-left-color: #c0392b; background: #fdecea; }
+table.rk-table { border-collapse: collapse; font-size: 13px; width: 100%; }
+table.rk-table th, table.rk-table td { border: 1px solid #bbb; padding: 4px 8px; text-align: left; }
+table.rk-table th { background: #f3f3f3; }
+.rk-img { max-width: 100%; border: 1px solid #ccc; border-radius: 4px; background: #fafafa; }
+.rk-status-line { font-size: 13px; margin: 4px 0; }
+.rk-spin { display: inline-block; width: 12px; height: 12px; border: 2px solid #ccc; border-top-color: #2d70b3; border-radius: 50%; animation: rkspin .8s linear infinite; vertical-align: -2px; margin-right: 6px; }
+@keyframes rkspin { to { transform: rotate(360deg); } }
+textarea.rk-ta { width: 100%; min-height: 120px; box-sizing: border-box; font-family: monospace; font-size: 13px; padding: 6px; white-space: pre; }
+@media (max-width: 600px) {
+  .rk-st td:first-child { width: 120px; }
+  .rk-btn { width: 100%; margin: 3px 0; }
+  .rk-row > div { flex: 1 1 100%; }
+}
+</style>
+
+<div class="rk-wrap">
+
+  <div class="rk-card">
+    <h3><%=T("YOLOv5n object detection","YOLOv5n 目标检测")%>
+        <span class="rk-dim" id="rk-st-ts"></span></h3>
+    <div id="rk-status-banner" class="rk-banner"><%=T("Checking engine and NPU ...","正在检查引擎与 NPU ...")%></div>
+    <table class="rk-st" id="rk-status-table"></table>
+  </div>
+
+  <div class="rk-card">
+    <h3><%=T("Detect an image","检测图片")%></h3>
+    <div class="rk-row">
+      <div>
+        <label for="rk-file"><%=T("Image file (jpg / png / bmp)","图片文件（jpg / png / bmp）")%></label>
+        <input type="file" id="rk-file" accept="image/*">
+      </div>
+      <div style="flex:0 0 130px;">
+        <label for="rk-loops"><%=T("Loops","循环次数")%></label>
+        <input type="number" id="rk-loops" value="1" min="1" max="50">
+      </div>
+      <div style="flex:0 0 auto;">
+        <button class="rk-btn rk-btn-primary" id="rk-go"><%=T("Detect","开始检测")%></button>
+      </div>
+      <div style="flex:0 0 auto;">
+        <button class="rk-btn" id="rk-sample"><%=T("Detect sample image","检测示例图")%></button>
+      </div>
+    </div>
+    <div class="rk-dim" style="margin-top:6px;">
+      <%=T("The image is uploaded to /tmp (tmpfs) only. Nothing is written to flash.","图片只上传到 /tmp（内存盘），不写 flash。")%>
+    </div>
+    <div class="rk-status-line" id="rk-progress"></div>
+  </div>
+
+  <div class="rk-card" id="rk-result-card" style="display:none;">
+    <h3><%=T("Result","检测结果")%> <span class="rk-dim" id="rk-obj-count"></span></h3>
+
+    <div id="rk-img-wrap" style="display:none;margin-bottom:10px;">
+      <div class="rk-dim" style="margin-bottom:4px;"><%=T("Annotated image","带框结果图")%></div>
+      <a id="rk-img-link" href="#" target="_blank"><img class="rk-img" id="rk-img" alt="out.png"></a>
+    </div>
+
+    <div style="overflow:auto;">
+      <table class="rk-table" id="rk-objs">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th><%=T("Label","类别")%></th>
+            <th><%=T("Score","置信度")%></th>
+            <th>x1</th><th>y1</th><th>x2</th><th>y2</th>
+            <th><%=T("W","宽")%></th>
+            <th><%=T("H","高")%></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="rk-status-line" id="rk-timing" style="margin-top:8px;"></div>
+
+    <div class="rk-row" style="margin-top:6px;">
+      <div style="flex:0 0 auto;">
+        <button class="rk-btn" id="rk-copy"><%=T("Copy result","复制结果")%></button>
+        <button class="rk-btn" id="rk-exp-txt"><%=T("Export .txt","导出 .txt")%></button>
+        <button class="rk-btn" id="rk-exp-csv"><%=T("Export .csv","导出 .csv")%></button>
+        <button class="rk-btn" id="rk-exp-json"><%=T("Export .json","导出 .json")%></button>
+      </div>
+    </div>
+
+    <details style="margin-top:8px;">
+      <summary class="rk-dim"><%=T("Engine log","引擎日志")%></summary>
+      <textarea class="rk-ta" id="rk-log" readonly spellcheck="false"></textarea>
+    </details>
+  </div>
+
+</div>
+
+<script type="text/javascript">
+(function () {
+	var BASE = '<%=luci.dispatcher.build_url("admin", "rk356x-ocr", "yolov5n")%>';
+	var state = { id: null, res: null, ready: false };
+
+	function byId(id) { return document.getElementById(id); }
+	function esc(s) {
+		return String(s == null ? '' : s)
+			.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+	}
+	function baseName(p) {
+		if (!p) return '';
+		var i = p.lastIndexOf('/');
+		return i >= 0 ? p.substring(i + 1) : p;
+	}
+
+	function xhr(method, url, body, cb) {
+		var x = new XMLHttpRequest();
+		x.open(method, url, true);
+		x.onreadystatechange = function () {
+			if (x.readyState !== 4) return;
+			var j = null;
+			try { j = JSON.parse(x.responseText); } catch (e) { j = null; }
+			cb(x.status, j, x.responseText);
+		};
+		x.send(body || null);
+	}
+
+	function row(label, ok, value) {
+		var cls = ok === true ? 'rk-ok' : (ok === false ? 'rk-err' : 'rk-dim');
+		var mark = ok === true ? 'OK' : (ok === false ? 'MISSING' : '-');
+		return '<tr><td>' + esc(label) + '</td><td class="' + cls + '">' + mark +
+			'</td><td class="rk-dim">' + esc(value || '') + '</td></tr>';
+	}
+
+	function fmt(n, d) {
+		if (n === null || n === undefined || isNaN(n)) return '-';
+		return Number(n).toFixed(d === undefined ? 2 : d);
+	}
+
+	function renderStatus(st) {
+		var ts = byId('rk-st-ts');
+		ts.textContent = '(' + new Date().toLocaleTimeString() + ')';
+		var b = byId('rk-status-banner');
+		if (!st || (st.ok === false && st.ready !== true && st.engine_ok === false)) {
+			b.className = 'rk-banner bad';
+			b.innerHTML = 'Status probe failed' + (st && st.error ? ': ' + esc(st.error) : '') +
+				'. The page still works; fix the engine and reload.';
+		} else if (st.ready) {
+			b.className = 'rk-banner ok';
+			b.innerHTML = 'Engine ready: <b>' + esc(st.engine) + '</b>';
+		} else {
+			b.className = 'rk-banner';
+			b.innerHTML = 'Some pieces are missing, detection will not run: <b>' +
+				esc((st.missing || []).join(', ')) +
+				'</b>. Install the rk356x-yolov5n package.';
+		}
+
+		var html = '';
+		html += row('Engine', st.engine_ok, st.engine || '/usr/bin/yolov5n');
+		html += row('Demo binary', st.demo_ok, st.demo);
+		html += row("Model", st.model_ok, st.model);
+		html += row('Labels', st.labels_ok, st.labels);
+		html += row('glibc loader', st.loader_ok, st.loader);
+		html += row('RKNN runtime', st.npu_ok, st.npu);
+		html += row('NPU device', st.npu_dev_ok, st.npu_dev);
+		if (st.last) {
+			html += row('Last run', st.last.ok === true ? true : false,
+				(st.last.count || 0) + ' ' + "<%=T("object(s)","个目标")%>" +
+				(st.last.npu_fps ? (', ' + fmt(st.last.npu_fps) + ' ' + "<%=T("NPU fps","NPU FPS")%>") : '') +
+				(st.last.labels ? (' | ' + esc(st.last.labels)) : ''));
+		} else {
+			html += row('Last run', null, 'no run yet this boot');
+		}
+		byId('rk-status-table').innerHTML = html;
+
+		state.ready = (st && st.ready === true);
+		byId('rk-go').disabled = false;
+		if (!state.ready) {
+			byId('rk-progress').innerHTML = '<span class="rk-warn">' +
+				"<%=T("Engine not ready.","引擎未就绪。")%>" + '</span> ' +
+				"<%=T("You can still try, but the run will very likely fail.","仍可尝试，但很可能失败。")%>";
+		}
+	}
+
+	function loadStatus() {
+		xhr('GET', BASE + '/status', null, function (code, j) {
+			if (code !== 200 || !j) {
+				renderStatus({ ok: false, ready: false, engine_ok: false,
+					error: 'HTTP ' + code });
+				return;
+			}
+			renderStatus(j);
+		});
+	}
+
+	function renderResult(res) {
+		state.res = res;
+		state.id = res.id || null;
+		byId('rk-result-card').style.display = '';
+
+		var objs = res.objects || [];
+
+		if (res.out_png) {
+			byId('rk-img-wrap').style.display = '';
+			var url = BASE + '/img?f=' + encodeURIComponent(baseName(res.out_png)) +
+				'&t=' + Date.now();
+			byId('rk-img').src = url;
+			byId('rk-img-link').href = url;
+		} else {
+			byId('rk-img-wrap').style.display = 'none';
+		}
+
+		var body = '';
+		for (var i = 0; i < objs.length; i++) {
+			var o = objs[i];
+			body += '<tr><td>' + (i + 1) + '</td><td>' + esc(o.label) + '</td><td>' +
+				fmt(o.score, 3) + '</td><td>' + o.x + '</td><td>' + o.y + '</td><td>' +
+				o.x2 + '</td><td>' + o.y2 + '</td><td>' + o.w + '</td><td>' + o.h +
+				'</td></tr>';
+		}
+		byId('rk-objs').getElementsByTagName('tbody')[0].innerHTML = body;
+		byId('rk-obj-count').textContent = '(' + objs.length + ' ' +
+			"<%=T("object(s)","个目标")%>" + ')';
+
+		var t = '';
+		if (res.npu_ms != null) {
+			t += "<%=T("NPU","NPU")%>: " + fmt(res.npu_ms) + ' ms (' +
+				fmt(res.npu_fps) + ' FPS)';
+		}
+		if (res.pipeline_ms != null) {
+			t += (t ? ' | ' : '') + "<%=T("End-to-end","端到端")%>: " +
+				fmt(res.pipeline_ms) + ' ms (' + fmt(res.pipeline_fps) + ' FPS)';
+		}
+		t += (t ? ' | ' : '') + "<%=T("Wall","墙钟")%>: " + (res.ms || 0) + ' ms';
+		if (res.loops != null) t += ' | loops ' + res.loops;
+		byId('rk-timing').textContent = t;
+
+		byId('rk-log').value = res.log || '';
+	}
+
+	function polledRender(code, j) {
+		byId('rk-go').disabled = false;
+		byId('rk-sample').disabled = false;
+		if (code !== 200 || !j) {
+			byId('rk-progress').innerHTML = '<span class="rk-err">Request failed.</span> HTTP ' + code;
+			return;
+		}
+		if (!j.ok) {
+			byId('rk-progress').innerHTML = '<span class="rk-err">Detection failed.</span> ' +
+				esc(j.error || ('exit ' + j.rc));
+			return;
+		}
+		byId('rk-progress').innerHTML = '<span class="rk-ok">Done.</span> ' +
+			(j.count || 0) + ' ' + "<%=T("object(s)","个目标")%>";
+		renderResult(j);
+		loadStatus();
+	}
+
+	function post(fd) {
+		byId('rk-go').disabled = true;
+		byId('rk-sample').disabled = true;
+		byId('rk-progress').innerHTML = '<span class="rk-spin"></span>' +
+			"<%=T("Detecting ...","正在检测 ...")%>";
+		byId('rk-result-card').style.display = 'none';
+		xhr('POST', BASE + '/run', fd, polledRender);
+	}
+
+	function start() {
+		var f = byId('rk-file').files && byId('rk-file').files[0];
+		if (!f) {
+			byId('rk-progress').innerHTML = '<span class="rk-err">' +
+				"<%=T("Choose an image first (or use the sample image).","请先选择图片（或使用示例图）。")%>" +
+				'</span>';
+			return;
+		}
+		var fd = new FormData();
+		fd.append('loops', byId('rk-loops').value || '1');
+		fd.append('img', f, f.name);
+		post(fd);
+	}
+
+	function startSample() {
+		var fd = new FormData();
+		fd.append('loops', byId('rk-loops').value || '1');
+		fd.append('path', '/opt/yolov5/model/bus.jpg');
+		post(fd);
+	}
+
+	function summaryText() {
+		var res = state.res;
+		if (!res) return '';
+		var out = 'YOLOv5n object detection';
+		out += '\n' + "<%=T("objects","目标数")%>" + ': ' + (res.objects || []).length;
+		if (res.npu_ms != null) out += '\nNPU: ' + fmt(res.npu_ms) + ' ms (' + fmt(res.npu_fps) + ' FPS)';
+		if (res.pipeline_ms != null) out += '\n' + "<%=T("End-to-end","端到端")%>" + ': ' + fmt(res.pipeline_ms) + ' ms (' + fmt(res.pipeline_fps) + ' FPS)';
+		out += '\n' + "<%=T("Wall","墙钟")%>" + ': ' + (res.ms || 0) + ' ms';
+		var objs = res.objects || [];
+		for (var i = 0; i < objs.length; i++) {
+			var o = objs[i];
+			out += '\n' + (i + 1) + '. ' + o.label + ' ' + fmt(o.score, 3) +
+				' @ (' + o.x + ' ' + o.y + ' ' + o.x2 + ' ' + o.y2 + ')';
+		}
+		return out;
+	}
+
+	function copyResult() {
+		var txt = summaryText();
+		if (!txt) return;
+		var done = false;
+		if (navigator.clipboard && navigator.clipboard.writeText) {
+			navigator.clipboard.writeText(txt).then(function () {
+				byId('rk-progress').innerHTML = '<span class="rk-ok">' +
+					"<%=T("Result copied to clipboard.","结果已复制到剪贴板。")%>" + '</span>';
+			}, function () {});
+			done = true;
+		}
+		if (!done) {
+			var ta = byId('rk-copy-buf');
+			ta.value = txt;
+			ta.focus(); ta.select();
+			try {
+				document.execCommand('copy');
+				byId('rk-progress').innerHTML = '<span class="rk-ok">' +
+					"<%=T("Result copied to clipboard.","结果已复制到剪贴板。")%>" + '</span>';
+			} catch (e) {
+				byId('rk-progress').innerHTML = '<span class="rk-warn">' +
+					"<%=T("Press Ctrl+C to copy the selected text.","请按 Ctrl+C 复制选中的文本。")%>" + '</span>';
+			}
+		}
+	}
+
+	function exportAs(fmt) {
+		if (!state.id) return;
+		window.location = BASE + '/export?id=' + encodeURIComponent(state.id) + '&fmt=' + fmt;
+	}
+
+	// Expose the click handlers on window so an inline handler (and automated
+	// tests) can drive the exact same code path.  Only namespaced names are
+	// added; the global "$" is deliberately untouched.
+	window.rkDetect = start;
+	window.rkDetectSample = startSample;
+	window.rkCopyResult = copyResult;
+	window.rkExport = exportAs;
+
+	byId('rk-go').addEventListener('click', start);
+	byId('rk-sample').addEventListener('click', startSample);
+	byId('rk-copy').addEventListener('click', copyResult);
+	byId('rk-exp-txt').addEventListener('click', function () { exportAs('txt'); });
+	byId('rk-exp-csv').addEventListener('click', function () { exportAs('csv'); });
+	byId('rk-exp-json').addEventListener('click', function () { exportAs('json'); });
+
+	loadStatus();
+	setInterval(loadStatus, 5000);
+})();
+</script>
+
+<textarea id="rk-copy-buf" style="position:absolute;left:-9999px;top:0;" readonly></textarea>
+
+<%+footer%>

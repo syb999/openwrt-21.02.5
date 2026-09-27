@@ -1,0 +1,10 @@
+#!/bin/sh
+# luci-app-rk356x-yolov5n first-run setup.
+#
+# Work areas live on tmpfs so uploaded images, boxed result pictures, per-run
+# JSON and logs never touch flash.  The engine at /opt/yolov5 is provided by
+# the rk356x-yolov5n package and is never modified here.
+
+mkdir -p /tmp/rk356x-yolov5n/uploads /tmp/rk356x-yolov5n/out 2>/dev/null
+
+exit 0
