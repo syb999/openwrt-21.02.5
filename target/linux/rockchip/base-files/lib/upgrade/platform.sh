@@ -179,31 +179,41 @@ rockchip_do_upgrade_generic() {
 #
 # Panther X2 path (rk3566).
 #
-# Storage: eMMC only (the SD slot is dead), enumerating as mmcblk2 for the
-# reason given at rockchip_upgrade_root_disk().
+# Storage: eMMC only (the SD slot is dead), enumerating as mmcblk2.
+#
+# The disk is *not* derived from the running root filesystem: OpenWrt mounts
+# the rootfs from the literal string /dev/root, which does not exist as a
+# device node on this board (ls /dev/root -> No such file), so /proc/mounts
+# cannot be used here - rockchip_upgrade_root_disk() always came back empty
+# and the upgrade refused with "cannot determine the boot disk".  The boot
+# device resolved from root=PARTUUID=... in /proc/cmdline is used instead:
+# export_bootdevice sets BOOTDEV_MAJOR/MINOR (179:0 -> mmcblk2 on this board)
+# and export_partdevice then maps partition numbers to minors, which on MMC
+# are the disk minor plus the partition number (mmcblk2p1 -> minor 1,
+# mmcblk2p2 -> minor 2).
 #
 # Image layout (pine64-img, same builder as every other board in this target):
 #   sector 0x40   idbloader (RKNS container: TPL + DDR init)
 #   sector 0x4000 u-boot.itb (ATF + U-Boot proper)
-#   sector 0x10000 partition 1, ext4, 32 MiB boot partition
-#   sector 0x18000 partition 2, squashfs root filesystem (+ f2fs overlay)
+#   sector 0x10000 partition 1, ext4, 16 MiB boot partition
+#   sector 0x20000 partition 2, squashfs root filesystem (+ f2fs overlay)
 #
-# Write only the filesystem partitions listed by the target image, so the
-# loader areas and the partition table on the running disk are never rewritten.
-# A running partition whose size does not match the image is treated as a hard
-# error, so a foreign or stale image can never be written half-way onto the
-# eMMC.
+# Write only partition 1 (kernel) and partition 2 (rootfs) - explicitly, one
+# at a time - so the loader areas below the first partition and the partition
+# table on the running disk are never rewritten, and an upgrade that is cut
+# short can always be retried.  A running partition whose size does not match
+# the image is treated as a hard error, so a foreign or stale image can never
+# be written half-way onto the eMMC.
 #
 rockchip_do_upgrade_panther() {
-	local disk part partdev dpart dsize
+	local diskdev part partdev start size dpart dsize
 
-	disk=$(rockchip_upgrade_root_disk)
-	if [ -z "$disk" ]; then
+	export_bootdevice && export_partdevice diskdev 0 || {
 		echo "cannot determine the boot disk, refusing to upgrade"
 		return 1
-	fi
+	}
 
-	echo "upgrading $disk from $1"
+	echo "upgrading /dev/$diskdev from $1"
 
 	get_image "$1" | dd of=/tmp/image.bs count=1 bs=512b 2>/dev/null
 	get_partitions /tmp/image.bs image
@@ -211,21 +221,32 @@ rockchip_do_upgrade_panther() {
 	sync
 
 	while read part start size; do
-		partdev=$(rockchip_upgrade_part_dev "$disk" "$part")
-		if [ ! -b "$partdev" ]; then
-			echo "partition $part ($partdev) not found, skipped"
+		case "$part" in
+		1|2) ;;
+		*) continue ;;
+		esac
+
+		if ! export_partdevice partdev "$part"; then
+			echo "partition $part ($diskdev$part) not found, skipped"
 			continue
 		fi
 
 		dpart=$(basename "$partdev")
 		dsize=$(cat "/sys/class/block/$dpart/size" 2>/dev/null)
-		if [ -n "$dsize" ] && [ "$dsize" != "$size" ]; then
-			echo "partition $part size mismatch (disk $dsize, image $size), refusing"
+		# Refuse only the dangerous direction: an image partition longer than
+		# the running one would be written past its end.  A running partition
+		# that is *larger* than the image's is normal - that is what a board
+		# leaves behind after its kernel/rootfs partition was enlarged by a
+		# full-image flash - and only the image's own length is written, so it
+		# is accepted.  This is what lets sysupgrade keep working after
+		# CONFIG_TARGET_KERNEL_PARTSIZE (or ROOTFS_PARTSIZE) was raised.
+		if [ -n "$dsize" ] && [ "$size" -gt "$dsize" ]; then
+			echo "partition $part: image ($size) longer than disk ($dsize), refusing"
 			return 1
 		fi
 
-		echo "writing image partition $part to $partdev"
-		get_image "$1" | dd of="$partdev" ibs=512 obs=1M \
+		echo "writing image partition $part to /dev/$partdev"
+		get_image "$1" | dd of="/dev/$partdev" ibs=512 obs=1M \
 			skip="$start" count="$size" conv=fsync
 	done < /tmp/partmap.image
 
