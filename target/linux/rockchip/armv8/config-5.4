@@ -381,6 +381,12 @@ CONFIG_ROCKCHIP_GRF=y
 CONFIG_ROCKCHIP_IODOMAIN=y
 CONFIG_ROCKCHIP_IOMMU=y
 CONFIG_ROCKCHIP_MBOX=y
+# Rockchip vendor video codec (MPP) stack.  Every symbol is tristate (=m) and
+# the whole stack links into the single module rk_vcodec.ko, which is packaged
+# as kmod-rk-vcodec (target/linux/rockchip/modules.mk) and installed only by
+# the devices that list it in DEVICE_PACKAGES (panther_x2).  The remaining
+# rockchip boards build the module from this shared subtarget config but never
+# install or load it, so MPP is device-isolated without a per-device config.
 CONFIG_ROCKCHIP_MPP_SERVICE=m
 # CONFIG_ROCKCHIP_MPP_DEVFREQ is not set
 CONFIG_ROCKCHIP_MPP_PROC_FS=m
@@ -547,6 +553,24 @@ CONFIG_PSTORE_DEFLATE_COMPRESS_DEFAULT=y
 # RK3566/RK3568 NPU (rknpu), back-ported from the vendor 5.10 driver.
 # DRM is required because the driver registers itself as a DRM render
 # node (/dev/dri/renderD*), which is what the RKNN userspace looks for.
+#
+# These symbols are global to the whole rockchip/armv8 subtarget and cannot be
+# made per-device: OpenWrt 21.02 has no per-device kernel config, and RKNPU has
+# to stay =y because the memory-manager choice at the bottom of this file is a
+# bool under "if ROCKCHIP_RKNPU" (a bool whose tristate parent is =m is
+# silently forced to =n, which would disable the DMA-heap path the RKNN
+# userspace uses).  They are nevertheless harmless on the other rockchip boards
+# that share this config:
+#
+#   * rknpu_of_match[] only lists rockchip,rknpu / rk3568-rknpu / rk3588-rknpu /
+#     rv1106 / rv1103b / rk3562 / rk3576.  None of rk3328, rk3399 or rk3528 has
+#     an rknpu DT node, so rknpu_probe() is never called there: the driver only
+#     registers a platform_driver at late_initcall and does nothing else (no
+#     clock/regulator/IRQ/IOMMU request, no /dev/rknpu, no misc device).
+#   * CONFIG_DRM=y is the generic DRM subsystem only (CONFIG_DRM_ROCKCHIP stays
+#     off); it has no SoC-specific side effect.
+#
+# The only cost on the other boards is a few tens of KB of unused vmlinux text.
 CONFIG_DRM=y
 CONFIG_ROCKCHIP_RKNPU=y
 # CONFIG_ROCKCHIP_RKNPU_DRM_GEM is not set
@@ -592,6 +616,21 @@ CONFIG_EXTRA_FIRMWARE_DIR="firmware"
 # and dynamic debug gives per-driver traces without rebuilding.
 CONFIG_DYNAMIC_DEBUG=y
 # CONFIG_STRICT_DEVMEM is not set
+# Vendor + mainline dma-buf heaps backing the NPU memory path.
+#
+# These are global to the subtarget for the same reason as the rknpu symbols
+# above: ROCKCHIP_RKNPU_DMA_HEAP is a bool that depends on
+# DMABUF_HEAPS_ROCKCHIP_CMA_HEAP, so the vendor CMA heap has to be built in
+# (=y) as well, and the mainline DMABUF_HEAPS framework is itself a bool.
+# None of this runs on a board whose DT has no rknpu node, and none of it
+# allocates memory at init:
+#   * rk_dma_heap_init() only allocates a chardev region, creates a class and a
+#     procfs directory; rk_cma_heap_init() only registers the "rk-dma-heap-cma"
+#     heap and bails out cleanly (-ENODEV, no crash) if no CMA area exists.
+#   * the mainline system heap only registers /dev/dma_heap/system; it reserves
+#     nothing until a process opens the chardev.
+# So rk3328/rk3399/rk3528 only gain a few extra chardev nodes, with no change
+# in behaviour.
 CONFIG_ROCKCHIP_RKNPU_DMA_HEAP=y
 CONFIG_DMABUF_HEAPS_ROCKCHIP=y
 CONFIG_DMABUF_HEAPS_ROCKCHIP_CMA_HEAP=y

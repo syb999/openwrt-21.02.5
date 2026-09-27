@@ -51,6 +51,7 @@ define Device/panther_x2
     kmod-usb-storage kmod-usb-storage-uas kmod-usb-storage-extras \
     kmod-usb-net-rtl8152 \
     kmod-brcmfmac wpad-basic-wolfssl iw kmod-bluetooth \
+    kmod-rk-vcodec \
     panel-ap-setup sht2x -urngd
 endef
 TARGET_DEVICES += panther_x2

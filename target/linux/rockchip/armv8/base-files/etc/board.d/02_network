@@ -32,7 +32,17 @@ rockchip_setup_interfaces()
 		# up attached to nothing (no br-lan, no address, no traffic).  Create
 		# the lan bridge on a *non-existent* eth1 purely as a home for the
 		# wireless interface; the physical port stays the wan.
-		ucidef_set_interface_lan 'eth1' 'static' '192.168.9.1' '255.255.255.0'
+		#
+		# No address is passed on purpose.  ucidef_set_interface_lan() only
+		# takes the device and the protocol; generate_network() in
+		# bin/config_generate supplies the standard static default and the
+		# user can change it from LuCI/uci.  The old
+		#   'eth1' 'static' '192.168.9.1' '255.255.255.0'
+		# form looked like a hard-coded LAN address, but the ipaddr/netmask
+		# arguments were silently dropped (they are not part of the helper's
+		# signature), so the address never took effect - it is removed here so
+		# the generated config is not misleading.
+		ucidef_set_interface_lan 'eth1'
 
 		# Open the wan zone, because this script is the only place that is
 		# *known* to run for this board (it is what writes the network
@@ -47,7 +57,7 @@ rockchip_setup_interfaces()
 		uci -q commit firewall
 
 		# Note: a static address on the dhcp wan (list ipaddr) is *not*
-		# applied by netifd, so there is no 192.168.9.1 fallback here; the
+		# applied by netifd, so there is no fixed fallback address here; the
 		# port carries the upstream lease only.
 		;;
 	*)
