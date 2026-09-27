@@ -1,0 +1,42 @@
+rk356x-yolov5n - Rockchip RK356x (RK3566/RK3568) NPU YOLOv5n demo for musl OpenWrt
+================================================================================
+
+Supported hardware
+------------------
+  Supported:     RK3566 / RK3568  (RK356x family, RKNPU1 NPU generation)
+  NOT supported: RK3588 / RK3576  (different NPU generation, needs different
+                                  .rknn models and a different librknnrt build)
+
+What it installs
+----------------
+  /opt/yolov5/rknn_yolov5_demo             YOLOv5n demo (glibc ELF)
+  /opt/yolov5/model/yolov5n_rk3566_i8.rknn YOLOv5n INT8 model (RK356x)
+  /opt/yolov5/model/coco_80_labels_list.txt 80-class COCO label list
+  /opt/yolov5/model/bus.jpg                sample image for a smoke test
+  /opt/yolov5/run_yolov5n.sh               in-tree runner script
+  /usr/bin/yolov5n                         wrapper script
+
+Dependencies
+------------
+  This package does NOT ship its own glibc or RKNPU runtime; it depends on
+  rk356x-npu-ocr, which provides:
+      /opt/glibc/ld-linux-aarch64.so.1 + shared libraries
+      /opt/rknpu/librknnrt.so
+  That reuse saves 20 MB+ of duplicated payloads.
+
+Usage
+-----
+  yolov5n /opt/yolov5/model/bus.jpg          single inference
+  yolov5n /opt/yolov5/model/bus.jpg 100      loop 100x (FPS benchmark)
+
+  The wrapper is equivalent to:
+      cd /opt/yolov5
+      /opt/glibc/ld-linux-aarch64.so.1 --library-path /opt/glibc:/opt/rknpu \
+          ./rknn_yolov5_demo model/yolov5n_rk3566_i8.rknn <image> <loop_count>
+
+  The demo resolves its label list relative to ./model/, hence the cd.
+
+License notes
+-------------
+  rknn_yolov5_demo, .rknn model, coco_80_labels_list.txt : Apache-2.0
+    (rknn_model_zoo / Ultralytics YOLOv5)

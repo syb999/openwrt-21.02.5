@@ -1,0 +1,27 @@
+#!/bin/sh
+#
+# yolov5n - RK356x NPU YOLOv5n object-detection entry point.
+#
+#   yolov5n <image> [loop_count]
+#
+# The engine is a glibc binary while OpenWrt is musl, so a small glibc
+# bundle is reused from rk356x-npu-ocr (/opt/glibc) and the RKNPU runtime
+# comes from the same package (/opt/rknpu); the loader is invoked explicitly.
+#
+# The demo resolves its label list relative to the current directory
+# (./model/coco_80_labels_list.txt), so the wrapper always cd's into
+# /opt/yolov5 before launching it.  A relative <image> is turned absolute
+# first so it keeps working from any caller directory.
+
+IMG="$1"
+N="${2:-1}"
+[ -z "$IMG" ] && { echo "usage: yolov5n <image> [loop_count]" >&2; exit 2; }
+
+case "$IMG" in
+	/*) ;;
+	*) IMG="$(pwd)/$IMG" ;;
+esac
+
+cd /opt/yolov5 || exit 1
+exec /opt/glibc/ld-linux-aarch64.so.1 --library-path /opt/glibc:/opt/rknpu \
+	./rknn_yolov5_demo model/yolov5n_rk3566_i8.rknn "$IMG" "$N"
