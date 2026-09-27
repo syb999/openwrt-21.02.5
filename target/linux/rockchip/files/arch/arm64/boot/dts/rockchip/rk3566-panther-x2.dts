@@ -799,10 +799,12 @@
 	status = "okay";
 };
 
-
-/* Enable the RGA2 2D accelerator (hardware image scaling/format convert).
- * The node lives in rk3568.dtsi with status = "disabled"; the power domain
- * RK3568_PD_RGA is already described there. */
+/*
+ * Enable the RGA2 2D acceleration core.  The SoC dtsi keeps rk_rga disabled;
+ * pd_rga (RK3568_PD_RGA) is now available, so the core can attach to its
+ * power domain and probe.  Only rk_rga is touched here - the MPP video
+ * nodes (vdpu/vepu/rkvdec/rkvenc) stay disabled deliberately.
+ */
 &rk_rga {
 	status = "okay";
 };

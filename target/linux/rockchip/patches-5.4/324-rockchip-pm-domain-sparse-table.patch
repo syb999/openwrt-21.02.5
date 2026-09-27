@@ -1,0 +1,144 @@
+--- a/drivers/soc/rockchip/pm_domains.c
++++ b/drivers/soc/rockchip/pm_domains.c
+@@ -72,6 +72,7 @@
+ 	int num_qos;
+ 	struct regmap **qos_regmap;
+ 	u32 *qos_save_regs[MAX_QOS_REGS_NUM];
++	bool qos_saved;
+ 	int num_clks;
+ 	struct clk_bulk_data *clks;
+ };
+@@ -195,9 +196,13 @@
+ 	ret = readx_poll_timeout_atomic(rockchip_pmu_domain_is_idle, pd,
+ 					is_idle, is_idle == idle, 0, 10000);
+ 	if (ret) {
++		unsigned int req_val;
++
++		regmap_read(pmu->regmap, pmu->info->req_offset, &req_val);
+ 		dev_err(pmu->dev,
+-			"failed to set idle on domain '%s', val=%d\n",
+-			genpd->name, is_idle);
++			"failed to set idle on domain '%s', idle=%d val=%d (req=0x%x ack=0x%x)\n",
++			genpd->name, idle, is_idle, req_val,
++			rockchip_pmu_read_ack(pmu));
+ 		return ret;
+ 	}
+ 
+@@ -313,6 +318,7 @@
+ 
+ 		if (!power_on) {
+ 			rockchip_pmu_save_qos(pd);
++			pd->qos_saved = true;
+ 
+ 			/* if powering down, idle request to NIU first */
+ 			rockchip_pmu_set_idle_request(pd, true);
+@@ -324,7 +330,27 @@
+ 			/* if powering up, leave idle mode */
+ 			rockchip_pmu_set_idle_request(pd, false);
+ 
+-			rockchip_pmu_restore_qos(pd);
++			/*
++			 * Only push the saved QoS values back after a real
++			 * power-down/power-up cycle.  On the very first
++			 * power-on, issued from rockchip_pm_add_one_domain(),
++			 * nothing has been saved yet: restoring would write
++			 * the zeroed save area (destroying the bootloader's
++			 * QoS setup) and, worse, touch a QoS block that is not
++			 * reachable until the domain is actually up.  On the
++			 * Panther X2 (rk3566) that write is what took the
++			 * asynchronous external abort reported as
++			 *   rockchip-pm-domain ... failed to set idle on
++			 *   domain '(null)'  followed by
++			 *   SError Interrupt ... rockchip_pd_power ->
++			 *   rockchip_pm_add_one_domain -> rockchip_pm_domain_probe
++			 * The vendor 5.10 driver restores QoS only when it has
++			 * saved it, do the same here.
++			 */
++			if (pd->qos_saved) {
++				rockchip_pmu_restore_qos(pd);
++				pd->qos_saved = false;
++			}
+ 		}
+ 
+ 		clk_bulk_disable(pd->num_clks, pd->clks);
+@@ -404,18 +430,22 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	if (id >= pmu->info->num_domains) {
++	/*
++	 * The domain tables are sparse: the ids the SoC does not implement
++	 * (for rk3568 that is RK3568_PD_CPU_0..3, CORE_ALIVE and PMU, i.e.
++	 * 0..5) have no entry at all, so domain_info[id].name is NULL for
++	 * them.  Such a hole must never be driven: it has a NULL name and an
++	 * all-zero mask set, and programming the PMU registers for it is
++	 * exactly what takes the SError on rk3566.
++	 */
++	if (id >= pmu->info->num_domains ||
++	    !pmu->info->domain_info[id].name) {
+ 		dev_err(pmu->dev, "%pOFn: invalid domain id %d\n",
+ 			node, id);
+ 		return -EINVAL;
+ 	}
+ 
+ 	pd_info = &pmu->info->domain_info[id];
+-	if (!pd_info) {
+-		dev_err(pmu->dev, "%pOFn: undefined domain id %d\n",
+-			node, id);
+-		return -EINVAL;
+-	}
+ 
+ 	pd = devm_kzalloc(pmu->dev, sizeof(*pd), GFP_KERNEL);
+ 	if (!pd)
+@@ -490,6 +520,16 @@
+ 		}
+ 	}
+ 
++	/*
++	 * Name the domain before it is powered on so that any diagnostic
++	 * printed from rockchip_pd_power()/rockchip_pmu_set_idle_request()
++	 * reports the real domain instead of '(null)'.
++	 */
++	if (pd->info->name)
++		pd->genpd.name = pd->info->name;
++	else
++		pd->genpd.name = kbasename(node->full_name);
++
+ 	error = rockchip_pd_power(pd, true);
+ 	if (error) {
+ 		dev_err(pmu->dev,
+@@ -498,10 +538,6 @@
+ 		goto err_unprepare_clocks;
+ 	}
+ 
+-	if (pd->info->name)
+-		pd->genpd.name = pd->info->name;
+-	else
+-		pd->genpd.name = kbasename(node->full_name);
+ 	pd->genpd.power_off = rockchip_pd_power_off;
+ 	pd->genpd.power_on = rockchip_pd_power_on;
+ 	pd->genpd.attach_dev = rockchip_pd_attach_dev;
+@@ -716,6 +752,23 @@
+ 	error = -ENODEV;
+ 
+ 	for_each_available_child_of_node(np, node) {
++		u32 id;
++
++		/*
++		 * The power-domain tables are sparse: a child that points at an
++		 * id with no table entry (name == NULL) must be skipped rather
++		 * than instantiated, otherwise the driver ends up writing PMU
++		 * registers for an unimplemented domain with an all-zero mask
++		 * set.  Skipping it keeps the rest of the domains usable.
++		 */
++		if (!of_property_read_u32(node, "reg", &id) &&
++		    (id >= pmu_info->num_domains ||
++		     !pmu_info->domain_info[id].name)) {
++			dev_warn(dev, "%pOF: no pm-domain table entry, skipping\n",
++				 node);
++			continue;
++		}
++
+ 		error = rockchip_pm_add_one_domain(pmu, node);
+ 		if (error) {
+ 			dev_err(dev, "failed to handle node %pOFn: %d\n",

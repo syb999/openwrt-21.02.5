@@ -68,7 +68,7 @@ define Device/hinlink_opc-h28k
   DEVICE_PACKAGES := kmod-r8168 e2fsprogs mkf2fs \
     fdisk cfdisk partx-utils block-mount dosfstools \
     kmod-fs-vfat kmod-fs-msdos kmod-nls-cp437 kmod-nls-utf8 \
-    ntfs-3g kmod-fuse \
+    ntfs-3g kmod-fuse luci-app-rk356x-ocr \
     kmod-usb-storage kmod-usb-storage-uas kmod-usb-storage-extras -urngd
 endef
 TARGET_DEVICES += hinlink_opc-h28k
