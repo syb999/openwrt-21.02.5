@@ -57,7 +57,7 @@ elif test $soc = 'rk3588'; then
 	serial_addr=',0xfeb50000'; serial_port='ttyS2';
 fi
 
-setenv bootargs "console=${serial_port},1500000 earlycon=uart8250,mmio32${serial_addr} root=PARTUUID=${uuid} rw rootwait panic=5 iomem=relaxed cma=128M r8168.aspm=0 r8168.dynamic_aspm=0 r8168.eee_enable=0 pcie_aspm=off"
+setenv bootargs "fw_devlink=permissive console=${serial_port},1500000 earlycon=uart8250,mmio32${serial_addr} root=PARTUUID=${uuid} rw rootwait panic=5 iomem=relaxed cma=128M r8168.aspm=0 r8168.dynamic_aspm=0 r8168.eee_enable=0 pcie_aspm=off"
 
 if test $soc = 'rk3528'; then
 	# Boot-stage breadcrumbs for a board with no exposed UART.

@@ -1,0 +1,30 @@
+Rockchip RGA (2D accelerator) multi-core driver: kernel build glue.
+
+Back-ported from the Rockchip develop-5.10 vendor tree and bound to the
+"rockchip,rga2" node found on rk356x.  The driver sources themselves live in
+the files/ overlay at drivers/video/rockchip/rga3/ (including the v5.4
+for_each_sgtable_sg() backport in include/rga_version_compat.h); this patch
+only hooks the new directory into the kernel build.
+
+drivers/video/rockchip/Kconfig and drivers/video/rockchip/Makefile are created
+by 317-rockchip-mpp-drivers.patch, therefore this patch must sort after it.
+
+--- a/drivers/video/rockchip/Kconfig
++++ b/drivers/video/rockchip/Kconfig
+@@ -9,3 +9,5 @@
+ # blocks are unrelated to video decode/encode.
+ #
+ source "drivers/video/rockchip/mpp/Kconfig"
++
++source "drivers/video/rockchip/rga3/Kconfig"
+--- a/drivers/video/rockchip/Makefile
++++ b/drivers/video/rockchip/Makefile
+@@ -7,3 +7,8 @@
+ # nothing runs unless the module is explicitly modprobed.
+ #
+ obj-$(CONFIG_ROCKCHIP_MPP_SERVICE) += mpp/
++
++# Rockchip RGA 2D accelerator (vendor multi-core driver).  The armv8 subtarget
++# sets CONFIG_ROCKCHIP_MULTI_RGA=y, so the driver is linked into vmlinux and
++# /dev/rga is registered during boot.
++obj-$(CONFIG_ROCKCHIP_MULTI_RGA) += rga3/

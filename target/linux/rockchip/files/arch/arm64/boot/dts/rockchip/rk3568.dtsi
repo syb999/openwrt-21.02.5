@@ -1173,8 +1173,21 @@
 					 <&qos_vop_m1>;
 				#power-domain-cells = <0>;
 			};
+			/*
+			 * The RGA2 accelerator (rk_rga@fdeb0000) references this
+			 * domain in its power-domains property.  The rockchip
+			 * pm-domain driver only walks *available* child nodes
+			 * (for_each_available_child_of_node), so a disabled node
+			 * here means domains[RK3568_PD_RGA] stays NULL and every
+			 * consumer fails to attach: of_genpd_xlate_onecell()
+			 * returns -ENOENT, genpd_dev_pm_attach() turns that into
+			 * -ENODEV ("ignoring dependency for device, assuming no
+			 * driver") and platform_drv_probe() bails out before the
+			 * driver probe is ever called.  Keep the domain enabled so
+			 * the RGA core can bind.
+			 */
 			pd_rga@RK3568_PD_RGA {
-				status = "disabled";
+				status = "okay";
 				reg = <RK3568_PD_RGA>;
 				clocks = <&cru HCLK_RGA_PRE>,
 					 <&cru PCLK_RGA_PRE>;

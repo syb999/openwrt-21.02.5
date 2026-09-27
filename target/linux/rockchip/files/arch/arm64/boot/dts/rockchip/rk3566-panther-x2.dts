@@ -799,3 +799,10 @@
 	status = "okay";
 };
 
+
+/* Enable the RGA2 2D accelerator (hardware image scaling/format convert).
+ * The node lives in rk3568.dtsi with status = "disabled"; the power domain
+ * RK3568_PD_RGA is already described there. */
+&rk_rga {
+	status = "okay";
+};

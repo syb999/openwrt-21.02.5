@@ -1,0 +1,20 @@
+Rockchip RGA: let drivers/video/ enter the rockchip/ vendor directory for
+built-in users as well.
+
+drivers/video/Makefile only descends into rockchip/ when
+CONFIG_ROCKCHIP_MPP_SERVICE is set, and that symbol is a tristate that this
+target builds as "m".  A directory reached that way is built in module context
+only, so obj-y entries inside it (the RGA driver, CONFIG_ROCKCHIP_MULTI_RGA=y)
+never get linked into vmlinux and /dev/rga is never created.
+
+Add a second descent keyed on CONFIG_ROCKCHIP_MULTI_RGA so the directory is
+also visited in the built-in pass; the per-entry obj-$(CONFIG_...) rules inside
+then keep MPP a module and make RGA part of vmlinux.
+
+--- a/drivers/video/Makefile
++++ b/drivers/video/Makefile
+@@ -17,3 +17,4 @@
+ # Rockchip vendor video codec (MPP) stack; tristate only, so it is never part
+ # of vmlinux - the whole directory builds solely into rk_vcodec.ko.
+ obj-$(CONFIG_ROCKCHIP_MPP_SERVICE) += rockchip/
++obj-$(CONFIG_ROCKCHIP_MULTI_RGA) += rockchip/
