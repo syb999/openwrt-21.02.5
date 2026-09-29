@@ -36,6 +36,28 @@ define Package/rk356x-yolov5n/description
     /usr/bin/yolov5n  wrapper (launches the demo through the glibc loader)
 endef
 
+# ---------------------------------------------------------------------------
+# Shipped models (files/opt/yolov5/model/)
+#
+#   yolov5n_rk3566_i8_cal200.rknn   DEFAULT.  INT8 quantised with an enlarged
+#                                   ~180-image COCO calibration set.  On the
+#                                   car-dense reference image it finds 21
+#                                   objects vs 19 for the older model, with
+#                                   consistently higher confidence, at the
+#                                   same inference cost (~26 FPS).  The runner
+#                                   script and /usr/bin/yolov5n point here.
+#
+#   yolov5n_rk3566_i8.rknn          KEPT FOR REFERENCE ONLY.  The original
+#                                   model calibrated on the stock 20-image
+#                                   subset.  It is still installed so the
+#                                   previous behaviour can be reproduced by
+#                                   pointing the runner at it explicitly, but
+#                                   nothing selects it by default.
+#
+# Keep both: the extra 3 MB is cheap and having the old weights around makes
+# A/B comparisons and regression checks repeatable without a re-conversion.
+# ---------------------------------------------------------------------------
+
 # No source tarball: every payload is shipped prebuilt under ./files.
 define Build/Prepare
 endef

@@ -49,7 +49,10 @@ local LASTF   = BASE .. "/last.json"
 
 local ENGINE   = "/usr/bin/yolov5n"
 local DEMO     = "/opt/yolov5/rknn_yolov5_demo"
-local MODEL    = "/opt/yolov5/model/yolov5n_rk3566_i8.rknn"
+-- Default model: the enlarged-calibration build (180-image COCO subset).
+-- The original 20-image model is still shipped for reference but is not used
+-- unless the runner is pointed at it explicitly.
+local MODEL    = "/opt/yolov5/model/yolov5n_rk3566_i8_cal200.rknn"
 local LABELS   = "/opt/yolov5/model/coco_80_labels_list.txt"
 local SAMPLE   = "/opt/yolov5/model/bus.jpg"
 local LOADER   = "/opt/glibc/ld-linux-aarch64.so.1"
@@ -215,6 +218,13 @@ local function parse_demo(out)
 		local n = line:match("detected%s+(%d+)%s+objects")
 		if n then bench.detected = tonumber(n) end
 
+		-- "filtered N objects (YOLO_ONLY=...)" and "drawn N boxes" are only
+		-- printed when the engine supports the class whitelist.
+		n = line:match("filtered%s+(%d+)%s+objects")
+		if n then bench.engine_filtered = tonumber(n) end
+		n = line:match("drawn%s+(%d+)%s+boxes")
+		if n then bench.drawn = tonumber(n) end
+
 		-- "<label> @ (x1 y1 x2 y2) <score>"  (label may contain spaces)
 		local label, a, b, c, d, sc =
 			line:match("^(.+) @ %((%d+) (%d+) (%d+) (%d+)%)%s+([%d%.]+)%s*$")
@@ -240,6 +250,42 @@ local function parse_demo(out)
 	end
 
 	return objs, bench
+end
+
+-- --------------------------------------------------------------------------
+-- class filter ("only")
+--
+-- The page may send only=car,bus,person to restrict the result to those COCO
+-- label names.  An absent or empty value means "no filtering": every class the
+-- model reports is returned.  Label names may contain spaces ("traffic light",
+-- "hot dog"), so only commas separate entries.
+-- --------------------------------------------------------------------------
+
+local function parse_only(s)
+	local set, list = {}, {}
+	s = util.trim(tostring(s or ""))
+	if s == "" then return set, list end
+	for tok in s:gmatch("[^,]+") do
+		tok = util.trim(tok):lower()
+		-- keep only characters that can appear in a COCO label
+		tok = tok:gsub("[^%w %-_%.]", "")
+		tok = util.trim(tok)
+		if tok ~= "" and not set[tok] then
+			set[tok] = true
+			list[#list + 1] = tok
+		end
+	end
+	return set, list
+end
+
+local function filter_objs(objs, set)
+	if next(set) == nil then return objs end
+	local keep = {}
+	for _, o in ipairs(objs) do
+		local lbl = tostring(o.label or ""):lower()
+		if set[lbl] then keep[#keep + 1] = o end
+	end
+	return keep
 end
 
 -- --------------------------------------------------------------------------
@@ -419,6 +465,7 @@ function action_run()
 	-- handler above).  Everything else is read afterwards from the cache.
 	local path = http.formvalue("path")
 	local loops = tonumber(http.formvalue("loops") or "1") or 1
+	local only_set, only_list = parse_only(http.formvalue("only"))
 	http.setfilehandler(nil)
 
 	if loops < 1 then loops = 1 end
@@ -450,8 +497,16 @@ function action_run()
 	local okrun, err = pcall(function()
 		-- 2>&1 so the BENCH lines and any error text land in one log file;
 		-- sys.call gives us the exit status as well.
-		rc = sys.call(string.format("%s %s %d >%s 2>&1",
-			sh_quote(ENGINE), sh_quote(input), loops, sh_quote(logf)))
+		-- YOLO_ONLY is exported to the engine so the demo drops the boxes of
+		-- every class that is not selected before it draws the annotated
+		-- image.  The page-side filter below uses the same list, so the table
+		-- and the picture always agree.
+		local env = ""
+		if #only_list > 0 then
+			env = "YOLO_ONLY=" .. sh_quote(table.concat(only_list, ",")) .. " "
+		end
+		rc = sys.call(string.format("%s%s %s %d >%s 2>&1",
+			env, sh_quote(ENGINE), sh_quote(input), loops, sh_quote(logf)))
 	end)
 
 	lock_release()
@@ -472,7 +527,14 @@ function action_run()
 			sh_quote(png) .. " 2>/dev/null") == 0) and exists(png)
 	end
 
-	local objs, bench = parse_demo(out)
+	local all_objs, bench = parse_demo(out)
+	local objs = filter_objs(all_objs, only_set)
+
+	-- raw_count is the unfiltered total, so the page can show "shown X / total
+	-- Y".  The demo always prints the unfiltered total on its "detected N
+	-- objects" line, even when it already dropped boxes for the picture.
+	local raw_count = bench.detected or #all_objs
+	if raw_count < #all_objs then raw_count = #all_objs end
 
 	local res = {
 		ok          = (rc == 0),
@@ -480,6 +542,15 @@ function action_run()
 		id          = id,
 		objects     = objs,
 		count       = #objs,
+		raw_count   = raw_count,
+		filtered    = (#only_list > 0),
+		only        = table.concat(only_list, ","),
+		-- Boxes the engine actually drew on the annotated image, and whether
+		-- the engine understood YOLO_ONLY at all (an old binary prints
+		-- neither line, in which case the table is filtered but the picture is
+		-- not - the page warns about that instead of lying).
+		image_boxes = bench.drawn,
+		engine_filtered = (bench.engine_filtered ~= nil),
 		detected    = bench.detected,
 		ms          = math.max(0, t1 - t0),
 		npu_ms      = bench.npu_ms,
@@ -503,6 +574,7 @@ function action_run()
 		write_file(OUTDIR .. "/" .. id .. ".json", jsonc.stringify(res))
 		write_file(LASTF, jsonc.stringify({
 			id = id, ts = os.time(), ok = res.ok, count = #objs,
+			raw_count = raw_count, only = res.only,
 			ms = res.ms, npu_ms = res.npu_ms, npu_fps = res.npu_fps,
 			pipeline_ms = res.pipeline_ms, pipeline_fps = res.pipeline_fps,
 			labels = (function()

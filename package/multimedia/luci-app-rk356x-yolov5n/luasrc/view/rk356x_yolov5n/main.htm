@@ -35,6 +35,10 @@ table.rk-table th { background: #f3f3f3; }
 .rk-spin { display: inline-block; width: 12px; height: 12px; border: 2px solid #ccc; border-top-color: #2d70b3; border-radius: 50%; animation: rkspin .8s linear infinite; vertical-align: -2px; margin-right: 6px; }
 @keyframes rkspin { to { transform: rotate(360deg); } }
 textarea.rk-ta { width: 100%; min-height: 120px; box-sizing: border-box; font-family: monospace; font-size: 13px; padding: 6px; white-space: pre; }
+select.rk-only-sel { width: 100%; min-height: 190px; box-sizing: border-box; padding: 4px; font-size: 13px; }
+.rk-only-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.rk-only-head label { display: inline-block; font-size: 13px; color: #333; margin: 0; }
+.rk-only-head input[type=checkbox] { vertical-align: -1px; margin-right: 5px; }
 @media (max-width: 600px) {
   .rk-st td:first-child { width: 120px; }
   .rk-btn { width: 100%; margin: 3px 0; }
@@ -75,8 +79,32 @@ textarea.rk-ta { width: 100%; min-height: 120px; box-sizing: border-box; font-fa
     <div class="rk-status-line" id="rk-progress"></div>
   </div>
 
+  <div class="rk-card">
+    <h3><%=T("Class filter","类别过滤")%></h3>
+    <div class="rk-only-head">
+      <label for="rk-use-only">
+        <input type="checkbox" id="rk-use-only">
+        <%=T("Enable class filter","启用类别过滤")%>
+      </label>
+      <button class="rk-btn" id="rk-only-all"><%=T("Select all","全选")%></button>
+      <button class="rk-btn" id="rk-only-none"><%=T("Clear","清空")%></button>
+      <span class="rk-dim" id="rk-only-count"></span>
+    </div>
+    <div id="rk-only-box" style="display:none;margin-top:8px;">
+      <select multiple id="rk-only" class="rk-only-sel" size="12"></select>
+      <div class="rk-dim" style="margin-top:4px;">
+        <%=T("When enabled, only the selected classes are kept, in both the table and the boxed image.","开启后，只保留选中的类别（表格与带框图一致）。")%>
+      </div>
+    </div>
+    <div class="rk-dim" id="rk-only-hint" style="margin-top:6px;">
+      <%=T("Off: every class the model finds is shown.","关闭时：显示模型找到的全部类别。")%>
+    </div>
+  </div>
+
   <div class="rk-card" id="rk-result-card" style="display:none;">
     <h3><%=T("Result","检测结果")%> <span class="rk-dim" id="rk-obj-count"></span></h3>
+
+    <div id="rk-eng-warn" class="rk-banner bad" style="display:none;"></div>
 
     <div id="rk-img-wrap" style="display:none;margin-bottom:10px;">
       <div class="rk-dim" style="margin-bottom:4px;"><%=T("Annotated image","带框结果图")%></div>
@@ -121,7 +149,28 @@ textarea.rk-ta { width: 100%; min-height: 120px; box-sizing: border-box; font-fa
 <script type="text/javascript">
 (function () {
 	var BASE = '<%=luci.dispatcher.build_url("admin", "rk356x-ocr", "yolov5n")%>';
-	var state = { id: null, res: null, ready: false };
+	var state = { id: null, res: null, ready: false, only: { use: false, sel: [] } };
+
+	// localStorage key that remembers the filter state across reloads.
+	var ONLY_KEY = 'rk_yolov5_only';
+
+	// The 80 COCO class names, in the exact order and spelling the engine
+	// prints.  Kept inline so the page never has to fetch the label file.
+	var COCO = [
+		'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train',
+		'truck', 'boat', 'traffic light', 'fire hydrant', 'stop sign',
+		'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep',
+		'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella',
+		'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard',
+		'sports ball', 'kite', 'baseball bat', 'baseball glove', 'skateboard',
+		'surfboard', 'tennis racket', 'bottle', 'wine glass', 'cup', 'fork',
+		'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange',
+		'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair',
+		'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv',
+		'laptop', 'mouse', 'remote', 'keyboard', 'cell phone', 'microwave',
+		'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase',
+		'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+	];
 
 	function byId(id) { return document.getElementById(id); }
 	function esc(s) {
@@ -157,6 +206,94 @@ textarea.rk-ta { width: 100%; min-height: 120px; box-sizing: border-box; font-fa
 		if (n === null || n === undefined || isNaN(n)) return '-';
 		return Number(n).toFixed(d === undefined ? 2 : d);
 	}
+
+	// ---- class filter -----------------------------------------------------
+	// The list of COCO classes is materialised into the <select multiple>,
+	// the current selection drives the "only" parameter of a run and is
+	// persisted in localStorage so a browser refresh keeps the choice.
+
+	function onlySelected() {
+		var sel = byId('rk-only');
+		var out = [];
+		if (!sel) return out;
+		for (var i = 0; i < sel.options.length; i++) {
+			if (sel.options[i].selected) out.push(sel.options[i].value);
+		}
+		return out;
+	}
+
+	function onlyCountText(n) {
+		return "<%=T("selected %d class(es)","已选 %d 类")%>".replace('%d', n);
+	}
+
+	function onlySave() {
+		try {
+			localStorage.setItem(ONLY_KEY, JSON.stringify({
+				use: state.only.use, sel: state.only.sel
+			}));
+		} catch (e) { /* private mode: filter simply is not remembered */ }
+	}
+
+	function onlyLoad() {
+		var raw = null;
+		try { raw = localStorage.getItem(ONLY_KEY); } catch (e) { raw = null; }
+		if (!raw) return;
+		var o = null;
+		try { o = JSON.parse(raw); } catch (e) { o = null; }
+		if (o && typeof o === 'object') {
+			state.only.use = !!o.use;
+			state.only.sel = (o.sel && o.sel.length) ? o.sel.slice() : [];
+		}
+	}
+
+	// read the DOM back into state and refresh the dependent widgets
+	function onlySync() {
+		state.only.use = byId('rk-use-only').checked;
+		state.only.sel = onlySelected();
+		byId('rk-only-box').style.display = state.only.use ? '' : 'none';
+		byId('rk-only-count').textContent = onlyCountText(state.only.sel.length);
+	}
+
+	function onlyChanged() { onlySync(); onlySave(); }
+
+	function onlyInit() {
+		var sel = byId('rk-only');
+		var html = '';
+		for (var i = 0; i < COCO.length; i++) {
+			html += '<option value="' + esc(COCO[i]) + '">' + esc(COCO[i]) + '</option>';
+		}
+		sel.innerHTML = html;
+
+		onlyLoad();
+		byId('rk-use-only').checked = state.only.use;
+		for (var j = 0; j < state.only.sel.length; j++) {
+			for (var k = 0; k < sel.options.length; k++) {
+				if (sel.options[k].value === state.only.sel[j]) sel.options[k].selected = true;
+			}
+		}
+		byId('rk-only-box').style.display = state.only.use ? '' : 'none';
+		byId('rk-only-count').textContent = onlyCountText(onlySelected().length);
+	}
+
+	function onlySelectAll() {
+		var sel = byId('rk-only');
+		for (var i = 0; i < sel.options.length; i++) sel.options[i].selected = true;
+		onlyChanged();
+	}
+
+	function onlyClear() {
+		var sel = byId('rk-only');
+		for (var i = 0; i < sel.options.length; i++) sel.options[i].selected = false;
+		onlyChanged();
+	}
+
+	// value for the POST "only" field: '' when the filter is off or empty
+	function onlyParam() {
+		if (!state.only.use) return '';
+		return onlySelected().join(',');
+	}
+
+	// ---- status panel -----------------------------------------------------
 
 	function renderStatus(st) {
 		var ts = byId('rk-st-ts');
@@ -240,8 +377,28 @@ textarea.rk-ta { width: 100%; min-height: 120px; box-sizing: border-box; font-fa
 				'</td></tr>';
 		}
 		byId('rk-objs').getElementsByTagName('tbody')[0].innerHTML = body;
-		byId('rk-obj-count').textContent = '(' + objs.length + ' ' +
-			"<%=T("object(s)","个目标")%>" + ')';
+
+		// "shown X / total Y object(s)" when the run was filtered, else the
+		// plain count.  raw_count is the engine's unfiltered total.
+		var cnt = objs.length;
+		var raw = (res.raw_count != null) ? res.raw_count : cnt;
+		if (res.filtered) {
+			byId('rk-obj-count').textContent = '(' +
+				"<%=T("shown %d of %d object(s)","显示 %d / 共 %d 个目标")%>"
+					.replace('%d', cnt).replace('%d', raw) + ')';
+		} else {
+			byId('rk-obj-count').textContent = '(' + cnt + ' ' +
+				"<%=T("object(s)","个目标")%>" + ')';
+		}
+
+		// Never claim the picture was filtered when the engine did not say so.
+		var w = byId('rk-eng-warn');
+		if (res.filtered && res.engine_filtered === false) {
+			w.style.display = '';
+			w.innerHTML = "<%=T("Engine did not filter: the table is filtered but the boxed image still contains every class.","引擎未过滤：表格已过滤，但带框图中仍包含全部类别的框。")%>";
+		} else {
+			w.style.display = 'none';
+		}
 
 		var t = '';
 		if (res.npu_ms != null) {
@@ -254,6 +411,7 @@ textarea.rk-ta { width: 100%; min-height: 120px; box-sizing: border-box; font-fa
 		}
 		t += (t ? ' | ' : '') + "<%=T("Wall","墙钟")%>: " + (res.ms || 0) + ' ms';
 		if (res.loops != null) t += ' | loops ' + res.loops;
+		if (res.only) t += ' | only: ' + res.only;
 		byId('rk-timing').textContent = t;
 
 		byId('rk-log').value = res.log || '';
@@ -271,8 +429,11 @@ textarea.rk-ta { width: 100%; min-height: 120px; box-sizing: border-box; font-fa
 				esc(j.error || ('exit ' + j.rc));
 			return;
 		}
-		byId('rk-progress').innerHTML = '<span class="rk-ok">Done.</span> ' +
-			(j.count || 0) + ' ' + "<%=T("object(s)","个目标")%>";
+		var msg = (j.count || 0) + ' ' + "<%=T("object(s)","个目标")%>";
+		if (j.filtered) {
+			msg += ' (' + "<%=T("of %d total","共 %d")%>".replace('%d', j.raw_count || 0) + ')';
+		}
+		byId('rk-progress').innerHTML = '<span class="rk-ok">Done.</span> ' + msg;
 		renderResult(j);
 		loadStatus();
 	}
@@ -286,7 +447,21 @@ textarea.rk-ta { width: 100%; min-height: 120px; box-sizing: border-box; font-fa
 		xhr('POST', BASE + '/run', fd, polledRender);
 	}
 
+	// A filter that is on but empty has no meaning: say so instead of
+	// silently running unfiltered.  Returns true when the run may proceed.
+	function onlyGate() {
+		if (!state.only.use) return true;
+		if (onlySelected().length === 0) {
+			byId('rk-progress').innerHTML = '<span class="rk-warn">' +
+				"<%=T("Class filter is on but no class is selected. Pick at least one class, or turn the filter off.","已启用类别过滤但未选择任何类别。请至少选择一个类别，或取消勾选过滤。")%>" +
+				'</span>';
+			return false;
+		}
+		return true;
+	}
+
 	function start() {
+		if (!onlyGate()) return;
 		var f = byId('rk-file').files && byId('rk-file').files[0];
 		if (!f) {
 			byId('rk-progress').innerHTML = '<span class="rk-err">' +
@@ -296,13 +471,18 @@ textarea.rk-ta { width: 100%; min-height: 120px; box-sizing: border-box; font-fa
 		}
 		var fd = new FormData();
 		fd.append('loops', byId('rk-loops').value || '1');
+		var only = onlyParam();
+		if (only) fd.append('only', only);
 		fd.append('img', f, f.name);
 		post(fd);
 	}
 
 	function startSample() {
+		if (!onlyGate()) return;
 		var fd = new FormData();
 		fd.append('loops', byId('rk-loops').value || '1');
+		var only = onlyParam();
+		if (only) fd.append('only', only);
 		fd.append('path', '/opt/yolov5/model/bus.jpg');
 		post(fd);
 	}
@@ -310,12 +490,14 @@ textarea.rk-ta { width: 100%; min-height: 120px; box-sizing: border-box; font-fa
 	function summaryText() {
 		var res = state.res;
 		if (!res) return '';
+		var objs = res.objects || [];
 		var out = 'YOLOv5n object detection';
-		out += '\n' + "<%=T("objects","目标数")%>" + ': ' + (res.objects || []).length;
+		out += '\n' + "<%=T("objects","目标数")%>" + ': ' + objs.length;
+		if (res.filtered) out += ' / ' + (res.raw_count || 0) + ' ' + "<%=T("total","合计")%>";
+		if (res.only) out += ' ' + "<%=T("(only)","（仅）")%>" + ' ' + res.only;
 		if (res.npu_ms != null) out += '\nNPU: ' + fmt(res.npu_ms) + ' ms (' + fmt(res.npu_fps) + ' FPS)';
 		if (res.pipeline_ms != null) out += '\n' + "<%=T("End-to-end","端到端")%>" + ': ' + fmt(res.pipeline_ms) + ' ms (' + fmt(res.pipeline_fps) + ' FPS)';
 		out += '\n' + "<%=T("Wall","墙钟")%>" + ': ' + (res.ms || 0) + ' ms';
-		var objs = res.objects || [];
 		for (var i = 0; i < objs.length; i++) {
 			var o = objs[i];
 			out += '\n' + (i + 1) + '. ' + o.label + ' ' + fmt(o.score, 3) +
@@ -350,6 +532,8 @@ textarea.rk-ta { width: 100%; min-height: 120px; box-sizing: border-box; font-fa
 		}
 	}
 
+	// Exports always use the stored (already filtered) result, so the table
+	// copy, .txt, .csv and .json all match what is on screen.
 	function exportAs(fmt) {
 		if (!state.id) return;
 		window.location = BASE + '/export?id=' + encodeURIComponent(state.id) + '&fmt=' + fmt;
@@ -362,6 +546,11 @@ textarea.rk-ta { width: 100%; min-height: 120px; box-sizing: border-box; font-fa
 	window.rkDetectSample = startSample;
 	window.rkCopyResult = copyResult;
 	window.rkExport = exportAs;
+	window.rkOnlySelectAll = onlySelectAll;
+	window.rkOnlyClear = onlyClear;
+	window.rkOnlySync = onlyChanged;
+	window.rkOnlyParam = onlyParam;
+	window.rkOnlySelected = onlySelected;
 
 	byId('rk-go').addEventListener('click', start);
 	byId('rk-sample').addEventListener('click', startSample);
@@ -370,6 +559,12 @@ textarea.rk-ta { width: 100%; min-height: 120px; box-sizing: border-box; font-fa
 	byId('rk-exp-csv').addEventListener('click', function () { exportAs('csv'); });
 	byId('rk-exp-json').addEventListener('click', function () { exportAs('json'); });
 
+	byId('rk-use-only').addEventListener('change', onlyChanged);
+	byId('rk-only').addEventListener('change', onlyChanged);
+	byId('rk-only-all').addEventListener('click', onlySelectAll);
+	byId('rk-only-none').addEventListener('click', onlyClear);
+
+	onlyInit();
 	loadStatus();
 	setInterval(loadStatus, 5000);
 })();
