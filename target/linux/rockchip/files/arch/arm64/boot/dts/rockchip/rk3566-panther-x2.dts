@@ -802,9 +802,102 @@
 /*
  * Enable the RGA2 2D acceleration core.  The SoC dtsi keeps rk_rga disabled;
  * pd_rga (RK3568_PD_RGA) is now available, so the core can attach to its
- * power domain and probe.  Only rk_rga is touched here - the MPP video
- * nodes (vdpu/vepu/rkvdec/rkvenc) stay disabled deliberately.
+ * power domain and probe.  The MPP video nodes are enabled in their own block
+ * further down.
  */
 &rk_rga {
+	status = "okay";
+};
+
+/*
+ * RK3568 video codecs (H.264/H.265/VP9 decode via rkvdec2, H.264/H.265 encode
+ * via rkvenc) and the MPP service that owns /dev/mpp_service.
+ *
+ * These nodes were left disabled for the same reason rk_rga was: powering a
+ * domain on this board used to take an asynchronous external abort.  That was
+ * a bug in the pm-domain driver, not in the domains: rockchip_pd_power()
+ * restored QoS on the very first power-on - writing a zeroed save area to a
+ * QoS block that is not reachable yet - and the domain loop also walked
+ * table holes (name == NULL).  patches-5.4/324 fixes both, which is what made
+ * pd_rga and pd_npu usable; pd_rkvdec/pd_rkvenc use the same code path and the
+ * same DOMAIN_RK3568() table entries from patches-5.4/315.
+ *
+ * The iommus property is DELETED on all three codec nodes below, and that is
+ * what lets the codec devices probe at all: the vendored rkvdec2/vdpu/venc
+ * drivers are written against the vendor iommu glue and cannot run iommu-less
+ * cleanly, while with the iommus phandle kept the three IOMMU nodes have to be
+ * enabled too - and that combination made this board reboot in a loop, so it
+ * is not an option.  Without iommus, mpp_iommu_probe() only logs
+ * "failed to attach iommu" and still returns success, so mpp->iommu_info ends
+ * up NULL.  rkvdec2_alloc_rcbbuf() then dereferences dec->mpp.iommu_info
+ * (NULL + 0x40) and the kernel oopses at boot.  That single dereference is
+ * contained by a kernel patch instead of by DT wiring:
+ * patches-5.4/326-rockchip-rkvdec2-rcb-iommu-guard.patch makes
+ * rkvdec2_alloc_rcbbuf() return -ENODEV when iommu_info is NULL, so no rcb
+ * buffer is set up and the codec simply stays unusable instead of crashing.
+ *
+ * rkvenc still deletes its iommus property, but rkvdec is a deliberate
+ * exception: its link/CCU path needs the contiguous 64 KiB IOVA window
+ * described at the &rkvdec block below, so rkvdec_mmu is enabled in this file
+ * (rkvenc_mmu keeps the "disabled" status it has in rk3568.dtsi).
+ */
+&mpp_srv {
+	status = "okay";
+};
+
+/*
+ * rkvdec2 (this node) drives the H.264 link/CCU path.  Its rcb buffer must be
+ * a contiguous 64 KiB IOVA window: in the vendor design the 45056-byte SRAM
+ * is followed by a mapped page (~65536 bytes total), which only the IOMMU can
+ * present as one contiguous IOVA range - the SRAM and the neighbouring
+ * pmucru window cannot be concatenated physically.
+ *
+ * With iommus deleted (the old workaround) rcb fell into the no-iommu
+ * physical-memory branch added by patches-5.4/326, the hardware did not accept
+ * it and every task timed out and was force-dequeued (mpp_rkvdec2 ... task N
+ * timeout ... force_dequeue 1 / resetting).  Attaching rkvdec to rkvdec_mmu
+ * (enabled just below) gives the link/CCU the contiguous 64 KiB IOVA it
+ * needs.  The IOMMU v2 backend this requires (compatible "rockchip,iommu-v2")
+ * comes from patches-5.4/327.
+ */
+&rkvdec {
+	status = "okay";
+};
+
+&rkvdec_mmu {
+	status = "okay";
+};
+
+&rkvenc {
+	/delete-property/ iommus;
+	status = "okay";
+};
+
+/*
+ * vdpu@fdea0400 - the VDPU34x core (compatible "rockchip,vpu-decoder-v2",
+ * driven by mpp_vdpu2.c inside rk_vcodec.ko).  On rk3566 H.264 is decoded by
+ * this block, rkvdec2 above is the HEVC/VP9 core, so H.264 needs this one as
+ * well as mpp-srv.  Its power domain is pd_vpu, enabled in rk3568.dtsi.
+ *
+ * Unlike rkvdec/rkvenc above, vdpu keeps its "iommus" phandle so it is attached
+ * to vdpu_mmu: on this kernel the H.264 core produces zero frames without
+ * address translation and it has no iommu-less fallback.  The MMU nodes in
+ * rk3568.dtsi use compatible "rockchip,iommu-v2", which the 5.4 driver did not
+ * recognise, so the master sat in a permanent -EPROBE_DEFER and the board never
+ * finished booting.  patches-5.4/327-rockchip-iommu-v2.patch adds the v2
+ * (rk3568) backend to the driver (v2 DTE/PTE bit layout, 40-bit DMA mask, no
+ * GFP_DMA32) and is the precondition for this wiring.
+ *
+ * The blast radius is kept to the two decode cores: vdpu stays attached to
+ * vdpu_mmu, rkvdec now attaches to rkvdec_mmu (enabled at the &rkvdec block
+ * above) because its link/CCU path needs contiguous IOMMU IOVA, and rkvenc
+ * stays iommu-less (see 326) with rkvenc_mmu keeping the "disabled" status it
+ * has in rk3568.dtsi.
+ */
+&vdpu {
+	status = "okay";
+};
+
+&vdpu_mmu {
 	status = "okay";
 };

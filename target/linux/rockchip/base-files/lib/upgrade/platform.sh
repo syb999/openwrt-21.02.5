@@ -215,6 +215,14 @@ rockchip_do_upgrade_panther() {
 
 	echo "upgrading /dev/$diskdev from $1"
 
+	# NOTE: do not remount the overlay read-only here to "protect" the write.
+	# It was tried (f2fs lives inside p2 on this board, so the running overlay
+	# keeps writing while p2 is overwritten) and it hangs the shutdown: the
+	# overlayfs above it still has dirty pages to flush, and with the f2fs
+	# below read-only the box wedges in umount -a right after
+	# "Rebooting system..." and never resets.  A plain sync is what the
+	# original design used and it lands the image correctly.
+
 	get_image "$1" | dd of=/tmp/image.bs count=1 bs=512b 2>/dev/null
 	get_partitions /tmp/image.bs image
 

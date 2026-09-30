@@ -1,0 +1,63 @@
+rockchip: mpp: rkvdec2_link: add pure-diagnostic dump on force_dequeue reset
+
+H.264 hard decode on Panther X2 (RK3566) yields 0 frames while the kernel
+loops on:
+
+    mpp_rkvdec2 fdf80200.rkvdec: session 4 task N timeout 0 abort 0 force_dequeue 1
+    resetting.../cruel reset/done
+
+Reading mpp_rkvdec2_link.c: in rkvdec2_link_try_dequeue() the trigger is
+
+    u32 iommu_fault = dec->mmu_fault && (mpp->irq_status & RKVDEC_TIMEOUT_STA);
+    u32 link_en = atomic_read(&link_dec->power_enabled) ? readl(...EN...) : 0;
+    u32 force_dequeue = iommu_fault || !link_en;
+
+timeout_flag and abort_flag are both 0, so the reset is driven by
+force_dequeue.  The existing dev_err prints only timeout/abort/force_dequeue,
+so from the serial log it is impossible to tell whether force_dequeue came
+from iommu_fault or from link_en == 0 (the LINK hardware block dropping its
+enable bit).
+
+This patch adds two extra dev_err() lines directly after the existing one,
+emitting the raw discriminators:
+
+    dbg: pw <power> link_en <reg raw> mmu_fault <flag> irq_status <raw> rcb_iova <addr>
+    dbg2: link_irq <raw LINK irq> cfg/mode/total/decnum <LINK block regs>
+          hack/run <rk356x hack task counters> sram <dec->sram_size>
+          tbl <current link table iova> fix <hack fix buffer iova>
+
+The dbg2 line is the decisive one for "LINK never enabled": it shows whether
+the LINK block ever consumed a node (total/decnum), what raw IRQ it raised
+(link_irq), whether the rk356x H.264 hack task was in flight, and where the
+link table, the hack fix buffer and the rcb live.
+
+Strictly diagnostic: no variable is modified, no control flow or return path
+changes, the reset sequence is byte-for-byte identical.  Field names
+(mpp->irq_status, dec->mmu_fault, dec->rcb_iova as %pad, dec->sram_size,
+dec->fix, link_dec->irq_status/hack_task_running/task_running, reg_base and the
+RKVDEC_LINK_* register offsets) are taken verbatim from the 5.4 tree.
+
+--- a/drivers/video/rockchip/mpp/mpp_rkvdec2_link.c
++++ b/drivers/video/rockchip/mpp/mpp_rkvdec2_link.c
+@@ -957,6 +957,21 @@
+ 			dev_err(mpp->dev, "session %d task %d timeout %d abort %d force_dequeue %d\n",
+ 				mpp_task->session->index, mpp_task->task_index,
+ 				timeout_flag, abort_flag, force_dequeue);
++			dev_err(mpp->dev,
++				"  dbg: pw %d link_en %#x mmu_fault %d irq_status %#x rcb_iova %pad\n",
++				atomic_read(&link_dec->power_enabled),
++				readl(link_dec->reg_base + RKVDEC_LINK_EN_BASE),
++				dec->mmu_fault, mpp->irq_status, &dec->rcb_iova);
++			dev_err(mpp->dev,
++				"  dbg2: link_irq %#x cfg %#x mode %#x total %#x decnum %#x hack %d run %d sram %u tbl %#x fix %#x\n",
++				link_dec->irq_status,
++				readl(link_dec->reg_base + RKVDEC_LINK_CFG_ADDR_BASE),
++				readl(link_dec->reg_base + RKVDEC_LINK_MODE_BASE),
++				readl(link_dec->reg_base + RKVDEC_LINK_TOTAL_NUM_BASE),
++				readl(link_dec->reg_base + RKVDEC_LINK_DEC_NUM_BASE),
++				link_dec->hack_task_running, link_dec->task_running,
++				dec->sram_size, (u32)task->table->iova,
++				dec->fix ? (u32)dec->fix->iova : 0);
+ 			rkvdec2_link_reset(mpp);
+ 			reset_flag = 1;
+ 			dec->mmu_fault = 0;

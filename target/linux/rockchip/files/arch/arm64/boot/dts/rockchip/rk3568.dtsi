@@ -1199,22 +1199,51 @@
 					 <&qos_rga_wr>;
 				#power-domain-cells = <0>;
 			};
+			/*
+			 * Upstream (Linux 6.x, rk356x-base.dtsi) declares this
+			 * child without a status property, i.e. available, and
+			 * the same table as this one drives it: a disabled node
+			 * here means domains[RK3568_PD_VPU] stays NULL, and
+			 * vdpu@fdea0400 - the VDPU34x block that decodes H.264 -
+			 * then dies in genpd_dev_pm_attach() with -ENODEV
+			 * ("ignoring dependency for device, assuming no driver")
+			 * before its driver is called.
+			 *
+			 * This is the domain that page-faulted the PMU when it was
+			 * enabled in the pre-324 driver; patches-5.4/324 (QoS only
+			 * restored after a real power cycle, table holes skipped) is
+			 * the fix, and the same path already works for pd_rga and
+			 * pd_npu on this board.
+			 */
 			pd_vpu@RK3568_PD_VPU {
-				status = "disabled";
+				status = "okay";
 				reg = <RK3568_PD_VPU>;
 				clocks = <&cru HCLK_VPU_PRE>;
 				pm_qos = <&qos_vpu>;
 				#power-domain-cells = <0>;
 			};
+			/*
+			 * Same reasoning as pd_rga above, and the same trap:
+			 * the pm-domain driver only walks *available* children
+			 * (for_each_available_child_of_node), so a disabled node
+			 * leaves domains[RK3568_PD_RKVDEC] NULL.  A consumer that
+			 * references it then dies in genpd_dev_pm_attach() with
+			 * -ENODEV - "ignoring dependency for device, assuming no
+			 * driver" - before its driver probe is ever called, which
+			 * is exactly how rkvdec@fdf80200 (enabled in
+			 * rk3566-panther-x2.dts) was failing.  Keep it enabled.
+			 */
 			pd_rkvdec@RK3568_PD_RKVDEC {
-				status = "disabled";
+				status = "okay";
 				clocks = <&cru HCLK_RKVDEC_PRE>;
 				reg = <RK3568_PD_RKVDEC>;
 				pm_qos = <&qos_rkvdec>;
 				#power-domain-cells = <0>;
 			};
+			/* see pd_rkvdec above: rkvenc@fdf40000 attaches to this
+			 * domain, so the child node has to stay available. */
 			pd_rkvenc@RK3568_PD_RKVENC {
-				status = "disabled";
+				status = "okay";
 				reg = <RK3568_PD_RKVENC>;
 				clocks = <&cru HCLK_RKVENC_PRE>;
 				pm_qos = <&qos_rkvenc_rd_m0>,

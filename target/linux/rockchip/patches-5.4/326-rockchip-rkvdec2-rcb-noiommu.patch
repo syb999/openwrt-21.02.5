@@ -1,0 +1,176 @@
+rockchip: rkvdec2: allocate the no-iommu rcb like rknpu (DMA/CMA, not alloc_pages)
+
+Panther X2 (RK3566) runs rkvdec2 without an IOMMU: the board DT deletes the
+"iommus" property and leaves rkvdec_mmu/vdpu_mmu disabled, so
+mpp_dev_probe() leaves mpp->iommu_info NULL and rkvdec2_alloc_rcbbuf() has
+to hand the hardware a *physical* address (the vendor IOVA/SRAM flow would
+dereference iommu_info->domain == NULL + 0x40 and oops).
+
+The rknpu driver solves the identical problem in its own non-iommu mode
+(dmesg: "rknpu iommu device-tree entry not found!, using non-iommu mode",
+rknpu_drv.c:833 rknpu_is_iommu_enable()) and still runs.  Its rule
+(rknpu_gem.c:194-211 rknpu_gem_alloc_buf()) is:
+
+    if (!rknpu_dev->iommu_en || ...) {
+            gfp_mask &= ~__GFP_HIGHMEM;
+            gfp_mask |= __GFP_DMA32;          /* stay below 4 GiB */
+    }
+    rknpu_obj->cookie = dma_alloc_attrs(dev, size, &dma_addr,
+                            gfp_mask, DMA_ATTR_FORCE_CONTIGUOUS);
+
+i.e. every buffer goes through the DMA API: __GFP_DMA32 keeps it reachable
+by the SoC's 32-bit address bus, DMA_ATTR_FORCE_CONTIGUOUS pulls one
+physically contiguous block from the default CMA area (bootargs carry
+"cma=128M", target/linux/rockchip/image/mmc.bootscript; patch 321 documents
+the CMA backing), and without an IOMMU the returned dma_addr *is* the
+physical address, which rknpu hands straight to the hardware
+(rknpu_gem.c:261 sg_dma_address(s) = sg_phys(s)).
+
+The previous rcb allocation used raw alloc_pages(): the 64 KiB block is
+contiguous, but it is device-unaware cacheable buddy memory that may sit
+outside the VPU's 32-bit window and never comes from CMA, so the VDPU read
+nothing reachable and H.264 decoded 0 frames with *no* mpp_dec error.
+
+This patch adopts the rknpu method for the no-iommu rcb path: allocate one
+dma_alloc_coherent() block (the same primitive mpp_dma_alloc() already uses
+for the link table / rk3568 fix buffer in mpp_iommu.c:151) and free it with
+dma_free_coherent().  The iommu path below is left byte-for-byte unchanged.
+
+SRAM is deliberately not used.  rk3566 sram is only 0xb000 = 45056 bytes
+(rk3568.dtsi:957-959), smaller than the 0x10000 rcb, and lives at MMIO
+0xfdcc.... so it is not physically adjacent to any DDR page; without an
+IOMMU the hardware needs a single *physically* contiguous window, so the
+vendor "SRAM + DDR tail" layout cannot be reconstructed.  rknpu behaves the
+same way: its SRAM path is gated on iommu_en (rknpu_drv.c:1518
+"CONFIG_ROCKCHIP_RKNPU_SRAM && rknpu_dev->iommu_en"), so with no iommu it
+uses no SRAM at all.  Hence the whole 64 KiB rcb lives in one
+dma_alloc_coherent block with sram_size = 0.
+
+Only drivers/video/rockchip/mpp/mpp_rkvdec2.c is touched.
+--- a/drivers/video/rockchip/mpp/mpp_rkvdec2.c
++++ b/drivers/video/rockchip/mpp/mpp_rkvdec2.c
+@@ -1443,6 +1443,84 @@
+ 		dev_err(dev, "rcb_size invalid.\n");
+ 		return -EINVAL;
+ 	}
++
++	/*
++	 * Panther X2 (RK3566) has no usable iommu: the board DT deletes the
++	 * "iommus" property and keeps rkvdec_mmu/vdpu_mmu disabled, so
++	 * mpp_dev_probe() leaves mpp->iommu_info NULL.  The hardware then walks
++	 * memory by physical address, so there is no IOVA window to map into and
++	 * dereferencing dec->mpp.iommu_info->domain (NULL + 0x40) would oops,
++	 * which is why the vendor IOVA/SRAM flow further down is skipped here.
++	 *
++	 * Use the allocation the rknpu driver uses in its non-iommu mode:
++	 *   drivers/rknpu/rknpu_drv.c:833 rknpu_is_iommu_enable() logs
++	 *     "rknpu iommu device-tree entry not found!, using non-iommu mode",
++	 *   drivers/rknpu/rknpu_gem.c:194-211 rknpu_gem_alloc_buf() then does
++	 *     if (!rknpu_dev->iommu_en || ...) {
++	 *             gfp_mask &= ~__GFP_HIGHMEM;
++	 *             gfp_mask |= __GFP_DMA32;      <- keep block below 4 GiB
++	 *     }
++	 *     rknpu_obj->cookie = dma_alloc_attrs(dev, size, &dma_addr,
++	 *                             gfp_mask, DMA_ATTR_FORCE_CONTIGUOUS);
++	 * so every buffer the NPU touches goes through the DMA API: __GFP_DMA32
++	 * keeps it reachable by the SoC's 32-bit address bus and
++	 * DMA_ATTR_FORCE_CONTIGUOUS pulls one physically contiguous block from
++	 * the default CMA area (bootargs carry "cma=128M",
++	 * target/linux/rockchip/image/mmc.bootscript; patch 321 documents the CMA
++	 * backing).  Without an iommu the resulting dma_addr *is* the physical
++	 * address and rknpu hands exactly that to the hardware
++	 * (rknpu_gem.c:261 sg_dma_address(s) = sg_phys(s)).
++	 *
++	 * The earlier code here used raw alloc_pages(): device-unaware, cacheable
++	 * buddy memory that may sit outside the VPU's 32-bit window and never goes
++	 * through CMA.  The block is contiguous, but the hardware can silently
++	 * read nothing from an unreachable/incoherent rcb -> H.264 decodes 0
++	 * frames with no mpp error.  dma_alloc_coherent() (the same primitive
++	 * mpp_dma_alloc() already uses for the link table, mpp_iommu.c:151) gives
++	 * a CMA-backed, coherent, low-physical block and fixes that.
++	 *
++	 * SRAM is deliberately NOT used.  rk3566 sram is only 0xb000 = 45056
++	 * bytes (rk3568.dtsi:957-959), smaller than the 0x10000 rcb, and lives at
++	 * MMIO 0xfdcc...., so it is not physically adjacent to any DDR page: the
++	 * no-iommu hardware needs one *physically* contiguous window, and the
++	 * vendor "SRAM + DDR tail" layout cannot be reconstructed.  rknpu does the
++	 * same: its SRAM path is gated on iommu_en (rknpu_drv.c:1518
++	 * "CONFIG_ROCKCHIP_RKNPU_SRAM && rknpu_dev->iommu_en"), so with no iommu it
++	 * uses no SRAM and keeps every buffer in DMA memory.  Keep the whole
++	 * 64 KiB rcb in one dma_alloc_coherent block, sram_size = 0.
++	 */
++	if (!dec->mpp.iommu_info) {
++		void *rcb_vaddr;
++
++		dec->rcb_page = NULL;
++		dec->rcb_size = rcb_size;
++		dec->sram_size = 0;
++
++		/*
++		 * __GFP_DMA32 mirrors rknpu_gem.c:194-199, which does exactly
++		 * this when it runs without an iommu.  The RK3566 VPU/VDPU are
++		 * 32-bit DMA masters, so the rcb must be placed below 4 GiB or
++		 * the hardware cannot reach it.
++		 */
++		rcb_vaddr = dma_alloc_coherent(dev, rcb_size, &dec->rcb_iova,
++					       GFP_KERNEL | __GFP_ZERO | __GFP_DMA32);
++		if (!rcb_vaddr) {
++			dev_err(dev, "no iommu: dma_alloc_coherent %u bytes rcb failed\n",
++				rcb_size);
++			return -ENOMEM;
++		}
++		/*
++		 * Keep a handle for rkvdec2_free_rcbbuf().  The device is
++		 * coherent (arm64 default, no "dma-noncoherent" in DT), so the
++		 * CPU pointer is the linear-map address of the block.
++		 */
++		dec->rcb_page = virt_to_page(rcb_vaddr);
++
++		dev_info(dev,
++			 "no iommu, rcb dma phys %pad size %u (rknpu-style CMA)\n",
++			 &dec->rcb_iova, dec->rcb_size);
++		goto read_rcb_info;
++	}
+ 	/* alloc reserve iova for rcb */
+ 	ret = iommu_dma_reserve_iova(dev, iova, rcb_size);
+ 	if (ret) {
+@@ -1508,6 +1586,7 @@
+ 	dev_info(dev, "sram_size %u\n", dec->sram_size);
+ 	dev_info(dev, "rcb_size %u\n", dec->rcb_size);
+ 
++read_rcb_info:
+ 	ret = of_property_read_u32(dev->of_node, "rockchip,rcb-min-width", &dec->rcb_min_width);
+ 	if (!ret && dec->rcb_min_width)
+ 		dev_info(dev, "min_width %u\n", dec->rcb_min_width);
+@@ -1705,12 +1784,27 @@
+ 	struct iommu_domain *domain;
+ 
+ 	if (dec->rcb_page) {
+-		size_t page_size = PAGE_ALIGN(dec->rcb_size - dec->sram_size);
+-		int order = min(get_order(page_size), MAX_ORDER);
++		/*
++		 * Without an iommu the rcb came from dma_alloc_coherent()
++		 * (rknpu-style CMA block) and must go back through the DMA API;
++		 * with an iommu it is the alloc_pages() tail block.
++		 */
++		if (!dec->mpp.iommu_info) {
++			dma_free_coherent(&pdev->dev, dec->rcb_size,
++					  page_address(dec->rcb_page),
++					  dec->rcb_iova);
++		} else {
++			size_t page_size = PAGE_ALIGN(dec->rcb_size - dec->sram_size);
++			int order = min(get_order(page_size), MAX_ORDER);
+ 
+-		__free_pages(dec->rcb_page, order);
++			__free_pages(dec->rcb_page, order);
++		}
+ 	}
+-	if (dec->rcb_iova) {
++	/*
++	 * Only unmap when the iommu path allocated an IOVA window; without an
++	 * iommu dec->rcb_iova holds a physical address and iommu_info is NULL.
++	 */
++	if (dec->rcb_iova && dec->mpp.iommu_info) {
+ 		domain = dec->mpp.iommu_info->domain;
+ 		iommu_unmap(domain, dec->rcb_iova, dec->rcb_size);
+ 	}

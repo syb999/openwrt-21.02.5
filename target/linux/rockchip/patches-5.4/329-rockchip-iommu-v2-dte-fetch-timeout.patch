@@ -1,0 +1,47 @@
+--- a/drivers/iommu/rockchip-iommu.c	2026-09-30 08:18:07.448069927 +0800
++++ b/iommu/rockchip-iommu.c	2026-09-30 08:18:16.592394163 +0800
+@@ -40,6 +40,19 @@
+ #define RK_MMU_INT_STATUS	0x20	/* IRQ status after masking */
+ #define RK_MMU_AUTO_GATING	0x24
+ 
++/*
++ * v2 (rockchip,iommu-v2, e.g. rk3566/rk3568): BIT(31) of RK_MMU_AUTO_GATING
++ * disables the DTE fetch time limit.  vendor 6.6 defines this as
++ * DISABLE_FETCH_DTE_TIME_LIMIT (vendor66_rockchip-iommu.c:78) and sets it in
++ * rk_iommu_enable() right after FORCE_RESET with the comment "Workaround for
++ * iommu blocked, BIT(31) default to 1" (vendor66_rockchip-iommu.c:1182-1185).
++ * Mainline and our v2 patch omit it.  With the fetch time limit active the
++ * very first page-table walk can be aborted and the MMU reports a page fault
++ * for an IOVA that is actually mapped, stalling the master (rk3566 symptom:
++ * page fault at rcb iova 0x10000000 + decoder TIMEOUT_STA).
++ */
++#define DISABLE_FETCH_DTE_TIME_LIMIT	BIT(31)
++
+ #define DTE_ADDR_DUMMY		0xCAFEBABE
+ 
+ #define RK_MMU_POLL_PERIOD_US		100
+@@ -929,6 +942,7 @@
+ {
+ 	struct iommu_domain *domain = iommu->domain;
+ 	struct rk_iommu_domain *rk_domain = to_rk_domain(domain);
++	u32 auto_gate;
+ 	int ret, i;
+ 
+ 	ret = clk_bulk_enable(iommu->num_clocks, iommu->clocks);
+@@ -948,6 +962,16 @@
+ 			       rk_ops->mk_dtentries(rk_domain->dt_dma));
+ 		rk_iommu_base_command(iommu->bases[i], RK_MMU_CMD_ZAP_CACHE);
+ 		rk_iommu_write(iommu->bases[i], RK_MMU_INT_MASK, RK_MMU_IRQ_MASK);
++
++		/*
++		 * v2 workaround, matches vendor 6.6 rk_iommu_enable()
++		 * (vendor66_rockchip-iommu.c:1182-1185): after FORCE_RESET keep
++		 * the DTE fetch time limit disabled, otherwise the first
++		 * page-table walk can be aborted even for a valid, mapped IOVA.
++		 */
++		auto_gate = rk_iommu_read(iommu->bases[i], RK_MMU_AUTO_GATING);
++		auto_gate |= DISABLE_FETCH_DTE_TIME_LIMIT;
++		rk_iommu_write(iommu->bases[i], RK_MMU_AUTO_GATING, auto_gate);
+ 	}
+ 
+ 	ret = rk_iommu_enable_paging(iommu);

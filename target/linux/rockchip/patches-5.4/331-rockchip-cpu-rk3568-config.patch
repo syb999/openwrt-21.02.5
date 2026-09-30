@@ -1,0 +1,68 @@
+rockchip: soc: declare CONFIG_CPU_RK3568 (vendor CPU selector)
+
+The back-ported vendor video codec stack (MPP/RKV, patch 317) keeps the
+vendor's per-SoC guards in mpp_rkvdec2.c.  The of_device_id table
+(drivers/video/rockchip/mpp/mpp_rkvdec2.c:1325) contains:
+
+    { .compatible = "rockchip,rkv-decoder-v2",     .data = &rkvdec_v2_data },
+    #ifdef CONFIG_CPU_RK3568
+    { .compatible = "rockchip,rkv-decoder-rk3568", .data = &rkvdec_rk3568_data },
+    #endif
+
+so the Panther X2's "rockchip,rkv-decoder-rk3568" node only reaches the
+RK3566/8 data path when CONFIG_CPU_RK3568 is defined.
+
+In the rockchip vendor kernel that symbol is declared in
+drivers/soc/rockchip/Kconfig.cpu, which is sourced from
+drivers/soc/rockchip/Kconfig and holds:
+
+    menu "Rockchip CPU selection"
+        depends on ARCH_ROCKCHIP
+        ...
+        config CPU_RK3568
+            bool "RK3566/8"
+        ...
+    endmenu
+
+and enabled from arch/arm64/configs/rockchip_defconfig.  This tree never
+imported Kconfig.cpu, so CONFIG_CPU_RK3568 is undefined, the rk3568
+of_match entry is compiled out, and rkvdec2 attaches the generic
+"rockchip,rkv-decoder-v2" data (rkvdec_v2_data):
+
+  * hack_setup is never set  -> rkvdec2_rk3568_alloc_task()/run() are not
+    used, need_hack stays 0, dec->fix is never allocated,
+  * the link register layout is the v2 one, which does not match the
+    RK3566/8 hardware (LINK_EN never latches).
+
+Result: no HEVC decode (diagnostics show fix 0x0 / link_en 0x0).
+
+This patch declares the missing selector in drivers/soc/rockchip/Kconfig
+with the vendor's semantics (plain bool, default n, enabled per target via
+the kernel config), and target/linux/rockchip/armv8/config-5.4 turns it on.
+No code changes: rkvdec_rk3568_data/rkvdec2_rk3568_{init,exit,alloc_task,
+run} and rkvdec_rk3568_{hw,dev}_ops are already defined unconditionally, so
+enabling the macro only re-enables the of_match entry.
+
+--- a/drivers/soc/rockchip/Kconfig
++++ b/drivers/soc/rockchip/Kconfig
+@@ -5,6 +5,20 @@
+ # Rockchip Soc drivers
+ #
+ 
++#
++# Rockchip CPU selection
++#
++# Plain bool SoC selectors consumed by the vendor video codec (MPP/RKV)
++# driver to pick its per-SoC data path.  Mirrors the vendor develop-5.10/6.6
++# tree's drivers/soc/rockchip/Kconfig.cpu (menu "Rockchip CPU selection");
++# only the RK3566/RK3568 selector is needed here: mpp_rkvdec2.c gates the
++# "rockchip,rkv-decoder-rk3568" of_match entry on CONFIG_CPU_RK3568, whose
++# absence made rkvdec2 fall back to the generic v2 data path (hack_setup=0,
++# no dec->fix, wrong link layout).
++#
++config CPU_RK3568
++	bool "RK3566/8"
++
+ config ROCKCHIP_GRF
+ 	bool "Rockchip General Register Files support" if COMPILE_TEST
+ 	default y if ARCH_ROCKCHIP
