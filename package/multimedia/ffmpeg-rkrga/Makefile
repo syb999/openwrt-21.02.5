@@ -14,6 +14,16 @@
 #   * libraries are built statically, nothing is installed in /usr/lib
 #   * the system ffmpeg / libffmpeg-* files are never touched
 #
+# TLS: GnuTLS is enabled on purpose (OpenSSL is not an option here: FFmpeg 6.0
+# refuses OpenSSL < 3.0 together with --enable-gpl, and this tree ships 1.1.1w;
+# GnuTLS is LGPL and is what the distribution ffmpeg uses as well).  Without TLS
+# this binary cannot open
+# https/rtmp/rtmps/hls sources at all (only file/http/rtp/tcp/udp), which forced
+# consumers to shell out to a second, non-hardware ffmpeg just to pull the
+# stream.  With TLS compiled in, /usr/bin/ffmpeg-rkrga is the ONLY ffmpeg an
+# application needs: hardware decode + RGA scaling + hardware encode + the
+# network protocol handling all in one process.
+#
 
 include $(TOPDIR)/rules.mk
 
@@ -40,7 +50,7 @@ define Package/ffmpeg-rkrga
   CATEGORY:=Multimedia
   TITLE:=FFmpeg with RGA scale_rkrga + MPP hardware codecs
   URL:=https://github.com/nyanmisaka/ffmpeg-rockchip
-  DEPENDS:=@aarch64 +librga +rockchip-mpp +libdrm +libstdcpp +zlib
+  DEPENDS:=@aarch64 +librga +rockchip-mpp +libdrm +libstdcpp +zlib +libgnutls
 endef
 
 define Package/ffmpeg-rkrga/description
@@ -50,9 +60,12 @@ define Package/ffmpeg-rkrga/description
   - hardware H.264/H.265/VP8/VP9/MPEG video decode + encode via the
     Rockchip MPP (rkmpp) decoders/encoders (requires the kernel
     rk_vcodec / mpp-srv support).
+  - TLS (GnuTLS) so that http/https/rtsp/rtmp/rtmps and HLS sources can be
+    opened by this single binary - no helper ffmpeg needed.
 
  The command is installed as /usr/bin/ffmpeg-rkrga and the libraries are
  statically linked, so it coexists with the distribution ffmpeg package.
+ (libgnutls is linked dynamically, like librga/mpp/libdrm.)
 endef
 
 FFMPEG_RKRGA_FILTERS:= \
@@ -63,18 +76,20 @@ FFMPEG_RKRGA_FILTERS:= \
 FFMPEG_RKRGA_DECODERS:= \
 	png mjpeg rawvideo h264 hevc mpeg1video mpeg2video mpeg4 vp8 vp9 av1 \
 	h263 wmv1 wmv2 gif bmp ppm tiff webp apng zlib \
+	aac ac3 eac3 mp3 mp2 vorbis opus flac pcm_s16le pcm_s16be pcm_u8 \
 	h264_rkmpp hevc_rkmpp mjpeg_rkmpp mpeg1_rkmpp mpeg2_rkmpp mpeg4_rkmpp \
 	vp8_rkmpp vp9_rkmpp h263_rkmpp av1_rkmpp
 
 FFMPEG_RKRGA_ENCODERS:= \
 	png mjpeg rawvideo mpeg4 gif bmp ppm tiff \
-	h264_rkmpp hevc_rkmpp mjpeg_rkmpp
+	h264_rkmpp hevc_rkmpp mjpeg_rkmpp \
+	aac
 
 FFMPEG_RKRGA_DEMUXERS:= \
 	image2 image2pipe image_png_pipe image_jpeg_pipe image_bmp_pipe \
 	image_tiff_pipe image_webp_pipe mjpeg rawvideo h264 hevc matroska mov \
 	avi mpegts rtsp rtp sdp concat yuv4mpegpipe flv mpegvideo mpegps \
-	mp3 wav ogg gif
+	mp3 wav ogg gif hls
 
 FFMPEG_RKRGA_MUXERS:= \
 	image2 image2pipe rawvideo mjpeg mp4 matroska avi mpegts h264 hevc \
@@ -87,7 +102,9 @@ FFMPEG_RKRGA_BSFS:= \
 	h264_mp4toannexb hevc_mp4toannexb mpeg4_unpack_bframes dump_extradata \
 	extract_extradata vp9_superframe null remove_extradata
 
-FFMPEG_RKRGA_PROTOCOLS:=file pipe tcp udp rtp cache data http
+# http  = plain HTTP  |  https/tls = TLS (OpenSSL)  |  rtmp/rtmps = FLV streaming
+# hls   = HLS playlist/segment fetching  |  crypto = AES-128 encrypted HLS
+FFMPEG_RKRGA_PROTOCOLS:=file pipe tcp udp rtp cache data http https tls rtmp rtmps hls crypto
 
 FFMPEG_RKRGA_INDEVS:=v4l2 lavfi
 FFMPEG_RKRGA_OUTDEVS:=v4l2
@@ -135,7 +152,7 @@ FFMPEG_RKRGA_CONFIGURE:= \
 	--disable-libopus \
 	--disable-libmp3lame \
 	--disable-libfdk-aac \
-	--disable-gnutls \
+	--enable-gnutls \
 	--disable-openssl \
 	--disable-libfreetype \
 	--disable-alsa \
