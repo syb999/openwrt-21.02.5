@@ -1,0 +1,28 @@
+{
+	"luci-app-vputrans": {
+		"description": "Grant access to LuCI app vputrans",
+		"read": {
+			"file": {
+				"/usr/bin/vputrans": [ "exec" ],
+				"/usr/bin/vputrans *": [ "exec" ],
+				"/usr/bin/ffmpeg-rkrga *": [ "exec" ],
+				"/usr/bin/ffprobe *": [ "exec" ],
+				"/tmp/vputrans.status": [ "read" ],
+				"/tmp/vputrans.log": [ "read" ],
+				"/tmp/vputrans.history": [ "read" ],
+				"/mnt/*": [ "read" ],
+				"/media/*": [ "read" ],
+				"/root/*": [ "read" ],
+				"/tmp/*": [ "read" ]
+			}
+		},
+		"write": {
+			"file": {
+				"/usr/bin/vputrans": [ "exec" ],
+				"/usr/bin/vputrans *": [ "exec" ],
+				"/usr/bin/ffmpeg-rkrga *": [ "exec" ],
+				"/usr/bin/ffprobe *": [ "exec" ]
+			}
+		}
+	}
+}

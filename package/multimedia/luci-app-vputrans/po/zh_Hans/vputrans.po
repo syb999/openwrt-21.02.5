@@ -1,0 +1,483 @@
+# Chinese (Simplified) translation for luci-app-vputrans.
+# This file is distributed under the same license as the package.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: luci-app-vputrans\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-09-30\n"
+"PO-Revision-Date: 2026-09-30\n"
+"Last-Translator: Panther X2 Project\n"
+"Language-Team: Chinese (Simplified)\n"
+"Language: zh_Hans\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "%s"
+msgstr "%s"
+
+msgid "0 = until the end / manual stop"
+msgstr "0 = 到结尾 / 手动停止"
+
+msgid "0-51, default 26"
+msgstr "0-51，默认 26"
+
+msgid "Another job is already running, wait for it or press Stop first"
+msgstr "已有任务在运行，请等它结束或先点“停止”"
+
+msgid "Audio"
+msgstr "音频"
+
+msgid "Authentication required: wrong user/password or token"
+msgstr "需要鉴权：用户名/密码或 token 不正确"
+
+msgid "Auto (live → mkv, file → mp4)"
+msgstr "自动（直播→mkv，点播→mp4）"
+
+msgid "Bitrate (CBR)"
+msgstr "码率 (CBR)"
+
+msgid "CBR bitrate"
+msgstr "CBR 码率"
+
+msgid "CQP QP"
+msgstr "CQP QP"
+
+msgid "Candidate files"
+msgstr "候选文件"
+
+msgid "Candidate files: loading…"
+msgstr "候选文件：加载中…"
+
+msgid "Candidate files: read error"
+msgstr "候选文件：读取异常"
+
+msgid "Candidate files: read failed"
+msgstr "候选文件：读取失败"
+
+msgid "Cannot create the output directory: %s"
+msgstr "无法创建输出目录：%s"
+
+msgid "Cannot parse the protocol of: %s"
+msgstr "无法解析协议：%s"
+
+msgid "Cannot start"
+msgstr "无法启动"
+
+msgid "Cannot stop"
+msgstr "无法停止"
+
+msgid "Connection refused: nothing is listening on that address/port (check the URL or whether the server is up)"
+msgstr "连接被拒绝：目标端口没有服务监听（检查地址/端口或服务器是否在线）"
+
+msgid "Connection timed out: no response within %ss (network unreachable, or the stream has not started)"
+msgstr "连接超时：目标 %ss 内无响应（网络不通或流未开始）"
+
+msgid "Constant quality (CQP, slow)"
+msgstr "恒定质量 CQP（画质优先，慢）"
+
+msgid "Copy (default, no re-encode)"
+msgstr "复制（默认，不重编码）"
+
+msgid "DNS resolution failed: check the device DNS settings or the address spelling"
+msgstr "域名解析失败：检查设备 DNS 或地址拼写"
+
+msgid "Drop audio"
+msgstr "去掉音频"
+
+msgid "Duration -t (seconds)"
+msgstr "时长 -t (秒)"
+
+msgid "Elapsed"
+msgstr "耗时"
+
+msgid "Output encoder"
+msgstr "输出编码器"
+
+msgid "Enter a path or URL and the source is probed automatically."
+msgstr "填写路径或 URL 后自动探测源信息。"
+
+msgid "Error"
+msgstr "出错"
+
+msgid "File not found: %s"
+msgstr "文件不存在：%s"
+
+msgid "Free-form input: local paths and http/https/rtsp/rtmp/rtmps/hls/udp URLs are all accepted (the backend detects the scheme automatically, there is no mode switch). The candidates below are suggestions only - pick one or just type over it."
+msgstr "可自由手填：本地路径与 http/https/rtsp/rtmp/rtmps/hls/udp 等 URL 均支持（后端自动识别，无模式开关）。下方为扫描到的候选，点选即填入，也可完全手打覆盖。"
+
+msgid "HW decode"
+msgstr "硬解"
+
+msgid "HW encode"
+msgstr "硬编"
+
+msgid "Hardware Media"
+msgstr "硬件媒体"
+
+msgid "Idle"
+msgstr "空闲"
+
+msgid "Input / path / URL"
+msgstr "输入源 / 路径 / URL"
+
+msgid "Input source"
+msgstr "输入源"
+
+msgid "Invalid resolution: %s"
+msgstr "分辨率无效：%s"
+
+msgid "Job stopped"
+msgstr "任务已被停止"
+
+msgid "Live stream"
+msgstr "直播流"
+
+msgid "Local file"
+msgstr "本地文件"
+
+msgid "No hardware decoder for %s, switching to software decode"
+msgstr "源编码 %s 无硬件解码器，自动改走软解"
+
+msgid "No history yet."
+msgstr "暂无历史。"
+
+msgid "No input path or URL given"
+msgstr "未提供输入路径或 URL"
+
+msgid "No input selected (local path or URL)"
+msgstr "未选择输入（本地路径或 URL）"
+
+msgid "No job is currently running"
+msgstr "当前没有正在运行的任务"
+
+msgid "No route to host: the network is unreachable"
+msgstr "无法到达主机：网络路由不可达"
+
+msgid "Online URL"
+msgstr "在线 URL"
+
+msgid "Output container"
+msgstr "输出容器"
+
+msgid "Output directory is not writable: %s"
+msgstr "输出目录没有写权限：%s"
+
+msgid "Output file"
+msgstr "输出文件"
+
+msgid "Output file (empty = automatic)"
+msgstr "输出文件（留空自动）"
+
+msgid "Output frame rate"
+msgstr "输出帧率"
+
+msgid "Output must differ from the input file"
+msgstr "输出不能和输入相同"
+
+msgid "Pipeline"
+msgstr "管线"
+
+msgid "Please enter a local path or URL first."
+msgstr "请先填写本地路径或 URL。"
+
+msgid "Probe"
+msgstr "探测"
+
+msgid "Probe failed"
+msgstr "探测失败"
+
+msgid "Probing…"
+msgstr "探测中…"
+
+msgid "Processed %ss / %ss (%s%)"
+msgstr "已处理 %ss / %ss（%s%）"
+
+msgid "Processed %ss / %ss (%s%) at %s"
+msgstr "已处理 %ss / %ss（%s%） 速度 %s"
+
+msgid "QP (CQP)"
+msgstr "QP (CQP)"
+
+msgid "Quality mode"
+msgstr "质量模式"
+
+msgid "RGA hardware scaling"
+msgstr "RGA 硬件缩放"
+
+msgid "RK3566 hardware transcode · local/online source auto-detection"
+msgstr "RK3566 硬件转码 · 本地/在线源自动识别"
+
+msgid "Reading status…"
+msgstr "正在读取状态…"
+
+msgid "Recorded %ss (live stream)"
+msgstr "已录制 %ss（直播流）"
+
+msgid "Recorded %ss (live stream) at %s"
+msgstr "已录制 %ss（直播流） 速度 %s"
+
+msgid "Recording finished ✓"
+msgstr "录制完成 ✓"
+
+msgid "Recording…"
+msgstr "录制中…"
+
+msgid "Refresh list"
+msgstr "刷新文件"
+
+msgid "Result"
+msgstr "结果"
+
+msgid "SW decode"
+msgstr "软解"
+
+msgid "Scaler (software-decode path only)"
+msgstr "缩放算法（仅软解路径生效）"
+
+msgid "Server error (5xx): the origin is broken, please retry later"
+msgstr "服务器错误（5xx）：源站故障，请稍后再试"
+
+msgid "Server returned 401: authentication required (user/password or token)"
+msgstr "服务器返回 401：需要鉴权（用户名/密码或 token）"
+
+msgid "Server returned 403: access denied (authentication may be required)"
+msgstr "服务器返回 403：该地址被拒绝访问（可能需要鉴权）"
+
+msgid "Server returned 404: the address does not exist or has expired"
+msgstr "服务器返回 404：地址不存在或已失效"
+
+msgid "Source audio %s cannot be stored in mp4, re-encoding to AAC"
+msgstr "源音频 %s 无法直接放进 mp4，已自动转 AAC"
+
+msgid "Source is 4:2:0 %s: hardware decoding available (%s)"
+msgstr "源为 4:2:0 %s，硬件解码可用（%s）"
+
+msgid "Source pixel format is %s (the VPU only decodes 4:2:0), switching to software decode"
+msgstr "源像素格式为 %s（VPU 仅支持 4:2:0 硬解），自动改走软解"
+
+msgid "Source size (no scaling)"
+msgstr "源尺寸（不缩放）"
+
+msgid "Start"
+msgstr "开始"
+
+msgid "Started…"
+msgstr "已启动…"
+
+msgid "Stop"
+msgstr "停止"
+
+msgid "Stop requested, finishing the current job"
+msgstr "收到停止指令，正在结束当前任务"
+
+msgid "Stop requested…"
+msgstr "已请求停止…"
+
+msgid "Stopped"
+msgstr "已停止"
+
+msgid "Stopped manually"
+msgstr "已手动停止"
+
+msgid "Stopping…"
+msgstr "正在停止…"
+
+msgid "Stream ended (the source closed early)"
+msgstr "流已结束（源提前关闭）"
+
+msgid "Target bitrate (CBR, fast)"
+msgstr "指定码率 CBR（默认，速度快）"
+
+msgid "Target resolution"
+msgstr "目标分辨率"
+
+msgid "This is a directory, not a video file: %s"
+msgstr "这是一个目录，不是视频文件：%s"
+
+msgid "Time"
+msgstr "时间"
+
+msgid "Transcode ended early (ffmpeg exit code %s), the output file was produced"
+msgstr "转码提前结束（ffmpeg 退出码 %s），产物已生成"
+
+msgid "Transcode failed (exit code %s)"
+msgstr "转码失败（退出码 %s）"
+
+msgid "Transcode finished ✓"
+msgstr "转码完成 ✓"
+
+msgid "Transcode to AAC"
+msgstr "转为 AAC"
+
+msgid "Transcoder %s is missing, please install ffmpeg-rkrga"
+msgstr "缺少转码器 %s，请安装 ffmpeg-rkrga"
+
+msgid "Transcoding…"
+msgstr "转码进行中…"
+
+msgid "Trim start -ss (seconds)"
+msgstr "起始裁剪 -ss (秒)"
+
+msgid "Type"
+msgstr "类型"
+
+msgid "Unknown argument: %s"
+msgstr "未知参数：%s"
+
+msgid "Unknown error, please check the log"
+msgstr "未知错误，请查看日志"
+
+msgid "Unrecognised data: not a valid video stream (maybe a web page or plain text)"
+msgstr "数据无法识别：目标不是有效的视频流（可能返回了网页/文本）"
+
+msgid "Unrecognised source (not a video, or damaged)"
+msgstr "无法识别该源（可能不是视频或已损坏）"
+
+msgid "Unsupported protocol: not in the list of available protocols"
+msgstr "不支持的协议：该协议不在可用的协议列表中"
+
+msgid "Video Transcode"
+msgstr "视频转码"
+
+msgid "audio"
+msgstr "音频"
+
+msgid "bicubic (default)"
+msgstr "bicubic（默认）"
+
+msgid "bilinear (faster)"
+msgstr "bilinear（更快）"
+
+msgid "source codec"
+msgstr "源编码"
+
+msgid "e.g. 2M / 4M"
+msgstr "如 2M / 4M"
+
+msgid "elapsed"
+msgstr "已用"
+
+msgid "empty = generate automatically"
+msgstr "留空则自动生成"
+
+msgid "failed"
+msgstr "失败"
+
+msgid "finished"
+msgstr "完成"
+
+msgid "hardware decode"
+msgstr "硬解"
+
+msgid "lanczos (sharper)"
+msgstr "lanczos（更锐）"
+
+msgid "limit reached"
+msgstr "已达上限"
+
+msgid "live stream"
+msgstr "直播流"
+
+msgid "live stream (no total duration)"
+msgstr "直播流（无总时长）"
+
+msgid "local file"
+msgstr "本地文件"
+
+msgid "no reply"
+msgstr "无返回"
+
+msgid "none"
+msgstr "无"
+
+msgid "online URL"
+msgstr "在线 URL"
+
+msgid "or"
+msgstr "或"
+
+msgid "output file"
+msgstr "输出文件"
+
+msgid "pixel format"
+msgstr "像素"
+
+msgid "processed"
+msgstr "已处理"
+
+msgid "running"
+msgstr "运行中"
+
+msgid "software decode"
+msgstr "软解"
+
+msgid "software scaling"
+msgstr "软件缩放"
+
+msgid "source or a number, e.g. 25"
+msgstr "source 或数字，如 25"
+
+msgid "stopped"
+msgstr "已停止"
+
+msgid "usage: vputrans {version|probe <src>|list|run <src> [opt]|status|stop|history}"
+msgstr "用法：vputrans {version|probe <src>|list|run <src> [opt]|status|stop|history}"
+
+msgid "written"
+msgstr "已写入"
+
+msgid "zero copy"
+msgstr "零拷贝"
+
+msgid "⏹ Stopped: %s (%s) in %ss"
+msgstr "⏹ 已停止：%s（%s）耗时 %ss"
+
+msgid "① Source (type a local path or an online URL - auto-detected)"
+msgstr "① 源（可自由手填本地路径 或 在线 URL，自动识别）"
+
+msgid "② Parameters"
+msgstr "② 参数"
+
+msgid "③ Progress and log"
+msgstr "③ 进度与日志"
+
+msgid "④ Recent jobs (newest 5)"
+msgstr "④ 最近任务（最多 5 条）"
+
+msgid "▶ Starting: %s (%s) | %s %s | %s + hardware encode %s | %s %s"
+msgstr "▶ 开始任务：%s（%s） ｜ %s %s ｜ %s + 硬编 %s ｜ %s %s"
+
+msgid "✔ Finished: %s (%s) in %ss"
+msgstr "✔ 任务完成：%s（%s）耗时 %ss"
+
+msgid "✔ Finished: %s (%s) in %ss, average %s"
+msgstr "✔ 任务完成：%s（%s）耗时 %ss，平均速度 %s"
+
+msgid "Source duration metadata (%ss) is unreliable - already exceeded, showing processed time instead"
+msgstr "源时长元数据不可靠（已超过它声明的 %ss），改为显示已处理时间"
+
+msgid "total length unknown"
+msgstr "总长未知"
+
+
+msgid "Source codec"
+msgstr "源编码"
+
+
+
+
+
+msgid "H.264/H.265 are encoded by the hardware engine (zero copy, fast)"
+msgstr "H.264/H.265 由硬件编码器完成（零拷贝，速度快）"
+
+
+
+
+msgid "Sources are hardware-decoded (H.264/HEVC/VP8/VP9) and encoded by the H.264/H.265 hardware encoder - the output codecs are the only two this SoC encodes in hardware"
+msgstr "源文件一律硬件解码（H.264/HEVC/VP8/VP9），再由 H.264/H.265 硬件编码器输出——这块 SoC 能硬件编码的只有这两种"
+
+msgid "Unsupported encoder: %s (this SoC only has H.264/H.265 hardware encoders)"
+msgstr "不支持的编码器：%s（这块 SoC 只有 H.264/H.265 硬件编码器）"

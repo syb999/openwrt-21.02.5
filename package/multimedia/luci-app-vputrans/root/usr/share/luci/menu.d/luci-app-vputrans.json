@@ -1,0 +1,20 @@
+{
+	"admin/hwmedia": {
+		"title": "Hardware Media",
+		"order": 55,
+		"action": {
+			"type": "firstchild"
+		}
+	},
+	"admin/hwmedia/vputrans": {
+		"title": "Video Transcode",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "vputrans/main"
+		},
+		"depends": {
+			"acl": [ "luci-app-vputrans" ]
+		}
+	}
+}

@@ -1,0 +1,1077 @@
+#!/bin/sh
+#
+# vputrans - video (re)transcode helper for OpenWrt / RK3566 (LuCI backend)  v2.4
+#
+# POSIX sh.  Drives local files AND online sources (http/https/rtsp/rtmp/...)
+# transparently - the scheme is auto-detected, there is no "mode" switch.
+#
+# ---------------------------------------------------------------------------
+# i18n contract (do not put any display text in a non-source language here)
+# ---------------------------------------------------------------------------
+# Every user-facing string is emitted as an ENGLISH message template (the
+# msgid, exactly as written in the .po file) plus its arguments.  The LuCI JS
+# frontend looks the template up in the translation catalog and substitutes
+# the arguments.  Nothing in this file is Chinese and nothing is pre-formatted
+# for display.
+#
+#   JSON message fields:   "<f>":"<english template>", "<f>_args":[ ... ]
+#     f = error | detail | reason | notice        (detail = secondary line,
+#     usually the raw ffmpeg message via the '%s' passthrough template)
+#   Log events ($EV file): "[mm:ss]\t<english template>\t<arg>\t<arg>..."
+#     the frontend renders "_(template).format(args)" with every arg passed
+#     through _() as well, so an English word in an argument gets translated
+#     while paths/numbers/codec names pass through untouched.
+# Templates are ALWAYS the first argument of fail / jm / log_ev, which is how
+# they stay extractable for msgid==source checking.
+# Arguments are passed as ONE tab-joined string (tjoin) so that spaces inside
+# paths survive; jarr/ev_json split it back on TAB only.
+#
+# Commands:
+#   vputrans version
+#   vputrans probe <src>            -> JSON source info + chosen pipeline
+#   vputrans list                   -> JSON list of candidate local files
+#   vputrans run <src> [options]    -> start a background transcode job
+#   vputrans status                 -> current status JSON
+#   vputrans stop                   -> terminate a running job
+#   vputrans history                -> last 5 finished jobs
+#
+# run options (all optional; sane defaults):
+#   --out <path>            output file (default: auto)
+#   --quality cbr|crf       rate control  (default cbr = target bitrate, fast)
+#   --bitrate <e.g. 2M>     target bitrate for cbr            (default 2M)
+#   --qp <0..51>            quantiser for crf (CQP) mode      (default 26)
+#   --codec h264|hevc       output encoder                    (default h264)
+#   --fps <n>|source        output frame rate                 (default source)
+#   --res 480p|720p|1080p|WxH|source   (short: -r, NOTE: -r = resolution)
+#   --scaler bicubic|bilinear|...  software scaler, software-decode path only
+#   --ss <seconds>          trim: start offset                (default 0)
+#   --dur <seconds>         trim / recording length           (default 0=until end)
+#   --audio copy|none|aac   audio strategy                    (default copy)
+#   --container auto|mp4|mkv|ts                               (default auto)
+#
+# Hard limits learned on the Panther X2 / RK3566 (do not "improve" these):
+#   * The VPU only hardware-decodes 4:2:0 H.264/HEVC.  A yuv444p source FAILS
+#     with the rkmpp decoder, so it is decoded in software and converted to
+#     4:2:0 before the hardware encoder.
+#   * HARDWARE PATH = ZERO COPY.  `-hwaccel rkmpp -hwaccel_output_format
+#     drm_prime` keeps the decoded frames as DRM prime buffers and feeds them
+#     straight to the hardware encoder.  DO NOT add `-pix_fmt yuv420p` there:
+#     the rkmpp decoder natively produces NV12, so forcing yuv420p makes
+#     ffmpeg insert a per-frame swscale NV12->YUV420P conversion in between.
+#     Measured on the Panther X2 (1366x768, 30 fps -> 2 Mbps, 4x A55):
+#         with    -pix_fmt yuv420p : 1.06x, 93% of one core   <- old behaviour
+#         drm_prime zero copy      : 4.39x, 38% of one core
+#     This was the real cause of "the CPU is still busy during hardware
+#     transcoding"; the -r / fps option is NOT involved (adding -r costs
+#     5.11x vs 4.39x = exactly the dropped frames, no extra CPU).
+#   * Scaling on the hardware path is done by the RGA (scale_rkrga); the
+#     software `scale` filter is only used on the software-decode path.
+#   * ONLY /usr/bin/ffmpeg-rkrga drives the transcode - one process, hardware
+#     in / hardware out.  (ffmpeg-rkrga >= 6.0.2 in this tree is built with
+#     OpenSSL, so it opens http/https/tls/rtmp/rtmps/hls itself; no helper
+#     "pull with the system ffmpeg and pipe it" stage exists any more.)
+#     /usr/bin/ffprobe is still used for probing/metadata only - it never
+#     touches the frames.
+#   * Only ONE job may run at a time (weak 4-core box); enforced with flock.
+
+VERSION="2.7.0"
+
+FFMPEG_HW="/usr/bin/ffmpeg-rkrga"
+FFPROBE="/usr/bin/ffprobe"
+
+STATE="/tmp/vputrans.status"
+LOG="/tmp/vputrans.log"
+EV="/tmp/vputrans.events"
+PROG="/tmp/vputrans.progress"
+LOCK="/tmp/vputrans.lock"
+PIDF="/tmp/vputrans.pid"
+STOPFLAG="/tmp/vputrans.stopping"
+HIST="/tmp/vputrans.history"
+
+LOG_TAIL=14
+UA="Mozilla/5.0"                 # plain user agent, no shell metacharacters
+NET_TIMEOUT_US=10000000          # 10s
+NET_TIMEOUT_S=10
+
+# zero-copy hardware decode/encode pipeline (see notes at the top)
+HW_ACCEL="-hwaccel rkmpp -hwaccel_output_format drm_prime"
+
+TAB=$(printf '\t')
+
+# ---------------------------------------------------------------------------
+# JSON helpers
+# ---------------------------------------------------------------------------
+
+esc() { sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r\n' | tr '\t' ' '; }
+jstr() { printf '"%s"' "$(printf '%s' "$1" | esc)"; }
+
+# file size in bytes.  stat is O(1) but is NOT a BusyBox applet in this tree
+# (/bin/stat is coreutils-stat, hence the package dependency); `wc -c < file`
+# reads every byte (measured ~2s CPU for 60MB) so it is only the last resort.
+fsize() { # $1 = path -> bytes (0 if unknown)
+	_sz=$(stat -c %s "$1" 2>/dev/null)
+	[ -n "$_sz" ] || _sz=$(wc -c < "$1" 2>/dev/null | tr -d ' ')
+	printf '%s' "${_sz:-0}"
+}
+
+# tab-join arguments into ONE string (no trailing separator; tabs inside an
+# argument are neutralised).  The JSON/event encoders rely on the exact field
+# count, and passing the joined string as a single quoted argument keeps spaces
+# inside paths intact.
+tjoin() { s=""; sep=""; for a in "$@"; do a=$(printf '%s' "$a" | tr '	' ' '); s="$s$sep$a"; sep="$TAB"; done; printf '%s' "$s"; }
+
+# tab-joined string -> JSON array
+jarr() {
+	[ -n "$1" ] || { printf '[]'; return 0; }
+	old="$IFS"; IFS="$TAB"; set -- $1; IFS="$old"
+	printf '['
+	s=""
+	for a in "$@"; do printf '%s%s' "$s" "$(jstr "$a")"; s=","; done
+	printf ']'
+}
+
+# message fragment: jm <field> <template> [tab-joined args]
+jm() {
+	f="$1"; t="$2"
+	printf '"%s":%s,"%s_args":%s' "$f" "$(jstr "$t")" "$f" "$(jarr "${3:-}")"
+}
+
+# whole-object failure reply: fail <template> [args...]
+fail() { t="$1"; shift; printf '{"ok":false,%s}\n' "$(jm error "$t" "$(tjoin "$@")")"; return 1; }
+
+# render a template with arguments (human-readable copy for $LOG)
+render() { # $1 = template, $2 = tab-joined args
+	awk -v t="$1" -v args="$2" 'BEGIN{
+		n = split(args, A, "\t"); j = 1; out = "";
+		while (j <= n && match(t, /%s/)) {
+			out = out substr(t, 1, RSTART - 1) A[j];
+			t = substr(t, RSTART + 2); j++;
+		}
+		printf "%s%s", out, t
+	}'
+}
+
+# ---------------------------------------------------------------------------
+# log filtering - drop ffmpeg -stats / -progress-byte noise and the chatty MPP
+# banners, but always keep anything that looks like a real error.
+# Our own events are written to $EV (structured); $LOG additionally keeps a
+# readable English copy for on-device debugging.
+# ---------------------------------------------------------------------------
+
+filt_log() {
+	[ -f "$LOG" ] || return 0
+	awk '
+		/^frame=|^fps=|^stream_[0-9]|^bitrate=|^total_size=|^out_time|^dup_frames=|^drop_frames=|^speed=|^progress=/ { next }
+		/^mpp_platform: client .* driver is not ready/ { next }
+		/^mpp\[/ { l = tolower($0); if (l !~ /err|fail|fatal|timeout|unsupport|invalid/) next }
+		{ print }
+	' "$LOG" 2>/dev/null
+}
+log_err_line() { filt_log | tail -n 1; }
+
+# structured events (translatable) - one line per event:
+#   [mm:ss]<TAB><english template><TAB><arg><TAB><arg>...
+log_ev() { # $1 = english template, $2 = tab-joined args (optional)
+	tpl="$1"; args="${2:-}"
+	ts=$(fmt_hms "${st_elapsed:-0}")
+	if [ -n "$args" ]; then
+		printf '[%s]	%s	%s\n' "$ts" "$tpl" "$args" >> "$EV" 2>/dev/null
+	else
+		printf '[%s]	%s\n' "$ts" "$tpl" >> "$EV" 2>/dev/null
+	fi
+	printf '[%s] %s\n' "$ts" "$(render "$tpl" "$args")" >> "$LOG" 2>/dev/null
+}
+# plain, untranslated line (internal bookkeeping only)
+log_raw() { printf '%s\n' "$1" >> "$LOG" 2>/dev/null; }
+
+# last N events as a JSON array
+ev_json() { # $1 = count
+	[ -f "$EV" ] || return 0
+	tail -n "$1" "$EV" 2>/dev/null | awk -F'\t' '
+		function js(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); printf "\"%s\"", s }
+		{ printf "%s{\"ts\":", sep; js($1); printf ",\"t\":"; js($2); printf ",\"a\":[";
+		  for (i = 3; i <= NF; i++) { if (i > 3) printf ","; js($i) }
+		  printf "]}"; sep = "," }
+	'
+}
+
+fmt_hms() { # $1 = seconds -> MM:SS (HH:MM:SS once >= 1h)
+	awk -v s="${1:-0}" 'BEGIN{ s=int(s); if(s<0)s=0; h=int(s/3600); m=int((s%3600)/60); c=s%60;
+		if(h>0) printf "%02d:%02d:%02d", h, m, c; else printf "%02d:%02d", m, c }'
+}
+
+fmt_size() { # $1 = bytes -> human
+	awk -v b="${1:-0}" 'BEGIN{ b=b+0;
+		if(b>=1073741824) printf "%.2f GB", b/1073741824;
+		else if(b>=1048576) printf "%.1f MB", b/1048576;
+		else if(b>=1024) printf "%.0f KB", b/1024;
+		else printf "%d B", b }'
+}
+
+# one short progress event; reuses the SAME progress/speed/elapsed variables the
+# status file already carries - no extra parsing.
+log_progress() {
+	# no usable total length -> report the processed time only
+	if [ "$live" = "true" ] || [ "${den_us:-0}" -eq 0 ] 2>/dev/null; then
+		if [ -n "${st_speed:-}" ]; then
+			log_ev 'Recorded %ss (live stream) at %s' "$(tjoin "${st_out_time:-0}" "$st_speed")"
+		else
+			log_ev 'Recorded %ss (live stream)' "$(tjoin "${st_out_time:-0}")"
+		fi
+	else
+		# total = expected OUTPUT length (see den_of)
+		tot=$(awk -v d="${den_us:-$dur_us}" 'BEGIN{ printf "%.1f", d/1000000 }')
+		if [ -n "${st_speed:-}" ]; then
+			log_ev 'Processed %ss / %ss (%s%) at %s' "$(tjoin "${st_out_time:-0}" "$tot" "${st_progress:-0}" "$st_speed")"
+		else
+			log_ev 'Processed %ss / %ss (%s%)' "$(tjoin "${st_out_time:-0}" "$tot" "${st_progress:-0}")"
+		fi
+	fi
+}
+
+# map a raw ffprobe/ffmpeg error line to a translatable template.
+# Sets H_TPL (template, empty = keep the raw line) and H_ARGS (tab-joined).
+human_err() { # $1 = raw line
+	H_TPL=""; H_ARGS=""
+	case "$1" in
+		*"Connection refused"*)
+			H_TPL='Connection refused: nothing is listening on that address/port (check the URL or whether the server is up)' ;;
+		*"Connection timed out"*|*"Operation timed out"*|*"timed out"*)
+			H_TPL='Connection timed out: no response within %ss (network unreachable, or the stream has not started)'
+			H_ARGS="$NET_TIMEOUT_S" ;;
+		*"No route to host"*)
+			H_TPL='No route to host: the network is unreachable' ;;
+		*"Server returned 404"*)
+			H_TPL='Server returned 404: the address does not exist or has expired' ;;
+		*"Server returned 403"*)
+			H_TPL='Server returned 403: access denied (authentication may be required)' ;;
+		*"Server returned 401"*)
+			H_TPL='Server returned 401: authentication required (user/password or token)' ;;
+		*"Server returned 5"*)
+			H_TPL='Server error (5xx): the origin is broken, please retry later' ;;
+		*"Protocol not found"*)
+			H_TPL='Unsupported protocol: not in the list of available protocols' ;;
+		*"Invalid data found"*)
+			H_TPL='Unrecognised data: not a valid video stream (maybe a web page or plain text)' ;;
+		*"Immediate exit requested"*)
+			H_TPL='Job stopped' ;;
+		*"End of file"*|*"EOF"*)
+			H_TPL='Stream ended (the source closed early)' ;;
+		*"401 Unauthorized"*)
+			H_TPL='Authentication required: wrong user/password or token' ;;
+		*"Could not resolve"*|*"Name or service not known"*|*"Temporary failure in name resolution"*)
+			H_TPL='DNS resolution failed: check the device DNS settings or the address spelling' ;;
+		"")
+			H_TPL='Unknown error, please check the log' ;;
+	esac
+}
+
+# ---------------------------------------------------------------------------
+# source classification
+# ---------------------------------------------------------------------------
+
+is_url() { case "$1" in *://*) return 0 ;; *) return 1 ;; esac; }
+proto_of() { printf '%s' "$1" | sed -n 's,^\([A-Za-z][A-Za-z0-9+.-]*\)://.*,\1,p' | tr 'A-Z' 'a-z'; }
+
+# ---------------------------------------------------------------------------
+# ffprobe helpers
+# ---------------------------------------------------------------------------
+
+net_in_opts() { # extra input options for a network source ($1 = proto)
+	case "$1" in
+		rtsp)          printf -- '-rtsp_transport tcp ' ;;
+		http|https)    printf -- '-user_agent %s ' "$UA" ;;
+	esac
+}
+
+# ONE ffprobe run for the whole video stream.  Probing used to fire a separate
+# ffprobe per field (codec, pix_fmt, width, height, fps, duration = 6 runs,
+# measured 3.5s of CPU on the Panther X2) which made the web UI sit on
+# "Probing…" for seconds.  One run with several -show_entries is ~0.5s.
+# NOTE: the helper variable must NOT be called `out`/`in`/`dur` - do_run() keeps
+# its output path in $out and the while-loop below runs in the current shell.
+ff_probe_v() { # $1=proto $2=src -> sets S_CODEC S_PIX S_W S_H S_FR S_DUR
+	extra=$(net_in_opts "$1")
+	S_CODEC=""; S_PIX=""; S_W=""; S_H=""; S_FR=""; S_DUR=""
+	# shellcheck disable=SC2086
+	pout=$("$FFPROBE" -v error -rw_timeout "$NET_TIMEOUT_US" $extra \
+		-select_streams v:0 \
+		-show_entries stream=codec_name,pix_fmt,width,height,avg_frame_rate \
+		-show_entries format=duration \
+		-of default=noprint_wrappers=1 "$2" 2>/dev/null)
+	while IFS='=' read -r k v; do
+		case "$k" in
+			codec_name)     S_CODEC="$v" ;;
+			pix_fmt)        S_PIX="$v" ;;
+			width)          S_W="$v" ;;
+			height)         S_H="$v" ;;
+			avg_frame_rate) S_FR="$v" ;;
+			duration)       S_DUR="$v" ;;
+		esac
+	done <<PROBEEOF
+$pout
+PROBEEOF
+}
+
+ff_duration() { # $1=proto $2=src -> container duration (seconds)
+	extra=$(net_in_opts "$1")
+	"$FFPROBE" -v error -rw_timeout "$NET_TIMEOUT_US" $extra \
+		-show_entries format=duration \
+		-of default=noprint_wrappers=1:nokey=1 "$2" 2>/dev/null | head -n 1
+}
+ff_audio() { # $1=proto $2=src
+	extra=$(net_in_opts "$1")
+	"$FFPROBE" -v error -rw_timeout "$NET_TIMEOUT_US" $extra \
+		-select_streams a:0 -show_entries stream=codec_name \
+		-of default=noprint_wrappers=1:nokey=1 "$2" 2>/dev/null | head -n 1
+}
+ff_probe_err() { # $1=proto $2=src -> last error line
+	extra=$(net_in_opts "$1")
+	"$FFPROBE" -v error -rw_timeout "$NET_TIMEOUT_US" $extra \
+		-show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$2" 2>&1 >/dev/null \
+		| tail -n 1
+}
+
+fps_of() { awk -v r="$1" 'BEGIN{n=split(r,a,"/"); if(n==2 && a[2]+0>0) printf "%.3f", a[1]/a[2]; else printf "0"}'; }
+
+# ---------------------------------------------------------------------------
+# pipeline decision - THE core bit
+# ---------------------------------------------------------------------------
+
+decide_pipeline() { # $1=codec $2=pix_fmt ; sets P_MODE P_DEC P_REASON P_REASON_ARGS
+	# hardware decoder for each codec this build provides.  vdpu handles H.264,
+	# rkvdec2 handles HEVC/VP8/VP9 - measured on the Panther X2 with zero copy:
+	#   h264 4.4x / 38% one core, vp9 4.5x / 32%, vp9 in SOFTWARE 3.0x / 320%
+	#   (3 whole cores) => always prefer the hardware decoder when one exists.
+	# 10-bit / 4:2:2 / 4:4:4 sources stay on the software path: the VPU only
+	# takes 4:2:0.
+	case "$1" in
+		h264|hevc|vp8|vp9)
+			case "$2" in
+				yuv420p|yuvj420p)
+					P_MODE="hw"; P_DEC="${1}_rkmpp"
+					P_REASON='Source is 4:2:0 %s: hardware decoding available (%s)'
+					P_REASON_ARGS=$(tjoin "$1" "${1}_rkmpp")
+					;;
+				*)
+					P_MODE="sw"; P_DEC=""
+					P_REASON='Source pixel format is %s (the VPU only decodes 4:2:0), switching to software decode'
+					P_REASON_ARGS=$(tjoin "$2")
+					;;
+			esac
+			;;
+		*)
+			P_MODE="sw"; P_DEC=""
+			P_REASON='No hardware decoder for %s, switching to software decode'
+			P_REASON_ARGS=$(tjoin "$1")
+			;;
+	esac
+}
+
+# Only H.264/HEVC have hardware encoders on this SoC, so those are the only
+# accepted values; an unknown name returns EMPTY, which do_run turns into a
+# clear error (never silently fall back to H.264).
+enc_of() {
+	case "$1" in
+		hevc|h265|hevc_rkmpp|h265_rkmpp) printf 'hevc_rkmpp' ;;
+		h264|avc|h264_rkmpp|'')          printf 'h264_rkmpp' ;;
+		*) printf '' ;;
+	esac
+}
+
+# expected output length in microseconds (see the progress notes in do_worker):
+#   source_duration - ss, capped by t; 0 = unknown
+den_of() {
+	awk -v d="$1" -v s="$2" -v t="$3" 'BEGIN{
+		x = (d+0>0) ? d+0 : 0;
+		ss = (s+0>0) ? s+0 : 0;
+		tt = (t+0>0) ? t+0 : 0;
+		x -= ss; if (x < 0) x = 0;
+		if (tt > 0 && (x == 0 || tt < x)) x = tt;
+		printf "%d", x*1000000
+	}'
+}
+
+# resolution sanity: refuse nonsense such as -r 25 (25 is a frame rate, not a
+# height; the old code silently produced scale=-2:25)
+res_ok() {
+	case "$1" in
+		""|source|src|srcsize) return 0 ;;
+		*x*|*X*)
+			w=${1%%[xX]*}; h=${1##*[xX]}
+			case "$w$h" in *[!0-9]*) return 0 ;; esac
+			[ "${w:-0}" -ge 64 ] && [ "${h:-0}" -ge 64 ] && return 0
+			return 1 ;;
+		*[!0-9]*) return 0 ;;
+		*) [ "${1:-0}" -ge 64 ] && return 0; return 1 ;;
+	esac
+}
+
+resolve_res() { # $1 = spec, $2 = mode (hw -> RGA, sw -> swscale), $3 = scaler
+	case "$1" in
+		""|source|src|srcsize) R_VF="" ; return ;;
+	esac
+	W=""; H=""
+	case "$1" in
+		480p)  H=480 ;;
+		720p)  H=720 ;;
+		1080p) H=1080 ;;
+		*x*|*X*) W=${1%%[xX]*}; H=${1##*[xX]} ;;
+		*)     H=$1 ;;
+	esac
+	if [ "$2" = "hw" ]; then
+		# RGA hardware scaling, DRM prime in / NV12 out, no CPU work
+		if [ -n "$W" ]; then R_VF="scale_rkrga=w=$W:h=$H:format=nv12"
+		else               R_VF="scale_rkrga=w=-2:h=$H:format=nv12"; fi
+	else
+		if [ -n "$W" ]; then R_VF="scale=$W:$H"
+		elif [ "$1" = "480p" ] || [ "$1" = "720p" ] || [ "$1" = "1080p" ]; then
+			R_VF="scale=-2:$H:flags=$3"
+		else R_VF="scale=-2:$H"; fi
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# status file
+# ---------------------------------------------------------------------------
+
+write_status() {
+	{
+		printf '{'
+		printf '"version":%s,' "$(jstr "$VERSION")"
+		printf '"state":%s,' "$(jstr "$st_state")"
+		printf '"in":%s,' "$(jstr "$st_in")"
+		printf '"out":%s,' "$(jstr "$st_out")"
+		printf '"sourcetype":%s,' "$(jstr "$st_stype")"
+		printf '"mode":%s,' "$(jstr "$st_mode")"
+		printf '"decoder":%s,' "$(jstr "$st_dec")"
+		printf '"encoder":%s,' "$(jstr "$st_enc")"
+		printf '"scaleeng":%s,' "$(jstr "${st_scaleeng:-}")"
+		printf '%s,' "$(jm reason "$st_reason" "${1:-}")"
+		printf '"live":%s,' "${st_live:-false}"
+		printf '"progmode":%s,' "$(jstr "${st_progmode:-pct}")"
+		printf '"total":%s,' "${st_total:-0}"
+		printf '"progress":%s,' "${st_progress:-0}"
+		printf '"out_time":%s,' "${st_out_time:-0}"
+		printf '"speed":%s,' "$(jstr "$st_speed")"
+		printf '"fps":%s,' "$(jstr "$st_fpsval")"
+		printf '"elapsed":%s,' "${st_elapsed:-0}"
+		printf '"outsize":%s,' "${st_outsize:-0}"
+		printf '%s,' "$(jm error "$st_error" "${st_error_args:-}")"
+		printf '%s,' "$(jm detail "${st_detail:-}" "${st_detail_args:-}")"
+		printf '%s,' "$(jm notice "${st_notice:-}" "${st_notice_args:-}")"
+		printf '"log":['
+		ev_json "$LOG_TAIL"
+		printf ']}\n'
+	} > "$STATE.tmp" 2>/dev/null
+	mv "$STATE.tmp" "$STATE" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# history (keeps the newest 5)
+# ---------------------------------------------------------------------------
+
+add_history() { # $1 state
+	[ -f "$HIST" ] || : > "$HIST"
+	line=$(printf '{"ts":%s,"time":%s,"src":%s,"stype":%s,"mode":%s,"enc":%s,"out":%s,"elapsed":%s,"size":%s,"state":%s}' \
+		"$(date +%s)" "$(jstr "$(date '+%Y-%m-%d %H:%M:%S')")" "$(jstr "$st_in")" \
+		"$(jstr "$st_stype")" "$(jstr "$st_mode")" "$(jstr "$st_enc")" \
+		"$(jstr "$st_out")" "${st_elapsed:-0}" "${st_outsize:-0}" "$(jstr "$1")")
+	{ printf '%s\n' "$line"; [ -f "$HIST" ] && tail -n 4 "$HIST"; } > "$HIST.tmp" 2>/dev/null
+	mv "$HIST.tmp" "$HIST" 2>/dev/null
+}
+
+do_history() {
+	printf '{"ok":true,"items":['
+	if [ -f "$HIST" ]; then
+		sep=""
+		while IFS= read -r ln; do
+			[ -n "$ln" ] || continue
+			printf '%s%s' "$sep" "$ln"
+			sep=","
+		done < "$HIST"
+	fi
+	printf ']}\n'
+}
+
+# ---------------------------------------------------------------------------
+# probe
+# ---------------------------------------------------------------------------
+
+# fills S_* globals for a local file or URL source. Returns 0 / sets S_ERR.
+probe_common() { # $1 = src
+	S_SRC="$1"; S_ERR=""; S_ERR_ARGS=""; S_ERR_DETAIL=""
+	if is_url "$S_SRC"; then
+		S_PROTO=$(proto_of "$S_SRC")
+		[ -n "$S_PROTO" ] || { S_ERR='Cannot parse the protocol of: %s'; S_ERR_ARGS=$(tjoin "$S_SRC"); return 1; }
+		S_STYPE="url"
+	else
+		S_PROTO=""
+		S_STYPE="local"
+		if [ -d "$S_SRC" ]; then
+			S_ERR='This is a directory, not a video file: %s'; S_ERR_ARGS=$(tjoin "$S_SRC"); return 1
+		fi
+		if [ ! -f "$S_SRC" ]; then
+			S_ERR='File not found: %s'; S_ERR_ARGS=$(tjoin "$S_SRC"); return 1
+		fi
+	fi
+
+	ff_probe_v "$S_PROTO" "$S_SRC"
+	if [ -z "$S_CODEC" ]; then
+		raw=$(ff_probe_err "$S_PROTO" "$S_SRC")
+		human_err "$raw"
+		if [ -n "$H_TPL" ]; then
+			S_ERR="$H_TPL"; S_ERR_ARGS="$H_ARGS"; S_ERR_DETAIL='%s'; S_ERR_DETAIL_ARGS=$(tjoin "$raw")
+		else
+			S_ERR='%s'; S_ERR_ARGS=$(tjoin "$raw")
+			[ -n "$raw" ] || { S_ERR='Unrecognised source (not a video, or damaged)'; S_ERR_ARGS=""; }
+		fi
+		return 1
+	fi
+	S_ACODEC=$(ff_audio "$S_PROTO" "$S_SRC")
+	S_FPS=$(fps_of "$S_FR")
+	S_DUR=$(awk -v d="$S_DUR" 'BEGIN{ if(d+0>0) printf "%.3f", d+0; else printf "0" }')
+
+	# live detection: an online source that reports no total duration
+	if [ "$S_STYPE" = "url" ] && [ "$(awk -v d="$S_DUR" 'BEGIN{print (d+0>0)?1:0}')" = "0" ]; then
+		S_LIVE=true; S_STYPE="live"
+	else
+		S_LIVE=false
+	fi
+
+	decide_pipeline "$S_CODEC" "$S_PIX"
+	S_MODE="$P_MODE"; S_DEC="$P_DEC"; S_REASON="$P_REASON"; S_REASON_ARGS="$P_REASON_ARGS"
+	return 0
+}
+
+# scale engine actually used for a given mode/spec
+scale_eng_of() { # $1 = mode, $2 = res spec
+	case "$2" in ""|source|src|srcsize) printf ''; return ;; esac
+	[ "$1" = "hw" ] && printf 'rga' || printf 'sw'
+}
+
+do_probe() {
+	if [ -z "$1" ]; then fail 'No input path or URL given'; return 1; fi
+	if ! probe_common "$1"; then
+		printf '{"ok":false,%s' "$(jm error "$S_ERR" "$S_ERR_ARGS")"
+		[ -n "$S_ERR_DETAIL" ] && printf ',%s' "$(jm detail "$S_ERR_DETAIL" "$S_ERR_DETAIL_ARGS")"
+		printf '}\n'
+		return 1
+	fi
+	asize=0
+	[ "$S_STYPE" = "local" ] && asize=$(fsize "$S_SRC")
+	printf '{"ok":true,"src":%s,"sourcetype":%s,"protocol":%s,"codec":%s,"pix_fmt":%s,"width":%s,"height":%s,"fps":%s,"duration":%s,"live":%s,"size":%s,"audio":%s,"mode":%s,"decoder":%s,%s}\n' \
+		"$(jstr "$S_SRC")" "$(jstr "$S_STYPE")" "$(jstr "$S_PROTO")" "$(jstr "$S_CODEC")" \
+		"$(jstr "$S_PIX")" "${S_W:-0}" "${S_H:-0}" "${S_FPS:-0}" "${S_DUR:-0}" \
+		"$S_LIVE" "${asize:-0}" "$(jstr "$S_ACODEC")" \
+		"$(jstr "$S_MODE")" "$(jstr "$S_DEC")" \
+		"$(jm reason "$S_REASON" "$S_REASON_ARGS")"
+}
+
+# ---------------------------------------------------------------------------
+# list - pure NAME scan.  NEVER runs ffprobe/ffmpeg (that cost ~40ms/file and
+# made the page hang for ~8s on a /tmp full of clips).  Size comes straight
+# from one batched `stat` per exec, so the whole call is a couple of find+stat
+# passes.  Depth <= 2, at most MAX_LIST entries, truncation is flagged.
+# ---------------------------------------------------------------------------
+
+MAX_LIST=200
+
+# the candidate scan itself (predicates in one place so the size source can be
+# swapped without duplicating it)
+list_find() {
+	find /mnt /media /root /tmp -maxdepth 2 -type f 2>/dev/null \
+		\( -iname '*.mp4'  -o -iname '*.mkv'  -o -iname '*.mov' \
+		   -o -iname '*.ts'   -o -iname '*.avi'  -o -iname '*.flv' \
+		   -o -iname '*.webm' -o -iname '*.m4v'  -o -iname '*.mpg' \
+		   -o -iname '*.m2ts' -o -iname '*.wmv'  -o -iname '*.3gp' \
+		   -o -iname '*.mkv'  -o -iname '*.rmvb' -o -iname '*.vob' \) \
+		"$@"
+}
+
+do_list() {
+	# `stat -c` is the fast path (one external batch, O(1) per file).  It needs
+	# coreutils-stat/busybox-stat; if neither exists, degrade to a name-only
+	# listing (size 0) instead of silently returning an empty list.
+	if command -v stat >/dev/null 2>&1; then
+		list_find -exec stat -c '%s|%n' {} + 2>/dev/null
+	else
+		list_find -print 2>/dev/null | awk '{ print "0|" $0 }'
+	fi \
+	| grep -v -e '/\.git/' -e '/\.cache/' -e '/tmp/ipk' -e '/\.cache$' \
+	| head -n "$((MAX_LIST + 1))" \
+	| awk -F'|' -v max="$MAX_LIST" '
+		BEGIN { printf "{\"ok\":true,\"files\":[" }
+		NR <= max {
+			s = $1 + 0
+			p = $2
+			e = p
+			gsub(/\\/, "\\\\", e)
+			gsub(/"/, "\\\"", e)
+			if (count) printf ","
+			printf "{\"path\":\"%s\",\"size\":%d}", e, s
+			count++
+		}
+		END {
+			trunc = (NR > max) ? "true" : "false"
+			printf "],\"count\":%d,\"truncated\":%s}\n", (count + 0), trunc
+		}
+	'
+}
+
+# ---------------------------------------------------------------------------
+# stop - signal the worker AND all of its children (no ps -o on busybox)
+# ---------------------------------------------------------------------------
+
+ppid_of() {
+	line=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+	rest=${line##*)}; set -- $rest; printf '%s' "$2"
+}
+kids_of() {
+	for d in /proc/[0-9]*; do
+		p=${d#/proc/}
+		[ "$p" = "$$" ] && continue
+		[ "$(ppid_of "$p")" = "$1" ] && printf '%s ' "$p"
+	done
+}
+kill_tree() {
+	for c in $(kids_of "$1"); do kill_tree "$c"; done
+	kill -TERM "$1" 2>/dev/null
+}
+
+do_stop() {
+	pid=$(cat "$PIDF" 2>/dev/null)
+	if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+		# maybe the worker already died but left 'running' -> finalise
+		if [ -f "$STATE" ] && grep -q '"state":"running"' "$STATE" 2>/dev/null; then
+			st_state="stopped"
+			st_error='Stopped manually'; st_error_args=""
+			st_detail=""; st_detail_args=""
+			st_speed=""
+			st_elapsed=$(sed -n 's/.*"elapsed":\([0-9][0-9]*\).*/\1/p' "$STATE" 2>/dev/null)
+			log_ev 'Stopped manually'
+			write_status; add_history "stopped"
+		fi
+		fail 'No job is currently running'
+		return 1
+	fi
+	: > "$STOPFLAG"
+	st_elapsed=$(sed -n 's/.*"elapsed":\([0-9][0-9]*\).*/\1/p' "$STATE" 2>/dev/null)
+	log_ev 'Stop requested, finishing the current job'
+	kill_tree "$pid"
+	# wait until the WORKER has written its terminal state (up to ~8s).  It must
+	# still be able to see $STOPFLAG, otherwise a stopped job is mislabelled
+	# "done"; busybox sleep has no fractions so we poll 1s at a time.
+	i=0
+	while [ $i -lt 8 ]; do
+		cst=$(sed -n 's/.*"state":"\([a-z]*\)".*/\1/p' "$STATE" 2>/dev/null)
+		[ "$cst" != "running" ] && break
+		sleep 1; i=$((i+1))
+	done
+	if kill -0 "$pid" 2>/dev/null; then
+		kill -KILL "$pid" 2>/dev/null
+		for c in $(kids_of "$pid"); do kill -KILL "$c" 2>/dev/null; done
+	fi
+	rm -f "$STOPFLAG"
+	printf '{"ok":true,"msg":"stopped"}\n'
+}
+
+do_status() {
+	if [ -f "$STATE" ]; then cat "$STATE"; else printf '{"state":"idle"}\n'; fi
+}
+
+# ---------------------------------------------------------------------------
+# run - validate, lock, seed status, detach the worker
+# ---------------------------------------------------------------------------
+
+do_run() {
+	in=""; out=""; quality="cbr"; br=""; qp=""; enc=""
+	res="source"; scaler="bicubic"; audio="copy"; container="auto"
+	ss="0"; dur="0"; fps="source"
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--out|-o)       out="$2"; shift 2 ;;
+			--quality)      quality="$2"; shift 2 ;;
+			--bitrate|-b)   br="$2"; shift 2 ;;
+			--qp)           qp="$2"; shift 2 ;;
+			--codec|-c)     enc="$2"; shift 2 ;;
+			--fps)          fps="$2"; shift 2 ;;
+			--res|-r)       res="$2"; shift 2 ;;
+			--scaler|-s)    scaler="$2"; shift 2 ;;
+			--ss)           ss="$2"; shift 2 ;;
+			--dur|-t)       dur="$2"; shift 2 ;;
+			--audio|-a)     audio="$2"; shift 2 ;;
+			--container|-f) container="$2"; shift 2 ;;
+			-*) fail 'Unknown argument: %s' "$1"; return 1 ;;
+			*) in="$1"; shift ;;
+		esac
+	done
+
+	if [ -z "$in" ]; then fail 'No input selected (local path or URL)'; return 1; fi
+	if [ ! -x "$FFMPEG_HW" ]; then
+		fail 'Transcoder %s is missing, please install ffmpeg-rkrga' "$FFMPEG_HW"; return 1
+	fi
+	if ! res_ok "$res"; then fail 'Invalid resolution: %s' "$res"; return 1; fi
+
+	# ---- probe ----
+	if ! probe_common "$in"; then
+		printf '{"ok":false,%s' "$(jm error "$S_ERR" "$S_ERR_ARGS")"
+		[ -n "$S_ERR_DETAIL" ] && printf ',%s' "$(jm detail "$S_ERR_DETAIL" "$S_ERR_DETAIL_ARGS")"
+		printf '}\n'
+		return 1
+	fi
+	codec="$S_CODEC"; pix="$S_PIX"; dur_src="$S_DUR"; acodec="$S_ACODEC"
+	stype="$S_STYPE"; live="$S_LIVE"
+	decide_pipeline "$codec" "$pix"
+	mode="$P_MODE"; dec="$P_DEC"; reason="$P_REASON"; reason_args="$P_REASON_ARGS"
+
+	# ---- defaults ----
+	[ -n "$enc" ] || enc="h264"
+	[ -n "$br" ]  || br="2M"
+	[ -n "$qp" ]  || qp="26"
+	E=$(enc_of "$enc")
+	if [ -z "$E" ]; then
+		fail 'Unsupported encoder: %s (this SoC only has H.264/H.265 hardware encoders)' "$enc"
+		return 1
+	fi
+
+	# container: resolve auto
+	csrc="$container"
+	if [ "$container" = "auto" ]; then
+		if [ -n "$out" ]; then
+			case "$out" in
+				*.mkv) container="mkv" ;;
+				*.ts)  container="ts" ;;
+				*.mp4) container="mp4" ;;
+			esac
+		fi
+	fi
+	if [ "$container" = "auto" ] || [ -z "$container" ]; then
+		if [ "$live" = "true" ]; then container="mkv"; else container="mp4"; fi
+	fi
+	case "$container" in mp4|mkv|ts) ;; *) container="mp4" ;; esac
+
+	# audio: auto-fix copy when the container cannot hold the codec
+	notice=""; notice_args=""
+	if [ "$audio" = "copy" ] && [ "$container" = "mp4" ] && [ -n "$acodec" ]; then
+		case "$acodec" in
+			aac|mp3|ac3|eac3|alac|mp2) ;;
+			*) audio="aac"
+			   notice='Source audio %s cannot be stored in mp4, re-encoding to AAC'
+			   notice_args=$(tjoin "$acodec")
+			   ;;
+		esac
+	fi
+	case "$audio" in copy|none|aac) ;; *) audio="copy" ;; esac
+
+	# output path
+	if [ -z "$out" ]; then
+		case "$container" in
+			mkv) ext="mkv" ;; ts) ext="ts" ;; *) ext="mp4" ;;
+		esac
+		if [ "$stype" = "local" ]; then
+			dir=$(dirname "$in"); base=$(basename "$in"); base="${base%.*}"
+			[ -z "$base" ] && base="vput"
+			[ -w "$dir" ] || dir="/tmp"
+			out="$dir/${base}_vput.$ext"
+		else
+			base=$(printf '%s' "$in" | sed -e 's/[?#].*$//' -e 's,/*$,,' | awk -F/ '{print $NF}')
+			[ -z "$base" ] && base="stream"
+			base=$(printf '%s' "$base" | sed 's/[^A-Za-z0-9._-]/_/g')
+			dir="/tmp"; [ -d /mnt ] && [ -w /mnt ] && dir="/mnt"
+			out="$dir/${base}_$(date +%Y%m%d_%H%M%S).$ext"
+		fi
+	else
+		case "$container" in
+			auto|"") : ;;
+		esac
+		# if user gave -o without a known ext, honour the resolved container
+		case "$out" in
+			*.mkv) container="mkv" ;; *.ts) container="ts" ;; *.mp4) container="mp4" ;;
+			*) case "$container" in
+					mkv) out="$out.mkv" ;; ts) out="$out.ts" ;; *) out="$out.mp4" ;;
+			   esac ;;
+		esac
+	fi
+	[ "$out" = "$in" ] && { fail 'Output must differ from the input file'; return 1; }
+	odir=$(dirname "$out")
+	if [ ! -d "$odir" ]; then
+		mkdir -p "$odir" 2>/dev/null || { fail 'Cannot create the output directory: %s' "$odir"; return 1; }
+	fi
+	[ -w "$odir" ] || { fail 'Output directory is not writable: %s' "$odir"; return 1; }
+
+	# single-instance lock; detached worker inherits fd 9 -> keeps the lock
+	exec 9>"$LOCK" 2>/dev/null
+	if ! flock -n 9 2>/dev/null; then
+		fail 'Another job is already running, wait for it or press Stop first'
+		return 1
+	fi
+
+	rm -f "$STOPFLAG"
+	st_state="running"; st_progress=0; st_speed=""; st_elapsed=0
+	st_total=$(awk -v d="$(den_of "$dur_src" "$ss" "$dur")" 'BEGIN{ printf "%.0f", d/1000000 }')
+	if [ "$live" = "true" ] || [ "$st_total" = "0" ]; then st_progmode="time"; else st_progmode="pct"; fi
+	st_out_time=0; st_fpsval=""
+	st_outsize=0
+	st_error=""; st_error_args=""; st_detail=""; st_detail_args=""
+	st_notice="$notice"; st_notice_args="$notice_args"
+	st_in="$in"; st_out="$out"
+	st_stype="$stype"
+	st_live="$live"; st_mode="$mode"; st_dec="$dec"
+	st_enc="$E"; st_reason="$reason"; st_reason_args="$reason_args"
+	st_scaleeng=$(scale_eng_of "$mode" "$res")
+	: > "$EV"
+	write_status "$reason_args"
+
+	# the worker inherits the notice (it cannot re-derive it)
+	VPU_NOTICE="$notice"; VPU_NOTICE_ARGS="$notice_args"; export VPU_NOTICE VPU_NOTICE_ARGS
+
+	# detach the real worker (survives the ~60s uhttpd CGI limit)
+	( exec "$0" __worker "$in" "$out" "$quality" "$qp" "$br" "$enc" "$res" "$scaler" \
+		"$audio" "$container" "$ss" "$dur" "$fps" "$codec" "$pix" "$live" "$stype" ) \
+		</dev/null >/dev/null 2>&1 &
+
+	printf '{"ok":true,"in":%s,"out":%s,"sourcetype":%s,"mode":%s,"decoder":%s,"encoder":%s,%s}\n' \
+		"$(jstr "$in")" "$(jstr "$out")" "$(jstr "$stype")" \
+		"$(jstr "$mode")" "$(jstr "$dec")" "$(jstr "$E")" "$(jm notice "$notice" "$notice_args")"
+}
+
+# ---------------------------------------------------------------------------
+# worker - build the command, run ffmpeg, keep the status file fresh
+# ---------------------------------------------------------------------------
+
+do_worker() {
+	in="$1"; out="$2"; quality="$3"; qp="$4"; br="$5"; enc="$6"; res="$7"; scaler="$8"
+	audio="$9"; container="${10}"; ss="${11}"; dur="${12}"; fps="${13}"
+	codec="${14}"; pix="${15}"; live="${16}"; stype="${17}"
+
+	E=$(enc_of "$enc")
+	proto=$(proto_of "$in")
+	dur_src=$(ff_duration "$proto" "$in")
+	dur_us=$(awk -v d="$dur_src" 'BEGIN{ if(d+0>0) printf "%d", d*1000000; else printf "0" }')
+	# How long the OUTPUT is expected to be: source length minus the -ss trim,
+	# capped by -t when given.  Progress must be measured against THIS, not
+	# against the raw source length (otherwise -t/-ss jobs under-report and
+	# then jump to 100%).
+	den_us=$(den_of "$dur_src" "$ss" "$dur")
+	# a declared length below 1s is garbage metadata (seen: an mkv header
+	# claiming 0.005s for a 60s clip) -> treat as unknown
+	[ "$den_us" -ge 1000000 ] 2>/dev/null || den_us=0
+	# NOTE: do NOT try to "cross-check" the declared length against
+	# size/bitrate - the container derives bit_rate from its own duration, so
+	# size*8/bit_rate == duration and the check is circular (verified: a file
+	# with a doctored 20s header reports exactly 20s from that formula).
+	# The honest signals are: an unusable duration (<1s / absent) -> time mode
+	# from the start, and "processed time passed the declared length" -> switch
+	# to time mode (see the progress loop below).
+
+	decide_pipeline "$codec" "$pix"
+	mode="$P_MODE"; dec="$P_DEC"; reason="$P_REASON"; reason_args="$P_REASON_ARGS"
+	resolve_res "$res" "$mode" "$scaler"
+
+	st_state="running"; st_progress=0; st_speed=""; st_outsize=0
+	st_total=$(awk -v d="$den_us" 'BEGIN{ printf "%.0f", d/1000000 }')
+	if [ "$live" = "true" ] || [ "$den_us" -eq 0 ] 2>/dev/null; then st_progmode="time"; else st_progmode="pct"; fi
+	st_error=""; st_error_args=""; st_detail=""; st_detail_args=""
+	st_out_time=0; st_fpsval=""
+	st_in="$in"; st_out="$out"
+	st_stype="$stype"
+	st_live="$live"; st_mode="$mode"; st_dec="$dec"; st_enc="$E"
+	st_reason="$reason"; st_reason_args="$reason_args"
+	st_scaleeng=$(scale_eng_of "$mode" "$res")
+	st_notice="${VPU_NOTICE:-}"; st_notice_args="${VPU_NOTICE_ARGS:-}"
+	start_ts=$(date +%s); st_elapsed=0
+	write_status "$reason_args"
+
+	: > "$LOG"; : > "$PROG"; : > "$EV"
+
+	# ---- readable start event ----
+	srckind="local file"
+	[ "$stype" = "url" ] && srckind="online URL"
+	[ "$stype" = "live" ] && srckind="live stream"
+	if [ "$mode" = "hw" ] && [ -n "$dec" ]; then decword="hardware decode"; else decword="software decode"; fi
+	if [ "$quality" = "crf" ]; then rckind="CQP QP"; rcval="$qp"; else rckind="CBR bitrate"; rcval="$br"; fi
+	log_ev '▶ Starting: %s (%s) | %s %s | %s + hardware encode %s | %s %s' \
+		"$(tjoin "$in" "$srckind" "$codec" "$pix" "$decword" "$E" "$rckind" "$rcval")"
+	[ -n "$st_notice" ] && log_ev "$st_notice" "$st_notice_args"
+	last_log=0
+
+	# ---- video encode options ----
+	venc=""
+	[ "$quality" = "crf" ] && venc="-rc_mode CQP -qp_init $qp" || venc="-b:v $br"
+	vopts="$venc"
+	# 🔴 hw mode = DRM prime zero copy: NO -pix_fmt (see the header notes)
+	if [ "$mode" = "hw" ]; then
+		[ -n "$R_VF" ] && vopts="$vopts -vf $R_VF"
+	else
+		vopts="$vopts -pix_fmt yuv420p"
+		[ -n "$R_VF" ] && vopts="$vopts -vf $R_VF"
+	fi
+	[ -n "$fps" ] && [ "$fps" != "source" ] && vopts="$vopts -r $fps"
+	case "$audio" in
+		copy) aopts="-c:a copy" ;;
+		none) aopts="-an" ;;
+		aac)  aopts="-c:a aac -b:a 128k" ;;
+	esac
+	case "$container" in
+		mp4) copts="-movflags +faststart -f mp4" ;;
+		mkv) copts="-f matroska" ;;
+		ts)  copts="-f mpegts" ;;
+	esac
+	ssopt=""; [ -n "$ss" ] && [ "$ss" != "0" ] && ssopt="-ss $ss"
+	d_opt=""; [ -n "$dur" ] && [ "$dur" != "0" ] && d_opt="-t $dur"
+
+	# extra network input options
+	extra=$(net_in_opts "$proto")
+
+	# hardware zero-copy flags only where the rkmpp decoder is in use
+	hwopt=""
+	[ "$mode" = "hw" ] && hwopt="$HW_ACCEL"
+
+	# single-process pipeline: ffmpeg-rkrga handles the protocol (file/http/
+	# https/rtsp/rtmp/hls), the hardware decode, the RGA scaling and the
+	# hardware encode by itself - there is no helper ffmpeg stage any more.
+	# shellcheck disable=SC2086
+	set -- "$FFMPEG_HW" -y -hide_banner -loglevel warning -nostats -progress "$PROG" \
+		-rw_timeout "$NET_TIMEOUT_US"
+	[ -n "$hwopt" ] && set -- "$@" $hwopt
+	[ -n "$extra" ] && set -- "$@" $extra
+	[ -n "$ssopt" ] && set -- "$@" $ssopt
+	if [ "$mode" = "hw" ] && [ -n "$dec" ]; then
+		set -- "$@" -c:v "$dec"
+	fi
+	set -- "$@" -i "$in"
+	set -- "$@" -c:v "$E"
+	# shellcheck disable=SC2086
+	[ -n "$vopts" ] && set -- "$@" $vopts
+	# shellcheck disable=SC2086
+	set -- "$@" $aopts
+	[ -n "$d_opt" ] && set -- "$@" $d_opt
+	# shellcheck disable=SC2086
+	set -- "$@" $copts "$out"
+	"$@" >>"$LOG" 2>&1 &
+	fpid=$!
+	echo "$fpid" > "$PIDF"
+
+	while kill -0 "$fpid" 2>/dev/null; do
+		ot=$(grep '^out_time_us=' "$PROG" 2>/dev/null | tail -n 1 | cut -d= -f2)
+		ot=${ot:-0}
+		st_out_time=$(awk -v t="$ot" 'BEGIN{ printf "%.1f", t/1000000 }')
+		# The declared source length can be a lie: a recording cut mid-stream
+		# keeps the old header duration, and a live HLS/IPTV playlist only
+		# declares its rolling window.  Once the processed time passes the
+		# declared length we KNOW the metadata is wrong -> stop showing a
+		# percentage (it would sit at 100% for the rest of the job) and show
+		# the processed time instead.
+		if [ "$st_progmode" = "pct" ] && [ "$ot" -gt "$den_us" ] 2>/dev/null; then
+			st_progmode="time"
+			[ -z "$st_notice" ] && {
+				st_notice='Source duration metadata (%ss) is unreliable - already exceeded, showing processed time instead'
+				st_notice_args=$(tjoin "${st_total:-0}")
+			}
+		fi
+		if [ "$st_progmode" = "time" ]; then
+			st_progress=0
+		else
+			# never claim 100% while still running (it is reached only when
+			# ffmpeg really is finished)
+			st_progress=$(awk -v t="$ot" -v d="$den_us" \
+				'BEGIN{ if(d>0){ p=t/d*100; if(p>99)p=99; if(p<0)p=0; printf "%.1f", p } else printf "0" }')
+		fi
+		st_speed=$(grep '^speed=' "$PROG" 2>/dev/null | tail -n 1 | cut -d= -f2)
+		st_fpsval=$(grep '^fps=' "$PROG" 2>/dev/null | tail -n 1 | cut -d= -f2)
+		st_outsize=$(grep '^total_size=' "$PROG" 2>/dev/null | tail -n 1 | cut -d= -f2)
+		st_elapsed=$(( $(date +%s) - start_ts ))
+		st_error=""; st_error_args=""
+		if [ -f "$STOPFLAG" ]; then st_error='Stopping…'; st_error_args=""; fi
+		# keep the log MOVING: at least one line every 10s
+		if [ $(( st_elapsed - last_log )) -ge 10 ]; then
+			log_progress
+			last_log=$st_elapsed
+		fi
+		write_status "$st_reason_args"
+		sleep 2
+	done
+
+	wait "$fpid"; rc=$?
+	st_elapsed=$(( $(date +%s) - start_ts ))
+
+	stopped=0
+	[ -f "$STOPFLAG" ] && stopped=1
+
+	# validate the product AND learn its real duration in the same ffprobe run
+	# (the last -progress flush can be up to one GOP short of the end)
+	outdur=$("$FFPROBE" -v error -show_entries stream=codec_name \
+		-show_entries format=duration \
+		-of default=noprint_wrappers=1:nokey=1 "$out" 2>/dev/null | tail -n 1)
+	if [ -s "$out" ] && [ -n "$outdur" ] && [ "$(awk -v d="$outdur" 'BEGIN{print (d+0>0)?1:0}')" = "1" ]; then
+		st_outsize=$(fsize "$out")
+		st_out_time=$(awk -v d="$outdur" 'BEGIN{ printf "%.1f", d+0 }')
+		if [ "$stopped" = "1" ]; then
+			st_state="stopped"; st_error='Stopped manually'; st_error_args=""; st_progress=100
+			st_detail=""; st_detail_args=""
+			add_history "stopped"
+		elif [ "$rc" -eq 0 ]; then
+			st_state="done"; st_progress=100; st_error=""; st_error_args=""
+			st_detail=""; st_detail_args=""
+			add_history "done"
+		else
+			st_state="done"; st_progress=100
+			st_error='Transcode ended early (ffmpeg exit code %s), the output file was produced'
+			st_error_args=$(tjoin "$rc")
+			st_detail=""; st_detail_args=""
+			add_history "done"
+		fi
+		st_speed=""
+	else
+		st_state="error"
+		el="$(log_err_line)"
+		raw=$(printf '%s' "$el" | sed 's/^.*]: //')
+		if [ "$stopped" = "1" ]; then
+			st_state="stopped"; st_error='Stopped manually'; st_error_args=""
+			st_detail=""; st_detail_args=""
+			add_history "stopped"
+		else
+			st_error='Transcode failed (exit code %s)'; st_error_args=$(tjoin "$rc")
+			human_err "$raw"
+			if [ -n "$H_TPL" ]; then
+				st_detail="$H_TPL"; st_detail_args="$H_ARGS"
+			else
+				st_detail='%s'; st_detail_args=$(tjoin "$raw")
+			fi
+			add_history "error"
+		fi
+	fi
+	# ---- readable terminal event ----
+	avg=$(awk -v t="${st_out_time:-0}" -v e="${st_elapsed:-0}" 'BEGIN{ if(e>0 && t+0>0) printf "%.2fx", t/e; else printf "" }')
+	sz=$(fmt_size "${st_outsize:-0}")
+	case "$st_state" in
+		done)
+			if [ -n "$avg" ]; then
+				log_ev '✔ Finished: %s (%s) in %ss, average %s' "$(tjoin "$out" "$sz" "${st_elapsed}" "$avg")"
+			else
+				log_ev '✔ Finished: %s (%s) in %ss' "$(tjoin "$out" "$sz" "${st_elapsed}")"
+			fi ;;
+		stopped) log_ev '⏹ Stopped: %s (%s) in %ss' "$(tjoin "$out" "$sz" "${st_elapsed}")" ;;
+		error)   log_ev "$st_error" "$st_error_args" ;;
+	esac
+	write_status "$st_reason_args"
+}
+
+# ---------------------------------------------------------------------------
+
+case "$1" in
+	version) printf '{"version":"%s"}\n' "$VERSION" ;;
+	probe)   shift; do_probe "$@" ;;
+	list)    do_list ;;
+	run)     shift; do_run "$@" ;;
+	status)  do_status ;;
+	stop)    do_stop ;;
+	history) do_history ;;
+	__worker) shift; do_worker "$@" ;;
+	*)
+		fail 'usage: vputrans {version|probe <src>|list|run <src> [opt]|status|stop|history}'
+		exit 2
+		;;
+esac
