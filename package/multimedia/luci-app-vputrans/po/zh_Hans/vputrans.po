@@ -441,10 +441,10 @@ msgstr "① 源（可自由手填本地路径 或 在线 URL，自动识别）"
 msgid "② Parameters"
 msgstr "② 参数"
 
-msgid "③ Progress and log"
+msgid "④ Progress and log"
 msgstr "③ 进度与日志"
 
-msgid "④ Recent jobs (newest 5)"
+msgid "⑤ Recent jobs (newest 5)"
 msgstr "④ 最近任务（最多 5 条）"
 
 msgid "▶ Starting: %s (%s) | %s %s | %s + hardware encode %s | %s %s"
@@ -481,3 +481,123 @@ msgstr "源文件一律硬件解码（H.264/HEVC/VP8/VP9），再由 H.264/H.265
 
 msgid "Unsupported encoder: %s (this SoC only has H.264/H.265 hardware encoders)"
 msgstr "不支持的编码器：%s（这块 SoC 只有 H.264/H.265 硬件编码器）"
+
+msgid "③ Batch (a directory, or a list of files one per line)"
+msgstr "③ 批处理（目录，或每行一个文件的列表）"
+
+msgid "Directory"
+msgstr "目录"
+
+msgid "recursive"
+msgstr "含子目录"
+
+msgid "File list (one path per line - Chinese names are fine)"
+msgstr "文件列表（每行一个路径，中文名没问题）"
+
+msgid "Output directory"
+msgstr "输出目录"
+
+msgid "empty = next to each source file"
+msgstr "留空 = 与源文件同目录"
+
+msgid "skip files that already have an output"
+msgstr "跳过已转码的文件"
+
+msgid "Scan directory"
+msgstr "扫描目录"
+
+msgid "Start batch"
+msgstr "开始批处理"
+
+msgid "Stop batch"
+msgstr "停止批处理"
+
+msgid "Batch"
+msgstr "批处理"
+
+msgid "ok"
+msgstr "成功"
+
+msgid "skipped"
+msgstr "跳过"
+
+msgid "queue finished"
+msgstr "队列已完成"
+
+msgid "current"
+msgstr "当前"
+
+msgid "Found %s file(s)"
+msgstr "找到 %s 个文件"
+
+msgid "Enter a directory first."
+msgstr "请先填写目录。"
+
+msgid "Scan failed"
+msgstr "扫描失败"
+
+msgid "Batch started: %s file(s) - one at a time"
+msgstr "批处理已开始：%s 个文件，将逐个处理"
+
+msgid "Stop requested - finishing the current file"
+msgstr "已请求停止——正在结束当前文件"
+
+msgid "Enter a directory or a file list first."
+msgstr "请先填写目录或文件列表。"
+
+msgid "batch needs --dir DIR or --list FILE"
+msgstr "批处理需要 --dir 目录 或 --list 列表文件"
+
+msgid "Empty file list"
+msgstr "文件列表为空"
+
+msgid "File list not found: %s"
+msgstr "找不到列表文件：%s"
+
+msgid "Directory not found: %s"
+msgstr "找不到目录：%s"
+
+msgid "No matching video files in %s"
+msgstr "在 %s 里没有匹配到的视频文件"
+
+msgid "✔ Batch finished: %s/%s ok, %s failed, %s skipped"
+msgstr "✔ 批处理完成：成功 %s/%s，失败 %s，跳过 %s"
+
+msgid "Unknown error"
+msgstr "未知错误"
+
+msgid "queue stopped"
+msgstr "队列已停止"
+
+msgid "⏹ Batch stopped: %s/%s ok, %s failed, %s skipped"
+msgstr "⏹ 批处理已停止：成功 %s/%s，失败 %s，跳过 %s"
+
+msgid "source bitrate"
+msgstr "源片码率"
+
+msgid "CBR target pre-filled from the source bitrate (85%)"
+msgstr "已按源片码率自动预填 CBR 目标（85%）"
+
+msgid "leave it, or type your own"
+msgstr "保持不变，或自己填"
+
+msgid "CBR target not set: using 85% of the source bitrate (%sk -> %s)"
+msgstr "没指定 CBR 码率：按源片码率的 85% 取值（%sk → %s）"
+
+msgid "empty = follow the source bitrate; e.g. 2M / 4M"
+msgstr "留空 = 跟随源片码率；也可填 2M / 4M"
+
+msgid "CBR left empty = follow the source bitrate"
+msgstr "CBR 留空 = 跟随源片码率"
+
+msgid "type a value here to override, e.g. 1M"
+msgstr "想覆盖就填一个值，例如 1M"
+
+msgid "CBR target not set: following the source bitrate (%s)"
+msgstr "没设 CBR 目标：跟随源片码率（%s）"
+
+msgid "Follow the source (default)"
+msgstr "跟随源片（默认）"
+
+msgid "CBR: following the source"
+msgstr "CBR：跟随源片码率"

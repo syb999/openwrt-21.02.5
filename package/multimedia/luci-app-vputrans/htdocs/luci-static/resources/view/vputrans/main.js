@@ -27,7 +27,7 @@
  * them), and so are regex literals containing "://" (jsmin truncates them).
  */
 
-var VPU_VER = 'v3.2.0';
+var VPU_VER = 'v3.3.3';
 
 /* ---------------------------------------------------------------------------
  * Backend vocabulary.  The backend sends these strings as message templates
@@ -72,6 +72,13 @@ var VPU_BACKEND_MSGS = [
 	_('DNS resolution failed: check the device DNS settings or the address spelling'),
 	_('Unknown error, please check the log'),
 	/* status / notices */
+	_('batch needs --dir DIR or --list FILE'),
+	_('Empty file list'),
+	_('File list not found: %s'),
+	_('Directory not found: %s'),
+	_('No matching video files in %s'),
+	_('✔ Batch finished: %s/%s ok, %s failed, %s skipped'),
+	_('⏹ Batch stopped: %s/%s ok, %s failed, %s skipped'),
 	_('Unsupported encoder: %s (this SoC only has H.264/H.265 hardware encoders)'),
 	_('Source duration metadata (%ss) is unreliable - already exceeded, showing processed time instead'),
 	_('Stopping…'),
@@ -234,7 +241,20 @@ return view.extend({
 			E('option', { value: 'cbr' }, [ _('Target bitrate (CBR, fast)') ]),
 			E('option', { value: 'crf' }, [ _('Constant quality (CQP, slow)') ])
 		]);
-		var brIn = E('input', Object.assign(inputOpts(), { value: '2M', placeholder: _('e.g. 2M / 4M') }));
+		/* 🔴 下拉菜单（不用文本框）：文本框会被浏览器恢复上次输入的值，改了默认也没用 ✗ */
+		var brIn = E('select', selectOpts(), [
+			E('option', { value: '' }, [ _('Follow the source (default)') ]),
+			E('option', { value: '500k' }, [ '500k' ]),
+			E('option', { value: '800k' }, [ '800k' ]),
+			E('option', { value: '1M' }, [ '1M' ]),
+			E('option', { value: '1.5M' }, [ '1.5M' ]),
+			E('option', { value: '2M' }, [ '2M' ]),
+			E('option', { value: '3M' }, [ '3M' ]),
+			E('option', { value: '4M' }, [ '4M' ]),
+			E('option', { value: '6M' }, [ '6M' ]),
+			E('option', { value: '8M' }, [ '8M' ]),
+			E('option', { value: '10M' }, [ '10M' ])
+		]);
 		var qpIn = E('input', Object.assign(inputOpts(), { value: '26', placeholder: _('0-51, default 26') }));
 
 		var encSel = E('select', selectOpts(), [
@@ -283,7 +303,18 @@ return view.extend({
 		var btnRun = E('button', { 'class': 'btn cbi-button cbi-button-apply vpu-btn', id: 'vpu-btn-run' }, [ _('Start') ]);
 		var btnStop = E('button', { 'class': 'btn cbi-button vpu-btn', id: 'vpu-btn-stop' }, [ _('Stop') ]);
 		var btnProbe = E('button', { 'class': 'btn cbi-button vpu-btn', id: 'vpu-btn-probe' }, [ _('Probe') ]);
-		var btnList = E('button', { 'class': 'btn cbi-button vpu-btn', id: 'vpu-btn-list' }, [ _('Refresh list') ]);
+		var btnList = E('button', { 'class': 'cbi-button', id: 'vpu-btn-list' }, [ _('Refresh list') ]);
+		/* ---- batch (queue) widgets ---- */
+		var bdirIn = E('input', { 'type': 'text', id: 'vpu-bdir', 'placeholder': '/mnt/iptv' });
+		var brecIn = E('input', { 'type': 'checkbox', id: 'vpu-brec' });
+		var bListArea = E('textarea', { id: 'vpu-blist', 'rows': 6, 'spellcheck': 'false' });
+		var boutDirIn = E('input', { 'type': 'text', id: 'vpu-boutdir', 'placeholder': _('empty = next to each source file') });
+		var bskipIn = E('input', { 'type': 'checkbox', id: 'vpu-bskip', 'checked': 'checked' });
+		var bStat = E('div', { 'class': 'vpu-dim', id: 'vpu-bstat' }, [ _('Idle') ]);
+		var bRes = E('div', { 'class': 'vpu-dim', id: 'vpu-bres' }, [ '' ]);
+		var btnScan = E('button', { 'class': 'btn cbi-button vpu-btn', id: 'vpu-btn-scan' }, [ _('Scan directory') ]);
+		var btnBStart = E('button', { 'class': 'btn cbi-button cbi-button-apply vpu-btn', id: 'vpu-btn-brun' }, [ _('Start batch') ]);
+		var btnBStop = E('button', { 'class': 'btn cbi-button vpu-btn', id: 'vpu-btn-bstop' }, [ _('Stop batch') ]);
 
 		function syncQuality() {
 			var crf = (qualitySel.value === 'crf');
@@ -324,8 +355,17 @@ return view.extend({
 				_('Type') + ' ' + srcKind(j.sourcetype) + (j.protocol ? (' (' + j.protocol + ')') : '') + ' / ' +
 				_('source codec') + ' ' + j.codec + ' / ' + _('pixel format') + ' ' + j.pix_fmt + ' / ' +
 				j.width + 'x' + j.height + ' / ' + j.fps + ' fps / ' + durTxt +
-				' / ' + _('audio') + ' ' + (j.audio || _('none'))
+				' / ' + _('audio') + ' ' + (j.audio || _('none')) +
+				((j.bitrate && Number(j.bitrate) > 0)
+					? (' / ' + _('source bitrate') + ' ~' + fmtSize(Number(j.bitrate) / 8) + '/s') : '')
 			]));
+			/* 🔴 不预填：码率框留空 = 跟随源片（视频轨码率）。这里只说清楚会用什么 */
+			if (j.bitrate && Number(j.bitrate) > 0 && qualitySel.value === 'cbr') {
+				probBox.appendChild(E('div', { 'class': 'vpu-dim' }, [
+					_('CBR: following the source') + ' ~' +
+					fmtSize(Number(j.bitrate) / 8) + '/s  (' +
+					_('type a value here to override, e.g. 1M') + ')' ]));
+			}
 			setOutDefault();
 		}
 
@@ -342,10 +382,18 @@ return view.extend({
 			});
 		}
 
+		var histSig = '';
 		function renderHistory() {
 			vexec([ 'history' ]).then(function(r) {
 				var j = parseJSON(r.out, { items: [] });
 				var items = j.items || [];
+				/* 🔴 定时器每 4 秒会调这里：只有内容真变了才重建表格，
+				 * 否则选区/滚动位置每次都被清掉 */
+				var sig = items.length + '|' + items.map(function (it) {
+					return (it.ts || '') + (it.state || '') + (it.size || '');
+				}).join(',');
+				if (sig === histSig) { return; }
+				histSig = sig;
 				histBox.innerHTML = '';
 				if (!items.length) { histBox.appendChild(E('span', { 'class': 'vpu-dim' }, [ _('No history yet.') ])); return; }
 				var tbl = E('table', { 'class': 'vpu-table' });
@@ -472,6 +520,114 @@ return view.extend({
 		/* ---- events ---- */
 		pathIn.addEventListener('change', doProbe);
 		btnProbe.addEventListener('click', doProbe);
+
+		/* ---- batch (queue) ----------------------------------------------------
+		 * Two ways to feed the queue: scan a directory, or type/paste a list
+		 * (one path per line - fully UTF-8, Chinese names are fine).  The
+		 * backend stores the pasted list (the UI has no write ACL) and runs
+		 * `vputrans run` per file, so every file behaves exactly like a manual
+		 * run; we only poll the queue status here.
+		 */
+		function batchOpts() {
+			var a = [ '--quality', qualitySel.value,
+				'--codec', encSel.value,
+				'--res', resSel.value,
+				'--scaler', scalerSel.value,
+				'--fps', (fpsIn.value.trim() || 'source'),
+				'--audio', audioSel.value,
+				'--container', contSel.value,
+				'--skip-existing', bskipIn.checked ? '1' : '0' ];
+			if (qualitySel.value === 'crf') a.push('--qp', (qpIn.value.trim() || '26'));
+			else if (brIn.value.trim()) a.push('--bitrate', brIn.value.trim());
+			if (ssIn.value.trim() && ssIn.value.trim() !== '0') a.push('--ss', ssIn.value.trim());
+			if (durIn.value.trim() && durIn.value.trim() !== '0') a.push('--dur', durIn.value.trim());
+			if (boutDirIn.value.trim()) a.push('--outdir', boutDirIn.value.trim());
+			return a;
+		}
+		function batchLines() {
+			return (bListArea.value || '').split('\n')
+				.map(function (x) { return x.trim(); })
+				.filter(function (x) { return x.length > 0; });
+		}
+		function renderBatch(j) {
+			if (!j) { return; }
+			var st = j.state || 'idle';
+			if (st === 'idle' || st === '') { bStat.textContent = _('Idle'); bRes.textContent = ''; return; }
+			var l = _('Batch') + ' ' + (j.i || 0) + '/' + (j.n || 0) +
+				'  ' + _('ok') + ' ' + (j.ok || 0) +
+				'  ' + _('failed') + ' ' + (j.bad || 0) +
+				'  ' + _('skipped') + ' ' + (j.skipped || 0);
+			if (st === 'finished') l += '  ·  ' + _('queue finished');
+			else if (st === 'stopped') l += '  ·  ' + _('queue stopped');
+			bStat.textContent = l;
+			var rows = (j.results || []).slice(-40).map(function (r) {
+				var m = (r.state === 'done') ? '✔ ' : (r.state === 'skipped') ? '⏭ ' : '✘ ';
+				return m + basename(r.src) + ' → ' + (r.out || '');
+			});
+			if (j.cur) rows.unshift(_('current') + ': ' + basename(j.cur));
+			bRes.textContent = rows.join('\n');
+		}
+		function refreshBatch() {
+			vexec([ 'batchstatus' ]).then(function (r) { renderBatch(parseJSON(r.out, null)); });
+		}
+		btnScan.addEventListener('click', function () {
+			var d = bdirIn.value.trim();
+			if (!d) { banner.className = 'vpu-banner vpu-banner-bad'; banner.textContent = _('Enter a directory first.'); return; }
+			btnScan.disabled = true;
+			vexec([ 'list', '--dir', d, brecIn.checked ? '1' : '0' ]).then(function (r) {
+				btnScan.disabled = false;
+				var j = parseJSON(r.out, null);
+				if (!j || !j.ok) {
+					banner.className = 'vpu-banner vpu-banner-bad';
+					banner.textContent = _('Scan failed') + ': ' + (r.err || _('Unknown error'));
+					return;
+				}
+				bListArea.value = (j.files || []).map(function (f) { return f.path; }).join('\n');
+				banner.className = 'vpu-banner';
+				banner.textContent = fmtTpl(_('Found %s file(s)'), [ String((j.files || []).length) ]);
+			});
+		});
+		btnBStart.addEventListener('click', function () {
+			var lines = batchLines();
+			var d = bdirIn.value.trim();
+			var opts = batchOpts();
+			var call;
+			if (lines.length) {
+				call = vexec([ 'putlist' ].concat(lines)).then(function (r1) {
+					var j1 = parseJSON(r1.out, null);
+					if (!j1 || !j1.ok) { return { out: r1.out, err: r1.err }; }
+					return vexec([ 'batch', '--list', '/tmp/vputrans.batch.queue' ].concat(opts));
+				});
+			} else if (d) {
+				call = vexec([ 'batch', '--dir', d ].concat(brecIn.checked ? [ '--recursive' ] : []).concat(opts));
+			} else {
+				banner.className = 'vpu-banner vpu-banner-bad';
+				banner.textContent = _('Enter a directory or a file list first.');
+				return;
+			}
+			btnBStart.disabled = true;
+			call.then(function (r) {
+				btnBStart.disabled = false;
+				var j = parseJSON(r.out, null);
+				if (!j || !j.ok) {
+					banner.className = 'vpu-banner vpu-banner-bad';
+					banner.textContent = _('Cannot start') + ': ' + (msg(j, 'error') || r.err || _('Unknown error'));
+					return;
+				}
+				banner.className = 'vpu-banner';
+				banner.textContent = fmtTpl(_('Batch started: %s file(s) - one at a time'), [ String(j.count) ]);
+				refreshBatch();
+			});
+		});
+		btnBStop.addEventListener('click', function () {
+			vexec([ 'batchstop' ]).then(function () {
+				banner.className = 'vpu-banner vpu-banner-warn';
+				banner.textContent = _('Stop requested - finishing the current file');
+			});
+		});
+		brecIn.addEventListener('change', function () {
+			if (bListArea.value.trim()) { return; }   /* keep a hand-edited list */
+		});
 		btnList.addEventListener('click', loadFileList);
 
 		btnRun.addEventListener('click', function() {
@@ -487,7 +643,7 @@ return view.extend({
 				'--audio', audioSel.value,
 				'--container', contSel.value ];
 			if (qualitySel.value === 'crf') args.push('--qp', (qpIn.value.trim() || '26'));
-			else args.push('--bitrate', (brIn.value.trim() || '2M'));
+			else if (brIn.value.trim()) args.push('--bitrate', brIn.value.trim());
 			if (ssIn.value.trim() && ssIn.value.trim() !== '0') args.push('--ss', ssIn.value.trim());
 			if (durIn.value.trim() && durIn.value.trim() !== '0') args.push('--dur', durIn.value.trim());
 			var o = outIn.value.trim();
@@ -528,6 +684,9 @@ return view.extend({
 			'.vpu-row>div{flex:1 1 200px;min-width:150px}',
 			'.vpu-row label{display:block;font-size:12px;color:#555;margin-bottom:3px}',
 			'.vpu-btn{margin:2px 4px 2px 0}',
+			'#vpu-blist{width:100%;font-family:monospace;font-size:12px;white-space:pre}',
+			'#vpu-bres{max-height:170px;overflow:auto;font-family:monospace;font-size:12px;white-space:pre;margin-top:6px}',
+			'#vpu-bdir,#vpu-boutdir{width:100%}',
 			'.vpu-banner{border-left:4px solid #999;background:#f6f6f6;padding:8px 12px;border-radius:4px;margin:8px 0;font-size:13px}',
 			'.vpu-banner-ok{border-left-color:#2d9c4f;background:#eef8f0}',
 			'.vpu-banner-bad{border-left-color:#c0392b;background:#fdecea}',
@@ -586,11 +745,30 @@ return view.extend({
 				E('div', { 'style': 'margin-top:10px' }, [ btnRun, btnStop ])
 			]),
 			E('div', { 'class': 'vpu-card' }, [
-				E('h3', {}, [ _('③ Progress and log') ]),
+				E('h3', {}, [ _('③ Batch (a directory, or a list of files one per line)') ]),
+				E('div', { 'class': 'vpu-row' }, [
+					E('div', { 'style': 'flex:2' }, [ E('label', {}, [ _('Directory') ]), bdirIn ]),
+					E('div', {}, [ E('label', {}, [ ' ' ]), btnScan ]),
+					E('div', {}, [ E('label', {}, [ ' ' ]), E('label', {}, [ brecIn, ' ' + _('recursive') ]) ])
+				]),
+				E('div', { 'style': 'margin-top:8px' }, [
+					E('label', {}, [ _('File list (one path per line - Chinese names are fine)') ]),
+					bListArea
+				]),
+				E('div', { 'class': 'vpu-row', 'style': 'margin-top:8px' }, [
+					E('div', { 'style': 'flex:2' }, [ E('label', {}, [ _('Output directory') ]), boutDirIn ]),
+					E('div', {}, [ E('label', {}, [ ' ' ]), E('label', {}, [ bskipIn, ' ' + _('skip files that already have an output') ]) ]),
+					E('div', { 'style': 'display:flex;gap:8px' }, [ E('label', {}, [ ' ' ]), btnBStart, btnBStop ])
+				]),
+				bStat,
+				bRes
+			]),
+			E('div', { 'class': 'vpu-card' }, [
+				E('h3', {}, [ _('④ Progress and log') ]),
 				logPre
 			]),
 			E('div', { 'class': 'vpu-card' }, [
-				E('h3', {}, [ _('④ Recent jobs (newest 5)') ]),
+			E('h3', {}, [ _('⑤ Recent jobs (newest 5)') ]),
 				histBox
 			])
 		]);
@@ -603,7 +781,10 @@ return view.extend({
 		this._vpuTimer = setInterval(function() {
 			if (!document.body.contains(wrap)) { clearInterval(self._vpuTimer); return; }
 			refreshStatus();
+			refreshBatch();
+			renderHistory();   /* 🔴 原来漏了这句，Recent jobs 只在加载时刷一次 ✗ */
 		}, 4000);
+		refreshBatch();
 
 		return wrap;
 	},

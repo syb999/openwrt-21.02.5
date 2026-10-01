@@ -74,7 +74,7 @@
 #     touches the frames.
 #   * Only ONE job may run at a time (weak 4-core box); enforced with flock.
 
-VERSION="2.7.0"
+VERSION="3.3.2"
 
 FFMPEG_HW="/usr/bin/ffmpeg-rkrga"
 FFPROBE="/usr/bin/ffprobe"
@@ -86,6 +86,13 @@ PROG="/tmp/vputrans.progress"
 LOCK="/tmp/vputrans.lock"
 PIDF="/tmp/vputrans.pid"
 STOPFLAG="/tmp/vputrans.stopping"
+# batch (queue) support
+BATCHQ="/tmp/vputrans.batch.queue"      # one source path per line
+BATCHA="/tmp/vputrans.batch.args"       # pass-through transcode opts, one argv per line
+BATCHSTATE="/tmp/vputrans.batch.status" # queue status JSON (polled by the UI)
+BATCHRES="/tmp/vputrans.batch.result"   # state<TAB>src<TAB>out per finished file
+BATCHSTOP="/tmp/vputrans.batch.stop"
+MAX_BATCH=500
 HIST="/tmp/vputrans.history"
 
 LOG_TAIL=14
@@ -292,12 +299,12 @@ net_in_opts() { # extra input options for a network source ($1 = proto)
 # its output path in $out and the while-loop below runs in the current shell.
 ff_probe_v() { # $1=proto $2=src -> sets S_CODEC S_PIX S_W S_H S_FR S_DUR
 	extra=$(net_in_opts "$1")
-	S_CODEC=""; S_PIX=""; S_W=""; S_H=""; S_FR=""; S_DUR=""
+	S_CODEC=""; S_PIX=""; S_W=""; S_H=""; S_FR=""; S_DUR=""; S_BR=""; S_VBR=""
 	# shellcheck disable=SC2086
 	pout=$("$FFPROBE" -v error -rw_timeout "$NET_TIMEOUT_US" $extra \
 		-select_streams v:0 \
-		-show_entries stream=codec_name,pix_fmt,width,height,avg_frame_rate \
-		-show_entries format=duration \
+		-show_entries stream=codec_name,pix_fmt,width,height,avg_frame_rate,bit_rate \
+		-show_entries format=duration,bit_rate \
 		-of default=noprint_wrappers=1 "$2" 2>/dev/null)
 	while IFS='=' read -r k v; do
 		case "$k" in
@@ -307,6 +314,7 @@ ff_probe_v() { # $1=proto $2=src -> sets S_CODEC S_PIX S_W S_H S_FR S_DUR
 			height)         S_H="$v" ;;
 			avg_frame_rate) S_FR="$v" ;;
 			duration)       S_DUR="$v" ;;
+			bit_rate)       if [ -z "$S_VBR" ]; then S_VBR="$v"; else S_BR="$v"; fi ;;
 		esac
 	done <<PROBEEOF
 $pout
@@ -388,7 +396,7 @@ den_of() {
 		tt = (t+0>0) ? t+0 : 0;
 		x -= ss; if (x < 0) x = 0;
 		if (tt > 0 && (x == 0 || tt < x)) x = tt;
-		printf "%d", x*1000000
+		printf "%.0f", x*1000000   # %d 会在 2147483647 处钳位 -> 长片分母全错 ✗
 	}'
 }
 
@@ -408,6 +416,7 @@ res_ok() {
 }
 
 resolve_res() { # $1 = spec, $2 = mode (hw -> RGA, sw -> swscale), $3 = scaler
+	# $4/$5 = source width/height (optional): used for the no-op guard below
 	case "$1" in
 		""|source|src|srcsize) R_VF="" ; return ;;
 	esac
@@ -419,6 +428,19 @@ resolve_res() { # $1 = spec, $2 = mode (hw -> RGA, sw -> swscale), $3 = scaler
 		*x*|*X*) W=${1%%[xX]*}; H=${1##*[xX]} ;;
 		*)     H=$1 ;;
 	esac
+	# normalize a trailing "p" (480p -> 480): keeps the filter argument numeric
+	# and lets the no-op check below actually compare numbers
+	case "$H" in *[0-9]p) H="${H%p}" ;; esac
+	# no-op guard: nothing to scale when the target already IS the source size,
+	# and scale_rkrga fails on at least one such 1:1 configuration (measured:
+	# 640x360 source with --res 360p dies with "Failed to configure output pad",
+	# while 854x480 -> 480p and 1280x720 -> 720p are fine).  Skipping the filter
+	# is correct anyway - there is nothing to do.
+	# For the -2 form the width follows the height, so the height alone decides;
+	# for an explicit WxH spec the width must match as well.
+	if [ -n "$5" ] && [ -n "$H" ] && [ "$H" = "$5" ] 2>/dev/null; then
+		if [ -z "$W" ] || [ "$W" = "$4" ]; then R_VF="" ; return ; fi
+	fi
 	if [ "$2" = "hw" ]; then
 		# RGA hardware scaling, DRM prime in / NV12 out, no CPU work
 		if [ -n "$W" ]; then R_VF="scale_rkrga=w=$W:h=$H:format=nv12"
@@ -560,10 +582,10 @@ do_probe() {
 	fi
 	asize=0
 	[ "$S_STYPE" = "local" ] && asize=$(fsize "$S_SRC")
-	printf '{"ok":true,"src":%s,"sourcetype":%s,"protocol":%s,"codec":%s,"pix_fmt":%s,"width":%s,"height":%s,"fps":%s,"duration":%s,"live":%s,"size":%s,"audio":%s,"mode":%s,"decoder":%s,%s}\n' \
+	printf '{"ok":true,"src":%s,"sourcetype":%s,"protocol":%s,"codec":%s,"pix_fmt":%s,"width":%s,"height":%s,"fps":%s,"duration":%s,"live":%s,"size":%s,"bitrate":%s,"audio":%s,"mode":%s,"decoder":%s,%s}\n' \
 		"$(jstr "$S_SRC")" "$(jstr "$S_STYPE")" "$(jstr "$S_PROTO")" "$(jstr "$S_CODEC")" \
 		"$(jstr "$S_PIX")" "${S_W:-0}" "${S_H:-0}" "${S_FPS:-0}" "${S_DUR:-0}" \
-		"$S_LIVE" "${asize:-0}" "$(jstr "$S_ACODEC")" \
+		"$S_LIVE" "${asize:-0}" "${S_VBR:-${S_BR:-0}}" "$(jstr "$S_ACODEC")" \
 		"$(jstr "$S_MODE")" "$(jstr "$S_DEC")" \
 		"$(jm reason "$S_REASON" "$S_REASON_ARGS")"
 }
@@ -579,8 +601,37 @@ MAX_LIST=200
 
 # the candidate scan itself (predicates in one place so the size source can be
 # swapped without duplicating it)
+# list_find [--dir DIR REC] [extra find args...]
+#   no --dir  -> the app's default candidate roots (depth 2)
+#   --dir D 0 -> only the files directly inside D      (a "transcode dir")
+#   --dir D 1 -> recursively inside D
 list_find() {
+	lfdir=""
+	if [ "$1" = "--dir" ]; then
+		lfdir="$2"; lfrec="$3"; shift 3
+		if [ "$lfrec" = "1" ]; then
+			find "$lfdir" -type f 2>/dev/null \
+				! -name '*_vput.*' \
+				\( -iname '*.mp4'  -o -iname '*.mkv'  -o -iname '*.mov' \
+				   -o -iname '*.ts'   -o -iname '*.avi'  -o -iname '*.flv' \
+				   -o -iname '*.webm' -o -iname '*.m4v'  -o -iname '*.mpg' \
+				   -o -iname '*.m2ts' -o -iname '*.wmv'  -o -iname '*.3gp' \
+				   -o -iname '*.rmvb' -o -iname '*.vob' \) \
+				"$@"
+			return
+		fi
+		find "$lfdir" -maxdepth 1 -type f 2>/dev/null \
+			! -name '*_vput.*' \
+			\( -iname '*.mp4'  -o -iname '*.mkv'  -o -iname '*.mov' \
+			   -o -iname '*.ts'   -o -iname '*.avi'  -o -iname '*.flv' \
+			   -o -iname '*.webm' -o -iname '*.m4v'  -o -iname '*.mpg' \
+			   -o -iname '*.m2ts' -o -iname '*.wmv'  -o -iname '*.3gp' \
+			   -o -iname '*.rmvb' -o -iname '*.vob' \) \
+			"$@"
+		return
+	fi
 	find /mnt /media /root /tmp -maxdepth 2 -type f 2>/dev/null \
+		! -name '*_vput.*' \
 		\( -iname '*.mp4'  -o -iname '*.mkv'  -o -iname '*.mov' \
 		   -o -iname '*.ts'   -o -iname '*.avi'  -o -iname '*.flv' \
 		   -o -iname '*.webm' -o -iname '*.m4v'  -o -iname '*.mpg' \
@@ -594,9 +645,9 @@ do_list() {
 	# coreutils-stat/busybox-stat; if neither exists, degrade to a name-only
 	# listing (size 0) instead of silently returning an empty list.
 	if command -v stat >/dev/null 2>&1; then
-		list_find -exec stat -c '%s|%n' {} + 2>/dev/null
+		list_find "$@" -exec stat -c '%s|%n' {} + 2>/dev/null
 	else
-		list_find -print 2>/dev/null | awk '{ print "0|" $0 }'
+		list_find "$@" -print 2>/dev/null | awk '{ print "0|" $0 }'
 	fi \
 	| grep -v -e '/\.git/' -e '/\.cache/' -e '/tmp/ipk' -e '/\.cache$' \
 	| head -n "$((MAX_LIST + 1))" \
@@ -728,7 +779,25 @@ do_run() {
 
 	# ---- defaults ----
 	[ -n "$enc" ] || enc="h264"
-	[ -n "$br" ]  || br="2M"
+	# SMART-CBR-DEFAULT-START
+	if [ -n "$br" ]; then
+		:
+	elif { [ -n "$S_VBR" ] || [ -n "$S_BR" ]; } && \
+	     [ "$(awk -v v="${S_VBR:-$S_BR}" 'BEGIN{print (v+0>0)?1:0}')" = "1" ]; then
+		# 🔴 用【视频轨】的码率，不是容器总码率：音频默认是 copy(128k 左右)，
+		# 拿总码率的 85% 当视频目标 -> 视频+音频的总码率反而超过源片 ✗
+		_src_k=$(( ${S_VBR:-$S_BR} / 1000 ))
+		# 留空 = 完全跟随源片（视频轨码率 100%）
+		_tgt=$_src_k
+		[ "$_tgt" -lt 100 ] && _tgt=100
+		br="${_tgt}k"
+		st_notice='CBR target not set: following the source bitrate (%s)'
+		st_notice_args=$(tjoin "${_src_k}k -> ${br}")
+		printf '[vputrans] CBR target auto: following the source (%sk)\n' "$_src_k" >&2
+	else
+		br="2M"
+	fi
+# SMART-CBR-DEFAULT-END
 	[ -n "$qp" ]  || qp="26"
 	E=$(enc_of "$enc")
 	if [ -z "$E" ]; then
@@ -829,7 +898,8 @@ do_run() {
 
 	# detach the real worker (survives the ~60s uhttpd CGI limit)
 	( exec "$0" __worker "$in" "$out" "$quality" "$qp" "$br" "$enc" "$res" "$scaler" \
-		"$audio" "$container" "$ss" "$dur" "$fps" "$codec" "$pix" "$live" "$stype" ) \
+		"$audio" "$container" "$ss" "$dur" "$fps" "$codec" "$pix" "$live" "$stype" \
+		"${S_W:-0}" "${S_H:-0}" "${S_DUR:-0}" ) \
 		</dev/null >/dev/null 2>&1 &
 
 	printf '{"ok":true,"in":%s,"out":%s,"sourcetype":%s,"mode":%s,"decoder":%s,"encoder":%s,%s}\n' \
@@ -845,11 +915,19 @@ do_worker() {
 	in="$1"; out="$2"; quality="$3"; qp="$4"; br="$5"; enc="$6"; res="$7"; scaler="$8"
 	audio="$9"; container="${10}"; ss="${11}"; dur="${12}"; fps="${13}"
 	codec="${14}"; pix="${15}"; live="${16}"; stype="${17}"
+	srcw="${18:-0}"; srch="${19:-0}"; dur_hint="${20:-0}"
 
 	E=$(enc_of "$enc")
 	proto=$(proto_of "$in")
 	dur_src=$(ff_duration "$proto" "$in")
-	dur_us=$(awk -v d="$dur_src" 'BEGIN{ if(d+0>0) printf "%d", d*1000000; else printf "0" }')
+	# Second probe is not reliable: while the source is still being written / the
+	# server is slow it reports a short value (measured: 2820 at run stage vs
+	# 2147.5 inside the worker -> the progress denominator was wrong).  The run
+	# stage already probed it (arg 20); keep the larger of the two.
+	if [ "$(awk -v a="$dur_hint" 'BEGIN{print (a+0>0)?1:0}')" = "1" ]; then
+		dur_src=$(awk -v a="$dur_src" -v b="$dur_hint" 'BEGIN{ printf "%.3f", (b+0>a+0)?b:a }')
+	fi
+	dur_us=$(awk -v d="$dur_src" 'BEGIN{ if(d+0>0) printf "%.0f", d*1000000; else printf "0" }')
 	# How long the OUTPUT is expected to be: source length minus the -ss trim,
 	# capped by -t when given.  Progress must be measured against THIS, not
 	# against the raw source length (otherwise -t/-ss jobs under-report and
@@ -868,7 +946,7 @@ do_worker() {
 
 	decide_pipeline "$codec" "$pix"
 	mode="$P_MODE"; dec="$P_DEC"; reason="$P_REASON"; reason_args="$P_REASON_ARGS"
-	resolve_res "$res" "$mode" "$scaler"
+	resolve_res "$res" "$mode" "$scaler" "$srcw" "$srch"
 
 	st_state="running"; st_progress=0; st_speed=""; st_outsize=0
 	st_total=$(awk -v d="$den_us" 'BEGIN{ printf "%.0f", d/1000000 }')
@@ -1061,10 +1139,185 @@ do_worker() {
 
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# batch (queue) processing
+#
+# Files are processed strictly one at a time (4-core box, and the single-job
+# flock is per file).  The supervisor spawns `vputrans run` per file, so every
+# file gets exactly the same pipeline / status / history / stop handling as a
+# manual run; the queue state lives in $BATCHSTATE for the UI to poll.
+# ---------------------------------------------------------------------------
+
+# the UI cannot write files itself (rpcd ACL), so it hands the list over
+do_putlist() {
+	: > "$BATCHQ"
+	n=0
+	for p in "$@"; do
+		[ -n "$p" ] || continue
+		printf '%s\n' "$p" >> "$BATCHQ"
+		n=$((n + 1))
+		[ "$n" -ge "$MAX_BATCH" ] && break
+	done
+	[ "$n" -gt 0 ] || { fail 'Empty file list'; return 1; }
+	printf '{"ok":true,"count":%d}\n' "$n"
+}
+
+batch_write() { # 1=i 2=n 3=cur 4=curout 5=ok 6=bad 7=skipped 8=state
+	{
+		printf '{'
+		printf '"state":%s,' "$(jstr "${8:-running}")"
+		printf '"i":%s,"n":%s,' "${1:-0}" "${2:-0}"
+		printf '"cur":%s,' "$(jstr "${3:-}")"
+		printf '"curout":%s,' "$(jstr "${4:-}")"
+		printf '"ok":%s,"bad":%s,"skipped":%s,' "${5:-0}" "${6:-0}" "${7:-0}"
+		printf '"results":['
+		first=1
+		if [ -f "$BATCHRES" ]; then
+			while IFS="$TAB" read -r rs rf ro; do
+				[ -n "$rs" ] || continue
+				[ "$first" = "1" ] || printf ','
+				first=0
+				printf '{"state":%s,"src":%s,"out":%s}' "$(jstr "$rs")" "$(jstr "$rf")" "$(jstr "$ro")"
+			done < "$BATCHRES"
+		fi
+		printf ']}'
+		printf '\n'
+	} > "$BATCHSTATE.tmp" 2>/dev/null
+	mv "$BATCHSTATE.tmp" "$BATCHSTATE" 2>/dev/null
+}
+
+do_batch_status() {
+	if [ -f "$BATCHSTATE" ]; then
+		cat "$BATCHSTATE" 2>/dev/null
+		printf '\n'
+	else
+		printf '{"state":"idle","i":0,"n":0,"ok":0,"bad":0,"skipped":0,"results":[]}\n'
+	fi
+}
+
+do_batch_stop() {
+	: > "$BATCHSTOP"
+	: > "$STOPFLAG"      # also stop the file that is running right now
+	printf '{"ok":true}\n'
+}
+
+do_batch_worker() { # 1=qfile 2=count 3=outdir 4=skip-existing 5=out-ext
+	bq="$1"; bn="$2"; bodir="$3"; bskip="$4"; bext="$5"
+	set --
+	while IFS= read -r a; do set -- "$@" "$a"; done < "$BATCHA"
+	rm -f "$BATCHSTOP"
+	: > "$BATCHRES"
+	i=0; ok=0; bad=0; skp=0
+	batch_write 0 "$bn" "" "" 0 0 0 running
+	while IFS= read -r f; do
+		[ -n "$f" ] || continue
+		[ -f "$BATCHSTOP" ] && break
+		i=$((i + 1))
+		case "$f" in
+			*/*) sdir="${f%/*}" ;;
+			*)   sdir="." ;;
+		esac
+		bbase="${f##*/}"
+		bstem="${bbase%.*}"
+		[ -n "$bstem" ] || bstem="$bbase"
+		odir="$bodir"; [ -n "$odir" ] || odir="$sdir"
+		[ -d "$odir" ] || mkdir -p "$odir" 2>/dev/null
+		bout="$odir/${bstem}_vput.$bext"
+		if [ "$bskip" = "1" ] && [ -s "$bout" ]; then
+			skp=$((skp + 1))
+			printf 'skipped\t%s\t%s\n' "$f" "$bout" >> "$BATCHRES"
+			batch_write "$i" "$bn" "$f" "$bout" "$ok" "$bad" "$skp" running
+			continue
+		fi
+		batch_write "$i" "$bn" "$f" "$bout" "$ok" "$bad" "$skp" running
+		# `run` only *spawns* the detached worker and returns immediately, so we
+		# must wait for the job to really finish - otherwise the next file hits
+		# the single-job lock and every entry is misreported.
+		brep=$("$0" run "$f" "$@" --out "$bout" 2>/dev/null)
+		case "$brep" in
+			*'"ok":false'*)
+				bad=$((bad + 1)); bs="failed"
+				;;
+			*)
+				w=0; bst=""
+				while [ "$w" -lt 43200 ]; do
+					bst=$(do_status 2>/dev/null | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p')
+					[ "$bst" != "running" ] && break
+					sleep 2
+					w=$((w + 2))
+				done
+				case "$bst" in
+					done)    ok=$((ok + 1));   bs="done" ;;
+					stopped) bad=$((bad + 1)); bs="stopped" ;;
+					*)       bad=$((bad + 1)); bs="failed" ;;
+				esac
+				;;
+		esac
+		printf '%s\t%s\t%s\n' "$bs" "$f" "$bout" >> "$BATCHRES"
+	done < "$bq"
+	if [ -f "$BATCHSTOP" ]; then
+		batch_write "$i" "$bn" "" "" "$ok" "$bad" "$skp" stopped
+		log_ev '⏹ Batch stopped: %s/%s ok, %s failed, %s skipped' "$(tjoin "$ok" "$bn" "$bad" "$skp")"
+	else
+		batch_write "$i" "$bn" "" "" "$ok" "$bad" "$skp" finished
+		log_ev '✔ Batch finished: %s/%s ok, %s failed, %s skipped' "$(tjoin "$ok" "$bn" "$bad" "$skp")"
+	fi
+}
+
+do_batch() {
+	bdir=""; brec="0"; blist=""; bodir=""; bskip="1"
+	: > "$BATCHA"
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--dir)           shift; bdir="$1" ;;
+			--recursive)     brec="1" ;;
+			--list)          shift; blist="$1" ;;
+			--outdir)        shift; bodir="$1" ;;
+			--skip-existing) shift; bskip="$1" ;;
+			*) printf '%s\n' "$1" >> "$BATCHA" ;;
+		esac
+		shift
+	done
+	# starting a queue while a single job runs would make every entry fail
+	bst0=$(do_status 2>/dev/null | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p')
+	if [ "$bst0" = "running" ]; then
+		fail 'Another job is already running, wait for it or press Stop first'
+		return 1
+	fi
+	if [ -n "$bdir" ]; then
+		[ -d "$bdir" ] || { fail 'Directory not found: %s' "$bdir"; return 1; }
+		list_find --dir "$bdir" "$brec" > "$BATCHQ" 2>/dev/null
+	elif [ -n "$blist" ]; then
+		[ -f "$blist" ] || { fail 'File list not found: %s' "$blist"; return 1; }
+		cp "$blist" "$BATCHQ" 2>/dev/null
+	else
+		fail 'batch needs --dir DIR or --list FILE'; return 1
+	fi
+	sort "$BATCHQ" -o "$BATCHQ" 2>/dev/null
+	bn=$(grep -c . "$BATCHQ" 2>/dev/null)
+	[ "${bn:-0}" -gt 0 ] || { fail 'No matching video files in %s' "${bdir:-$blist}"; return 1; }
+	[ "${bn:-0}" -gt "$MAX_BATCH" ] && bn="$MAX_BATCH"
+	bcont=""
+	bnx=0
+	while IFS= read -r a; do
+		if [ "$bnx" = "1" ]; then bcont="$a"; bnx=0; continue; fi
+		case "$a" in --container|-f) bnx=1 ;; esac
+	done < "$BATCHA"
+	case "$bcont" in mkv) bext="mkv" ;; ts) bext="ts" ;; *) bext="mp4" ;; esac
+	rm -f "$BATCHSTOP"
+	( exec "$0" __batch "$BATCHQ" "$bn" "$bodir" "$bskip" "$bext" ) >/dev/null 2>&1 &
+	printf '{"ok":true,"count":%s}\n' "$bn"
+}
+
 case "$1" in
 	version) printf '{"version":"%s"}\n' "$VERSION" ;;
 	probe)   shift; do_probe "$@" ;;
-	list)    do_list ;;
+	list)    shift; do_list "$@" ;;
+	putlist) shift; do_putlist "$@" ;;
+	batch)   shift; do_batch "$@" ;;
+	batchstatus) do_batch_status ;;
+	batchstop)   do_batch_stop ;;
+	__batch) shift; do_batch_worker "$@" ;;
 	run)     shift; do_run "$@" ;;
 	status)  do_status ;;
 	stop)    do_stop ;;
