@@ -1,0 +1,718 @@
+<%#
+ luci-app-diskrestore - 损坏 U 盘 / 移动硬盘 一键文件恢复
+ 后端: /usr/bin/diskrestore  (ddrescue -> testdisk -> 只读挂载按原名复制 -> photorec)
+-%>
+
+<%+header%>
+
+<style type="text/css">
+	.dr-card { background:#fff; border:1px solid #ddd; border-radius:5px; padding:12px 14px; margin:0 0 12px 0; }
+	.dr-card h3 { margin:0 0 8px 0; font-size:14px; text-transform:uppercase; letter-spacing:.5px; color:#555; }
+	.dr-disk { border:1px solid #ddd; border-radius:4px; padding:8px 10px; margin-bottom:6px; cursor:pointer; background:#fafafa; }
+	.dr-disk:hover { border-color:#999; }
+	.dr-disk.dr-sel { border-color:#2e7d32; background:#f1f8e9; box-shadow:inset 0 0 0 1px #2e7d32; }
+	.dr-disk .dr-name { font-weight:bold; font-family:monospace; font-size:13px; }
+	.dr-disk .dr-sub { font-size:12px; color:#666; margin-top:3px; }
+	.dr-badge { display:inline-block; border-radius:10px; padding:1px 8px; font-size:11px; line-height:1.6; }
+	.dr-ok { background:#e8f5e9; color:#1b5e20; border:1px solid #81c784; }
+	.dr-warn { background:#fff8e1; color:#8d6e00; border:1px solid #ffd54f; }
+	.dr-bad { background:#fdecea; color:#b71c1c; border:1px solid #ef9a9a; }
+	.dr-na { background:#f0f0f0; color:#666; border:1px solid #ccc; }
+	.dr-bar { height:14px; background:#eee; border:1px solid #ddd; border-radius:7px; overflow:hidden; margin:6px 0 8px 0; }
+	.dr-bar > div { height:100%; background:#2196f3; width:0; transition:width .4s; }
+	.dr-kv { font-size:12px; color:#444; margin:2px 0; }
+	.dr-kv b { color:#111; }
+	.dr-pre { background:#f8f8f8; border:1px solid #ddd; border-radius:4px; padding:8px;
+		max-height:240px; overflow:auto; font-size:11px; line-height:1.45; white-space:pre-wrap;
+		word-break:break-all; margin:6px 0 0 0; }
+	.dr-ver { color:#aaa; font-size:11px; margin-bottom:8px; }
+	.dr-hint { font-size:12px; color:#666; line-height:1.6; }
+	.dr-bad-note { color:#b71c1c; font-weight:bold; }
+	.dr-ok-note { color:#1b5e20; font-weight:bold; }
+	.dr-warn-note { color:#8d6e00; font-weight:bold; }
+	.dr-tbl { width:100%; font-size:12px; border-collapse:collapse; }
+	.dr-tbl th, .dr-tbl td { text-align:left; padding:3px 6px; border-bottom:1px solid #eee; vertical-align:top; }
+	.dr-tbl td.dr-sz { text-align:right; font-family:monospace; white-space:nowrap; }
+	.dr-in { font-family:monospace; font-size:12px; width:min(560px,100%); }
+</style>
+
+<h2 name="content"><%:磁盘数据恢复%></h2>
+<div class="dr-ver">diskrestore v<span id="dr_ver">?</span> · /usr/bin/diskrestore</div>
+
+<div class="dr-card">
+	<div class="dr-hint">
+		<%:对损坏的 U 盘 / 移动硬盘一键恢复文件。固定四步：① ddrescue 只读整盘镜像（坏区自动重试、中断可续）；② testdisk 分析分区表；③ 把镜像里的分区只读挂载出来，连原文件名和目录结构一起复制（能保住名字的关键一步）；④ 只有挂载失败（文件系统引导扇区坏了）才退回 photorec 按签名雕取。源盘全程只读。%>
+	</div>
+</div>
+
+<div class="dr-card">
+	<h3><%:1. 选择要恢复的磁盘%></h3>
+	<div id="dr_disks" class="dr-hint"><%:正在检测磁盘…%></div>
+	<div style="margin-top:10px;border-top:1px dashed #ddd;padding-top:8px;">
+		<b><%:或者：用已经做好的镜像文件恢复（跳过“制作镜像”这一步）%></b>
+		<div class="dr-kv"><%:填镜像文件路径，或点下面扫描出来的镜像直接选中。同一份镜像可以反复做恢复，不必每次都重新制作。%></div>
+		<div style="margin:6px 0;">
+			<input type="text" id="dr_imgpath" class="cbi-input-text dr-in" value=""
+				placeholder="/mnt/sda1/diskrestore/sdb/image.img" oninput="dr_img_typed()" />
+		</div>
+		<div>
+			<input type="button" class="cbi-button cbi-button-action" value="<%:扫描已有镜像%>" onclick="dr_load_images(1)" />
+			<span id="dr_img_note" style="margin-left:8px;font-size:12px;"></span>
+		</div>
+		<div id="dr_imgs" class="dr-hint" style="margin-top:6px;"></div>
+	</div>
+</div>
+
+<div class="dr-card">
+	<h3><%:2. 目标目录（镜像 + 恢复的文件都写在这里）%></h3>
+	<div class="dr-kv">
+		<%:可以直接输入任意目录（不存在会自动创建）；也可以从下面的已挂载可写目录里点一下快速填入：%>
+	</div>
+	<div style="margin:6px 0;">
+		<input type="text" id="dr_destpath" class="cbi-input-text dr-in" value=""
+			placeholder="/mnt/sda1/recover" oninput="dr_dest_typed()" onchange="dr_checkdest()" />
+	</div>
+	<div style="margin:6px 0;">
+		<select id="dr_dest" class="cbi-input-select" style="min-width:340px;max-width:100%;" onchange="dr_pickdest(this.value)"></select>
+	</div>
+	<div id="dr_dest_note" class="dr-kv"></div>
+	<div style="margin-top:8px;">
+		<input type="button" class="cbi-button cbi-button-apply" id="dr_go" value="<%:开始恢复%>" onclick="dr_start()" />
+		<input type="button" class="cbi-button cbi-button-reset" id="dr_stopbtn" value="<%:停止%>" onclick="dr_stop()" />
+		<span id="dr_msg" style="margin-left:10px;font-size:12px;"></span>
+	</div>
+</div>
+
+<div class="dr-card" id="dr_progbox" style="display:none;">
+	<h3><%:3. 进度%></h3>
+	<div>
+		<span id="dr_state" class="dr-badge dr-na">-</span>
+		<span id="dr_phase" style="font-size:13px;margin-left:6px;"></span>
+	</div>
+	<div class="dr-bar"><div id="dr_bar"></div></div>
+	<div class="dr-kv"><%:当前步骤%>: <b id="dr_step">-</b> · <%:百分比%>: <b id="dr_pct">0%</b> · <%:已耗时%>: <b id="dr_el">00:00</b></div>
+	<div class="dr-kv"><%:已恢复文件%>: <b id="dr_files">0</b> · <%:大小%>: <b id="dr_bytes">0 KB</b></div>
+	<div class="dr-kv" id="dr_work"></div>
+	<div class="dr-pre" id="dr_log"><%:等待日志…%></div>
+</div>
+
+<div class="dr-card" id="dr_resbox" style="display:none;">
+	<h3><%:4. 恢复结果%></h3>
+	<div class="dr-kv" id="dr_res_summary"></div>
+	<div class="dr-kv" id="dr_res_paths" style="word-break:break-all;"></div>
+	<div style="margin-top:8px;"><b><%:各分区按原文件名/目录恢复情况%>:</b></div>
+	<table class="dr-tbl" id="dr_byname"></table>
+	<div style="margin-top:8px;"><b><%:按签名雕出的文件（名字已丢失，数字是起始扇区）%>:</b></div>
+	<div style="max-height:260px;overflow:auto;">
+		<table class="dr-tbl" id="dr_res_tbl"></table>
+	</div>
+	<div id="dr_org" style="margin-top:10px;"></div>
+</div>
+
+<script type="text/javascript">
+var DR_UI = '1.6.7';
+var DR_BASE = '<%=luci.dispatcher.build_url("admin/services/diskrestore")%>';
+
+var DR_DISKS = [];
+var DR_DESTS = [];
+var DR_SEL = '';
+var DR_DESTID = '';
+var DR_TYPED = '';
+var DR_CHECK = null;
+var SIG_DISK = null;
+var SIG_DEST = null;
+var SIG_LOG = null;
+var SIG_RES = null;
+var DR_BUSY = false;
+var DR_TYPETIMER = null;
+var DR_PREFILLED = false;
+var DR_IMG = '';
+var DR_IMAGES = [];
+var SIG_IMG = null;
+var DR_PENDING = false;      /* 刚点了开始, 还没等到新任务的第一个状态 */
+var DR_OLDRUN = -1;          /* 上一次任务的 started 时间戳(状态令牌), 用来识别"还是旧的那次" */
+var DR_LASTSTARTED = -1;
+var DR_RES_STAMP = '';       /* 结果只在状态真正更新时才重新拉取, 别每 3 秒都拉 */
+var DR_RES_LOADED = false;
+var DR_ORG_STATE = '';       /* 整理任务的状态 */
+var DR_LAST_FILES = 0;       /* 最近一次结果里的"雕出文件数" */
+
+function dr_esc(s) {
+	if (s == null) { return ''; }
+	return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/* base64url: 用户输入的目录名不直接进命令行, 后端解码后校验 */
+/* 路径 → 十六进制(UTF-8 字节)。用 hex 不用 base64: 设备上 busybox 没有 base64,
+   而且后端用 awk 一行就能解出 hex —— 全程不把用户串喂给 shell。 */
+function dr_hex(s) {
+	var bytes = [], out = '', i, b;
+	if (window.TextEncoder) { bytes = new TextEncoder().encode(s); }
+	else { var e = unescape(encodeURIComponent(s)); for (i = 0; i < e.length; i++) { bytes.push(e.charCodeAt(i)); } }
+	for (i = 0; i < bytes.length; i++) { b = bytes[i]; out += (b < 16 ? '0' : '') + b.toString(16); }
+	return out;
+}
+
+function dr_get(act, qs, cb) {
+	XHR.get(DR_BASE + '/' + act + (qs ? '?' + qs : ''), null,
+		function(xhr, d) { cb(d || null); },
+		function(xhr) { cb(null); }
+	);
+}
+
+/* ---------- 磁盘列表 ---------- */
+function dr_load_disks() {
+	dr_get('list', null, function(d) {
+		if (!d || !d.disks) { return; }
+		DR_DISKS = d.disks;
+		var sig = '';
+		for (var i = 0; i < DR_DISKS.length; i++) {
+			sig += DR_DISKS[i].dev + '|' + DR_DISKS[i].verdict + '|' + DR_DISKS[i].size;
+			var sm0 = DR_DISKS[i].smart || {};
+			sig += '|' + (sm0.health || '') + ',' + (sm0.pending || 0) + ',' + (sm0.realloc || 0) + ',' + (sm0.avail ? 1 : 0);
+			var ps = DR_DISKS[i].partitions || [];
+			for (var j = 0; j < ps.length; j++) { sig += ps[j].name + ps[j].fs; }
+		}
+		if (sig === SIG_DISK) { return; }
+		SIG_DISK = sig;
+		if (!DR_DISKS.length) {
+			document.getElementById('dr_disks').innerHTML =
+				'<%:没有检测到可恢复的外接磁盘。%>' + '<br><span class="dr-hint" id="dr_seendevs">' +
+				'<%:正在看内核里有哪些块设备…%>' + '</span>' +
+				'<br><span class="dr-hint"><%:把坏盘插到 USB 口后本页每 3 秒自动刷新；虚拟设备（loop/dm）可写 /tmp/diskrestore/extra_devs。%></span>';
+			/* 空列表也得能看出"内核到底看见了什么", 否则没法判断是盘没插好还是没识别 */
+			dr_get('devs', null, function(x) {
+				var box = document.getElementById('dr_seendevs');
+				if (!box) { return; }
+				var all = (x && x.devs) || [];
+				var sys = (x && x.system) || [];
+				box.innerHTML = '<%:内核里现有块设备%>: <b>' + (all.length ? dr_esc(all.join(', ')) : '<%:（一个都没有）%>') +
+					'</b> ｜ <%:已排除（系统盘/正在被占用）%>: <b>' + (sys.length ? dr_esc(sys.join(', ')) : '-') + '</b>';
+			});
+			return;
+		}
+		var h = '';
+		for (var k = 0; k < DR_DISKS.length; k++) {
+			var dv = DR_DISKS[k];
+			var cls = dv.verdict === 'ok' ? 'dr-ok' : (dv.verdict === 'warn' ? 'dr-warn' : 'dr-bad');
+			var sm = dv.smart || {};
+			var scls = 'dr-na', stxt = '<%:SMART 不可用%>';
+			var sdet = '';
+			if (sm.avail) {
+				if (sm.health === 'FAILED') { scls = 'dr-bad'; stxt = '<%:SMART 失败%>'; }
+				else if ((sm.pending || 0) > 0) { scls = 'dr-warn'; stxt = '<%:SMART 劣化（有待映射扇区）%>'; }
+				else if ((sm.realloc || 0) > 0) { scls = 'dr-warn'; stxt = '<%:SMART 劣化（有重映射扇区）%>'; }
+				else { scls = 'dr-ok'; stxt = '<%:SMART 正常%>'; }
+				sdet = '<%:待映射%> ' + (sm.pending || 0) + ' · <%:重映射%> ' + (sm.realloc || 0) +
+					(sm.temp ? ' · ' + sm.temp + '°C' : '') + (sm.hours ? ' · ' + sm.hours + ' h' : '');
+			} else if (sm.note) { sdet = dr_esc(sm.note); }
+			h += '<div class="dr-disk' + (DR_SEL === dv.dev ? ' dr-sel' : '') + '" data-dev="' + dr_esc(dv.dev) + '" onclick="dr_pick(this)">';
+			h += '<div><span class="dr-name">/dev/' + dr_esc(dv.dev) + '</span> &nbsp;' + dr_esc(dv.size_h);
+			if (dv.model) { h += ' &nbsp;<span class="dr-sub">' + dr_esc(dv.model) + '</span>'; }
+			h += ' &nbsp;<span class="dr-badge ' + cls + '">' + dr_esc(dv.verdict_text) + '</span>';
+			h += ' &nbsp;<span class="dr-badge ' + scls + '">' + stxt + '</span></div>';
+			if (sdet) { h += '<div class="dr-sub">' + sdet + '</div>'; }
+			var ps = dv.partitions || [];
+			if (ps.length) {
+				h += '<div class="dr-sub">';
+				for (var m = 0; m < ps.length; m++) {
+					h += '/dev/' + dr_esc(ps[m].name) + ' ' + dr_esc(ps[m].size_h) + ' ' +
+						(ps[m].fs ? dr_esc(ps[m].fs) : '<%:文件系统认不出%>') +
+						(ps[m].start ? ' @' + ps[m].start : '') +
+						(ps[m].mounted ? ' (' + '<%:已挂载%>' + ' ' + dr_esc(ps[m].mounted) + ')' : '') + ' &nbsp;';
+				}
+				h += '</div>';
+			}
+			h += '</div>';
+		}
+		document.getElementById('dr_disks').innerHTML = h;
+	});
+}
+
+function dr_pick(el) {
+	if (DR_BUSY) { return; }
+	var dev = el.getAttribute('data-dev');
+	if (DR_SEL === dev && !DR_IMG) { return; }
+	DR_SEL = dev;
+	if (DR_IMG) {                       /* 源二选一: 选了磁盘就清掉镜像 */
+		DR_IMG = '';
+		document.getElementById('dr_imgpath').value = '';
+		dr_img_render();
+		dr_img_note();
+	}
+	SIG_DISK = null;
+	dr_load_disks();
+	dr_load_dests(dev);
+	dr_checkdest();
+}
+
+/* ---------- 已有镜像 (跳过制作镜像) ---------- */
+function dr_load_images(force) {
+	dr_get('images', null, function(d) {
+		if (!d || !d.images) { return; }
+		var sig = '';
+		for (var i = 0; i < d.images.length; i++) { sig += d.images[i].path + '|' + d.images[i].mtime; }
+		if (sig === SIG_IMG && !force) { return; }
+		SIG_IMG = sig;
+		DR_IMAGES = d.images;
+		dr_img_render();
+	});
+}
+
+function dr_img_render() {
+	var box = document.getElementById('dr_imgs');
+	if (!DR_IMAGES.length) {
+		box.innerHTML = '<%:（没扫到 *.img 镜像文件；也可以直接在上面填路径）%>';
+		return;
+	}
+	var h = '';
+	for (var i = 0; i < DR_IMAGES.length; i++) {
+		var im = DR_IMAGES[i];
+		h += '<div class="dr-disk' + (DR_IMG === im.path ? ' dr-sel' : '') + '" data-img="' + dr_esc(im.path) + '" onclick="dr_pickimg(this)">';
+		h += '<div><span class="dr-name">' + dr_esc(im.path) + '</span> &nbsp;' + dr_esc(im.size_h);
+		if (im.mtime) { h += ' &nbsp;<span class="dr-sub">' + dr_esc(im.mtime) + '</span>'; }
+		h += '</div></div>';
+	}
+	box.innerHTML = h;
+}
+
+function dr_pickimg(el) {
+	if (DR_BUSY) { return; }
+	DR_IMG = el.getAttribute('data-img');
+	document.getElementById('dr_imgpath').value = DR_IMG;
+	if (DR_SEL) {                       /* 源二选一: 选了镜像就清掉磁盘 */
+		DR_SEL = '';
+		SIG_DISK = null;
+		dr_load_disks();
+		dr_load_dests('');
+		dr_checkdest();
+	}
+	dr_img_render();
+	dr_img_note();
+	dr_dest_note();
+}
+
+function dr_img_typed() {
+	DR_IMG = (document.getElementById('dr_imgpath').value || '').replace(/^\s+|\s+$/g, '');
+	if (DR_IMG && DR_SEL) {
+		DR_SEL = '';
+		SIG_DISK = null;
+		dr_load_disks();
+		dr_load_dests('');
+	}
+	dr_img_render();
+	dr_img_note();
+	dr_dest_note();
+}
+
+function dr_img_note() {
+	var n = document.getElementById('dr_img_note');
+	if (!DR_IMG) { n.innerHTML = ''; return; }
+	n.innerHTML = '<%:将用镜像恢复%>: <b>' + dr_esc(DR_IMG) + '</b> · <%:跳过制作镜像%>';
+}
+
+/* ---------- 目标目录 ---------- */
+function dr_load_dests(dev) {
+	var qs = dev ? 'dev=' + encodeURIComponent(dev) : null;
+	dr_get('dests', qs, function(d) {
+		if (!d || !d.dests) { return; }
+		DR_DESTS = d.dests;
+		var sig = '';
+		for (var i = 0; i < DR_DESTS.length; i++) {
+			sig += DR_DESTS[i].path + '|' + DR_DESTS[i].free + '|' + DR_DESTS[i].same_disk;
+		}
+		if (sig === SIG_DEST) { return; }
+		SIG_DEST = sig;
+		var sel = document.getElementById('dr_dest');
+		var keep = DR_DESTID;
+		sel.innerHTML = '';
+		for (var j = 0; j < DR_DESTS.length; j++) {
+			var o = document.createElement('option');
+			o.value = DR_DESTS[j].id;
+			o.text = DR_DESTS[j].path + '  (' + DR_DESTS[j].free_h + ' <%:可用%>)' +
+				(DR_DESTS[j].same_disk ? ' - <%:与源盘同一块盘，不可用%>' : '');
+			sel.appendChild(o);
+		}
+		if (keep !== '') { sel.value = keep; }
+		if (sel.value === '' && DR_DESTS.length) { sel.value = DR_DESTS[0].id; }
+		DR_DESTID = sel.value;
+		/* 第一次加载时给输入框一个合理默认值 (之后绝不覆盖用户输入) */
+		if (!DR_PREFILLED && DR_DESTS.length) {
+			DR_PREFILLED = true;
+			if (!document.getElementById('dr_destpath').value) {
+				document.getElementById('dr_destpath').value = DR_DESTS[0].path;
+				DR_TYPED = DR_DESTS[0].path;
+				dr_checkdest();
+			}
+		}
+	});
+}
+
+/* 下拉只是快捷填入输入框, 真正用的是输入框里的路径 */
+function dr_pickdest(v) {
+	DR_DESTID = v;
+	for (var i = 0; i < DR_DESTS.length; i++) {
+		if (String(DR_DESTS[i].id) === String(v)) {
+			document.getElementById('dr_destpath').value = DR_DESTS[i].path;
+			DR_TYPED = DR_DESTS[i].path;
+			break;
+		}
+	}
+	dr_checkdest();
+}
+
+function dr_dest_typed() {
+	DR_TYPED = document.getElementById('dr_destpath').value;
+	DR_CHECK = null;
+	dr_dest_note();
+	if (DR_TYPETIMER) { window.clearTimeout(DR_TYPETIMER); }
+	DR_TYPETIMER = window.setTimeout(dr_checkdest, 700);
+}
+
+function dr_checkdest() {
+	var p = (document.getElementById('dr_destpath').value || '').replace(/^\s+|\s+$/g, '');
+	DR_TYPED = p;
+	if (!p) { DR_CHECK = null; dr_dest_note(); return; }
+	var qs = 'p=' + encodeURIComponent(dr_hex(p));
+	if (DR_SEL) { qs += '&dev=' + encodeURIComponent(DR_SEL); }
+	dr_get('destcheck', qs, function(d) {
+		DR_CHECK = d;
+		dr_dest_note();
+	});
+}
+
+function dr_dest_note() {
+	var n = document.getElementById('dr_dest_note');
+	var p = DR_TYPED;
+	var bad = false;
+	var txt = '';
+	if (!DR_SEL && !DR_IMG) {
+		txt = '<%:还没选恢复源：上面点一个磁盘，或者选/填一个已有镜像。%>';
+		bad = true;
+	} else if (!p) {
+		txt = '<%:请填写目标目录（或从上面选一个）。%>';
+		bad = true;
+	} else if (!DR_CHECK) {
+		txt = '<%:检查目标目录中…%>';
+		bad = true;
+	} else if (!DR_CHECK.ok) {
+		txt = '<span class="dr-bad-note">' + dr_esc(DR_CHECK.error || '<%:目录不可用%>') + '</span>';
+		bad = true;
+	} else {
+		txt = '<%:目标%>: <b>' + dr_esc(DR_CHECK.path) + '</b>';
+		if (DR_CHECK.exists === false) {
+			txt += ' · <span class="dr-ok-note"><%:目录不存在，开始时会自动创建%></span>';
+			if (DR_CHECK.free && DR_CHECK.free > 0) {
+				txt += ' · <%:所在分区剩余空间%>: <b>' + dr_esc(DR_CHECK.free_h) + '</b>' +
+					(DR_CHECK.free_of ? ' <span class="dr-hint">(' + dr_esc(DR_CHECK.free_of) + ')</span>' : '');
+			}
+		} else {
+			txt += ' · <%:剩余空间%>: <b>' + dr_esc(DR_CHECK.free_h) + '</b>';
+		}
+		if (DR_CHECK.same_disk && !DR_IMG) {
+			bad = true;
+			txt += ' · <span class="dr-bad-note"><%:与源盘是同一块盘，不能作为目标%></span>';
+		}
+		var need = 0;
+		for (var j = 0; j < DR_DISKS.length; j++) {
+			if (DR_DISKS[j].dev === DR_SEL) { need = DR_DISKS[j].size; }
+		}
+		if (DR_IMG) {
+			/* 源是已有镜像: 不用再放整盘镜像, 只要够放恢复出来的文件; 空间偏小只提示不拦 */
+			for (var k = 0; k < DR_IMAGES.length; k++) {
+				if (DR_IMAGES[k].path === DR_IMG) { need = DR_IMAGES[k].size; }
+			}
+			if (need && DR_CHECK.exists !== false && DR_CHECK.free < need / 10) {
+				txt += ' · <span class="dr-warn-note"><%:剩余空间偏小，可能只能恢复一部分文件%></span>';
+			}
+		} else if (need && DR_CHECK.exists !== false && DR_CHECK.free < need) {
+			bad = true;
+			txt += ' · <span class="dr-bad-note"><%:空间不够放整盘镜像，请换大盘或大目录%></span>';
+		}
+	}
+	n.innerHTML = txt;
+	var go = document.getElementById('dr_go');
+	go.disabled = bad || (!DR_SEL && !DR_IMG) || DR_BUSY;
+}
+
+/* ---------- 开始 / 停止 ---------- */
+function dr_start() {
+	var msg = document.getElementById('dr_msg');
+	var srcqs = '';
+	if (DR_IMG) {
+		srcqs = 'img=' + encodeURIComponent(dr_hex(DR_IMG));
+	} else if (DR_SEL) {
+		srcqs = 'dev=' + encodeURIComponent(DR_SEL);
+	} else {
+		msg.innerHTML = '<%:还没选恢复源：上面点一个磁盘，或者选/填一个已有镜像。%>';
+		return;
+	}
+	var p = (document.getElementById('dr_destpath').value || '').replace(/^\s+|\s+$/g, '');
+	if (!p) { msg.innerHTML = '<%:请填写目标目录%>'; return; }
+	if (DR_CHECK && DR_CHECK.ok === false) { msg.innerHTML = '<span class="dr-bad-note">' + dr_esc(DR_CHECK.error) + '</span>'; return; }
+	if (DR_IMG) {
+		if (!confirm('<%:开始恢复？将直接用这份已有镜像（不再重新制作镜像）；恢复出的文件写入目标目录。可以关掉页面（任务在后台继续跑）。%>')) { return; }
+	} else {
+		if (!confirm('<%:开始恢复？源盘只读；镜像和恢复出的文件会写入目标目录。大容量盘耗时较长，期间可以关掉页面（任务在后台继续跑）。%>')) { return; }
+	}
+	DR_BUSY = true;
+	msg.innerHTML = '<%:正在启动…%>';
+	/* 立刻清掉上一次的进度/结果: start 请求本身要 1~3 秒, 不能等它回来才清,
+	   否则这几秒页面还在拿旧值当新值显示 (状态UI不许显过期值)。 */
+	DR_OLDRUN = DR_LASTSTARTED;
+	DR_PENDING = true;
+	SIG_LOG = null;
+	SIG_RES = null;
+	DR_RES_LOADED = false;
+	DR_RES_STAMP = '';
+	document.getElementById('dr_log').textContent = '';
+	document.getElementById('dr_res_summary').innerHTML = '';
+	document.getElementById('dr_byname').innerHTML = '';
+	document.getElementById('dr_res_tbl').innerHTML = '';
+	document.getElementById('dr_res_paths').innerHTML = '';
+	document.getElementById('dr_work').innerHTML = '';
+	document.getElementById('dr_state').innerHTML = '<span class="dr-badge dr-warn"><%:启动中%></span>';
+	document.getElementById('dr_phase').innerHTML = '<%:已派发，正在启动…%>';
+	document.getElementById('dr_bar').style.width = '0%';
+	dr_show_res(false);
+	dr_show_prog(true);
+	dr_dest_note();
+	dr_get('start', srcqs + '&dest=' + encodeURIComponent('hex:' + dr_hex(p)), function(d) {
+		if (!d || !d.ok) {
+			DR_BUSY = false;
+			msg.innerHTML = '<span class="dr-bad-note">' + dr_esc((d && d.error) || '<%:启动失败%>') + '</span>';
+			dr_dest_note();
+			return;
+		}
+		msg.innerHTML = '<%:已启动%>';
+		dr_tick();
+	});
+}
+
+function dr_stop() {
+	var msg = document.getElementById('dr_msg');
+	msg.innerHTML = '<%:正在停止…%>';
+	dr_get('stop', null, function(d) {
+		msg.innerHTML = (d && d.ok) ? '<%:已停止%>' : dr_esc((d && d.error) || '<%:停止失败%>');
+		dr_tick();
+	});
+}
+
+/* ---------- 状态 ---------- */
+function dr_show_prog(on) { document.getElementById('dr_progbox').style.display = on ? '' : 'none'; }
+function dr_show_res(on) { document.getElementById('dr_resbox').style.display = on ? '' : 'none'; }
+
+function dr_state_badge(st) {
+	var cls = 'dr-na', txt = st || 'idle';
+	if (st === 'running') { cls = 'dr-warn'; txt = '<%:进行中%>'; }
+	else if (st === 'done') { cls = 'dr-ok'; txt = '<%:完成%>'; }
+	else if (st === 'error') { cls = 'dr-bad'; txt = '<%:出错%>'; }
+	else if (st === 'stopped') { cls = 'dr-na'; txt = '<%:已停止%>'; }
+	else { txt = '<%:空闲%>'; }
+	return '<span class="dr-badge ' + cls + '">' + txt + '</span>';
+}
+
+function dr_tick() {
+	dr_get('status', null, function(st) {
+		if (!st) { return; }
+		/* 刚点了开始: 新任务的第一个状态还没到, 别把上一次的结果当成本次的显示 */
+		if (DR_PENDING) {
+			if (!st.started || String(st.started) === String(DR_OLDRUN)) { return; }
+			DR_PENDING = false;
+		}
+		if (st.started) { DR_LASTSTARTED = st.started; }
+		var run = (st.state === 'running');
+		DR_BUSY = run;
+		if (run || st.state === 'done' || st.state === 'stopped' || st.state === 'error') {
+			dr_show_prog(true);
+		}
+		document.getElementById('dr_state').innerHTML = dr_state_badge(st.state);
+		document.getElementById('dr_phase').innerHTML = dr_esc(st.phase || '');
+		document.getElementById('dr_step').innerHTML = dr_esc(st.step || '-');
+		var pct = st.pct || 0;
+		document.getElementById('dr_pct').innerHTML = pct + '%';
+		document.getElementById('dr_bar').style.width = pct + '%';
+		document.getElementById('dr_el').innerHTML = dr_hms(st.elapsed || 0);
+		document.getElementById('dr_files').innerHTML = st.files || 0;
+		document.getElementById('dr_bytes').innerHTML = dr_size(st.bytes || 0);
+		var w = '';
+		if (st.srctype === 'img' && st.image) {
+			w = '<%:源%>: <b>' + dr_esc(st.image) + '</b> <span class="dr-sub">(<%:已有镜像，未重新制作%>)</span>';
+		} else if (st.dev) {
+			w = '<%:源盘%>: <b>/dev/' + dr_esc(st.dev) + '</b>';
+		}
+		if (st.dest) { w += ' · <%:目标%>: <b>' + dr_esc(st.dest) + '</b>'; }
+		if (st.work) { w += ' · <%:工作目录%>: <b>' + dr_esc(st.work) + '</b>'; }
+		if (st.error) { w += ' · <span class="dr-bad-note">' + dr_esc(st.error) + '</span>'; }
+		document.getElementById('dr_work').innerHTML = w;
+
+		if (st.state === 'done' || st.state === 'stopped') {
+			/* 结果只在状态真的更新过才重拉: 几万个文件时别每 3 秒都去后端取一遍 */
+			if (!DR_RES_LOADED || DR_RES_STAMP !== String(st.updated)) { dr_load_result(String(st.updated)); }
+			dr_org_tick();      /* 整理任务可能有进度/刚结束 */
+		} else if (st.state === 'error') { dr_show_res(false); }
+		dr_load_log();
+		dr_dest_note();
+	});
+}
+
+function dr_hms(s) {
+	s = parseInt(s, 10) || 0;
+	var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), c = s % 60;
+	function p(n) { return (n < 10 ? '0' : '') + n; }
+	return h > 0 ? (p(h) + ':' + p(m) + ':' + p(c)) : (p(m) + ':' + p(c));
+}
+
+function dr_size(b) {
+	b = parseInt(b, 10) || 0;
+	if (b >= 1073741824) { return (b / 1073741824).toFixed(1) + ' GB'; }
+	if (b >= 1048576) { return (b / 1048576).toFixed(1) + ' MB'; }
+	if (b >= 1024) { return Math.round(b / 1024) + ' KB'; }
+	return b + ' B';
+}
+
+function dr_load_log() {
+	dr_get('log', null, function(d) {
+		if (!d || !d.lines) { return; }
+		var sig = d.lines.join(String.fromCharCode(10));
+		if (sig === SIG_LOG) { return; }
+		SIG_LOG = sig;
+		var el = document.getElementById('dr_log');
+		el.textContent = d.lines.length ? d.lines.join(String.fromCharCode(10)) : '<%:（暂无日志）%>';
+		el.scrollTop = el.scrollHeight;
+	});
+}
+
+function dr_load_result(stamp) {
+	dr_get('result', 'n=200', function(d) {
+		if (!d || !d.ok) { return; }
+		DR_RES_LOADED = true;
+		DR_RES_STAMP = String(stamp || '');
+		var sig = (d.recup || '') + '|' + (d.files || 0) + '|' + (d.bytes || 0) + '|' + JSON.stringify(d.byname || []);
+		if (sig === SIG_RES) { return; }
+		SIG_RES = sig;
+		dr_show_res(true);
+		var paths = '';
+		if (d.image) { paths += '<%:整盘镜像%>: <b>' + dr_esc(d.image) + '</b> (' + dr_esc(d.img_size_h || '') + ')<br>'; }
+		if (d.recup) { paths += '<%:按签名雕出的文件%>: <b>' + dr_esc(d.recup) + '</b>'; }
+		paths += '<br><span class="dr-sub">' + '<%:完整文件清单（文件很多时用这个，纯文本）%>' + ': ' +
+			'<a href="' + DR_BASE + '/filelist?w=byname" target="_blank"><%:按原文件名%></a> · ' +
+			'<a href="' + DR_BASE + '/filelist?w=recup" target="_blank"><%:按签名雕出%></a></span>';
+		document.getElementById('dr_res_paths').innerHTML = paths;
+
+		/* 按原名恢复的结果 */
+		var bn = d.byname || [];
+		var hb = '<tr><th><%:分区%></th><th><%:文件系统%></th><th><%:结果%></th></tr>';
+		for (var i = 0; i < bn.length; i++) {
+			var b = bn[i];
+			var pcell = '<b>' + dr_esc(b.part) + '</b>' + (b.dev ? ' <span class="dr-sub">(' + dr_esc(b.dev) + ')</span>' : '');
+			if (b.ok) {
+				hb += '<tr><td>' + pcell + '</td><td>' + dr_esc(b.fs) + '</td><td>' +
+					'<span class="dr-ok-note"><%:成功%></span>: ' + (b.capped ? '20000+' : b.files) + ' <%:个文件%> / ' + dr_size(b.bytes) +
+					(b.bs ? '<br><span class="dr-warn-note"><%:（该分区引导扇区已用备份修复后挂载）%></span>' : '') +
+					(b.failed ? '<br><span class="dr-bad-note"><%:其中%> ' + b.failed + ' <%:个文件/目录损坏未复制%></span>' : '') +
+					'<br><span class="dr-sub">' + dr_esc(b.dst) + '</span></td></tr>';
+			} else {
+				hb += '<tr><td>' + pcell + '</td><td>' + dr_esc(b.fs) + '</td><td>' +
+					'<span class="dr-bad-note"><%:未成功%></span>: ' + dr_esc(b.reason) + '</td></tr>';
+			}
+		}
+		if (!bn.length) { hb += '<tr><td colspan="3"><%:（镜像里没找到可识别的分区）%></td></tr>'; }
+		document.getElementById('dr_byname').innerHTML = hb;
+
+		/* 汇总: 按原文件名恢复的 + 按签名雕出的 (两个口径分开说, 不含糊) */
+		var bnFiles = 0, bnBytes = 0, bnCapped = false;
+		for (var q = 0; q < bn.length; q++) {
+			if (bn[q].ok) {
+				bnFiles += bn[q].files || 0;
+				bnBytes += bn[q].bytes || 0;
+				if (bn[q].capped) { bnCapped = true; }
+			}
+		}
+		document.getElementById('dr_res_summary').innerHTML =
+			'<%:按原文件名恢复%>: <b>' + (bnCapped ? '20000+' : bnFiles) + '</b> <%:个%>（' + dr_size(bnBytes) + '） · ' +
+			'<%:按签名雕出%>: <b>' + (d.capped ? '20000+' : (d.files || 0)) + '</b> <%:个%>（' + dr_size(d.bytes || 0) + '）';
+
+		var list = d.list || [];
+		var h = '<tr><th><%:文件%></th><th style="text-align:right;"><%:大小%></th></tr>';
+		for (var j = 0; j < list.length; j++) {
+			h += '<tr><td>' + dr_esc(list[j].name) + '</td><td class="dr-sz">' + dr_size(list[j].size) + '</td></tr>';
+		}
+		if (!list.length) { h += '<tr><td colspan="2"><%:（没有雕出文件）%></td></tr>'; }
+		if ((d.files || 0) > list.length) {
+			h += '<tr><td colspan="2" class="dr-sub"><%:只列出前%> ' + list.length + ' <%:个（共%> ' +
+				(d.capped ? '20000+' : (d.files || 0)) + ' <%:个）— 完整清单见上面链接%></td></tr>';
+		}
+		document.getElementById('dr_res_tbl').innerHTML = h;
+		DR_LAST_FILES = d.files || 0;
+		dr_render_org(d.org || {}, DR_LAST_FILES);
+	});
+}
+
+/* ---------- 整理雕出的文件（按 年/月 归档） ---------- */
+function dr_render_org(o, files) {
+	var box = document.getElementById('dr_org');
+	o = o || {};
+	var st = o.state || 'idle';
+	var h = '';
+	if (st === 'running') {
+		h = '<span class="dr-badge dr-warn"><%:整理中%></span> <span class="dr-sub">' + dr_esc(o.phase || '') + '</span> ' +
+			'<b>' + (o.pct || 0) + '%</b> · <%:已归档%> ' + (o.moved || 0) + '/' + (o.total || 0) + ' <%:个%>';
+	} else if (st === 'done') {
+		h = '<span class="dr-badge dr-ok"><%:已整理%></span> <%:按 年/月 归档%>: <b>' + (o.moved || 0) + '</b> <%:个文件%>' +
+			' → <b>' + dr_esc(o.dir || '') + '</b>';
+	} else if (st === 'error') {
+		h = '<span class="dr-bad-note">' + dr_esc(o.error || '') + '</span>';
+	}
+	/* 已经整理过就不再显示按钮(重新跑一次恢复会重置整理状态, 按钮会再出现) */
+	if (st !== 'running' && st !== 'done' && files > 0) {
+		h += (h ? '<br>' : '') +
+			'<input type="button" class="cbi-button cbi-button-action" value="<%:整理雕出的文件（按年/月归档）%>" onclick="dr_organize()" />' +
+			'<span class="dr-sub" style="margin-left:8px;"><%:雕出来的文件没有名字，点这里按文件日期分到 年/月 两级目录%></span>';
+	}
+	box.innerHTML = h;
+}
+
+function dr_org_tick() {
+	dr_get('orgstatus', null, function(o) {
+		if (!o) { return; }
+		var prev = DR_ORG_STATE;
+		DR_ORG_STATE = o.state || 'idle';
+		dr_render_org(o, DR_LAST_FILES);
+		if (prev === 'running' && DR_ORG_STATE !== 'running') {
+			/* 整理结束 ⇒ 目录结构变了, 强制重拉结果 */
+			DR_RES_LOADED = false;
+			DR_RES_STAMP = '';
+			dr_load_result('org-done');
+		}
+	});
+}
+
+function dr_organize() {
+	document.getElementById('dr_org').innerHTML = '<span class="dr-sub"><%:正在启动整理…%></span>';
+	dr_get('organize', null, function(d) {
+		if (!d || !d.ok) {
+			dr_render_org({ state: 'error', error: (d && d.error) || '<%:启动失败%>' }, DR_LAST_FILES);
+			return;
+		}
+		DR_ORG_STATE = 'running';
+		dr_org_tick();
+	});
+}
+
+document.getElementById('dr_ver').innerHTML = DR_UI;
+dr_load_disks();
+dr_load_dests('');
+dr_load_images(1);
+dr_img_render();
+dr_img_note();
+dr_dest_note();
+dr_tick();
+window.setInterval(function() {
+	dr_load_disks();
+	dr_load_dests(DR_SEL);
+	dr_tick();
+}, 3000);
+</script>
+
+<%+footer%>

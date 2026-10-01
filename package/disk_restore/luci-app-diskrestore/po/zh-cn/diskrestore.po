@@ -1,0 +1,294 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: luci-app-diskrestore\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: zh_Hans\n"
+
+msgid "磁盘数据恢复"
+msgstr "磁盘数据恢复"
+
+msgid "对损坏的 U 盘 / 移动硬盘一键恢复文件。固定四步：① ddrescue 只读整盘镜像（坏区自动重试、中断可续）；② testdisk 分析分区表；③ 把镜像里的分区只读挂载出来，连原文件名和目录结构一起复制（能保住名字的关键一步）；④ 只有挂载失败（文件系统引导扇区坏了）才退回 photorec 按签名雕取。源盘全程只读。"
+msgstr "对损坏的 U 盘 / 移动硬盘一键恢复文件。固定四步：① ddrescue 只读整盘镜像（坏区自动重试、中断可续）；② testdisk 分析分区表；③ 把镜像里的分区只读挂载出来，连原文件名和目录结构一起复制（能保住名字的关键一步）；④ 只有挂载失败（文件系统引导扇区坏了）才退回 photorec 按签名雕取。源盘全程只读。"
+
+msgid "1. 选择要恢复的磁盘"
+msgstr "1. 选择要恢复的磁盘"
+
+msgid "正在检测磁盘…"
+msgstr "正在检测磁盘…"
+
+msgid "或者：用已经做好的镜像文件恢复（跳过“制作镜像”这一步）"
+msgstr "或者：用已经做好的镜像文件恢复（跳过“制作镜像”这一步）"
+
+msgid "填镜像文件路径，或点下面扫描出来的镜像直接选中。同一份镜像可以反复做恢复，不必每次都重新制作。"
+msgstr "填镜像文件路径，或点下面扫描出来的镜像直接选中。同一份镜像可以反复做恢复，不必每次都重新制作。"
+
+msgid "扫描已有镜像"
+msgstr "扫描已有镜像"
+
+msgid "2. 目标目录（镜像 + 恢复的文件都写在这里）"
+msgstr "2. 目标目录（镜像 + 恢复的文件都写在这里）"
+
+msgid "可以直接输入任意目录（不存在会自动创建）；也可以从下面的已挂载可写目录里点一下快速填入："
+msgstr "可以直接输入任意目录（不存在会自动创建）；也可以从下面的已挂载可写目录里点一下快速填入："
+
+msgid "开始恢复"
+msgstr "开始恢复"
+
+msgid "停止"
+msgstr "停止"
+
+msgid "3. 进度"
+msgstr "3. 进度"
+
+msgid "当前步骤"
+msgstr "当前步骤"
+
+msgid "百分比"
+msgstr "百分比"
+
+msgid "已耗时"
+msgstr "已耗时"
+
+msgid "已恢复文件"
+msgstr "已恢复文件"
+
+msgid "大小"
+msgstr "大小"
+
+msgid "等待日志…"
+msgstr "等待日志…"
+
+msgid "4. 恢复结果"
+msgstr "4. 恢复结果"
+
+msgid "各分区按原文件名/目录恢复情况"
+msgstr "各分区按原文件名/目录恢复情况"
+
+msgid "按签名雕出的文件（名字已丢失，数字是起始扇区）"
+msgstr "按签名雕出的文件（名字已丢失，数字是起始扇区）"
+
+msgid "没有检测到外接磁盘。把坏盘插到 USB 口后本页会自动刷新（每 3 秒）。"
+msgstr "没有检测到外接磁盘。把坏盘插到 USB 口后本页会自动刷新（每 3 秒）。"
+
+msgid "SMART 不可用"
+msgstr "SMART 不可用"
+
+msgid "SMART 失败"
+msgstr "SMART 失败"
+
+msgid "SMART 劣化（有待映射扇区）"
+msgstr "SMART 劣化（有待映射扇区）"
+
+msgid "SMART 劣化（有重映射扇区）"
+msgstr "SMART 劣化（有重映射扇区）"
+
+msgid "SMART 正常"
+msgstr "SMART 正常"
+
+msgid "待映射"
+msgstr "待映射"
+
+msgid "重映射"
+msgstr "重映射"
+
+msgid "文件系统认不出"
+msgstr "文件系统认不出"
+
+msgid "已挂载"
+msgstr "已挂载"
+
+msgid "（没扫到 *.img 镜像文件；也可以直接在上面填路径）"
+msgstr "（没扫到 *.img 镜像文件；也可以直接在上面填路径）"
+
+msgid "将用镜像恢复"
+msgstr "将用镜像恢复"
+
+msgid "跳过制作镜像"
+msgstr "跳过制作镜像"
+
+msgid "可用"
+msgstr "可用"
+
+msgid "与源盘同一块盘，不可用"
+msgstr "与源盘同一块盘，不可用"
+
+msgid "还没选恢复源：上面点一个磁盘，或者选/填一个已有镜像。"
+msgstr "还没选恢复源：上面点一个磁盘，或者选/填一个已有镜像。"
+
+msgid "请填写目标目录（或从上面选一个）。"
+msgstr "请填写目标目录（或从上面选一个）。"
+
+msgid "检查目标目录中…"
+msgstr "检查目标目录中…"
+
+msgid "目录不可用"
+msgstr "目录不可用"
+
+msgid "目标"
+msgstr "目标"
+
+msgid "目录不存在，开始时会自动创建"
+msgstr "目录不存在，开始时会自动创建"
+
+msgid "剩余空间"
+msgstr "剩余空间"
+
+msgid "与源盘是同一块盘，不能作为目标"
+msgstr "与源盘是同一块盘，不能作为目标"
+
+msgid "剩余空间偏小，可能只能恢复一部分文件"
+msgstr "剩余空间偏小，可能只能恢复一部分文件"
+
+msgid "空间不够放整盘镜像，请换大盘或大目录"
+msgstr "空间不够放整盘镜像，请换大盘或大目录"
+
+msgid "请填写目标目录"
+msgstr "请填写目标目录"
+
+msgid "开始恢复？将直接用这份已有镜像（不再重新制作镜像）；恢复出的文件写入目标目录。可以关掉页面（任务在后台继续跑）。"
+msgstr "开始恢复？将直接用这份已有镜像（不再重新制作镜像）；恢复出的文件写入目标目录。可以关掉页面（任务在后台继续跑）。"
+
+msgid "开始恢复？源盘只读；镜像和恢复出的文件会写入目标目录。大容量盘耗时较长，期间可以关掉页面（任务在后台继续跑）。"
+msgstr "开始恢复？源盘只读；镜像和恢复出的文件会写入目标目录。大容量盘耗时较长，期间可以关掉页面（任务在后台继续跑）。"
+
+msgid "正在启动…"
+msgstr "正在启动…"
+
+msgid "启动中"
+msgstr "启动中"
+
+msgid "已派发，正在启动…"
+msgstr "已派发，正在启动…"
+
+msgid "启动失败"
+msgstr "启动失败"
+
+msgid "已启动"
+msgstr "已启动"
+
+msgid "正在停止…"
+msgstr "正在停止…"
+
+msgid "已停止"
+msgstr "已停止"
+
+msgid "停止失败"
+msgstr "停止失败"
+
+msgid "进行中"
+msgstr "进行中"
+
+msgid "完成"
+msgstr "完成"
+
+msgid "出错"
+msgstr "出错"
+
+msgid "空闲"
+msgstr "空闲"
+
+msgid "源"
+msgstr "源"
+
+msgid "已有镜像，未重新制作"
+msgstr "已有镜像，未重新制作"
+
+msgid "源盘"
+msgstr "源盘"
+
+msgid "工作目录"
+msgstr "工作目录"
+
+msgid "（暂无日志）"
+msgstr "（暂无日志）"
+
+msgid "整盘镜像"
+msgstr "整盘镜像"
+
+msgid "按签名雕出的文件"
+msgstr "按签名雕出的文件"
+
+msgid "完整文件清单（文件很多时用这个，纯文本）"
+msgstr "完整文件清单（文件很多时用这个，纯文本）"
+
+msgid "按原文件名"
+msgstr "按原文件名"
+
+msgid "按签名雕出"
+msgstr "按签名雕出"
+
+msgid "分区"
+msgstr "分区"
+
+msgid "文件系统"
+msgstr "文件系统"
+
+msgid "结果"
+msgstr "结果"
+
+msgid "成功"
+msgstr "成功"
+
+msgid "个文件"
+msgstr "个文件"
+
+msgid "（该分区引导扇区已用备份修复后挂载）"
+msgstr "（该分区引导扇区已用备份修复后挂载）"
+
+msgid "其中"
+msgstr "其中"
+
+msgid "个文件/目录损坏未复制"
+msgstr "个文件/目录损坏未复制"
+
+msgid "未成功"
+msgstr "未成功"
+
+msgid "（镜像里没找到可识别的分区）"
+msgstr "（镜像里没找到可识别的分区）"
+
+msgid "按原文件名恢复"
+msgstr "按原文件名恢复"
+
+msgid "个"
+msgstr "个"
+
+msgid "文件"
+msgstr "文件"
+
+msgid "（没有雕出文件）"
+msgstr "（没有雕出文件）"
+
+msgid "只列出前"
+msgstr "只列出前"
+
+msgid "个（共"
+msgstr "个（共"
+
+msgid "个）— 完整清单见上面链接"
+msgstr "个）— 完整清单见上面链接"
+
+msgid "整理中"
+msgstr "整理中"
+
+msgid "已归档"
+msgstr "已归档"
+
+msgid "已整理"
+msgstr "已整理"
+
+msgid "按 年/月 归档"
+msgstr "按 年/月 归档"
+
+msgid "整理雕出的文件（按年/月归档）"
+msgstr "整理雕出的文件（按年/月归档）"
+
+msgid "雕出来的文件没有名字，点这里按文件日期分到 年/月 两级目录"
+msgstr "雕出来的文件没有名字，点这里按文件日期分到 年/月 两级目录"
+
+msgid "正在启动整理…"
+msgstr "正在启动整理…"
+
+msgid "文件恢复"
+msgstr "文件恢复"

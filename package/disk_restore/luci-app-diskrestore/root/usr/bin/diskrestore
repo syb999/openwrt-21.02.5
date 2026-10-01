@@ -1,0 +1,1408 @@
+#!/bin/sh
+#
+# diskrestore - backend for luci-app-diskrestore
+#
+#   diskrestore list                    -> {"disks":[...]}
+#   diskrestore destinations [<dev>]    -> {"dests":[...]}
+#   diskrestore status                  -> job state (fast, <1s)
+#   diskrestore start <dev> <dest_id>   -> {"ok":true}   (spawns detached worker)
+#   diskrestore stop                    -> {"ok":true}
+#   diskrestore log [n]                 -> {"lines":[...]}
+#   diskrestore result [n]              -> {"files":N,"bytes":N,"files_list":[...]}
+#   diskrestore worker <dev> <dest_id>  -> internal worker
+#
+# Pipeline (one set of parameters, no mode switches):
+#   1) ddrescue images the source device (READ ONLY on the source)
+#   2) testdisk analyses the image and reports the recoverable partitions
+#   3) photorec carves files out of the image
+# Everything is written under <dest>/diskrestore/<dev>/.
+#
+# luci-app-diskrestore
+
+BASE=/tmp/diskrestore
+LOG=$BASE/diskrestore.log
+STATE=$BASE/job.json
+STOPF=$BASE/stop
+PIDF=$BASE/worker.pid
+# Optional: extra block devices to offer as recovery sources, one name per
+# line (/dev/<name>). Only needed for non-USB sources (loop/dm/lvm); the file
+# does not exist on a normal install and the UI is unchanged without it.
+EXTRA=$BASE/extra_devs
+ORG=$BASE/org.json
+ORGPID=$BASE/org.pid
+CLIVER=1.6.7
+KEEP_LOG=100
+RETRY=3
+
+mkdir -p "$BASE" 2>/dev/null
+
+# --- json helpers -----------------------------------------------------------
+# jesc: own (possibly UTF-8) text -> json string body
+jesc() { printf '%s' "$1" | tr -d '\r\n' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+# jasc: kernel/user supplied ascii (disk model etc) -> strict whitelist
+jasc() { printf '%s' "$1" | tr -cd 'A-Za-z0-9 ./_+():#,-' ; }
+
+err() { printf '{"ok":false,"error":"%s"}\n' "$(jesc "$1")"; }
+ok()  { printf '{"ok":true%s}\n' "$1"; }
+
+# --- misc helpers -----------------------------------------------------------
+log() {
+	local lc
+	if [ -f "$LOG" ]; then
+		lc=$(wc -l < "$LOG" 2>/dev/null)
+		if [ "${lc:-0}" -gt "$KEEP_LOG" ]; then
+			tail -n "$KEEP_LOG" "$LOG" > "$LOG.t" 2>/dev/null && mv "$LOG.t" "$LOG"
+		fi
+	fi
+	printf '%s\n' "$*" >> "$LOG" 2>/dev/null
+}
+
+fmt_size() {
+	awk -v b="${1:-0}" 'BEGIN{ b=b+0;
+		if (b>=1099511627776) printf "%.1f TB",b/1099511627776;
+		else if (b>=1073741824) printf "%.1f GB",b/1073741824;
+		else if (b>=1048576) printf "%.1f MB",b/1048576;
+		else printf "%.0f KB",b/1024 }'
+}
+
+fmt_hms() {
+	awk -v s="${1:-0}" 'BEGIN{ s=int(s); if(s<0)s=0; h=int(s/3600); m=int((s%3600)/60); c=s%60;
+		if(h>0) printf "%02d:%02d:%02d",h,m,c; else printf "%02d:%02d",m,c }'
+}
+
+parent_disk() {
+	case "$1" in
+		mmcblk[0-9]*p[0-9]*) printf '%s' "${1%p*}" ;;
+		mmcblk[0-9]*)        printf '%s' "$1" ;;
+		sd[a-z]*[0-9])       printf '%s' "$(printf '%s' "$1" | sed 's/[0-9][0-9]*$//')" ;;
+		*)                   printf '%s' "$1" ;;
+	esac
+}
+
+# disks that must never be touched (backing a mounted filesystem)
+busy_disks() {
+	awk '$1 ~ /^\/dev\// { gsub("/dev/","",$1); print $1 }' /proc/mounts 2>/dev/null | sort -u | \
+	while read -r b; do
+		if [ "$b" = "root" ]; then b=$(basename "$(readlink -f /dev/root 2>/dev/null)"); fi
+		parent_disk "$b"
+	done | sort -u
+}
+
+mountpoint_of() { awk -v d="/dev/$1" '$1==d { gsub(/\\040/, " ", $2); print $2 }' /proc/mounts 2>/dev/null | head -n1; }
+
+# 取数字: 命令替换可能给空串/非数字。🔴 ash 里 $(( )) 遇到空值会直接
+# "arithmetic syntax error" 把整个脚本干掉(worker 就是这么被干掉的), 算数前一律过一遍。
+num() { case "${1:-}" in ''|*[!0-9]*) printf '0' ;; *) printf '%s' "$1" ;; esac; }
+
+# 路径所在文件系统的空间(字节)。$2=f 剩余(默认) / u 已用
+# 🔴 三个坑叠在一起, 这里必须逐级兜底:
+#    1) busybox 的 df 处理不了含空格的**路径**(/proc/mounts 里空格是 \040, df 拿真实空格去比对
+#       会报 No such file or directory 且只输出表头);
+#    2) 不能直接拿 /proc/mounts 的第 1 列当设备去问 df —— tmpfs / overlay / none 这类**不是块设备**
+#       (实测 /tmp 就是这么被算成 0 KB 的: df -k tmpfs 无效 ⇒ 空值 ⇒ 页面显示"剩余空间: 0 KB");
+#    3) 取到空值又进 $(( )) 会 arithmetic syntax error 干掉 worker, 所以出口统一交给 num()。
+df_bytes() {
+	_p="$1"; _c="${2:-f}"
+	# 1) 路径本身不含空格 ⇒ 直接问 df(最准)
+	case "$_p" in
+		*\ *) ;;
+		*)
+			_v=$(df -k "$_p" 2>/dev/null | awk -v c="$_c" 'NR>=2{print (c=="u"?$3:$4); exit}')
+			if [ -n "$_v" ]; then printf '%s' "$_v"; return 0; fi
+			;;
+	esac
+	# 2) 按 /proc/mounts 找最长前缀挂载点(优先用它在 /proc/mounts 里的**转义**写法, df 认这个)
+	_esc=$(awk -v p="$1" 'BEGIN{ best=""; bl=0 }
+		{ mt=$2; gsub(/\\040/, " ", mt)
+		  if (mt ~ /^\// && index(p, mt) == 1 && length(mt) > bl &&
+		      (length(p) == length(mt) || substr(p, length(mt)+1, 1) == "/")) { best=$2; bl=length(mt) } }
+		END{ if (best != "") print best }' /proc/mounts 2>/dev/null)
+	[ -n "$_esc" ] || return 0
+	_v=$(df -k "$_esc" 2>/dev/null | awk -v c="$_c" 'NR>=2{print (c=="u"?$3:$4); exit}')
+	if [ -n "$_v" ]; then printf '%s' "$_v"; return 0; fi
+	# 3) 最后才按设备问(只有真块设备才行)
+	_dev=$(awk -v m="$_esc" '$2 == m { print $1; exit }' /proc/mounts 2>/dev/null)
+	case "$_dev" in
+		/dev/*) df -k "$_dev" 2>/dev/null | awk -v c="$_c" 'NR>=2{print (c=="u"?$3:$4); exit}' ;;
+	esac
+}
+
+# sysfs dir for a block device name (follows /dev/<name> symlinks)
+sysd_of() {
+	if [ -d "/sys/block/$1" ]; then printf '/sys/block/%s' "$1"; return 0; fi
+	tgt=$(ls -l "/dev/$1" 2>/dev/null | sed 's/.* -> //')
+	case "$tgt" in /*) ;;
+		*) [ -n "$tgt" ] && [ -d "/sys/block/${tgt##*/}" ] && printf '/sys/block/%s' "${tgt##*/}" ;;
+	esac
+}
+
+dev_size() {
+	sd=$(sysd_of "$1")
+	[ -n "$sd" ] || { printf '0'; return; }
+	printf '%s' $(( $(num "$(cat "$sd/size" 2>/dev/null)") * 512 ))
+}
+
+# user facing candidates: sd* + removable mmcblk* + explicit extra devices
+cand_names() {
+	for sysd in /sys/block/sd* /sys/block/mmcblk*; do
+		[ -e "$sysd/dev" ] || continue
+		d=${sysd##*/}
+		case "$d" in
+			mmcblk*) [ "$(cat "$sysd/removable" 2>/dev/null)" = "1" ] || continue ;;
+		esac
+		[ -b "/dev/$d" ] && printf '%s\n' "$d"
+	done
+	if [ -f "$EXTRA" ]; then
+		while read -r e; do
+			[ -n "$e" ] || continue
+			[ -b "/dev/$e" ] && printf '%s\n' "$e"
+		done < "$EXTRA"
+	fi
+}
+
+dev_in_list() {
+	cand_names | while read -r n; do [ "$n" = "$1" ] && { printf 'yes'; break; }; done | grep -q yes
+}
+
+dest_disk() {
+	local mp
+	mp=$(awk -v p="$1" 'BEGIN{best=""} $2 ~ /^\// { gsub(/\\040/, " ", $2); if (index(p,$2)==1 && length($2)>length(best)) best=$2 }
+		END{ if(best!="") print best }' /proc/mounts 2>/dev/null)
+	[ -z "$mp" ] && return 1
+	mp=$(awk -v m="$mp" '$2==m {print $1}' /proc/mounts 2>/dev/null | head -n1)
+	[ -z "$mp" ] && return 1
+	parent_disk "$(basename "$mp")"
+}
+
+# --- destination directories ------------------------------------------------
+# id order must be stable between "destinations" and "start"
+FS_OK="ext4 ext3 ext2 f2fs vfat exfat ntfs xfs btrfs squashfs_ro"
+dest_list() {
+	# prints: id<TAB>path<TAB>fstype<TAB>free_bytes
+	awk '$2 ~ /^\// && $4 ~ /rw/ { gsub(/\\040/, " ", $2); print $2" "$3 }' /proc/mounts 2>/dev/null | sort -u | \
+	while read -r mp fs; do
+		case " $FS_OK " in *" $fs "*) ;; *) continue ;; esac
+		case "$mp" in /rom|/rom/*) continue ;; esac
+		[ -d "$mp" ] || continue
+		[ -w "$mp" ] || continue
+		free=$(num "$(df_bytes "$mp")")
+		[ "$free" = "0" ] && continue
+		printf '%s\t%s\t%s\t%s\n' "" "$mp" "$fs" "$(( free * 1024 ))"
+	done | awk -F'\t' -v OFS='\t' '{ $1=NR-1; print }'
+}
+
+dest_by_id() {
+	dest_list | awk -F'	' -v id="$1" '$1==id { print $2 }' | head -n1
+}
+
+# 目标目录参数有两种形式:
+#   <数字>            目标列表里的序号 (mount 出来的可写目录)
+#   hex:<十六进制>   用户手输的绝对路径。转 hex 是为了绝不把用户串喂给 shell。
+#   🔴 别用 base64: busybox 默认没有 base64 applet, /bin/base64 来自 coreutils-base64 包;
+#      hex 用 awk 一行就能解, awk 一定在(还可以正确处理 UTF-8 中文路径)。
+hexpath() {
+	printf '%s' "${1#hex:}" | awk '
+		function hv(c) { return index("0123456789abcdef", tolower(c)) - 1 }
+		{ n = length($0); for (i = 1; i + 1 <= n; i += 2) printf "%c", hv(substr($0, i, 1)) * 16 + hv(substr($0, i + 1, 1)) }
+	'
+}
+
+resolve_dest() {
+	case "$1" in
+		hex:*)       hexpath "$1" ;;
+		''|*[!0-9]*) printf '' ;;
+		*)           dest_by_id "$1" ;;
+	esac
+}
+
+# 手输路径的合法性: 绝对路径 / 无 .. / 能创建 / 可写
+check_custom_path() {
+	case "$1" in
+		/*) ;;
+		*)  err "目标目录必须是绝对路径（以 / 开头）"; return 1 ;;
+	esac
+	case "$1" in
+		*..*) err "目标目录不能包含 .."; return 1 ;;
+	esac
+	if [ ! -d "$1" ]; then
+		if mkdir -p "$1" 2>/dev/null; then
+			log "已创建目标目录 $1"
+		else
+			err "无法创建目录 $1（父目录不存在或只读？）"; return 1
+		fi
+	fi
+	[ -w "$1" ] || { err "目录不可写: $1"; return 1; }
+	return 0
+}
+
+cmd_destcheck() {
+	p=$(resolve_dest "${1:-}")
+	[ -n "$p" ] || { err "路径无效"; return; }
+	case "$p" in
+		/*) ;;
+		*) err "必须是绝对路径（以 / 开头）"; return ;;
+	esac
+	case "$p" in
+		*..*) err "路径不能包含 .."; return ;;
+	esac
+	if [ ! -d "$p" ]; then
+		# 目录还不存在: 拿最近存在的父目录的空间给用户看 —— 否则页面只能显示"会自动创建",
+		# 用户没法判断"这块盘空间够不够"(他之前就为"看不到真实剩余空间"提过意见)
+		_par="$p"
+		while [ -n "$_par" ] && [ ! -d "$_par" ]; do _par=$(dirname "$_par"); done
+		_pf=0; _ph="-"
+		if [ -n "$_par" ] && [ -d "$_par" ]; then
+			_pf=$(num "$(df_bytes "$_par")")
+			_ph=$(fmt_size "$(( _pf * 1024 ))")
+		fi
+		printf '{"ok":true,"path":"%s","exists":false,"free":%s,"free_h":"%s","free_of":"%s","same_disk":false}\n' \
+			"$(jesc "$p")" "$(( _pf * 1024 ))" "$_ph" "$(jesc "$_par")"
+		return
+	fi
+	[ -w "$p" ] || { printf '{"ok":false,"path":"%s","error":"目录不可写"}\n' "$(jesc "$p")"; return; }
+	free=$(( $(num "$(df_bytes "$p")") * 1024 ))
+	same=false
+	if [ -n "${2:-}" ]; then
+		dstd=$(dest_disk "$p" 2>/dev/null)
+		if [ -n "$dstd" ] && [ "$dstd" = "$(parent_disk "$2")" ]; then same=true; fi
+	fi
+	printf '{"ok":true,"path":"%s","exists":true,"free":%s,"free_h":"%s","same_disk":%s}\n' \
+		"$(jesc "$p")" "$free" "$(fmt_size "$free")" "$same"
+}
+cmd_destinations() {
+	src=${1:-}
+	srcd=""
+	[ -n "$src" ] && srcd=$(parent_disk "$src")
+	printf '{"dests":['
+	first=1
+	dest_list | while IFS='	' read -r id path fs free; do
+		same=false
+		if [ -n "$srcd" ]; then
+			dd=$(dest_disk "$path" 2>/dev/null)
+			[ "$dd" = "$srcd" ] && same=true
+		fi
+		printf '%s{"id":%s,"path":"%s","fs":"%s","free":%s,"free_h":"%s","same_disk":%s}' \
+			"$sep" "$id" "$(jesc "$path")" "$(jasc "$fs")" "$free" "$(fmt_size "$free")" "$same"
+		sep=,
+	done
+	printf ']}\n'
+}
+
+# --- SMART (盘健康) ---------------------------------------------------------
+# smartctl 在坏盘/烂 USB 桥上会卡住, 而设备上没有 timeout 命令 ⇒ 后台跑 + 自己超时,
+# 结果缓存到 /tmp/diskrestore/smart_<dev>.json; list 接口只读缓存, 保证 <1s 返回。
+SMART_TTL=120
+
+smart_scan() {   # $1 dev — 走 start-stop-daemon 脱离调用者运行
+	d=$1
+	o="$BASE/.smart.$d.out"
+	cf="$BASE/smart_$d.json"
+	smartctl -H -A -i "/dev/$d" > "$o" 2>&1 &
+	sp=$!
+	i=0
+	while [ "$i" -lt 8 ]; do
+		kill -0 "$sp" 2>/dev/null || break
+		sleep 1
+		i=$(( i + 1 ))
+	done
+	if kill -0 "$sp" 2>/dev/null; then
+		kill -9 "$sp" 2>/dev/null
+		printf '{"avail":false,"note":"SMART 读取超时 (盘或 USB 桥无响应)"}' > "$cf.t"
+		mv "$cf.t" "$cf" 2>/dev/null
+		rm -f "$o"
+		return
+	fi
+	if ! command -v smartctl >/dev/null 2>&1; then
+		printf '{"avail":false,"note":"未安装 smartmontools（opkg install smartmontools）"}' > "$cf.t"; mv "$cf.t" "$cf" 2>/dev/null; return
+	fi
+	case "$(sed -n 's/.*SMART support is: *//p' "$o" | head -n1)" in
+		Unavailable*|Disabled*)
+			printf '{"avail":false,"note":"该 USB 桥/设备不支持 SMART 透传"}' > "$cf.t"
+			mv "$cf.t" "$cf" 2>/dev/null
+			rm -f "$o"
+			return ;;
+	esac
+	h=$(sed -n 's/.*self-assessment test result: *//p' "$o" | head -n1 | tr -cd 'A-Za-z')
+	[ -n "$h" ] || h=$(sed -n 's/.*SMART Health Status: *//p' "$o" | head -n1 | tr -cd 'A-Za-z')
+	# 只有真的读到 PASSED/FAILED 才算"有 SMART", 否则不能显示"正常"
+	# (loop/不支持透传的 USB 桥会返回空 → 之前会误报 avail=true/health=UNKNOWN)
+	case "$h" in
+		PASSED|FAILED|OK|GOOD) ;;
+		*)
+			printf '{"avail":false,"note":"读不到 SMART 健康状态 (设备类型或 USB 桥不支持透传)"}' > "$cf.t"
+			mv "$cf.t" "$cf" 2>/dev/null
+			rm -f "$o"
+			return ;;
+	esac
+	vals=$(awk '
+		$2=="Reallocated_Sector_Ct"  { print "r"$10 }
+		$2=="Current_Pending_Sector" { print "p"$10 }
+		$2=="Temperature_Celsius"    { print "t"$10 }
+		$2=="Power_On_Hours"         { print "h"$10 }
+	' "$o" 2>/dev/null | head -n8)
+	realloc=0; pending=0; temp=0; hours=0
+	for v in $vals; do
+		case "$v" in
+			r*) realloc=$(printf '%s' "${v#r}" | tr -cd '0-9') ;;
+			p*) pending=$(printf '%s' "${v#p}" | tr -cd '0-9') ;;
+			t*) temp=$(printf '%s' "${v#t}" | tr -cd '0-9') ;;
+			h*) hours=$(printf '%s' "${v#h}" | tr -cd '0-9') ;;
+		esac
+	done
+	[ -n "$h" ] || h=UNKNOWN
+	printf '{"avail":true,"health":"%s","realloc":%s,"pending":%s,"temp":%s,"hours":%s,"note":""}' \
+		"$h" "${realloc:-0}" "${pending:-0}" "${temp:-0}" "${hours:-0}" > "$cf.t"
+	mv "$cf.t" "$cf" 2>/dev/null
+	rm -f "$o"
+}
+
+smart_ensure() {   # $1 dev — 返回缓存内容, 必要时派一个后台扫描
+	cf="$BASE/smart_$1.json"
+	age=999999
+	[ -f "$cf" ] && age=$(( $(date +%s) - $(date -r "$cf" +%s 2>/dev/null || echo 0) ))
+	if [ "$age" -ge "$SMART_TTL" ]; then
+		lk="$BASE/smart_$1.lock"
+		lage=999999
+		[ -f "$lk" ] && lage=$(( $(date +%s) - $(date -r "$lk" +%s 2>/dev/null || echo 0) ))
+		if [ "$lage" -gt 20 ]; then
+			touch "$lk" 2>/dev/null
+			start-stop-daemon -S -b -x /usr/bin/diskrestore -q -- smart_scan "$1" >/dev/null 2>&1
+		fi
+	fi
+	if [ -f "$cf" ]; then
+		cat "$cf" 2>/dev/null
+	else
+		printf '{"avail":false,"note":"SMART 检测中…"}'
+	fi
+}
+
+# --- disk enumeration -------------------------------------------------------
+cmd_list() {
+	busy=$(busy_disks)
+	printf '{"disks":['
+	sep=
+	cand_names | while read -r d; do
+		sysd=$(sysd_of "$d")
+		[ -n "$sysd" ] || continue
+		rem=$(cat "$sysd/removable" 2>/dev/null)
+		skip=0
+		for b in $busy; do [ "$b" = "$d" ] && skip=1; done
+		[ "$skip" = "1" ] && continue
+
+		secs=$(cat "$sysd/size" 2>/dev/null)
+		[ -z "$secs" ] && continue
+		[ "$secs" = "0" ] && continue
+		size=$(( secs * 512 ))
+		model=$(jasc "$(cat "$sysd/device/model" 2>/dev/null)$(cat "$sysd/device/name" 2>/dev/null)")
+		vend=$(jasc "$(cat "$sysd/device/vendor" 2>/dev/null)")
+
+		# readable?
+		dd if="/dev/$d" bs=512 count=1 of=/dev/null 2>/dev/null
+		if [ $? -eq 0 ]; then rd=true; else rd=false; fi
+
+		ptype=$(jasc "$(blkid -p -s PTTYPE -o value "/dev/$d" 2>/dev/null)")
+		rawfs=$(jasc "$(blkid -p -s TYPE -o value "/dev/$d" 2>/dev/null)")
+
+		# partitions
+		plist=""
+		psep=
+		nfs=0
+		npart=0
+		for pd in "$sysd/$d"*; do
+			[ -e "$pd/partition" ] || continue
+			pn=${pd##*/}
+			npart=$(( npart + 1 ))
+			psz=$(( $(num "$(cat "$pd/size" 2>/dev/null)") * 512 ))
+			pst=$(cat "$pd/start" 2>/dev/null)
+			pfs=$(jasc "$(blkid -s TYPE -o value "/dev/$pn" 2>/dev/null)")
+			pmp=$(jesc "$(mountpoint_of "$pn")")
+			[ -n "$pfs" ] && nfs=$(( nfs + 1 ))
+			plist="$plist$psep{\"name\":\"$(jasc "$pn")\",\"size\":$psz,\"size_h\":\"$(fmt_size "$psz")\",\"start\":${pst:-0},\"fs\":\"$pfs\",\"mounted\":\"$pmp\"}"
+			psep=,
+		done
+
+		# 盘健康 (只读缓存, 必要时派后台扫描; 见 smart_ensure)
+		smt=$(smart_ensure "$d")
+		[ -n "$smt" ] || smt='{"avail":false,"note":"SMART 不可用"}'
+
+		# verdict
+		verdict=ok
+		vtext="分区表与文件系统可识别"
+		if [ "$rd" = "false" ]; then
+			verdict=bad; vtext="读取错误：扇区 0 读不出来（物理损坏或坏道）"
+		elif [ -z "$ptype" ] && [ -z "$rawfs" ] && [ "$nfs" = "0" ]; then
+			verdict=bad; vtext="无分区表签名、也无文件系统：分区表已损坏或被格式化"
+		elif [ -n "$ptype" ] && [ "$nfs" = "0" ] && [ "$npart" -gt 0 ]; then
+			verdict=bad; vtext="分区表 $ptype 存在，但 $npart 个分区的文件系统都认不出来（文件系统损坏）"
+		elif [ -z "$ptype" ] && [ -n "$rawfs" ]; then
+			verdict=warn; vtext="没有分区表，但整盘上有一个 $rawfs 文件系统"
+		elif [ -n "$ptype" ] && [ "$nfs" -lt "$npart" ]; then
+			verdict=warn; vtext="分区表 $ptype，$npart 个分区里有 $(( npart - nfs )) 个文件系统不可识别"
+		fi
+
+		printf '%s{"dev":"%s","size":%s,"size_h":"%s","model":"%s","vendor":"%s","removable":%s,"table":"%s","raw_fs":"%s","readable":%s,"nparts":%s,"partitions":[%s],"smart":%s,"verdict":"%s","verdict_text":"%s"}' \
+			"$sep" "$(jasc "$d")" "$size" "$(fmt_size "$size")" "$model" "$vend" \
+			"$( [ "$rem" = "1" ] && echo true || echo false )" \
+			"$ptype" "$rawfs" "$rd" "${npart:-0}" "$plist" "$smt" "$verdict" "$(jesc "$vtext")"
+		sep=,
+	done
+	printf ']}\n'
+}
+
+# --- status -----------------------------------------------------------------
+cur_state() {
+	[ -f "$STATE" ] || { printf 'idle'; return; }
+	sed -n 's/.*"state":"\([a-zA-Z]*\)".*/\1/p' "$STATE" 2>/dev/null | head -n1
+}
+
+# worker 进程是否真的活着 (状态是 running 但进程没了 = 设备重启/被杀留下的假状态)
+worker_alive() {
+	[ -f "$STATE" ] || return 1
+	[ "$(cur_state)" = "running" ] || return 1
+	p=$(cat "$PIDF" 2>/dev/null)
+	[ -n "$p" ] || return 1
+	kill -0 "$p" 2>/dev/null
+}
+
+# 把假 running 落成 error (自愈)。返回 0 = 刚清理过。status 每次轮询都会调它,
+# 所以页面看几秒就自己恢复了, 不需要人工点停止。
+# 🔴 这里必须"事后复核再落盘": 判断是 running 之后、sed 落盘之前, worker 可能刚好
+#    写完 done/stopped —— 直接 mv 就会把过期的错误文本注进一个正常的状态里
+#    (实测踩过: 最终状态是 done 却带着"进程已退出")。
+heal_stale_state() {
+	[ -f "$STATE" ] || return 1
+	[ "$(cur_state)" = "running" ] || return 1
+	worker_alive && return 1
+	sed -e 's/"state":"running"/"state":"error"/' \
+	    -e 's/"error":""/"error":"恢复进程已退出（设备重启或进程被杀），可从日志查看进度，重新开始即可"/' \
+	    "$STATE" > "$STATE.t" 2>/dev/null || return 1
+	if grep -q '"state":"error"' "$STATE.t" 2>/dev/null && ! grep -q '"state":"running"' "$STATE.t" 2>/dev/null; then
+		mv "$STATE.t" "$STATE" 2>/dev/null
+		return 0
+	fi
+	# 落到一半状态已经变了 (worker 写完了) ⇒ 丢弃, 绝不覆盖
+	rm -f "$STATE.t" 2>/dev/null
+	return 1
+}
+
+cmd_status() {
+	if [ ! -f "$STATE" ]; then
+		printf '{"state":"idle","cli":"%s"}\n' "$CLIVER"
+		return
+	fi
+	heal_stale_state
+	cat "$STATE" 2>/dev/null
+	printf '\n'
+}
+
+cmd_log() {
+	n=${1:-20}
+	case "$n" in ''|*[!0-9]*) n=20 ;; esac
+	printf '{"lines":['
+	tail -n "$n" "$LOG" 2>/dev/null | awk '{ gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); gsub(/\r/,""); printf "%s\"%s\"", (NR>1?",":""), $0 }'
+	printf ']}\n'
+}
+
+# --- results ----------------------------------------------------------------
+result_dir() {
+	# <dest>/diskrestore/<dev>  (read from state)
+	[ -f "$STATE" ] || return 1
+	sed -n 's/.*"work":"\([^"]*\)".*/\1/p' "$STATE" 2>/dev/null | head -n1
+}
+
+cmd_result() {
+	n=${1:-100}
+	case "$n" in ''|*[!0-9]*) n=100 ;; esac
+	[ "$n" -gt 500 ] && n=500      # 硬上限: 页面只渲染前 N 个, 别让人手传个大数把浏览器搞死
+	w=$(result_dir)
+	if [ -z "$w" ] || [ ! -d "$w" ]; then
+		printf '{"ok":false,"error":"还没有恢复结果"}\n'; return
+	fi
+	rec=""
+	for c in "$w"/recup*; do [ -d "$c" ] && rec="$c"; done
+	# 整理过之后 recup.* 里只剩 report.xml ⇒ 文件清单改从 organized/ 里列
+	if [ -n "$rec" ] && [ -z "$(find "$rec" -maxdepth 1 -type f ! -name 'report.xml' 2>/dev/null | head -n 1)" ]; then
+		rec=""
+	fi
+	if [ -z "$rec" ] && [ -d "$w/organized" ]; then rec="$w/organized"; fi
+	# 🔴 计数一律读 worker 写好的 state, 绝不在这里 find/du:
+	#    文件几万个时, 页面每 3 秒轮询一次就会全目录扫描一次 ⇒ CGI 超时/页面卡死(就是"崩溃")。
+	files=$(sed -n 's/.*"files":\([0-9]*\).*/\1/p' "$STATE" 2>/dev/null | head -n1)
+	bytes=$(sed -n 's/.*"bytes":\([0-9]*\).*/\1/p' "$STATE" 2>/dev/null | head -n1)
+	capped=$(sed -n 's/.*"capped":\(true\|false\).*/\1/p' "$STATE" 2>/dev/null | head -n1)
+	[ -n "$files" ] || files=0
+	[ -n "$bytes" ] || bytes=0
+	[ -n "$capped" ] || capped=false
+	img=$(sed -n 's/.*"image":"\([^"]*\)".*/\1/p' "$STATE" 2>/dev/null | head -n1)
+	imgsz=$(sed -n 's/.*"img_size":\([0-9]*\).*/\1/p' "$STATE" 2>/dev/null | head -n1)
+	bn="[]"
+	if [ -f "$w/byname.json" ]; then
+		bn=$(cat "$w/byname.json" 2>/dev/null)
+		[ -n "$bn" ] || bn="[]"
+	fi
+	orgj="{}"
+	if [ -f "$ORG" ] && [ -s "$ORG" ]; then
+		orgj=$(cat "$ORG" 2>/dev/null)
+		[ -n "$orgj" ] || orgj="{}"
+	fi
+	printf '{"ok":true,"work":"%s","recup":"%s","files":%s,"files_h":%s,"bytes":%s,"bytes_h":"%s","capped":%s,"image":"%s","img_size":%s,"img_size_h":"%s","byname":%s,"org":%s,"shown":%s,"list":[' \
+		"$(jesc "$w")" "$(jesc "$rec")" "$files" "$files" "$bytes" "$(fmt_size "$bytes")" \
+		"$capped" "$(jesc "$img")" "${imgsz:-0}" "$(fmt_size "${imgsz:-0}")" "$bn" "$orgj" "$n"
+	if [ -n "$rec" ]; then
+		# 只取前 n 个: find 在 head 关闭管道后会收到 SIGPIPE 提前结束, 不会扫完整个目录。
+		# (以前用 ls -l 会把几万个文件全列出来再让 awk 截断, 大目录很慢。)
+		# 🔴 xargs 默认按空白切分参数 ⇒ 路径里有空格就会被切成两半。一律走 NUL 分隔:
+		#    生成时把换行转成 \0, 用 xargs -0 喂进去。名字也从"去掉行首大小字段"取,
+		#    这样带空格的文件名也能完整保留。
+		find "$rec" -type f ! -name 'report.xml' 2>/dev/null | head -n "$n" | tr '\n' '\0' > "$BASE/.flist.$$"
+		# 🔴 逐个 wc -c 会为每个文件起一个进程 (200 个 ≈ 1.5s), 用 xargs 一次交给 wc:
+		#    页面每 3 秒轮询一次, 这里必须是"一次进程"级别的开销。
+		xargs -0 wc -c < "$BASE/.flist.$$" 2>/dev/null | awk '
+			{
+				line = $0
+				if (line ~ / total$/) next
+				sub(/^ *[0-9]+ +/, "", line)          # 去掉行首的大小字段
+				if (line == "" || line == $0) next
+				sz = $1; sub(/[^0-9].*$/, "", sz)
+				sub(/^.*\//, "", line)                # 去掉目录, 只留文件名
+				printf "%s{\"name\":\"%s\",\"size\":%s}", (c++ ? "," : ""), line, sz
+			}'
+		rm -f "$BASE/.flist.$$"
+	fi
+	printf ']}\n'
+}
+
+# --- 已有镜像扫描 ------------------------------------------------------------
+# 在可写挂载点里找已经做好的镜像文件 (*.img, >1MB, 深度<=4), 供"用已有镜像恢复"选。
+# 注意: 必须用 `while read ... done < 文件` 而不是管道, 否则计数器在子 shell 里丢失。
+# 内核里看得见的块设备(用于"没有磁盘"时给出根因)
+cmd_devs() {
+	printf '{"devs":['
+	sep=
+	for d in $(ls /sys/block 2>/dev/null); do
+		case "$d" in loop*|ram*|zram*) continue ;; esac
+		printf '%s"%s"' "$sep" "$(jasc "$d")"
+		sep=,
+	done
+	printf '],"system":['
+	sep=
+	for d in $(busy_disks 2>/dev/null); do
+		printf '%s"%s"' "$sep" "$(jasc "$d")"
+		sep=,
+	done
+	printf ']}\n'
+}
+
+cmd_images() {
+	LISTF="$BASE/.imgs.$$"
+	: > "$LISTF"
+	for mp in $(dest_list | awk -F'	' '{print $2}'); do
+		# 🔴 busybox find 的 -size 只认 k(c) 后缀: `-size +1M` 会报 "invalid number '1M'"
+		#    并且因为 2>/dev/null 而静默返回空 —— 一开始扫不到镜像就是这个原因。
+		# 🔴 overlay 上扫出来的会是 /overlay/upper/root/... 这种内部路径, 换成用户看得见的
+		#    可见路径 (去掉 <mp>/upper 前缀), 否则列表里全是 upper/ 很迷惑。
+		for f in $(find "$mp" -maxdepth 4 -type f -name '*.img' -size +1024k 2>/dev/null); do
+			np=$f
+			case "$f" in
+				"$mp"/upper/*) np=${f#"$mp"/upper} ;;
+			esac
+			[ -e "$np" ] || np=$f
+			printf '%s\n' "$np"
+		done >> "$LISTF"
+	done
+	printf '{"images":['
+	sep=
+	n=0
+	while read -r f; do
+		[ -n "$f" ] || continue
+		[ -f "$f" ] || continue
+		n=$(( n + 1 ))
+		[ "$n" -gt 40 ] && break
+		sz=$(wc -c < "$f" 2>/dev/null)
+		mt=$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null)
+		printf '%s{"path":"%s","size":%s,"size_h":"%s","mtime":"%s"}' \
+			"$sep" "$(jesc "$f")" "${sz:-0}" "$(fmt_size "${sz:-0}")" "$(jesc "$mt")"
+		sep=,
+	done < "$LISTF"
+	rm -f "$LISTF"
+	printf ']}\n'
+}
+
+# --- start / stop -----------------------------------------------------------
+cmd_start() {
+	src=$1
+	didx=$2
+
+	# 目标目录参数: 序号(可挂载的可写目录) 或 hex:<十六进制绝对路径>
+	case "$didx" in
+		hex:*)
+			case "${didx#hex:}" in
+				''|*[!0-9a-fA-F]*) err "目标目录参数非法"; return ;;
+			esac
+			;;
+		''|*[!0-9]*) err "目标目录参数非法"; return ;;
+	esac
+
+	# 恢复源: 设备名(sd*/mmcblk*/loop*) 或 hex:<已有镜像文件路径>
+	#   用已有镜像 = 跳过"制作镜像"这一步, 想跑几次恢复就跑几次, 不必重新做 img。
+	SRCTYPE=dev
+	IMG=
+	IMGSZ=0
+	dev=
+	case "$src" in
+		hex:*)
+			case "${src#hex:}" in
+				''|*[!0-9a-fA-F]*) err "镜像路径参数非法"; return ;;
+			esac
+			IMG=$(hexpath "$src")
+			[ -n "$IMG" ] || { err "镜像路径解码失败"; return; }
+			[ -f "$IMG" ] || { err "镜像文件不存在: $IMG"; return; }
+			[ -r "$IMG" ] || { err "镜像文件不可读: $IMG"; return; }
+			IMGSZ=$(wc -c < "$IMG" 2>/dev/null)
+			[ "${IMGSZ:-0}" -ge 1048576 ] || { err "镜像文件太小（$(fmt_size "${IMGSZ:-0}")），不像磁盘镜像"; return; }
+			SRCTYPE=img
+			;;
+		*)
+			dev=$src
+			[ -b "/dev/$dev" ] || { err "/dev/$dev 不存在"; return; }
+			dev_in_list "$dev" || { err "设备 $dev 不在可恢复设备列表里"; return; }
+			;;
+	esac
+
+	st=$(cur_state)
+	if worker_alive; then err "已有恢复任务在运行，请先停止"; return; fi
+	heal_stale_state        # 假 running (设备重启/被杀) 直接自愈, 不挡新任务
+
+	case "$didx" in
+		hex:*)
+			dest=$(hexpath "$didx")
+			[ -n "$dest" ] || { err "目标目录路径解码失败"; return; }
+			check_custom_path "$dest" || return
+			;;
+		*)
+			dest=$(dest_by_id "$didx")
+			[ -n "$dest" ] || { err "目标目录无效（可能已卸载）"; return; }
+			;;
+	esac
+
+	if [ "$SRCTYPE" = "img" ]; then
+		# 源是镜像文件: 不做"同盘"检查 —— 镜像只是目标盘上的一个文件, 把恢复结果写在
+		# 同一个盘上是正常用法(要防的只是"写坏正在恢复的源盘")。只要求留出空间放文件。
+		free=$(( $(num "$(df_bytes "$dest")") * 1024 ))
+		if [ "$free" -lt 33554432 ]; then
+			err "目标目录剩余空间太少（$(fmt_size "$free")），至少留 32 MB 放恢复出来的文件"; return
+		fi
+	else
+		srcd=$(parent_disk "$dev")
+		dstd=$(dest_disk "$dest" 2>/dev/null)
+		if [ -n "$dstd" ] && [ "$srcd" = "$dstd" ]; then
+			err "目标目录就在源盘上，已拒绝：镜像会覆盖正在恢复的盘"; return
+		fi
+		need=$(dev_size "$dev")
+		free=$(( $(num "$(df_bytes "$dest")") * 1024 ))
+		if [ "$free" -lt "$need" ]; then
+			err "目标目录空间不足：整盘镜像需要 $(fmt_size "$need")，$dest 只剩 $(fmt_size "$free")——请换一个大盘/目录"; return
+		fi
+	fi
+
+	rm -f "$STOPF" 2>/dev/null
+	: > "$LOG"
+	rm -f "$STATE" "$STATE.t" 2>/dev/null      # 清掉上一次的状态, 否则会拿旧状态误判本次
+	rm -f "$ORG" "$ORG.t" 2>/dev/null          # 新任务 ⇒ 整理状态重来(新雕出的文件要能再整理)
+	if [ "$SRCTYPE" = "img" ]; then
+		log "▶ 开始恢复: 镜像 $IMG ($(fmt_size "$IMGSZ")) → $dest  （使用已有镜像, 跳过制作镜像）"
+	else
+		log "▶ 开始恢复: /dev/$dev → $dest  (源盘 $(fmt_size "$need"))"
+	fi
+
+	start-stop-daemon -S -b -m -p "$PIDF" -x /usr/bin/diskrestore -q -- worker "$src" "$didx" >/dev/null 2>&1
+	# 🔴 别用固定 sleep 去赌 worker 写没写状态: worker 可能还没写, 而 $STATE 里是上一次的
+	#    旧状态(比如 done), 于是把"其实跑成功了"报成失败。先删旧状态, 再等新状态出现。
+	i=0
+	while [ "$i" -lt 3 ]; do
+		[ -f "$STATE" ] && break
+		sleep 1      # 注意: OpenWrt 的 busybox sleep 不支持小数 (sleep 0.5 会报 invalid number)
+		i=$(( i + 1 ))
+	done
+	if [ -f "$STATE" ] && [ "$(cur_state)" != "running" ]; then
+		if [ -f "$STATE" ]; then
+			cat "$STATE" | sed -n 's/.*"error":"\([^"]*\)".*/{"ok":false,"error":"\1"}/p' | head -n1
+			printf '\n'
+			return
+		fi
+	fi
+	if [ "$(cur_state)" != "running" ]; then
+		# worker 还没写状态而已(不是失败): 照实返回"已派发", 页面 3 秒后轮询就能看到真实状态
+		if [ "$SRCTYPE" = "img" ]; then
+			printf '{"ok":true,"starting":true,"srctype":"img","image":"%s","dest":"%s"}\n' "$(jesc "$IMG")" "$(jesc "$dest")"
+		else
+			printf '{"ok":true,"starting":true,"srctype":"dev","dev":"%s","dest":"%s"}\n' "$(jasc "$dev")" "$(jesc "$dest")"
+		fi
+		return
+	fi
+	if [ "$SRCTYPE" = "img" ]; then
+		printf '{"ok":true,"srctype":"img","image":"%s","dest":"%s"}\n' "$(jesc "$IMG")" "$(jesc "$dest")"
+	else
+		printf '{"ok":true,"srctype":"dev","dev":"%s","dest":"%s"}\n' "$(jasc "$dev")" "$(jesc "$dest")"
+	fi
+}
+
+cmd_stop() {
+	if ! worker_alive; then
+		heal_stale_state
+		err "当前没有正在运行的恢复任务（上次的进程已经不在了，状态已自动清理）"
+		return
+	fi
+	touch "$STOPF" 2>/dev/null
+	log "⏹ 收到停止指令，正在结束当前步骤…"
+	pid=$(cat "$PIDF" 2>/dev/null)
+	# give the worker time to write its final state (avoids "提前结束" mis-report)
+	i=0
+	while [ "$i" -lt 10 ]; do
+		[ "$(cur_state)" != "running" ] && break
+		sleep 1; i=$(( i + 1 ))
+	done
+	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+		kill -9 "$pid" 2>/dev/null
+		# 强杀后 worker 的 trap 不会执行 ⇒ 自己落一个明确的 stopped 状态,
+		# 否则会留下假 running, 把后面所有 start 都挡住。
+		if [ "$(cur_state)" = "running" ]; then
+			sed -e 's/"state":"running"/"state":"stopped"/' -e 's/"phase":"[^"]*"/"phase":"已停止"/' \
+				"$STATE" > "$STATE.t" 2>/dev/null && mv "$STATE.t" "$STATE" 2>/dev/null
+		fi
+	fi
+	rm -f "$STOPF" 2>/dev/null
+	ok ',"stopped":true'
+}
+
+# --- worker -----------------------------------------------------------------
+STEP_RC=0
+STATE_K=running
+PHASE="准备"
+STEPNO=1
+PCT=0
+FILES=0
+BYTES=0
+ELAPSED=0
+STARTED=0
+ERRMSG=""
+DEV=
+DEST=
+WORK=
+IMG=
+CHILD=
+
+write_state() {
+	printf '{"state":"%s","phase":"%s","step":"%s","pct":%s,"files":%s,"bytes":%s,"capped":%s,"elapsed":%s,"started":%s,"updated":%s,"srctype":"%s","dev":"%s","dest":"%s","work":"%s","image":"%s","img_size":%s,"img_size_h":"%s","error":"%s"}' \
+		"$STATE_K" "$(jesc "$PHASE")" "$STEPNO/4" "$PCT" "$FILES" "$BYTES" "${STAT_CAPPED:-false}" "$ELAPSED" "$STARTED" "$(date +%s)" \
+		"${SRCTYPE:-dev}" "$(jasc "$DEV")" "$(jesc "$DEST")" "$(jesc "$WORK")" "$(jesc "$IMG")" "$SRC_SIZE" "$(fmt_size "$SRC_SIZE")" "$(jesc "$ERRMSG")" \
+		> "$STATE.t" 2>/dev/null && mv "$STATE.t" "$STATE"
+}
+
+# parse the running step's output file into PCT / FILES / BYTES
+progress_of() {
+	line=
+	case "$1" in
+		dd)
+			line=$(tr '\r' '\n' < "$2" 2>/dev/null | grep 'pct rescued' | tail -n1)
+			[ -n "$line" ] && PCT=$(printf '%s' "$line" | sed -n 's/.*pct rescued: *\([0-9.]*\)%.*/\1/p' | cut -d. -f1)
+			;;
+		pr)
+			line=$(tr '\r' '\n' < "$2" 2>/dev/null | grep -o 'Reading sector[0-9 ]*/[0-9]*' | tail -n1)
+			if [ -n "$line" ]; then
+				cur=$(printf '%s' "$line" | sed 's/.*sector *//; s#/.*##')
+				tot=$(printf '%s' "$line" | sed 's#.*/##')
+				[ "${tot:-0}" -gt 0 ] && PCT=$(( cur * 100 / tot ))
+			fi
+			;;
+	esac
+	[ "${PCT:-0}" -gt 100 ] && PCT=100
+}
+
+# run one step with a progress monitor; returns the command's exit code
+step_run() {
+	kind=$1; phase=$2; outf=$3
+	shift 3
+	PHASE=$phase
+	PCT=0
+	write_state
+	: > "$outf" 2>/dev/null
+	"$@" >> "$outf" 2>&1 < /dev/null &
+	CHILD=$!
+	t0=$(date +%s)
+	lastlog=0
+	while kill -0 "$CHILD" 2>/dev/null; do
+		if [ -f "$STOPF" ]; then
+			kill "$CHILD" 2>/dev/null
+			sleep 1
+			kill -9 "$CHILD" 2>/dev/null
+			wait "$CHILD" 2>/dev/null
+			STEP_RC=130
+			return 130
+		fi
+		ELAPSED=$(( $(num "$(date +%s)") - $(num "${STARTED:-0}") ))
+		progress_of "$kind" "$outf"
+		write_state
+		if [ $(( ELAPSED - lastlog )) -ge 15 ]; then
+			case "$kind" in
+				dd) log "[$(fmt_hms "$ELAPSED")] 镜像 /dev/$DEV 已恢复 $PCT%（$(fmt_size "$(( SRC_SIZE * PCT / 100 ))") / $(fmt_size "$SRC_SIZE")）" ;;
+				pr) log "[$(fmt_hms "$ELAPSED")] 雕取扫描 $PCT%（剩余 $(fmt_hms "$( [ "$PCT" -gt 0 ] && echo $(( (ELAPSED * 100 / PCT) - ELAPSED )) || echo 0 )")）" ;;
+				*)  log "[$(fmt_hms "$ELAPSED")] $PHASE…" ;;
+			esac
+			lastlog=$ELAPSED
+		fi
+		sleep 2
+	done
+	wait "$CHILD"
+	STEP_RC=$?
+	ELAPSED=$(( $(num "$(date +%s)") - $(num "${STARTED:-0}") ))
+	write_state
+	return $STEP_RC
+}
+
+# 统计上限: 超过就只报 "20000+" (STAT_CAPPED=true), 避免几十万个文件把这一步拖成几分钟
+STAT_CAP=20001
+STAT_CAPPED=false
+
+count_recup() {
+	FILES=0
+	BYTES=0
+	STAT_CAPPED=false
+	log "正在统计雕出的文件数…（文件多时需要一会儿）"
+	for c in "$1"/recup*; do
+		[ -d "$c" ] || continue
+		# find 接 head: 超过上限立刻停, 不会扫完整个大目录
+		nf=$(find "$c" -type f 2>/dev/null | head -n "$STAT_CAP" | wc -l)
+		FILES=$(( FILES + nf ))
+		[ "$nf" -ge "$STAT_CAP" ] && STAT_CAPPED=true
+		BYTES=$(( BYTES + $(du -sk "$c" 2>/dev/null | awk '{print $1}') * 1024 ))
+	done
+}
+
+# ---- 3/4 按原文件名/原目录恢复 --------------------------------------------
+# 把镜像里的每个分区只读挂出来, 整树 (含文件名+目录结构) 复制到 by_name/partN。
+# 这是唯一能保住原文件名和路径的办法 —— photorec 是按签名雕取, 天生丢名字。
+# 挂不上 (文件系统启动扇区/元数据损坏) 就退回签名雕取, 并在结果里说明原因。
+BYNAME="$BASE/byname.json"
+LOOP=
+MNT=
+
+byname_mount_try() {   # $1 device, $2 mountpoint
+	for t in "$PFS" ntfs-3g exfat vfat msdos ext4 ext3 ext2 f2fs btrfs; do
+		[ -n "$t" ] || continue
+		mount -t "$t" -o ro,noatime "$1" "$2" 2>/dev/null && return 0
+	done
+	return 1
+}
+
+# FAT32/FAT16/FAT12/exFAT 的备份引导扇区修复。
+#   exFAT: 主引导扇区在扇区 0, 备份在扇区 12
+#   FAT32/16/12: 主在扇区 0, 备份在扇区 6
+# 只写镜像副本 (loop 分区设备), 源盘绝不写。
+# 🔴 判据必须看**备份**而不是损坏的主扇区 (主扇区坏了签名就没了), 而且判据要格式无关:
+#    别用 OEM 名白名单 —— mkfs/mformat 会写自己的名字 (实测 mformat 写 "MTOO4032",
+#    既不叫 FAT32 也不叫 MSWIN4.1)。只用引导扇区的两条硬特征:
+#      offset 11 的 2 字节 = 00 02 (512 字节/扇区), offset 510 的 2 字节 = 55 AA
+#    exFAT 的备份在扇区 12, FAT32/16/12 的备份在扇区 6; 顺序先 12 后 6:
+#   exFAT 的扇区 6 是"扩展引导扇区"(全 0) 过不了判据, FAT32 的扇区 12 在 FAT 里
+#   也几乎不可能同时命中这两个字段。
+bs_is_boot() {   # $1 dev, $2 sector — 像不像一个引导扇区
+	# 🔴 别用 cmp 比较字节: /usr/bin/cmp 来自 diffutils 包, 不是基本系统自带的。
+	#    纯 shell 即可: 跟 NUL 比用 tr -d + wc -c, 跟普通字节比用命令替换 + printf。
+	_b0=$(dd if="$1" bs=1 skip=$(( $2 * 512 + 11 )) count=1 2>/dev/null | tr -d '\000' | wc -c)
+	[ "$_b0" = "0" ] || return 1                                    # offset 11 = 0x00
+	_b1=$(dd if="$1" bs=1 skip=$(( $2 * 512 + 12 )) count=1 2>/dev/null)
+	[ "$_b1" = "$(printf '\002')" ] || return 1                    # offset 12 = 0x02
+	_s0=$(dd if="$1" bs=1 skip=$(( $2 * 512 + 510 )) count=1 2>/dev/null)
+	_s1=$(dd if="$1" bs=1 skip=$(( $2 * 512 + 511 )) count=1 2>/dev/null)
+	[ "$_s0" = "$(printf '\125')" ] && [ "$_s1" = "$(printf '\252')" ] || return 1   # 55 AA
+	return 0
+}
+
+bs_restore() {   # $1 partition device; 返回 0 = 已修复 (bs_from = 用的备份扇区号)
+	for bk in 12 6; do
+		bs_is_boot "$1" "$bk" || continue
+		dd if="$1" bs=512 count=1 of="$BASE/.bs.orig" 2>/dev/null || continue
+		dd if="$1" bs=512 skip="$bk" count=1 of="$BASE/.bs.bak" 2>/dev/null || continue
+		[ -s "$BASE/.bs.bak" ] || continue
+		dd if="$BASE/.bs.bak" of="$1" bs=512 seek=0 conv=notrunc 2>/dev/null || continue
+		bs_from=$bk
+		return 0
+	done
+	return 1
+}
+
+bs_rollback() {   # $1 partition device — 修完还是挂不上就还原, 保持镜像忠实
+	[ -s "$BASE/.bs.orig" ] || return 1
+	dd if="$BASE/.bs.orig" of="$1" bs=512 seek=0 conv=notrunc 2>/dev/null
+	return 0
+}
+
+# 整树复制挂载点 (顶层项逐个 cp -a, 顶层计数当进度); 结果放 nf/nb/nfail/dst
+byname_copy() {   # $1 label (part1 / whole)  $2 mountpoint
+	bi=$1; bm=$2
+	dst="$WORK/by_name/$bi"
+	mkdir -p "$dst" 2>/dev/null
+	ntop=$(ls -1 "$bm" 2>/dev/null | wc -l)
+	[ "$ntop" -gt 0 ] || ntop=1
+	# 源侧文件总数(带上限): 文件几十万时按"已复制文件数"算百分比, 否则进度会看着不动
+	totf=$(find "$bm" -type f 2>/dev/null | head -n "$STAT_CAP" | wc -l)
+	i=0
+	lastlog=$(date +%s)
+	: > "$BASE/.cperr"
+	for e in "$bm"/* "$bm"/.[!.]*; do
+		[ -e "$e" ] || continue
+		cp -a "$e" "$dst"/ 2>>"$BASE/.cperr"
+		i=$(( i + 1 ))
+		now=$(date +%s)
+		if [ $(( now - lastlog )) -ge 15 ]; then
+			ELAPSED=$(( now - STARTED ))
+			if [ "${totf:-0}" -gt 0 ]; then
+				done_f=$(find "$dst" -type f 2>/dev/null | head -n "$STAT_CAP" | wc -l)
+				PCT=$(( done_f * 100 / totf ))
+				log "[$(fmt_hms "$ELAPSED")] 按原名复制 $bi: 已复制 $done_f/$totf 个文件（$PCT%）"
+			else
+				PCT=$(( i * 100 / ntop ))
+				log "[$(fmt_hms "$ELAPSED")] 按原名复制 $bi: $i/$ntop 个顶层项"
+			fi
+			write_state
+			lastlog=$now
+		fi
+		[ -f "$STOPF" ] && break
+	done
+	# 统计复制出来的文件: 文件多时这一步要一会儿, 先写日志(静默=bug), 并且接 head 限流
+	ELAPSED=$(( $(num "$(date +%s)") - $(num "${STARTED:-0}") ))
+	log "[$(fmt_hms "$ELAPSED")] 正在统计 $bi 的文件数…（文件多时需要一会儿）"
+	nf=$(find "$dst" -type f 2>/dev/null | head -n "$STAT_CAP" | wc -l)
+	bn_capped=false
+	[ "$nf" -ge "$STAT_CAP" ] && bn_capped=true
+	nb=$(( $(num "$(du -sk "$dst" 2>/dev/null | awk '{print $1}')") * 1024 ))
+	nfail=$(wc -l < "$BASE/.cperr" 2>/dev/null)
+	[ -n "${nfail:-}" ] || nfail=0
+	rm -f "$BASE/.cperr"
+	return 0
+}
+
+# 处理一个可挂载目标(分区 或 裸镜像本身): 挂载 → 需要时修引导扇区 → 空间检查 → 整树复制 → 写 JSON
+byname_try_target() {   # $1 label(part1|whole)  $2 device  $3 fs hint
+	bt_label=$1; bt_dev=$2; PFS=$3
+	ok=false; reason=""; nf=0; nb=0; nfail=0; dst=""; bsfix=0; mounted=0; bn_capped=false
+	mkdir -p "$MNT"
+	byname_mount_try "$bt_dev" "$MNT" && mounted=1
+	if [ "$mounted" = "0" ]; then
+		# 最常见的一种损坏: 引导扇区被打坏(挂载报 bad superblock / unknown entry type)。
+		# FAT32/FAT16/exFAT 都有备份引导扇区, 用它把镜像副本修回来再挂一次。
+		if bs_restore "$bt_dev"; then
+			bsfix=1
+			log "[$(fmt_hms "$ELAPSED")] $bt_label ($bt_dev, ${PFS:-认不出}): 引导扇区损坏, 已用备份(扇区 $bs_from)修复镜像副本 (源盘未动), 重试挂载…"
+			sleep 1
+			byname_mount_try "$bt_dev" "$MNT" && mounted=1
+			if [ "$mounted" = "1" ]; then
+				np=$(blkid -s TYPE -o value "$bt_dev" 2>/dev/null)
+				[ -n "$np" ] && PFS=$np
+			else
+				bs_rollback "$bt_dev"
+				log "      ↺ 修复后仍挂不上, 已回滚引导扇区 (镜像保持原样)"
+			fi
+		fi
+	fi
+	if [ "$mounted" = "1" ]; then
+		used=$(( $(num "$(df_bytes "$MNT" u)") * 1024 ))
+		dfree=$(( $(num "$(df_bytes "$DEST")") * 1024 ))
+		if [ "$used" -gt "$dfree" ]; then
+			reason="里面有 $(fmt_size "$used") 数据, 超过目标剩余空间 $(fmt_size "$dfree"), 已跳过整树复制"
+			log "[$(fmt_hms "$ELAPSED")] ✖ $bt_label ($bt_dev, ${PFS:-认不出}): $reason"
+			umount "$MNT" 2>/dev/null
+		else
+			byname_copy "$bt_label" "$MNT"
+			umount "$MNT" 2>/dev/null
+			ok=true
+			FILES=$(( FILES + nf ))
+			BYTES=$(( BYTES + nb ))
+			[ "$nfail" -gt 0 ] && reason="有 $nfail 个文件/目录因损坏读不出来 (其余已按原名复制)"
+			log "[$(fmt_hms "$ELAPSED")] ✔ $bt_label ($bt_dev, ${PFS:-认不出})$( [ "$bsfix" = "1" ] && echo ' [引导扇区已修复]' ) 按原文件名恢复: $nf 个文件 / $(fmt_size "$nb") → by_name/$bt_label"
+			[ "$nfail" -gt 0 ] && log "    其中 $nfail 个文件/目录损坏未复制"
+		fi
+	else
+		if [ "$bsfix" = "1" ]; then
+			reason="引导扇区用备份修过但仍挂不上 (目录/FAT 等元数据也坏了, 已回滚) — 改用按签名雕取"
+		else
+			reason="挂载失败 (文件系统 $( [ -n "$PFS" ] && echo "$PFS" || echo "认不出" ) 已损坏), 改用按签名雕取"
+		fi
+		log "[$(fmt_hms "$ELAPSED")] ✖ $bt_label ($bt_dev): $reason"
+	fi
+	printf '%s{"part":"%s","dev":"%s","fs":"%s","ok":%s,"files":%s,"capped":%s,"bytes":%s,"failed":%s,"bs":%s,"dst":"%s","reason":"%s"}' \
+		"$bnsep" "$(jasc "$bt_label")" "$(jasc "$bt_dev")" "$(jasc "$PFS")" "$ok" "$nf" "$bn_capped" "$nb" "$nfail" \
+		"$( [ "$bsfix" = "1" ] && [ "$mounted" = "1" ] && echo true || echo false )" "$(jesc "$dst")" "$(jesc "$reason")" >> "$BYNAME"
+	rm -f "$BASE/.bs.orig" "$BASE/.bs.bak" 2>/dev/null
+	bnsep=,
+	return 0
+}
+
+byname_step() {
+	PHASE="按原文件名恢复 (只读挂载镜像分区)"
+	STEPNO=3
+	PCT=0
+	FILES=0
+	BYTES=0
+	write_state
+	printf '[' > "$BYNAME"
+	bnsep=
+	LOOP=$(losetup -f 2>/dev/null)
+	if [ -z "$LOOP" ]; then
+		log "[$(fmt_hms "$ELAPSED")] ✖ 没有空闲 loop 设备, 无法按文件名恢复 (只做签名雕取)"
+		printf ']' >> "$BYNAME"
+		return 0
+	fi
+	if ! losetup -P "$LOOP" "$IMG" 2>/dev/null; then
+		log "[$(fmt_hms "$ELAPSED")] ✖ 镜像挂不到 $LOOP, 跳过按文件名恢复"
+		printf ']' >> "$BYNAME"
+		LOOP=
+		return 0
+	fi
+	sleep 1
+	MNT="$WORK/.mnt"
+	mkdir -p "$MNT"
+	idx=0
+	for pd in "/sys/block/${LOOP##*/}/${LOOP##*/}"p*; do
+		[ -e "$pd/partition" ] || continue
+		pn=${pd##*/}
+		[ -b "/dev/$pn" ] || continue
+		idx=$(( idx + 1 ))
+		byname_try_target "part$idx" "/dev/$pn" "$(blkid -s TYPE -o value "/dev/$pn" 2>/dev/null)"
+		[ -f "$STOPF" ] && break
+	done
+	if [ "$idx" = "0" ]; then
+		# 镜像里没有分区表(或分区表也坏了) ⇒ 多半是"单个分区的镜像"(裸文件系统),
+		# 那就把镜像本身当文件系统挂出来 (不带 -P 的 loop 设备)。
+		log "[$(fmt_hms "$ELAPSED")] 镜像里没有分区表, 改把镜像本身当文件系统挂载…"
+		losetup -d "$LOOP" 2>/dev/null
+		if losetup "$LOOP" "$IMG" 2>/dev/null; then
+			sleep 1
+			byname_try_target "whole" "$LOOP" "$(blkid -s TYPE -o value "$LOOP" 2>/dev/null)"
+		else
+			log "[$(fmt_hms "$ELAPSED")] ✖ 镜像挂不到 $LOOP, 跳过按文件名恢复"
+		fi
+	fi
+	umount "$MNT" 2>/dev/null
+	[ -n "$LOOP" ] && losetup -d "$LOOP" 2>/dev/null
+	LOOP=
+	# 记下"按原文件名"这部分的合计 (后面 count_recup 会重置 FILES/BYTES)
+	BYNAME_FILES=$FILES
+	BYNAME_BYTES=$BYTES
+	printf ']' >> "$BYNAME"
+	ELAPSED=$(( $(num "$(date +%s)") - $(num "${STARTED:-0}") ))
+	write_state
+	return 0
+}
+
+worker_done() {
+	ELAPSED=$(( $(num "$(date +%s)") - $(num "${STARTED:-0}") ))
+	STATE_K=done
+	PHASE="完成"
+	PCT=100
+	write_state
+	log "✔ 恢复完成：按原文件名 ${BYNAME_FILES:-0} 个（$(fmt_size "${BYNAME_BYTES:-0}")）+ 按签名雕出 $FILES 个（$(fmt_size "$BYTES")），耗时 $(fmt_hms "$ELAPSED")"
+	if grep -q '"ok":true' "$BYNAME" 2>/dev/null; then
+		log "  ✔ 保留原文件名/目录的: $WORK/by_name/"
+	fi
+	log "  按签名雕出的: $WORK/recup.1"
+	if [ "$SRCTYPE" = "img" ]; then
+		log "  使用的镜像: $IMG"
+	else
+		log "  整盘镜像: $IMG"
+	fi
+}
+
+worker_fail() {
+	ELAPSED=$(( $(num "$(date +%s)") - $(num "${STARTED:-0}") ))
+	STATE_K=error
+	ERRMSG=$1
+	write_state
+	log "✖ 错误：$1"
+}
+
+cmd_worker() {
+	src=$1
+	didx=$2
+	DEST=$(resolve_dest "$didx")
+	[ -n "$DEST" ] || { STATE_K=error; ERRMSG="目标目录无效"; write_state; return 1; }
+	# 源: 设备名 或 hex:<已有镜像文件路径>
+	SRCTYPE=dev
+	DEV=
+	IMGSRC=
+	case "$src" in
+		hex:*) SRCTYPE=img; IMGSRC=$(hexpath "$src") ;;
+		*)     DEV=$src ;;
+	esac
+	if [ "$SRCTYPE" = "img" ]; then
+		[ -f "$IMGSRC" ] || { STATE_K=error; ERRMSG="镜像文件不存在"; write_state; return 1; }
+		# 注意: 必须先把 basename 的换行去掉再 tr, 否则 tr 会把换行也换成 '_'
+		IMGBASE=$(basename "$IMGSRC")
+		IMGBASE=$(printf '%s' "$IMGBASE" | tr -c 'A-Za-z0-9._-' '_')
+		# 标签只用来区分不同镜像的工作目录 ⇒ 用**路径**算 (瞬时), 千万别去校验整个
+		# 镜像文件 —— 62G 的镜像光算校验和就要好几分钟。同一路径 ⇒ 同一个工作目录。
+		# 🔴 用 sha256sum 不用 cksum: 设备上根本没有 cksum (busybox 未编该 applet)。
+		IMGTAG=$(printf '%s' "$IMGSRC" | sha256sum 2>/dev/null | cut -c1-8)
+		[ -n "$IMGTAG" ] && IMGTAG="-$IMGTAG"
+		WORK="$DEST/diskrestore/img-$IMGBASE$IMGTAG"
+	else
+		WORK="$DEST/diskrestore/$DEV"
+	fi
+	mkdir -p "$WORK" 2>/dev/null || { STATE_K=error; ERRMSG="无法在目标目录建立工作目录"; write_state; return 1; }
+	if [ "$SRCTYPE" = "img" ]; then
+		IMG="$IMGSRC"
+	else
+		IMG="$WORK/image.img"
+	fi
+	SRC_SIZE=$( [ "$SRCTYPE" = "img" ] && wc -c < "$IMG" 2>/dev/null || dev_size "$DEV" )
+	STARTED=$(date +%s)
+	ELAPSED=0
+	cd "$WORK" 2>/dev/null || cd /
+	BYNAME="$WORK/byname.json"
+
+	trap 'rc=$?
+		if [ -n "$CHILD" ] && kill -0 "$CHILD" 2>/dev/null; then kill "$CHILD" 2>/dev/null; fi
+		if [ -n "$MNT" ]; then umount "$MNT" 2>/dev/null; fi
+		if [ -n "$LOOP" ]; then losetup -d "$LOOP" 2>/dev/null; fi
+		rm -f "$BASE/.bs.orig" "$BASE/.bs.bak" 2>/dev/null
+		if [ "$STATE_K" = "running" ]; then
+			if [ "$rc" = "130" ] || [ -f "$STOPF" ]; then
+				ELAPSED=$(( $(num "$(date +%s)") - $(num "${STARTED:-0}") )); STATE_K=stopped; PHASE="已停止"
+				write_state; log "⏹ 已停止（手动）：已雕出 $FILES 个文件，耗时 $(fmt_hms "$ELAPSED")"
+			else
+				worker_fail "worker 异常退出（退出码 $rc），请看日志尾部"
+			fi
+		fi
+		rm -f "$STOPF" 2>/dev/null' EXIT
+
+	# ---- 1/4 镜像 (用已有镜像时直接跳过, 想跑几次恢复就跑几次) ----
+	STEPNO=1
+	if [ "$SRCTYPE" = "img" ]; then
+		PHASE="使用已有镜像 (跳过制作镜像)"
+		PCT=100
+		write_state
+		log "[$(fmt_hms "$ELAPSED")] ① 使用已有镜像，跳过「制作镜像」这一步：$IMG（$(fmt_size "$SRC_SIZE")）"
+		[ -f "$IMG.map" ] && log "  镜像带 mapfile（上次可能没跑完），本次按镜像现有内容恢复"
+		log "  ✔ 同一份镜像可以反复用来恢复，不必每次重新制作"
+	else
+		step_run dd "镜像 (ddrescue)" "$BASE/dd.out" \
+			ddrescue -f -r"$RETRY" -d "/dev/$DEV" "$IMG" "$WORK/image.map"
+		if [ "$STEP_RC" != "0" ]; then
+			if [ "$STEP_RC" = "130" ]; then return 130; fi
+			# 100% rescued with bad sectors still exits 0 unless unrecovered data
+			case "$STEP_RC" in
+				1) worker_fail "ddrescue 退出码 1：有坏区且重试后仍读不出（其余数据已镜像，可继续雕取）"; return 1 ;;
+				*) worker_fail "ddrescue 失败（退出码 $STEP_RC）；源盘可能拔掉了或权限不足"; return 1 ;;
+			esac
+		fi
+		log "[$(fmt_hms "$ELAPSED")] ✔ 镜像完成：$IMG（$(fmt_size "$( [ -f "$IMG" ] && du -sk "$IMG" | awk '{print $1*1024}' || echo 0 )")）"
+	fi
+
+	# ---- 2/4 analyse the image ----
+	STEPNO=2
+	step_run tf "分析分区 (testdisk)" "$BASE/tf.out" \
+		testdisk /list "$IMG"
+	tpart=$(grep -cE '^ +[0-9]+ [P*ED] ' "$BASE/tf.out" 2>/dev/null)
+	log "[$(fmt_hms "$ELAPSED")] ✔ 分区分析完成：testdisk 找到 $tpart 个分区表项"
+	[ "$tpart" -gt 0 ] && grep -E '^ +[0-9]+ [P*ED] ' "$BASE/tf.out" 2>/dev/null | head -n 10 | while read -r l; do log "    $l"; done
+
+	# ---- 3/4 files with their original names (read only mount of the image) ----
+	byname_step
+	if [ -f "$STOPF" ]; then return 130; fi
+
+	# ---- 4/4 carve files by signature (last resort, names are lost) ----
+	STEPNO=4
+	step_run pr "雕取文件 (photorec)" "$BASE/pr.out" \
+		photorec /log /d "$WORK/recup" /cmd "$IMG" search
+	if [ "$STEP_RC" = "130" ]; then return 130; fi
+	count_recup "$WORK"
+	case "$STEP_RC" in
+		0) : ;;
+		*) worker_fail "photorec 失败（退出码 $STEP_RC）：目标目录可能已满，见日志"; return 1 ;;
+	esac
+
+	worker_done
+	return 0
+}
+
+# --- 整理雕出的文件 (按 年/月 归档) -------------------------------------------
+# 什么时候需要: testdisk 保不住文件名/目录, 只能靠 photorec 雕取时 —— 雕出来的名字是
+# f<扇区>.<ext>, 全平铺在一个 recup.N 里。这个按钮按**文件日期(mtime)**把它们分到
+# organized/<年>/<月>/ 两级目录。
+# 🔴 几十万个文件不能逐个 fork: mtime 用 xargs 批量 stat 一次取, 移动用 xargs 批量 mv
+#    (每批 100 个, 一次进程搬一批); 进度按已移动/总数算, 并且是后台任务(有进度可轮询)。
+org_write() {   # 1=state 2=phase 3=pct 4=moved 5=total 6=dir 7=err
+	printf '{"state":"%s","phase":"%s","pct":%s,"moved":%s,"total":%s,"dir":"%s","error":"%s"}\n' \
+		"$1" "$(jesc "$2")" "$3" "$4" "$5" "$(jesc "$6")" "$(jesc "$7")" > "$ORG.t" 2>/dev/null && mv "$ORG.t" "$ORG"
+}
+
+cmd_orgstatus() {
+	if [ -f "$ORG" ]; then cat "$ORG"; printf '\n'; else printf '{"state":"idle"}\n'; fi
+}
+
+cmd_organize() {
+	if [ "$(cur_state)" = "running" ]; then err "恢复任务正在运行，等它结束再整理"; return; fi
+	if [ "$(sed -n 's/.*"state":"\([a-z]*\)".*/\1/p' "$ORG" 2>/dev/null | head -n1)" = "running" ]; then
+		err "正在整理中，请稍候"; return
+	fi
+	w=$(result_dir)
+	if [ -z "$w" ] || [ ! -d "$w" ]; then err "还没有恢复结果"; return; fi
+	# 只有还有雕出的文件才值得整理 (report.xml 不算)
+	if [ -z "$(find "$w" -path '*/recup*' -type f ! -name 'report.xml' 2>/dev/null | head -n 1)" ]; then
+		if [ -d "$w/organized" ]; then err "已经整理过了（结果在 $w/organized/）"; else err "没有可整理的雕取文件"; fi
+		return
+	fi
+	start-stop-daemon -S -b -m -p "$ORGPID" -x /usr/bin/diskrestore -q -- organize_worker >/dev/null 2>&1
+	printf '{"ok":true}\n'
+}
+
+cmd_organize_worker() {
+	w=$(result_dir)
+	if [ -z "$w" ] || [ ! -d "$w" ]; then
+		org_write error "没有恢复结果" 0 0 0 "" "工作目录不存在"
+		return 1
+	fi
+	OUT="$w/organized"
+	LISTF="$BASE/.org.lst"
+	MAP="$BASE/.org.map"
+	GRP="$BASE/.org.grp"
+	# 🔴 清单用 NUL 分隔(-print0): 路径可能带空格, 而 xargs 默认按空白切分参数
+	find "$w" -path '*/recup*' -type f ! -name 'report.xml' -print0 2>/dev/null > "$LISTF"
+	total=$(tr '\0' '\n' < "$LISTF" | grep -c . 2>/dev/null)
+	[ -n "$total" ] || total=0
+	if [ "$total" = "0" ]; then
+		org_write done "没有可整理的文件" 100 0 0 "$OUT" ""
+		log "整理: recup.* 里没有可整理的文件"
+		rm -f "$LISTF"
+		return 0
+	fi
+	log "开始整理 $total 个雕出的文件：按文件日期分到 年/月 目录 → $OUT"
+	org_write running "读取文件日期" 5 0 "$total" "$OUT" ""
+	# 本地时区偏移(秒), 让归档的日期和本地时间一致
+	z=$(date +%z 2>/dev/null)
+	off=0
+	case "$z" in
+		[+-][0-9][0-9][0-9][0-9])
+			hh=$(printf '%s' "$z" | cut -c2-3); mm=$(printf '%s' "$z" | cut -c4-5)
+			off=$(( ${hh#0} * 3600 + ${mm#0} * 60 ))
+			case "$z" in -*) off=$(( 0 - off )) ;; esac
+			;;
+	esac
+	# 取"文件日期" → 年/月。两条路：
+	#   快路 stat -c '%Y %n'（批量）。🔴 stat 不是基本系统自带的: /bin/stat 来自
+	#        coreutils 包的 coreutils-stat（busybox 里根本没有 stat applet），
+	#        DEPENDS 里已声明；没装时下面的退路照样能跑。
+	#   退路 解析 ls -l 的日期列（busybox ls 一定有），只精确到"年/月"够用。
+	#        ls 的时间形式("Mon DD HH:MM")不含年份 ⇒ 用当前年；月份大于当前月按上一年算。
+	rm -f "$MAP" "$GRP"
+	if stat -c '%Y' / >/dev/null 2>&1; then
+		xargs -0 -n 200 stat -c '%Y %n' < "$LISTF" 2>/dev/null > "$MAP"
+		got=$(wc -l < "$MAP" 2>/dev/null)
+		log "  已用 stat 读取 $got/$total 个文件的日期"
+		awk -v off="$off" '
+	function ym(t,   d, era, doe, yoe, y, doy, mp, m) {
+		d = int((t + off) / 86400) + 719468
+		era = int(d / 146097); doe = d - era * 146097
+		yoe = int((doe - int(doe/1460) + int(doe/36524) - int(doe/146096)) / 365)
+		y = yoe + era * 400; doy = doe - (365*yoe + int(yoe/4) - int(yoe/100))
+		mp = int((5*doy + 2)/153); m = mp + 3 - 12*int(mp/10)
+		if (m <= 2) y++
+		return sprintf("%04d/%02d", y, m)
+	}
+	NF >= 2 { nm = substr($0, index($0, " ") + 1); print ym($1, 0) "\t" nm }
+	' "$MAP" > "$GRP"
+	else
+		log "  提示: 系统没有可用的 stat（coreutils-stat 未装），改用 ls 解析日期（只精确到年/月）"
+		cy=$(date +%Y 2>/dev/null); cm=$(date +%m 2>/dev/null)
+		cy=$(( ${cy:-1970} + 0 )); cm=$(( ${cm:-1} + 0 ))
+		xargs -0 -n 200 ls -l < "$LISTF" 2>/dev/null | awk -v cy="$cy" -v cm="$cm" '
+			BEGIN { split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", mn, " "); for (i = 1; i <= 12; i++) M[mn[i]] = i }
+			$1 ~ /^-/ {
+				mo = M[$6]; if (!mo) next
+				if ($8 ~ /:/) { yr = (mo > cm) ? cy - 1 : cy } else { yr = $8 + 0 }
+				nm = $9; for (k = 10; k <= NF; k++) nm = nm " " $k
+				printf "%04d/%02d\t%s\n", yr, mo, nm
+			}' > "$GRP"
+	fi
+	got=$(wc -l < "$GRP" 2>/dev/null)
+	log "  已生成 $got/$total 条 年/月 归档索引"
+	cut -f1 "$GRP" | sort -u > "$BASE/.org.dirs"
+	moved=0
+	while read -r d; do
+		[ -n "$d" ] || continue
+		mkdir -p "$OUT/$d" 2>/dev/null
+		awk -F'\t' -v d="$d" '$1 == d { print $2 }' "$GRP" > "$BASE/.org.files"
+		n=$(wc -l < "$BASE/.org.files" 2>/dev/null)
+		[ -n "$n" ] || n=0
+		tr '\n' '\0' < "$BASE/.org.files" | xargs -0 -n 100 sh -c 'mv "$@" "'"$OUT/$d"'/" 2>/dev/null' _
+		moved=$(( moved + n ))
+		PCT=$(( moved * 100 / total ))
+		[ "$PCT" -gt 99 ] && PCT=99
+		org_write running "归档到 年/月 目录" "$PCT" "$moved" "$total" "$OUT" ""
+		log "  已归档 $OUT/$d ：$n 个（累计 $moved/$total）"
+	done < "$BASE/.org.dirs"
+	rm -f "$LISTF" "$MAP" "$GRP" "$BASE/.org.dirs" "$BASE/.org.files" 2>/dev/null
+	for c in "$w"/recup*; do
+		[ -d "$c" ] || continue
+		rmdir "$c" 2>/dev/null        # 只剩 report.xml 时删不掉, 无妨
+	done
+	org_write done "整理完成" 100 "$moved" "$total" "$OUT" ""
+	log "✔ 整理完成：$moved 个文件按 年/月 归档到 $OUT/"
+	return 0
+}
+
+# --- 完整文件清单 (纯文本下载) -----------------------------------------------
+# 几万/几十万个文件时页面只能渲染前 N 个, 想看全部就给一份纯文本清单让人下载。
+cmd_filelist() {
+	w=$(result_dir)
+	if [ -z "$w" ] || [ ! -d "$w" ]; then
+		printf '还没有恢复结果\n'
+		return
+	fi
+	which=${1:-recup}
+	case "$which" in
+		''|*[!a-z]*) which=recup ;;
+	esac
+	MAX=100000
+	if [ "$which" = "byname" ]; then
+		printf '# 按原文件名/目录恢复出来的文件（路径相对工作目录 %s）\n' "$w"
+		find "$w/by_name" -type f 2>/dev/null | head -n "$MAX"
+	else
+		printf '# 按签名雕出的文件（大小<TAB>文件名）\n'
+		nrec=0
+		for c in "$w"/recup*; do
+			[ -d "$c" ] || continue
+			[ -z "$(find "$c" -maxdepth 1 -type f ! -name 'report.xml' 2>/dev/null | head -n 1)" ] || nrec=$(( nrec + 1 ))
+			printf '## %s\n' "${c##*/}"
+			ls -l "$c" 2>/dev/null | awk '$1 ~ /^-/ { print $5"	"$9 }' | head -n "$MAX"
+		done
+		# 整理过以后从 organized/ 列 (名字变成 年/月/文件名 的相对路径)
+		if [ -d "$w/organized" ]; then
+			printf '## organized（按 年/月 归档后）\n'
+			cd "$w/organized" 2>/dev/null && find . -type f 2>/dev/null | head -n "$MAX" | sed 's#^\./##'
+		fi
+	fi
+}
+
+# --- dispatch ---------------------------------------------------------------
+case "$1" in
+	list)         cmd_list ;;
+	destinations) shift; cmd_destinations "$@" ;;
+	destcheck)    shift; cmd_destcheck "$@" ;;
+	images)       cmd_images ;;
+	devs)         cmd_devs ;;
+	status)       cmd_status ;;
+	start)        shift; cmd_start "$@" ;;
+	stop)         cmd_stop ;;
+	log)          shift; cmd_log "$@" ;;
+	result)       shift; cmd_result "$@" ;;
+	filelist)     shift; cmd_filelist "$@" ;;
+	organize)     cmd_organize ;;
+	organize_worker) cmd_organize_worker ;;
+	orgstatus)    cmd_orgstatus ;;
+	smart_scan)   shift; smart_scan "$@" ;;
+	worker)       shift; cmd_worker "$@" ;;
+	version)      printf '{"version":"%s"}\n' "$CLIVER" ;;
+	*)            printf '{"ok":false,"error":"用法: diskrestore {list|destinations|destcheck|images|status|start|stop|log|result|filelist|organize|orgstatus|version}","cli":"%s"}\n' "$CLIVER" ;;
+esac
