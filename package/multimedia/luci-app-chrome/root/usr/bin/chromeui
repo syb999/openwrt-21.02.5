@@ -1,0 +1,3963 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+#
+# chromeui - headless-Chrome page grabber / media-resource extractor (LuCI backend)
+#            for OpenWrt on RK356x (chrome-headless-shell + chromedriver in a
+#            glibc chroot at /opt/chrome-root).
+#
+# ---------------------------------------------------------------------------
+# Contract (same as the other LuCI apps in this tree)
+# ---------------------------------------------------------------------------
+#  * stdout is ALWAYS exactly one JSON object.  Diagnostics go to stderr.
+#  * Every user-facing string is an ENGLISH message template (the msgid, as
+#    written in po/zh_Hans/chrome.po) plus its arguments:
+#         {"ok":false,"error":"<english template>","error_args":[...]}
+#    The LuCI JS frontend looks the template up in the catalog and substitutes
+#    the arguments.  There is no Chinese in this file.
+#  * Data (titles, urls, mime types, numbers) is passed through untouched.
+#
+# Commands:
+#   chromeui version
+#   chromeui status                        -> components / mounts / disk / driver
+#   chromeui selftest                      -> really execute chrome + driver
+#   chromeui grab <url> [options]           -> one browser session, fetch all
+#   chromeui start <url> [options]          -> same, but detached: returns at once,
+#                                             progress/result land in /tmp/chromeui/job.json
+#   chromeui job                            -> current/last job STATE only (polled)
+#   chromeui result                         -> the last grab's reduced result
+#   chromeui filedata --file N [--offset O] [--len L] [--b64]
+#                                           -> chunked reader (screenshot / html)
+#   chromeui stop                           -> abort the running grab
+#   chromeui mediaprobe <url>               -> headers / HLS playlist details
+#   chromeui fetch <url> [--out P] [--max-bytes N]
+#   chromeui export [--out P] [--all]       -> write the last grab's media as .m3u
+#
+# grab options:
+#   --wait CSS        wait until this CSS selector appears (default: body)
+#   --timeout N       page timeout in seconds                 (default 30)
+#   --width W         window width                            (default 1280)
+#   --height H        window height                           (default 900)
+
+#   --scroll          scroll to the bottom, to trigger lazy loading
+#   --click SELECTOR  click these (comma separated) before collecting - for
+#                     players that only load their source on a play click;
+#                     the grabber also auto-tries audio/video + play buttons
+#   --headers TEXT    request headers to send with EVERY request (paste what
+#                     DevTools shows for a logged-in request: cookie/token/...).
+#                     This is how a login-gated page can be fetched at all.
+#   --headers-file NAME  same, read from a file in the work dir (headers.txt)
+#   --no-close        do not auto-dismiss a login/modal overlay (Escape as fallback)
+#   --no-wake         do not auto-try to start the player
+#   --no-canvas       do not export <canvas> pages as PNG (document sites such as
+#                     doc88 have no URLs at all - the pages are painted on canvas)
+#   --waitload        wait for the WHOLE page (default is eager: heavy video
+#                     pages otherwise blow the page timeout)
+#   --html            include the rendered HTML in the reply
+#   --all-codecs      keep AV1/HEVC tracks (default: ask sites for H.264, which
+#                     every player can decode - see CODEC_PREFER_JS above)
+#   --screenshot      also save a PNG (NOT done by default: this app is a URL
+#                     extractor, nothing is downloaded unless asked for)
+#   --full            with --screenshot: capture the whole page
+#   --no-shot         force "no screenshot" (default anyway)
+#   --shot PATH       where to write the screenshot (default /tmp/chromeui/..)
+#   --max N           cap the media list                      (default 400)
+#
+# Only ONE grab runs at a time (a 4 GB board cannot host two Chrome sessions);
+# a second one fails fast with "Another grab is already running ...".
+
+import base64
+import errno
+import json
+import glob
+import os
+import random
+import re
+import socket
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+# substituted with $(PKG_VERSION) while the package is built (see the Makefile):
+# the page compares this with its own stamped value and warns when the browser is
+# still running an older view script.
+VERSION = "__PKG_VERSION__"
+ROOT = os.environ.get("CHROME_ROOT", "/opt/chrome-root")
+CDRV = "/opt/chrome-root/cdrv.sh"
+RUNCHROME = "/opt/chrome-root/run-chrome.sh"
+CHROME_BIN = "/opt/chrome/chrome-headless-shell"
+DRIVER_BIN = "/opt/chrome-tools/chromedriver"
+WORKDIR = "/tmp/chromeui"
+LOCK = WORKDIR + "/chromeui.lock"
+JOB = WORKDIR + "/job.json"
+PIDFILE = WORKDIR + "/job.pid"
+WORKER_LOG = WORKDIR + "/worker.log"
+TEXT_FILE = WORKDIR + "/last.txt"
+HTML_FILE = WORKDIR + "/last.html"
+SHOT_KEEP = 0             # 0 = keep only the newest screenshot
+# 🔴 A UA containing "HeadlessChrome" is an instant bot flag: sites then serve
+# challenge pages / refuse to play media (ximalaya ran geetest against us).
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/154.0.0.0 Safari/537.36")
+
+# hide the other automation tell-tales as well
+STEALTH_JS = r"""
+(function () {
+  try {
+    Object.defineProperty(navigator, 'webdriver', { get: function () { return undefined; } });
+  } catch (e) {}
+  try {
+    if (!navigator.plugins || !navigator.plugins.length) {
+      Object.defineProperty(navigator, 'plugins', { get: function () { return [1, 2, 3, 4, 5]; } });
+    }
+  } catch (e) {}
+  try {
+    if (!navigator.languages || !navigator.languages.length) {
+      Object.defineProperty(navigator, 'languages', { get: function () { return ['zh-CN', 'zh', 'en']; } });
+    }
+  } catch (e) {}
+  try { window.chrome = window.chrome || { runtime: {} }; } catch (e) {}
+})();
+"""
+
+TEXT_CAP = 200000          # chars of visible text returned
+HTML_CAP = 600000          # chars of HTML returned (only with --html)
+
+# ---- response size budget -------------------------------------------------
+# The LuCI frontend calls us through rpcd's ubus "file exec", and a ubus reply
+# is capped: measured on this box, 131 KB comes through fine while 262 KB
+# returns the ubus error `result:[8]` (the reply is simply dropped).  A 780 KB
+# reply - a full-page screenshot as base64 plus the HTML - silently killed the
+# page's polling loop, so nothing may ever be returned in one piece:
+#   * `job`      never carries the result at all (it is polled every 1.5 s)
+#   * `result`   carries a REDUCED view (text <= TEXT_UI_CAP, media <= MEDIA_UI_CAP)
+#   * the full text/HTML go to files on the device (last.txt / last.html)
+#   * the screenshot is fetched in CHUNK-sized pieces by `filedata`
+TEXT_UI_CAP = 20000
+MEDIA_UI_CAP = 300
+CHUNK = 48000              # bytes per filedata chunk (~64 KB as base64)
+FILE_WHITELIST = ("last.html", "last.txt", "playlist.m3u", "playlist.m3u8")
+
+# --------------------------------------------------------------------------
+# output helpers
+# --------------------------------------------------------------------------
+
+
+def die(tpl, *args, **kw):
+    """print one JSON error object and exit non-zero"""
+    if PROGRESS_PATH:
+        progress_write(PROGRESS_PATH, {
+            "state": "error", "phase": "error", "url": JOB_URL,
+            "elapsed": round(time.time() - JOB_START, 1),
+            "error": tpl, "error_args": list(args)})
+    out = {"ok": False, "error": tpl, "error_args": list(args)}
+    out.update(kw)
+    sys.stdout.write(json.dumps(out, ensure_ascii=False))
+    sys.stdout.write("\n")
+    sys.exit(1)
+
+
+def ok(obj):
+    obj["ok"] = True
+    obj.setdefault("version", VERSION)
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False))
+    sys.stdout.write("\n")
+    sys.exit(0)
+
+
+def warn(m):
+    sys.stderr.write("chromeui: %s\n" % m)
+
+
+# ---- background-job progress (the UI polls /tmp/chromeui/job.json) ---------
+# A synchronous call would leave the web UI staring at a spinner for the whole
+# page load (and risk the RPC timing out), so `start` detaches a worker and the
+# UI polls `job` every couple of seconds instead.
+PROGRESS_PATH = None
+JOB_START = 0.0
+JOB_URL = ""
+
+
+def progress_write(path, obj):
+    if not path:
+        return
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(obj, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError as e:
+        warn("cannot write the progress file: %s" % e)
+
+
+def progress_phase(phase, **kw):
+    if not PROGRESS_PATH:
+        return
+    o = {"state": "running", "phase": phase, "url": JOB_URL,
+         "elapsed": round(time.time() - JOB_START, 1)}
+    o.update(kw)
+    progress_write(PROGRESS_PATH, o)
+
+
+# --------------------------------------------------------------------------
+# small utilities
+# --------------------------------------------------------------------------
+
+MEDIA_KIND_BY_EXT = {
+    ".m3u8": "hls", ".m3u": "hls", ".mpd": "dash", ".ts": "ts", ".m4s": "video",
+    ".mp4": "video", ".m4v": "video", ".mkv": "video", ".webm": "video",
+    ".flv": "video", ".mov": "video", ".avi": "video", ".wmv": "video",
+    ".mpg": "video", ".mpeg": "video", ".3gp": "video", ".ogv": "video",
+    ".mp3": "audio", ".m4a": "audio", ".aac": "audio", ".flac": "audio",
+    ".wav": "audio", ".ogg": "audio", ".oga": "audio", ".opus": "audio",
+    ".wma": "audio", ".mka": "audio",
+    ".jpg": "image", ".jpeg": "image", ".png": "image", ".gif": "image",
+    ".webp": "image", ".bmp": "image", ".svg": "image", ".ico": "image",
+    ".avif": "image", ".tif": "image", ".tiff": "image",
+    ".vtt": "subtitle", ".srt": "subtitle", ".ass": "subtitle", ".ssa": "subtitle",
+}
+
+MIME_KIND = {
+    "application/vnd.apple.mpegurl": "hls",
+    "application/x-mpegurl": "hls",
+    "application/mpegurl": "hls",
+    "audio/mpegurl": "hls",
+    "audio/x-mpegurl": "hls",
+    "application/dash+xml": "dash",
+    "video/mp2t": "ts",
+    "application/vnd.ms-sstr+xml": "smooth",
+    "application/x-shockwave-flash": "flash",
+}
+
+# resource kinds that the UI shows by default ("real" media / streams)
+STREAM_KINDS = ("hls", "dash", "smooth", "ts", "video", "audio", "flash", "subtitle")
+
+URL_RE = re.compile(r"""["'(](https?://[^\s"'()<>\\]+)["')]""")
+# bare urls inside script text
+RAW_URL_RE = re.compile(r"""https?://[^\s"'()<>\\]+""")
+
+
+def kind_of(url, mime=""):
+    ext = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
+    if ext in MEDIA_KIND_BY_EXT:
+        return MEDIA_KIND_BY_EXT[ext]
+    m = (mime or "").split(";")[0].strip().lower()
+    if m in MIME_KIND:
+        return MIME_KIND[m]
+    if m.startswith("video/"):
+        return "video"
+    if m.startswith("audio/"):
+        return "audio"
+    if m.startswith("image/"):
+        return "image"
+    return None
+
+
+def is_data_url(u):
+    return u.startswith("data:") or u.startswith("blob:") or u.startswith("about:")
+
+
+# --------------------------------------------------------------------------
+# status
+# --------------------------------------------------------------------------
+
+def opkg_versions():
+    """{package: version} from /usr/lib/opkg/status (no subprocess)"""
+    res = {}
+    try:
+        with open("/usr/lib/opkg/status", "r", errors="replace") as f:
+            pkg = ver = st = None
+            for line in f:
+                line = line.rstrip("\n")
+                if line.startswith("Package: "):
+                    pkg = line[9:].strip()
+                elif line.startswith("Version: "):
+                    ver = line[9:].strip()
+                elif line.startswith("Status: "):
+                    st = line[8:].strip()
+                elif not line:
+                    if pkg and st and "installed" in st:
+                        res[pkg] = ver or ""
+                    pkg = ver = st = None
+    except OSError as e:
+        warn("cannot read opkg status: %s" % e)
+    return res
+
+
+def mounted_paths():
+    want = [ROOT + "/dev", ROOT + "/proc", ROOT + "/sys", ROOT + "/tmp"]
+    seen = set()
+    try:
+        with open("/proc/mounts", "r", errors="replace") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    seen.add(parts[1])
+    except OSError:
+        pass
+    return {p.split("/")[-1]: (p in seen) for p in want}
+
+
+def disk_info(path):
+    try:
+        st = os.statvfs(path)
+        total = st.f_blocks * st.f_frsize
+        avail = st.f_bavail * st.f_frsize
+        used = total - st.f_bfree * st.f_frsize
+        pct = int(round(100.0 * used / total)) if total else 0
+        return {"total": total, "used": used, "avail": avail, "use_pct": pct}
+    except OSError as e:
+        warn("statvfs %s: %s" % (path, e))
+        return None
+
+
+def port_open(port, host="127.0.0.1", timeout=1.0):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def py_module_version(name):
+    try:
+        import importlib.metadata as md
+        return md.version(name)
+    except Exception:
+        try:
+            mod = __import__(name)
+            return getattr(mod, "__version__", "?")
+        except Exception:
+            return None
+
+
+I18N_DIR = "/usr/share/chromeui/i18n"
+
+
+def cmd_i18n(argv):
+    """Serve the view's translation catalogue over the RPC channel.
+
+    LuCI's own dictionary is an HTTP resource with Cache-Control: max-age=31536000
+    - a browser keeps its first copy for a year, so anything added later shows up
+    in English.  This reply is not cached anywhere.
+    """
+    lang = (argv[0] if argv else "zh-cn").strip().lower().replace("_", "-")
+    if "-" in lang:
+        lang = lang.split("-")[0] + "-" + lang.split("-")[1]
+    path = os.path.join(I18N_DIR, lang + ".json")
+    if not os.path.exists(path):
+        # fall back to the first catalogue we ship
+        try:
+            cands = sorted(x for x in os.listdir(I18N_DIR) if x.endswith(".json"))
+        except OSError:
+            cands = []
+        path = os.path.join(I18N_DIR, cands[0]) if cands else ""
+    if not path or not os.path.exists(path):
+        ok({})
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            ok(json.load(f))
+    except (OSError, ValueError) as e:
+        die("cannot read the catalogue: %s", e)
+
+
+def cmd_version():
+    ok({"version": VERSION})
+
+
+def cmd_status():
+    pkgs = opkg_versions()
+    comps = []
+    for name, path, got in (
+            ("chrome-glibc-runtime", ROOT + "/lib", None),
+            ("chrome-headless-shell", ROOT + CHROME_BIN, "binary"),
+            ("chromedriver", ROOT + DRIVER_BIN, "binary")):
+        item = {"name": name,
+                "installed": (name in pkgs) or os.path.exists(path),
+                "opkg_version": pkgs.get(name, ""),
+                "path": path,
+                "file_ok": os.path.exists(path)}
+        comps.append(item)
+    ok({
+        "version": VERSION,
+        "root": ROOT,
+        "components": comps,
+        "mounts": mounted_paths(),
+        "disk": disk_info(ROOT),
+        "driver_listening": port_open(9515),
+        "selenium": py_module_version("selenium"),
+        "chrome_bin": CHROME_BIN,
+        "runner": RUNCHROME,
+    })
+
+
+def cmd_selftest():
+    """actually execute both packaged binaries - the real proof they work"""
+    res = {"steps": []}
+    for label, argv, to in (("chrome", [RUNCHROME, "--version"], 60),
+                            ("chromedriver", [CDRV, "--version"], 60)):
+        t0 = time.time()
+        step = {"name": label, "argv": argv}
+        try:
+            p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               timeout=to)
+            out = p.stdout.decode("utf-8", "replace").strip()
+            step["code"] = p.returncode
+            step["out"] = out.splitlines()[0] if out else ""
+            step["ms"] = int((time.time() - t0) * 1000)
+        except subprocess.TimeoutExpired:
+            step["code"] = -1
+            step["error"] = "Timed out after %ss" % to
+        except OSError as e:
+            step["code"] = -1
+            step["error"] = "%s" % e
+        res["steps"].append(step)
+    res["pass"] = all(s.get("code") == 0 for s in res["steps"])
+    ok(res)
+
+
+# --------------------------------------------------------------------------
+# grab
+# --------------------------------------------------------------------------
+
+MEDIA_SCAN_JS = r"""
+var out = [];
+function push(el, doc) {
+    var t = el.tagName, s = '';
+    try {
+        s = el.getAttribute('src') || el.getAttribute('data-src') ||
+            el.getAttribute('data-original') || el.getAttribute('data-lazy-src') || '';
+    } catch (e) {}
+    if (!s) { try { s = el.src || ''; } catch (e) {} }
+    var cur = '';
+    try { cur = el.currentSrc || ''; } catch (e) {}
+    var typ = '';
+    try { typ = el.getAttribute('type') || ''; } catch (e) {}
+    var post = '';
+    try { post = el.poster || el.getAttribute('poster') || ''; } catch (e) {}
+    var title = '';
+    try { title = el.getAttribute('title') || ''; } catch (e) {}
+    out.push({ tag: t, src: s, cur: cur, type: typ, poster: post, title: title });
+}
+function scanDoc(d, depth) {
+    var sel = 'video,audio,source,track,img,iframe,embed,object';
+    var nodes;
+    try { nodes = d.querySelectorAll(sel); } catch (e) { return; }
+    for (var i = 0; i < nodes.length; i++) { push(nodes[i], d); }
+    /* custom-element players (ximalaya's <xm-player>, xgplayer, ...) keep the
+       real <audio>/<video> inside a shadow root, where querySelectorAll on the
+       document can never see it */
+    if ((depth || 0) > 3) return;
+    try {
+        var all = d.querySelectorAll('*');
+        var cap = Math.min(all.length, 12000);   /* node budget: a huge page must
+                                                    not turn one scan into minutes */
+        for (var j = 0; j < cap; j++) {
+            if (all[j].shadowRoot) scanDoc(all[j].shadowRoot, (depth || 0) + 1);
+        }
+    } catch (e) {}
+}
+try { scanDoc(document, 0); } catch (e) {}
+try {
+    var fr = document.querySelectorAll('iframe');
+    for (var i = 0; i < fr.length && i < 30; i++) {
+        var doc = null;
+        try { doc = fr[i].contentDocument; } catch (e) { doc = null; }
+        if (doc) { try { scanDoc(doc); } catch (e) {} }
+    }
+} catch (e) {}
+return out;
+"""
+
+# NOTE: scripts are wrapped by selenium in "function(){ ... }", so the value
+# must be handed back with a plain top-level `return` - wrapping the code in an
+# IIFE and just calling it silently returns undefined (innerText came back empty
+# because of exactly that).
+SCROLL_JS = r"""
+var h = document.body ? document.body.scrollHeight : 0;
+var vh = window.innerHeight || 800;
+var steps = Math.min(8, Math.max(1, Math.ceil(h / (vh * 1.5))));
+var step = Math.max(1, Math.floor(h / steps));
+for (var i = 1; i <= steps; i++) { window.scrollTo(0, step * i); }
+window.scrollTo(0, h);
+return h;
+"""
+
+TEXT_JS = r"""
+var b = document.body;
+if (!b) { return ''; }
+return b.innerText || b.textContent || '';
+"""
+
+
+def acquire_lock():
+    os.makedirs(WORKDIR, exist_ok=True)
+    import fcntl
+    fd = os.open(LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        os.close(fd)
+        if e.errno in (errno.EAGAIN, errno.EACCES):
+            return None
+        raise
+    return fd
+
+
+def parse_args(argv, spec):
+    """tiny option parser: spec = {name: (takes_value, alias)}"""
+    out = {}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        key = None
+        if a.startswith("--"):
+            key = a[2:]
+        if key is None:
+            die("Unknown argument: %s", a)
+        if key not in spec:
+            die("Unknown argument: %s", a)
+        takes, _alias = spec[key]
+        if takes:
+            if i + 1 >= len(argv):
+                die("Missing value for --%s", key)
+            out[key] = argv[i + 1]
+            i += 2
+        else:
+            out[key] = True
+            i += 1
+    return out
+
+
+def ui_payload(res):
+    """Reduced view of a grab result, sized for a ubus reply (see the budget).
+
+    Everything bulky is replaced by a pointer: the full visible text and the
+    rendered HTML live in /tmp/chromeui/last.txt and last.html, the screenshot
+    is fetched in chunks from its own file.
+    """
+    shot = dict(res.get("shot") or {})
+    shot.pop("b64", None)
+    media = res.get("media") or []
+    return {
+        "url": res.get("url", ""),
+        "title": res.get("title", ""),
+        "text": (res.get("text") or "")[:TEXT_UI_CAP],
+        "text_len": res.get("text_len", 0),
+        "text_cut": res.get("text_len", 0) > TEXT_UI_CAP,
+        "text_path": TEXT_FILE,
+        "html_len": res.get("html_len", 0) if res.get("html") or res.get("html_saved") else 0,
+        "html_path": HTML_FILE if res.get("html_saved") else "",
+        "shot": shot,
+        "media": media[:MEDIA_UI_CAP],
+        "api_calls": res.get("api_calls") or [],
+        "media_count": res.get("media_count", 0),
+        "media_cut": len(media) > MEDIA_UI_CAP,
+        "hdrs": res.get("hdrs") or [],
+        "elapsed": res.get("elapsed", 0),
+        "notice": res.get("notice", ""),
+        "notice_args": res.get("notice_args", []),
+    }
+
+
+GRAB_SPEC = {
+    "wait": (True, None), "timeout": (True, None), "width": (True, None),
+    "height": (True, None), "full": (False, None), "scroll": (False, None),
+    "waitload": (False, None), "html": (False, None), "no-shot": (False, None),
+    "screenshot": (False, None), "all-codecs": (False, None),
+    "click": (True, None), "no-wake": (False, None), "no-canvas": (False, None),
+    "no-close": (False, None), "headers": (True, None), "headers-file": (True, None),
+    "no-api": (False, None), "quiet-cdp": (False, None), "each": (False, None),
+    "max-total": (True, None),
+    "each-max": (True, None),
+    "shot": (True, None), "max": (True, None), "progress": (True, None),
+    "nolock": (False, None),
+}
+
+
+def collect_api_media(driver, logs, maxn, warn=None):
+    """Media URLs that only exist inside XHR/fetch answers (login-gated sites)."""
+    found = []
+    try:
+        ids = api_request_ids(logs, 15)
+    except Exception:
+        return found
+    for rid, rurl, mt in ids:
+        if not rid:
+            continue
+        if out_of_time():
+            break
+        try:
+            b = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": rid})
+        except Exception:
+            continue
+        body = (b or {}).get("body") or ""
+        if (b or {}).get("base64Encoded"):
+            try:
+                body = base64.b64decode(body).decode("utf-8", "replace")
+            except Exception:
+                continue
+        if not body or len(body) > 800000:
+            continue
+        for u in mine_media_urls(body):
+            found.append({"url": u, "kind": kind_of(u, "") or "video", "mime": "",
+                          "status": 200, "source": "api", "tag": "api:" + rurl.split("/")[2][:24],
+                          "type": "", "title": ""})
+    if found and warn:
+        warn("api: mined %d media url(s) out of %d interface response(s)" % (len(found), len(ids)))
+    return found
+
+
+def _conn_dead(e):
+    """selenium 的"连接断了"类异常（区别于页面 JS 报错）"""
+    s = str(e)
+    return any(k in s for k in ("Connection aborted", "RemoteDisconnected",
+                                "Connection refused", "Max retries exceeded",
+                                "HTTPConnectionPool", "Errno 111", "Connection reset",
+                                "Max retries", "ConnectionError"))
+
+
+def collect_logged_media(logs, max_items):
+    """Media URLs found by regexing the raw log text.
+
+    Ported from a working ximalaya VIP downloader: it simply looks for
+    "...audiopay....m4a..." in every log line.  Going through the log text (instead
+    of the parsed response entry) catches tracks whose mime type/type bookkeeping
+    does not look like media, which is exactly how VIP audio arrives.
+    """
+    found, seen = [], set()
+    for e in logs:
+        txt = e.get("message", "") if isinstance(e, dict) else str(e)
+        if ".m4a" not in txt and ".mp3" not in txt and ".m3u8" not in txt and ".mp4" not in txt:
+            continue
+        for m in re.finditer(r"https://[^\s\"'\\]*?\.(?:m4a|mp3|m4s|mp4|m3u8|ts)"
+                             r"(?:[^\s\"'\\]*)?", txt):
+            u = m.group(0).replace("\\/", "/").rstrip('.,;)')
+            if u in seen or is_data_url(u):
+                continue
+            seen.add(u)
+            found.append({"url": u, "kind": kind_of(u, "") or "audio", "mime": "",
+                          "status": 206, "source": "log", "tag": "log",
+                          "type": "", "title": ""})
+            if len(found) >= max_items:
+                return found
+    return found
+
+
+def collect_network_media(logs, max_items):
+    """Network.responseReceived -> media entries"""
+    found = []
+    for e in logs:
+        try:
+            m = json.loads(e.get("message", "")).get("message", {})
+        except (ValueError, AttributeError):
+            continue
+        if m.get("method") != "Network.responseReceived":
+            continue
+        r = m.get("params", {}).get("response", {})
+        u = r.get("url", "")
+        if not u or is_data_url(u):
+            continue
+        mt = r.get("mimeType", "") or ""
+        k = kind_of(u, mt)
+        if not k:
+            continue
+        found.append({
+            "url": u, "kind": k, "mime": mt.split(";")[0].strip(),
+            "status": r.get("status", 0), "source": "network", "tag": "",
+            "type": "", "title": "",
+        })
+        if len(found) >= max_items * 4:
+            break
+    return found
+
+
+# 🔴 Login-gated media does not sit in the DOM and is not a "media" response: the
+# page's JavaScript asks an API (XHR/fetch) and the ANSWER carries the real
+# address ({"src":"https://a.xmcdn.com/....m4a?sign=..."}).  Those responses are
+# JSON, so a scan that only looks at media mime types never sees them.  Read those
+# bodies and mine the URLs out of them.
+MEDIA_URL_RE = re.compile(
+    r'https?://[^\s"\'<>\\]+?\.(?:m4a|mp3|mp4|m4s|m4v|m3u8|mpd|ts|aac|flac|webm|ogg|opus|wav)'
+    r'(?:\?[^\s"\'<>\\]*)?', re.I)
+
+
+def api_request_ids(logs, maxn=40):
+    """(requestId, url, mime) of XHR/fetch responses - candidates for the real URL."""
+    out, seen = [], set()
+    for e in logs:
+        try:
+            m = json.loads(e.get("message", "")).get("message", {})
+        except (ValueError, AttributeError):
+            continue
+        if m.get("method") != "Network.responseReceived":
+            continue
+        p = m.get("params", {}) or {}
+        if (p.get("type") or "") not in ("XHR", "Fetch"):
+            continue
+        r = p.get("response", {}) or {}
+        u = r.get("url", "")
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        mt = (r.get("mimeType") or "").lower()
+        if not mt or any(t in mt for t in ("json", "text", "javascript", "xml", "octet-stream", "html")):
+            out.append((p.get("requestId"), u, mt))
+        if len(out) >= maxn:
+            break
+    return out
+
+
+def mine_media_urls(text):
+    """Absolute media URLs inside an API answer (JSON escapes unescaped first)."""
+    t = (text or "").replace("\\/", "/").replace("\\u0026", "&").replace("\\u003d", "=")
+    t = t.replace("\\u0025", "%").replace("\\u003F", "?").replace("\\u002:", ":")
+    out, seen = [], set()
+    for m in MEDIA_URL_RE.finditer(t):
+        u = m.group(0).rstrip('.,;)')
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+# Headers a browser sends for a media request are frequently what makes the URL
+# usable elsewhere: JS-generated tokens (x-token/auth/sign) and the Cookie the
+# network stack adds after the fact.  CDP hands us both:
+#   Network.requestWillBeSent          -> request.headers (as the renderer saw it)
+#   Network.requestWillBeSentExtraInfo -> the FINAL headers, cookie included
+NOISY_HEADERS = ("accept", "accept-encoding", "accept-language", "connection",
+                 "cache-control", "pragma", "dnt", "te", "priority",
+                 "upgrade-insecure-requests", "content-length", "content-type")
+NOISY_PREFIX = ("sec-ch-ua", "sec-fetch-")   # browser noise, useless for replaying
+HDR_MAX = 18               # headers kept per request
+HDR_VAL_MAX = 1200         # chars per header value
+HDR_SETS_MAX = 8           # distinct header sets kept per grab
+HDR_TOTAL_MAX = 12000      # chars of header data for the whole grab
+
+
+def collect_request_headers(logs, maxn):
+    """url (percent-decoded) -> {header: value} for every request we saw"""
+    byid = {}
+    for e in logs or []:
+        try:
+            m = json.loads(e.get("message", "")).get("message", {})
+        except (ValueError, AttributeError):
+            continue
+        meth = m.get("method")
+        if meth not in ("Network.requestWillBeSent", "Network.requestWillBeSentExtraInfo"):
+            continue
+        p = m.get("params") or {}
+        rid = p.get("requestId")
+        if not rid:
+            continue
+        rec = byid.setdefault(rid, {"url": "", "headers": {}})
+        req = p.get("request") or {}
+        if req.get("url") and not rec["url"]:
+            rec["url"] = req["url"]
+        for src in (req.get("headers") or {}, p.get("headers") or {}):
+            for k, v in src.items():
+                if k.startswith(":"):
+                    continue
+                kl = k.lower()
+                if kl in NOISY_HEADERS or kl.startswith(NOISY_PREFIX):
+                    continue
+                if kl == "cookie":
+                    continue      # cookies may arrive again via ExtraInfo
+                rec["headers"][kl] = str(v)[:HDR_VAL_MAX]
+        for c in (p.get("associatedCookies") or []):
+            if c.get("blockedReasons"):
+                continue
+            ck = c.get("cookie") or {}
+            if ck.get("name"):
+                rec["headers"]["cookie"] = (rec["headers"].get("cookie", "") +
+                                            ("; " if rec["headers"].get("cookie") else "") +
+                                            "%s=%s" % (ck.get("name"), ck.get("value")))
+        if rec["headers"].get("cookie"):
+            rec["headers"]["cookie"] = rec["headers"]["cookie"][:HDR_VAL_MAX]
+    out = {}
+    for rec in byid.values():
+        if not rec["url"] or not rec["headers"]:
+            continue
+        out[urllib.parse.unquote(rec["url"])] = dict(list(rec["headers"].items())[:HDR_MAX])
+    return out
+
+
+def build_header_sets(media, hdr_by_url, maxn):
+    """Attach a deduplicated header set to each stream entry.
+
+    All media requests of a page normally carry the SAME headers, so the sets are
+    fingerprinted and stored once; entries just reference the index.  That keeps
+    the ubus reply small (a ubus answer is capped at ~128 KB).
+    """
+    sets, index, total = [], {}, 0
+    for m in media:
+        if m.get("kind") in ("subtitle",):
+            continue
+        h = hdr_by_url.get(urllib.parse.unquote(m.get("url", "")))
+        if not h:
+            continue
+        key = "\n".join("%s: %s" % (k, h[k]) for k in sorted(h))
+        if key in index:
+            m["hdr"] = index[key]
+            continue
+        if len(sets) >= HDR_SETS_MAX or total + len(key) > HDR_TOTAL_MAX:
+            continue
+        sets.append(h)
+        index[key] = len(sets) - 1
+        m["hdr"] = len(sets) - 1
+        total += len(key)
+    return sets
+
+
+def collect_dom_media(nodes, base_url, max_items):
+    found = []
+    for n in nodes or []:
+        for attr in ("cur", "src", "poster"):
+            u = n.get(attr) or ""
+            if not u or is_data_url(u):
+                continue
+            if u.startswith("//"):
+                u = urllib.parse.urlparse(base_url).scheme + ":" + u
+            u = urllib.parse.urljoin(base_url, u)
+            k = kind_of(u, n.get("type", ""))
+            if not k:
+                continue
+            found.append({
+                "url": u, "kind": k, "mime": "", "status": 0, "source": "dom",
+                "tag": n.get("tag", ""), "type": n.get("type", ""),
+                "title": n.get("title", ""),
+            })
+            if len(found) >= max_items * 2:
+                return found
+    return found
+
+
+def collect_html_media(html, base_url, max_items):
+    found = []
+    urls = []
+    for m in RAW_URL_RE.finditer(html or ""):
+        urls.append(m.group(0))
+        if len(urls) >= 4000:
+            break
+    for u in urls:
+        u = u.rstrip("\\'\"),;")
+        if is_data_url(u):
+            continue
+        k = kind_of(u, "")
+        if not k:
+            continue
+        found.append({
+            "url": u, "kind": k, "mime": "", "status": 0, "source": "html",
+            "tag": "", "type": "", "title": "",
+        })
+        if len(found) >= max_items:
+            break
+    return found
+
+
+def merge_media(items, max_items):
+    """dedupe by url; network wins for mime/status, dom adds the tag.
+
+    The dedupe key is the *percent-decoded* url: the same resource reaches us
+    as "afx 2_x.mp4" through the DOM (el.src keeps the raw characters) and as
+    "afx%202_x.mp4" through the network log, so a naive string compare reports
+    it twice and offers the un-encoded (unusable) variant first."""
+    byurl = {}
+    order = []
+    for it in items:
+        k = urllib.parse.unquote(it["url"])
+        cur = byurl.get(k)
+        if cur is None:
+            byurl[k] = dict(it)
+            order.append(k)
+            continue
+        if it.get("source") == "network":
+            cur["mime"] = it.get("mime") or cur.get("mime")
+            cur["status"] = it.get("status") or cur.get("status")
+            cur["url"] = it["url"]          # canonical (encoded) form
+            cur["source"] = "network"
+        elif cur.get("source") == "html" and it.get("source") == "dom":
+            cur["source"] = "dom"
+        if it.get("tag") and not cur.get("tag"):
+            cur["tag"] = it["tag"]
+        if it.get("type") and not cur.get("type"):
+            cur["type"] = it["type"]
+        if it.get("title") and not cur.get("title"):
+            cur["title"] = it["title"]
+        # codec/kind from the page manifest (or a sniff) beats the network log's
+        # guess - "video/mp4" is what the log claims for bilibili's AAC track too
+        if it.get("codec") and not cur.get("codec"):
+            for k in ("codec", "codec_name", "picky", "kind", "note"):
+                cur[k] = it.get(k)
+        if it.get("size") and not cur.get("size"):
+            cur["size"] = it["size"]
+    rank = {"hls": 0, "dash": 1, "smooth": 1, "ts": 2, "video": 3, "audio": 4,
+            "flash": 5, "subtitle": 6, "image": 7}
+    items = [byurl[u] for u in order]
+    items.sort(key=lambda x: (rank.get(x.get("kind"), 9), x.get("url", "")))
+    return items[:max_items]
+
+
+def cmd_grab(argv):
+    if not argv:
+        die("No URL given")
+    url = argv[0]
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        url = "http://" + url
+    opt = parse_args(argv[1:], GRAB_SPEC)
+
+    global PROGRESS_PATH, JOB_START, JOB_URL
+    PROGRESS_PATH = opt.get("progress") or None
+    JOB_START = time.time()
+    JOB_URL = url
+    # 🔴 默认值从 110 提到 240：抖音这类重页面实测要 ~220 秒（历史上成功那次 257.8s），
+    # 110 秒的默认值会让它们每次都"Time cap reached"报错 ✗。轻页面不受影响 ——
+    # 拿到资源就返回（见下面的 media fast-path），上限只对重页面生效。
+    try:
+        maxtotal = float(opt.get("max-total") or 330)
+    except ValueError:
+        maxtotal = 330.0
+    # 🔴 hard wall-clock cap for the whole grab (see _DEADLINE / out_of_time):
+    # whatever a site or a CDN does, this one always returns
+    _DEADLINE[0] = time.time() + max(20.0, maxtotal)
+    _wd = None
+    warn("time cap: %.0fs for this grab (--max-total to change)" % maxtotal)
+
+    try:
+        timeout = float(opt.get("timeout", 30))
+    except ValueError:
+        die("Invalid number: %s", opt.get("timeout"))
+    # ---- v.qq.com: the site's own API, no browser at all ---------------------
+    # measured: the headless browser wedges on that page (its player saturates the
+    # renderer), while two plain HTTP calls return the media address in seconds.
+    if QQ_URL_RE.search(url):
+        _qm, _qnote = [], ""
+        try:
+            _h0 = parse_header_text(opt.get("headers"))
+            _hf = os.path.basename(opt.get("headers-file") or "")
+            if _hf:
+                try:
+                    with open(os.path.join(WORKDIR, _hf), encoding="utf-8", errors="replace") as _f:
+                        for _k, _v in parse_header_text(_f.read()).items():
+                            _h0.setdefault(_k, _v)
+                except OSError as _e:
+                    warn("headers file %s: %s" % (_hf, _e))
+            _ck = ""
+            for _k, _v in _h0.items():
+                if _k.lower() == "cookie":
+                    _ck = _v
+            _qm, _qnote = tencent_probe(url, cookie=_ck, warn=warn)
+        except Exception as _e:
+            _qnote = "tencent api error: %s" % str(_e).splitlines()[0][:70]
+        warn("tencent: %s" % _qnote)
+        # the API answered (even if it would not hand over a playable address):
+        # do NOT fall back to the browser - that page wedges the renderer and
+        # would burn the whole time cap for nothing.  Answer in seconds instead.
+        _api_spoke = bool(_qnote) and not _qnote.startswith(("no vid", "getinfo failed",
+                                                             "getinfo:", "tencent api error"))
+        if _qm or _api_spoke:
+            _res = {"url": url, "final_url": url,
+                    "title": "v.qq.com video (address from the site API)",
+                    "text": "", "text_len": 0, "html_len": 0, "html": "",
+                    "media": _qm, "media_count": len(_qm), "hdrs": [], "api_calls": [],
+                    "shot": {"path": "", "b64": "", "bytes": 0, "error": ""},
+                    "elapsed": round(time.time() - JOB_START, 1), "source": "tencent-api"}
+            if _qm:
+                _res["notice"] = ("v.qq.com: the address comes from the site's own API "
+                                  "(no browser needed). %s")
+            else:
+                # the API answered but would not give a playable address: say so
+                # (and that a logged-in Cookie is the usual reason)
+                _res["notice"] = ("v.qq.com: its public API only hands over one segment (%s) - "
+                                  "for the WHOLE episode press the Tencent button in the media card "
+                                  "(it asks /usr/bin/qqurl for the HLS playlist).")
+            _res["notice_args"] = [_qnote]
+            if PROGRESS_PATH:
+                progress_write(PROGRESS_PATH, {
+                    "state": "done", "phase": "done", "url": _res["url"],
+                    "elapsed": _res["elapsed"], "result_ready": True,
+                    "result": ui_payload(_res)})
+                ok({"state": "done", "url": _res["url"], "media_count": _res["media_count"],
+                    "elapsed": _res["elapsed"]})
+            ok(_res)
+            return
+
+    try:
+        width = int(opt.get("width", 1280))
+        height = int(opt.get("height", 900))
+        maxn = int(opt.get("max", 400))
+    except ValueError:
+        die("Invalid number: %s", opt.get("width") or opt.get("height") or opt.get("max"))
+
+    if not os.access(ROOT + CHROME_BIN, os.X_OK):
+        die("chrome-headless-shell is not installed (%s)", ROOT + CHROME_BIN)
+    if not os.access(CDRV, os.X_OK):
+        die("chromedriver is not installed (%s)", CDRV)
+
+    if opt.get("nolock"):
+        # started by `chromeui start`: the parent already holds the exclusive
+        # lock and handed us its file descriptor (pass_fds), so the lock stays
+        # held for as long as this process lives.  Do NOT close it.
+        lock = None
+    else:
+        lock = acquire_lock()
+        if lock is None:
+            die("Another grab is already running, wait for it to finish")
+
+    progress_phase("starting", step="browser")
+    shot_path = opt.get("shot") or ""
+    t0 = time.time()
+    driver = None
+    try:
+        os.makedirs(WORKDIR, exist_ok=True)
+        if not shot_path:
+            shot_path = os.path.join(WORKDIR, "shot-%d.png" % int(time.time()))
+            # keep the working directory from growing forever
+            try:
+                olds = sorted([os.path.join(WORKDIR, f) for f in os.listdir(WORKDIR)
+                               if f.startswith("shot-") and f.endswith(".png")],
+                              key=os.path.getmtime, reverse=True)
+                for p in olds[SHOT_KEEP:]:
+                    os.unlink(p)
+            except OSError:
+                pass
+
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.chrome.service import Service
+
+        o = Options()
+        o.binary_location = CHROME_BIN
+        # 🔴 sites that sabotage playback when DevTools is open (ximalaya is one:
+        # "Chrome>137 + devtools open => deliberately fail on play") also react to a
+        # browser whose console/network is being read, which is exactly what the
+        # performance log is.  --quiet-cdp drops that reading (the media list then
+        # comes from the DOM and the interface bodies only).
+        if not opt.get("quiet-cdp"):
+            o.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+        o.add_argument("--window-size=%d,%d" % (width, height))
+        o.add_argument("--hide-scrollbars")
+        # NOTE: do NOT pass --user-data-dir here.  On this glibc-chroot setup
+        # chromedriver then never finds the DevToolsActivePort file it expects
+        # and fails the session with "unable to discover open pages" after a
+        # full 60 s timeout (chrome itself starts fine and writes the file into
+        # the directory we asked for - chromedriver just looks elsewhere).
+        # Letting chromedriver manage its own temp profile works and is fast.
+        # EAGER by default: video sites (bilibili and friends) keep loading
+        # sub-resources forever, and with the default strategy driver.get()
+        # waits for all of them - it hit the 30 s page timeout and the whole
+        # grab was reported as a failure even though the DOM was ready.
+        # --waitload opts back into the blocking behaviour.
+        o.page_load_strategy = "normal" if opt.get("waitload") else "eager"
+        for a in ("--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+                  "--no-first-run", "--disable-extensions", "--mute-audio",
+                  "--autoplay-policy=no-user-gesture-required",
+                  "--user-agent=" + UA, "--lang=zh-CN",
+                  "--disable-blink-features=AutomationControlled",
+                  "--disable-background-networking", "--disable-sync",
+                  "--disable-features=Translate,OptimizationHints"):
+            o.add_argument(a)
+
+        drvlog = os.path.join(WORKDIR, "chromedriver.log")
+        try:
+            drvsvc = Service(executable_path=CDRV, log_output=drvlog)
+        except TypeError:
+            drvsvc = Service(executable_path=CDRV)
+        try:
+            driver = webdriver.Chrome(service=drvsvc, options=o)
+            # 🔴 浏览器一旦挂掉，selenium 每次调用会在死连接上重试 ~30 秒；
+            # 抖音实测就是这样把"15 秒就抓到的东西"拖到 110 秒才报超时。
+            try:
+                driver.command_executor.set_timeout(12)
+            except Exception:
+                pass
+        except Exception as e:
+            tail = ""
+            try:
+                with open(drvlog, "r", errors="replace") as f:
+                    tail = " | ".join([l.strip() for l in f.readlines()[-25:] if l.strip()])
+            except OSError:
+                pass
+            die("Cannot start the browser session: %s || driver log: %s",
+                " | ".join([l.strip() for l in str(e).splitlines() if l.strip()]),
+                tail or "-")
+        # 🔴 login-gated pages: replay the headers the user copied out of their own
+        # (logged in) browser - CDP then attaches them to every request the page
+        # makes, so the site answers as if that user were browsing.
+        if not opt.get("quiet-cdp"):
+            try:
+                driver.execute_cdp_cmd("Network.enable", {})    # keeps XHR bodies around
+            except Exception:
+                pass
+        extra_headers = parse_header_text(opt.get("headers"))
+        hf = os.path.basename(opt.get("headers-file") or "")
+        if hf:
+            try:
+                with open(os.path.join(WORKDIR, hf), encoding="utf-8", errors="replace") as f:
+                    for k, v in parse_header_text(f.read()).items():
+                        extra_headers.setdefault(k, v)
+            except OSError as e:
+                warn("headers file %s: %s" % (hf, e))
+        if extra_headers:
+            try:
+                driver.execute_cdp_cmd("Network.enable", {})
+                driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": extra_headers})
+                warn("sending %d extra header(s) with every request: %s" % (
+                    len(extra_headers), ", ".join(sorted(extra_headers))[:140]))
+            except Exception as e:
+                warn("could not set extra headers: %s" % str(e).splitlines()[0][:80])
+            # 🔴 a Cookie sent as a HEADER is invisible to the page's JavaScript:
+            # document.cookie stays empty, so a player/banner that checks the login
+            # in JS (ximalaya does - it even shows a lock icon) still treats the
+            # visitor as logged out, while the server-side API says "logged in".
+            # Install the cookies for real, then the page sees them too.
+            ck = ""
+            for _k, _v in extra_headers.items():
+                if _k.lower() == "cookie":
+                    ck = _v
+            if ck:
+                n_ok = 0
+                for part in ck.split(";"):
+                    part = part.strip()
+                    if not part or "=" not in part:
+                        continue
+                    cname, cval = part.split("=", 1)
+                    cname, cval = cname.strip(), cval.strip()
+                    if not cname or cname.startswith("$"):
+                        continue
+                    try:
+                        rr = driver.execute_cdp_cmd("Network.setCookie", {
+                            "name": cname, "value": cval, "url": url, "path": "/"})
+                        if isinstance(rr, dict) and rr.get("success"):
+                            n_ok += 1
+                    except Exception:
+                        pass
+                warn("login: %d/%d cookie(s) installed INTO the browser "
+                     "(document.cookie now carries them as well)" % (n_ok, len(ck.split(";"))))
+
+        progress_phase("loading", step="page")
+        try:
+            driver.set_page_load_timeout(timeout)
+            # 🔴 a page whose JS never returns (endless player/feed loops - v.qq.com
+            # does exactly this) would block execute_script forever.  A script
+            # timeout turns that into an exception the code handles, so a grab
+            # always keeps making progress.
+            try:
+                driver.set_script_timeout(8)     # a JS call that needs longer than
+                                                 # this means the renderer is wedged
+            except Exception:
+                pass
+            # 🔴 hard watchdog: at the cap the browser tree is killed, so even a
+            # wedged renderer (a call that never returns) cannot keep this running
+            try:
+                import threading
+
+                def _watchdog():
+                    kill_browser_tree("grab exceeded its %.0fs cap" % maxtotal)
+
+                _wd = threading.Timer(max(20.0, maxtotal), _watchdog)
+                _wd.daemon = True
+                _wd.start()
+            except Exception:
+                _wd = None
+        except Exception:
+            pass
+        # must be installed BEFORE the page scripts run
+        for js, whatname in ((STEALTH_JS, "stealth"), (None if opt.get("all-codecs") else CODEC_PREFER_JS, "codec")):
+            if not js:
+                continue
+            try:
+                driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": js})
+            except Exception as e:
+                warn("%s script not installed: %s" % (whatname, e))
+
+        page_notice = ""
+        page_notice_args = []
+        # 🔴 NEVER wait for the load event.  A media page (v.qq.com: player + DRM
+        # init + endless ad/tracking requests) can keep the load event pending
+        # forever, and driver.get() then blocks until the whole time cap is gone -
+        # although the DOM and, above all, the NETWORK LOG already carry the media
+        # addresses.  Navigate through CDP (returns at once) and only watch
+        # readyState with a few cheap, timeout-bounded probes.
+        _t_nav = time.time()
+        nav_via_cdp = False
+        try:
+            driver.execute_cdp_cmd("Page.navigate", {"url": url})
+            nav_via_cdp = True
+        except Exception as e:
+            warn("Page.navigate unavailable (%s) - using driver.get" % str(e).splitlines()[0][:60])
+        if not nav_via_cdp:
+            try:
+                driver.get(url)
+            except Exception as e:
+                first = str(e).splitlines()[0] if str(e) else "unknown"
+                if "timeout" in first.lower() or "timed out" in first.lower():
+                    page_notice = ("The page did not finish loading within %ss - "
+                                   "showing what has rendered so far")
+                    page_notice_args = [str(int(timeout))]
+                    warn("page load timed out, continuing: %s" % first)
+                    try:
+                        driver.execute_script("window.stop()")
+                    except Exception:
+                        pass
+                else:
+                    die("Cannot open %s (%s)", url, first)
+        else:
+            budget = min(20.0, max(8.0, timeout))
+            t_end = time.time() + budget
+            state = ""
+            while time.time() < t_end:
+                try:
+                    state = driver.execute_script("return document.readyState") or ""
+                except Exception as e:
+                    warn("readyState probe failed (%s) - going on with what we have"
+                         % str(e).splitlines()[0][:44])
+                    break
+                if state == "complete" or (state == "interactive" and time_left() < budget - 10):
+                    break
+                time.sleep(0.6)
+            warn("page readyState=%s after %.1fs (network log already has the media)"
+                 % (state or "?", time.time() - _t_nav))
+            if state != "complete":
+                _DEADLINE[0] = min(_DEADLINE[0], time.time() + 30.0)
+            early_logs = []      # 定义必须在这里（提前抽取要用）——原来放在后面，导致那步永远 NameError ✗
+            # 🔴 立刻把 performance log 抽干：
+            # 资源在页面加载完成时就已在日志里；而抖音这类页面会在 ~20 秒时把浏览器自己
+            # 关掉（CDP 之后永久断开），之后任何 driver 调用都白等 + 那时的日志也读不到了。
+            # 实测：15.2 秒时日志里已有媒体，却因为抽日志要等"关遮罩之后"，最后 110 秒报超时 ✗
+            try:
+                _e = list(driver.get_log("performance") or [])
+                early_logs.extend(_e)
+                warn("early log drain right after load: %d entries" % len(_e))
+            except Exception as e:
+                warn("early log drain failed: %s" % str(e).splitlines()[0][:50])
+            # 🔴 关键：资源已经在日志里 -> 后面那些"关遮罩/唤醒/点播放"全部跳过。
+            # 它们是为"点一下才出资源"的站点（喜马拉雅等）准备的；对抖音这类
+            # 加载完就有资源的页面，继续折腾只会把浏览器搞死，然后空转到 --max-total ✗
+            # 🔴 不要因为"日志里已经有媒体"就跳过关遮罩/唤醒 ——
+            # 实测抖音：广告本身就是媒体 ✗，一跳过，遮罩不关 -> 播放器不播 ->
+            # 真视频（douyinvod 的 video 轨）永远不请求，结果只剩"一堆广告 + 真视频的音频"。
+            page_gone = False
+
+        # wait for the page to be usable
+        # 🔴 Never poll the page with execute_script on a heavy site: every CDP
+        # evaluate has to wait for the renderer's main thread, and on bilibili a
+        # single call measured 3-20 s (the old readyState polling loop burned
+        # 25 s that way).  Sleep instead - it costs the wall clock and nothing
+        # else - and only do a real selector wait when the user asked for one.
+        if opt.get("wait"):
+            try:
+                from selenium.webdriver.common.by import By
+                from selenium.webdriver.support.ui import WebDriverWait
+                from selenium.webdriver.support import expected_conditions as EC
+                WebDriverWait(driver, min(timeout, 15)).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, opt["wait"])))
+            except Exception:
+                die("Element %s did not appear within %ss", opt["wait"],
+                    int(min(timeout, 15)))
+
+        # let late (XHR/JS-driven) resources fire: a plain sleep, no CDP round
+        # trips (heavy pages such as bilibili never reach readyState=complete,
+        # so waiting for it is pointless anyway)
+        time.sleep(2.0)
+
+        # 🔴 page_gone 已在上面（加载完成时）置好：媒体到手 = 跳过交互；
+        # 另外任何 CDP 断连也会把它置 True，然后直接用手上的资源出结果。
+
+        # ---- dismiss a login / modal overlay -------------------------------
+        # Must happen BEFORE anything else: while the overlay is up every click
+        # lands on the mask and no media is ever requested (douyin's login wall).
+        overlay_done = False
+        if not opt.get("no-close") and not page_gone:
+            try:
+                dj = driver.execute_script(DOUYIN_CLOSE_JS) or {}
+                if dj.get("tried"):
+                    warn("site close: pressed %s | overlays left %s"
+                         % (", ".join(dj.get("tried") or [])[:100], dj.get("big")))
+                    time.sleep(1.5)
+                    if dj.get("gone"):
+                        warn("site close: login wall dismissed (this is what lets the "
+                             "player load on douyin)")
+                        overlay_done = True
+            except Exception as e:
+                warn("site close failed: %s" % str(e).splitlines()[0][:60])
+        if not opt.get("no-close") and not page_gone and not overlay_done:
+            for attempt in range(3):
+                try:
+                    info = driver.execute_script(CLOSE_JS) or {}
+                except Exception as e:
+                    warn("close scan failed: %s" % str(e).splitlines()[0][:70])
+                    if _conn_dead(e):
+                        page_gone = True
+                        warn("CDP connection is gone - skipping the rest of the page "
+                             "interaction and returning what the network log already has")
+                    break
+                if not info.get("overlay"):
+                    break
+                if attempt == 0:
+                    warn("overlay: %s (%s%% of the screen)" % (info.get("overlay"), info.get("pct")))
+                    # 把遮罩的真实 HTML 存下来（好写针对它的关闭选择器；别靠猜）
+                    try:
+                        with open(os.path.join(WORKDIR, "modal.html"), "w") as _f:
+                            _f.write("<!-- overlay=%s box=%s pct=%s -->\n%s"
+                                     % (info.get("overlay"), info.get("box"), info.get("pct"),
+                                        info.get("html") or ""))
+                        warn("overlay HTML saved to %s/modal.html (%d bytes)"
+                             % (WORKDIR, len(info.get("html") or "")))
+                    except OSError as _e:
+                        warn("cannot save modal.html: %s" % _e)
+                gone = False
+                for _ci, cd in enumerate((info.get("cands") or [])[:3]):
+                    # element-level press first (no coordinates at all)
+                    try:
+                        pr = driver.execute_script(CLOSE_JS, _ci) or {}
+                        warn("close: pressed %s" % (pr.get("tag") or cd.get("tag")))
+                    except Exception:
+                        pr = {}
+                    time.sleep(0.9)
+                    try:
+                        if not (driver.execute_script(CLOSE_JS) or {}).get("overlay"):
+                            gone = True
+                            break
+                    except Exception:
+                        break
+                    if not pr.get("pressed") and cd.get("x") is not None:
+                        _click_at(driver, cd.get("x"), cd.get("y"))   # last resort
+                        warn("close: mouse-clicked %s" % cd.get("tag"))
+                    try:
+                        if not (driver.execute_script(CLOSE_JS) or {}).get("overlay"):
+                            gone = True
+                            break
+                    except Exception:
+                        break
+                if gone:
+                    warn("close: overlay dismissed")
+                    break
+                try:      # 关门后再确认一次（专用/通用混用时的兜底）
+                    _chk = driver.execute_script(DOUYIN_CLOSE_JS) or {}
+                    if _chk.get("gone"):
+                        warn("close: overlay gone after re-check")
+                        break
+                except Exception:
+                    pass
+                # 🔴 不再用 Escape 兜底：抖音的弹层收到 Escape 会顺手 window.close()，
+                # 浏览器随即消失（CDP 永久断开），之后什么都抓不到。宁可不关遮罩。
+                if not pr.get("pressed"):
+                    warn("close: no working close button - leaving the overlay alone")
+                    break
+
+        # 🔴 等"主播放器真的起播"再收尾。
+        # 抖音：真视频轨（douyinvod 的 video）是播放器起播后才请求的，比广告晚很多；
+        # 旧版成功那次耗时 257.8 秒，而现在流程 ~200 秒就返回 -> 正好错过 ✗。
+        # 判据直接用 <video> 的 currentTime/readyState（不看日志，广告也会进日志 ✗）。
+        if not page_gone:
+            _t_end = min(time.time() + 90.0, time.time() + max(5.0, time_left()))
+            _waited = 0.0
+            while time.time() < _t_end:
+                try:
+                    st = driver.execute_script(
+                        "var v=document.querySelector('video');"
+                        "return v ? [Math.round(v.currentTime), v.readyState, v.duration||0] : null;")
+                except Exception as e:
+                    warn("playback wait: probe failed (%s)" % str(e).splitlines()[0][:50])
+                    break
+                if st and (st[0] > 0 or (st[1] or 0) >= 3):
+                    warn("playback started (t=%ss rs=%s dur=%s) after %.0fs of waiting"
+                         % (st[0], st[1], int(st[2] or 0), _waited))
+                    break
+                if _waited == 0.0:
+                    warn("waiting for the player to start playing (up to 90s)…")
+                time.sleep(3.0)
+                _waited += 3.0
+            else:
+                warn("playback wait: no <video> playback after %.0fs" % _waited)
+
+        # ---- explicit --click selectors (a close button, "continue", "play") --
+        for sel in [x.strip() for x in (opt.get("click") or "").split(",") if x.strip()]:
+            done_click = None
+            for _try in range(10):
+                try:
+                    r = driver.execute_script(CLICK_JS, sel)
+                except Exception as e:
+                    warn("click %s failed: %s" % (sel, str(e).splitlines()[0][:80]))
+                    break
+                if r and r.get("ok"):
+                    # JS click already happened inside CLICK_JS; the mouse click is
+                    # only sent when the element actually has a box on screen
+                    good = (r.get("w") or 0) >= 4 and (r.get("h") or 0) >= 4 and r.get("x") is not None
+                    if good and r.get("hit"):
+                        # element-level press already happened; the mouse click is
+                        # only added when the point provably hits the element
+                        _click_at(driver, r.get("x"), r.get("y"))
+                        r["via"] = "press+mouse(point verified)"
+                    elif good:
+                        r["via"] = "press only (point misses: covered or moved)"
+                    else:
+                        r["via"] = "press only (no box: %sx%s)" % (round(r.get("w") or 0), round(r.get("h") or 0))
+                    done_click = r
+                    break
+                time.sleep(0.8)
+            if done_click:
+                warn("clicked %s -> %s [%s]" % (sel, done_click.get("tag"), done_click.get("via")))
+                time.sleep(1.8)
+            else:
+                warn("click %s: element not found" % sel)
+
+        # ---- wake the player up -------------------------------------------
+        # Many sites (ximalaya and every web-component player) do NOT request
+        # the media until you press play, so a passive grab finds nothing.
+        # Always try: start every <audio>/<video> (muted, inside shadow DOM too)
+        # and click up to 3 elements that look like a play button.  --click gives
+        # an exact selector when the heuristic is not enough.
+        # 🔴 driver.get_log("performance") returns the entries since the last
+        # call and CLEARS them - the wake loop below reads this log several
+        # times, so everything it drains has to be kept or the media response
+        # it just discovered would be missing from the final result.
+
+        if not opt.get("no-wake"):
+            # Closed loop: click a candidate, look whether media actually
+            # appeared (network log / a media element got a src), and if not try
+            # the next one.  Guessing the right button from its looks alone does
+            # not work - on ximalaya the biggest "play" element is an
+            # album-cover link that just navigates away.
+            def media_now():
+                try:
+                    early_logs.extend(driver.get_log("performance") or [])
+                except Exception:
+                    pass
+                try:
+                    srcs = driver.execute_script(MEDIA_SRC_JS) or []
+                except Exception:
+                    srcs = []
+                return _count_streams(early_logs), srcs
+
+            base_cnt, base_src = media_now()
+            played_note = False
+            clicked = []          # tags, for the log only
+            # 🔴 dedupe by INDEX: on an album every episode's play icon
+            # has the same class, so a tag-based guard would skip episodes 2..N
+            clicked_idx = set()
+            got_media = bool(base_src)
+            start_url = ""
+            try:
+                start_url = driver.current_url
+            except Exception:
+                pass
+            # --each: walk EVERY play control of the page (an album lists all its
+            # episodes: pressing them one by one is how you get all the audio URLs,
+            # not just the first one)
+            each = bool(opt.get("each"))
+            # 🔴 抖音这类站点播放器是"很晚才创建"的：实测 22 秒时页面上连 <video> 都没有，
+            # 而原来看门狗只找 35 秒就收工 -> "nothing to click" -> 真视频轨永不请求 ✗
+            deadline = min(time.time() + (120.0 if each else 95.0),
+                           time.time() + max(5.0, time_left()))
+            rounds = 0
+            while (time.time() < deadline and rounds < (1 if each else 12)
+                   and (each or not got_media)):
+                rounds += 1
+                if page_gone:
+                    break
+                try:
+                    wk = driver.execute_script(WAKE_JS, -1) or {}
+                except Exception as e:
+                    warn("wake failed: %s" % e)
+                    if _conn_dead(e):
+                        page_gone = True
+                    break
+                if wk.get("played") and not played_note:
+                    warn("wake: started %s" % wk.get("played"))
+                    played_note = True
+                ncand = int(wk.get("n") or 0)
+                if not ncand:
+                    # the player is not in the DOM yet - ximalaya builds its buttons
+                    # several seconds after the load event, and douyin needs much longer
+                    # (no <video> at all at 22 s), so keep looking instead of giving up
+                    if rounds == 1:
+                        warn("wake: no play control yet - waiting for the player to appear")
+                    time.sleep(3.0)
+                    continue
+                if rounds == 1:
+                    warn("wake: %d play-button candidates" % ncand)
+                fresh = 0
+                js_stuck = 0
+                for idx in range(min(30 if each else 12, ncand)):
+                    try:
+                        cd = driver.execute_script(WAKE_JS, idx) or {}
+                    except Exception as e:
+                        js_stuck += 1
+                        if js_stuck >= 2:
+                            warn("wake: the page's JS keeps timing out (%s) - "
+                                 "giving up on this step" % str(e).splitlines()[0][:50])
+                            break
+                        continue
+                    if cd.get("x") is None:
+                        # no box: the JS press is the only way in (and it is
+                        # already aimed at this exact candidate)
+                        try:
+                            jr = driver.execute_script(PRESS_MARKED_JS) or {}
+                            warn("wake: JS-clicked %s (no box)" % str(jr.get("tag") or ("#%d" % idx)))
+                        except Exception:
+                            pass
+                        time.sleep(3.0)
+                        cnt2, srcs2 = media_now()
+                        if len(srcs2) > len(base_src):
+                            got_media = True
+                        continue
+                    tag = str(cd.get("tag") or ("#%d" % idx))
+                    if idx in clicked_idx:
+                        continue
+                    clicked_idx.add(idx)
+                    clicked.append(tag)
+                    fresh += 1
+                    # 1) press the ELEMENT (resolution independent: works at any
+                    #    window size and on 0x0 controls)
+                    try:
+                        jr = driver.execute_script(PRESS_MARKED_JS) or {}
+                        warn("wake: pressed %s%s" % (jr.get("tag") or tag,
+                                                     "  [cand %d/%d]" % (idx + 1, ncand) if each else ""))
+                    except Exception:
+                        pass
+                    time.sleep(3.0 if each else 3.0)
+                    cnt1, srcs1 = media_now()
+                    if len(srcs1) > len(base_src):
+                        got_media = True
+                        if each:
+                            continue      # keep walking the list
+                        break             # single-page grab: we have what we came for
+                    # 2) only if that changed nothing, try a real mouse click - and
+                    #    only when the point provably hits the element
+                    if cd.get("hit"):
+                        _click_at(driver, cd.get("x"), cd.get("y"))
+                        warn("wake: mouse-clicked %s (point verified)" % tag)
+                        time.sleep(5.0)
+                        cnt1, srcs1 = media_now()
+                        if len(srcs1) > len(base_src):
+                            got_media = True
+                            if each:
+                                continue
+                            break
+                    else:
+                        warn("wake: %s has no verified point - skipped the mouse click" % tag)
+                    # safety net: if that click navigated, come back, otherwise
+                    # everything collected afterwards belongs to the wrong page
+                    try:
+                        now = driver.current_url
+                    except Exception:
+                        now = start_url
+                    if start_url and now != start_url:
+                        warn("wake: %s navigated to %s - going back" % (tag, now[:60]))
+                        try:
+                            driver.get(start_url)
+                            time.sleep(1.5)
+                        except Exception as e:
+                            warn("wake: cannot go back: %s" % str(e).splitlines()[0][:60])
+                        continue
+                    cnt, srcs = media_now()
+                    if srcs:
+                        warn("wake: media element is playing %s" % srcs[:1])
+                        got_media = True
+                        break
+                    if base_cnt >= 0 and cnt > base_cnt:
+                        warn("wake: %d new media response(s) after %s" % (cnt - base_cnt, tag))
+                        got_media = True
+                        break
+                    if len(clicked) >= 4:
+                        break
+                if fresh == 0:
+                    break          # every candidate was already tried
+                if not got_media:
+                    time.sleep(1.5)   # let the player render its next control
+            if not clicked and not played_note:
+                warn("wake: nothing to click")
+            time.sleep(0.8)
+
+
+        if opt.get("scroll"):
+            try:
+                driver.execute_script(SCROLL_JS)
+                time.sleep(0.8)
+                driver.execute_script("window.scrollTo(0,0)")
+                time.sleep(0.2)
+            except Exception as e:
+                warn("scroll: %s" % e)
+
+        progress_phase("collecting", step="media")
+        _t = [time.time()]
+
+        def _step(name):
+            warn("timing %-10s %6.1fs" % (name, time.time() - _t[0]))
+            _t[0] = time.time()
+
+        final_url = driver.current_url
+        title = driver.title or ""
+        _step("url+title")
+        try:
+            text = driver.execute_script(TEXT_JS) or ""
+        except Exception:
+            text = ""
+        _step("innerText")
+        html = driver.page_source or ""
+        _step("page_source")
+
+        # ---- --each: press every episode of the list, one by one -------------
+        if opt.get("each"):
+            EP_SEL = ('i[class*="web_album_btn_play_s"], .playIcon, '
+                      '[class*="album_btn_play"], [class*="btn_play"]')
+            walked = 0
+            # 🔴 cap it: pressing 20+ episodes loads 20+ players and this board's
+            # headless Chrome dies (measured).  8 is safe; raise it with --each-max.
+            try:
+                cap = max(1, min(40, int(opt.get("each-max") or 8)))
+            except ValueError:
+                cap = 8
+            for k in range(cap):
+                try:
+                    rr = driver.execute_script(EACH_PRESS_JS, EP_SEL, k) or {}
+                except Exception as e:
+                    warn("each: %d stop: %s" % (k, str(e).splitlines()[0][:60]))
+                    break
+                if not rr.get("ok"):
+                    warn("each: done, %d episode(s) pressed (list has %s)" % (walked, rr.get("total")))
+                    break
+                if walked >= cap:
+                    warn("each: stopped at the cap of %d (use --each-max to walk further)" % cap)
+                    break
+                walked += 1
+                if k == 0:
+                    warn("each: %d 个可点条目" % (rr.get("total") or 0))
+                time.sleep(3.5)
+            warn("each: pressed %d item(s)" % walked)
+
+        # ---- media resources: network log + DOM + raw html ----
+        try:
+            try:
+                _late = [] if (opt.get("quiet-cdp") or page_gone) \
+                    else (driver.get_log("performance") or [])
+            except Exception as e:
+                _late = []
+                warn("final log read failed (%s) - using the entries already collected"
+                     % str(e).splitlines()[0][:50])
+                page_gone = True
+            logs = early_logs + _late
+        except Exception as e:
+            warn("performance log: %s" % e)
+            logs = list(early_logs)
+        _step("perf_log")
+        try:
+            if page_gone:      # CDP 断了：读 DOM 只会一次次白等（每次 12 秒）
+                nodes = []
+            else:
+                nodes = driver.execute_script(MEDIA_SCAN_JS)
+        except Exception as e:
+            warn("dom scan: %s" % e)
+            nodes = []
+        _step("dom_scan")
+
+        media = merge_media(
+            collect_playinfo_media(html, final_url, maxn) +
+            ([] if page_gone else collect_api_media(driver, logs, maxn, warn)) +
+            collect_logged_media(logs, maxn) +
+            collect_network_media(logs, maxn) +
+            collect_dom_media(nodes, final_url, maxn) +
+            collect_html_media(html, final_url, maxn), maxn)
+        _step("merge")
+
+        # what a DASH track really is cannot be told from the log: sniff the
+        # first bytes of the streams so the list does not call an AAC audio
+        # track "video", and so AV1/HEVC tracks get flagged.  Ranged GET into
+        # memory - nothing is downloaded to disk.
+        # ---- canvases: the only way to get the content of a canvas-rendered
+        #      document (there is no URL to report for those pages) -------------
+        canvas_note = ""
+        if not opt.get("no-canvas") and not page_gone:   # CDP 断了就别再扫画布（每次白等 12 秒）
+            try:
+                cl = driver.execute_script(CANVAS_LIST_JS) or []
+            except Exception as e:
+                cl = []
+                warn("canvas scan: %s" % str(e).splitlines()[0][:70])
+            if cl:
+                warn("found %d canvas(es) - exporting them as PNG" % len(cl))
+                made = 0
+                for n, c in enumerate(cl[:40]):
+                    dataurl = ""
+                    try:
+                        dataurl = driver.execute_script(CANVAS_SHOT_JS, c.get("i")) or ""
+                    except Exception as e:
+                        warn("canvas %d: %s" % (n, str(e).splitlines()[0][:60]))
+                        continue
+                    if not dataurl.startswith("data:image/png;base64,"):
+                        if dataurl:
+                            warn("canvas %d not exportable: %s" % (n, dataurl[:60]))
+                        continue
+                    try:
+                        raw = base64.b64decode(dataurl.split(",", 1)[1])
+                    except Exception:
+                        continue
+                    fname = "page-%02d.png" % (n + 1)
+                    try:
+                        with open(os.path.join(WORKDIR, fname), "wb") as f:
+                            f.write(raw)
+                    except OSError as e:
+                        warn("cannot write %s: %s" % (fname, e))
+                        continue
+                    made += 1
+                    media.append({
+                        "url": "canvas:%s" % (c.get("id") or ("page_%d" % (n + 1))),
+                        "kind": "image", "mime": "image/png", "source": "canvas",
+                        "status": 0, "tag": "canvas", "size": len(raw),
+                        "file": fname, "title": "page %d (%dx%d)" % (n + 1, c.get("w", 0), c.get("h", 0)),
+                    })
+                if made:
+                    canvas_note = ("This document is painted on a canvas - it has no per-page URL. "
+                                   "%s page image(s) were exported and can be downloaded")
+                    canvas_note_args = [str(made)]
+                    warn("exported %d canvas page(s)" % made)
+
+        try:
+            hdr_sets = build_header_sets(media, collect_request_headers(logs, maxn), maxn)
+        except Exception as e:
+            warn("request headers: %s" % e)
+            hdr_sets = []
+        if hdr_sets:
+            warn("collected %d distinct request header set(s)" % len(hdr_sets))
+        _step("headers")
+
+        sn, snif = 0, []
+        for m in media:
+            if sn >= SNIFF_MAX:
+                break
+            if out_of_time():
+                warn("time cap reached - stopped sniffing codecs (%d done)" % sn)
+                break
+            u = m.get("url") or ""
+            if m.get("codec") or m.get("kind") not in ("video", "audio", "ts", "dash"):
+                continue
+            if ".m3u8" in u or u.split("?")[0].endswith((".mpd", ".ts")):
+                continue
+            c, k, total = sniff_codec(u, final_url)
+            sn += 1
+            if not c:
+                continue
+            m["codec"] = c
+            m["codec_name"] = CODEC_NAMES.get(c, c.upper())
+            m["picky"] = c in PICKY_CODECS
+            if k:
+                m["kind"] = k
+            if total > 0 and not m.get("size"):
+                m["size"] = total
+            snif.append("%s=%s" % (os.path.basename(u.split("?")[0])[:28], m["codec_name"]))
+        if snif:
+            warn("sniffed codecs: %s" % ", ".join(snif))
+        # the same track often arrives via several CDN hosts; once the size is
+        # known, identical (name, size) is the same file
+        _seen, _kept = set(), []
+        for m in media:
+            k = (os.path.basename(m.get("url", "").split("?")[0]), m.get("size") or 0)
+            if k[1] > 0:
+                if k in _seen:
+                    continue
+                _seen.add(k)
+            _kept.append(m)
+        media = _kept
+        media.sort(key=lambda x: ({"hls": 0, "dash": 1, "ts": 2, "video": 3, "audio": 4,
+                                   "flash": 5, "subtitle": 6, "image": 7}.get(x.get("kind"), 9),
+                                  x.get("url", "")))
+        _step("sniff codecs")
+        if out_of_time():
+            warn("⏱ time cap reached - returning what has been collected so far "
+                 "(%.0fs)" % (time.time() - JOB_START))
+
+        # ---- screenshot ----
+        shot = {"path": "", "b64": "", "bytes": 0, "error": ""}
+        want_shot = bool(opt.get("screenshot") or opt.get("shot")) and not opt.get("no-shot")
+        if want_shot:
+            progress_phase("screenshot", step="screenshot")
+            try:
+                if opt.get("full"):
+                    el = driver.find_element("tag name", "body")
+                    png = el.screenshot_as_png
+                else:
+                    png = driver.get_screenshot_as_png()
+                with open(shot_path, "wb") as f:
+                    f.write(png)
+                shot["path"] = shot_path
+                shot["name"] = os.path.basename(shot_path)
+                shot["bytes"] = len(png)
+                # the picture travels to the browser in `filedata` chunks, never
+                # in one reply; keep the base64 only for command line use
+                if not PROGRESS_PATH:
+                    shot["b64"] = base64.b64encode(png).decode("ascii")
+            except Exception as e:
+                shot["error"] = str(e).splitlines()[0]
+
+        # full text (small) always; the rendered HTML ONLY when it was actually
+        # asked for - this app is a URL extractor, and a 1.5 MB page_source has
+        # no business appearing in /tmp unless the user ticked "HTML source"
+        try:
+            with open(TEXT_FILE, "w") as f:
+                f.write(text)
+            if opt.get("html") and html:
+                with open(HTML_FILE, "w") as f:
+                    f.write(html)
+        except OSError as e:
+            warn("cannot write the text/html files: %s" % e)
+        _step("write files")
+
+        res = {
+            "url": final_url,
+            "title": title,
+            "text": text[:TEXT_CAP],
+            "text_len": len(text),
+            "html_len": len(html),
+            "shot": shot,
+            "media": media,
+            "media_count": len(media),
+        "api_calls": [u for _i, u, _m in api_request_ids(logs, 12)],
+            "hdrs": hdr_sets,
+            "elapsed": round(time.time() - t0, 1),
+        }
+        # a /sound page of a VIP episode cannot play at all in an automated
+        # browser (the site sabotages it); the same episode in its ALBUM page does
+        # play - so hand the user that URL instead of silence
+        if not page_notice:
+            kinds = {m.get("kind") for m in media}
+            if not (kinds & {"audio", "video", "hls", "ts"}) and "/sound/" in (res.get("url") or ""):
+                ma = re.search(r"/album/(\d{4,})", html or "")
+                if ma:
+                    page_notice = ("This episode does not play on its own page (the site blocks that). "
+                                   "It belongs to the album %s - grab the album page instead, and tick "
+                                   "'Walk every episode' to press each one.")
+                    page_notice_args = ["https://www.ximalaya.com/album/%s" % ma.group(1)]
+                    warn("sound page without audio -> album page: %s" % page_notice_args[0])
+
+        if page_notice:
+            res["notice"] = page_notice
+            res["notice_args"] = page_notice_args
+        if canvas_note:
+            res["notice"] = canvas_note
+            res["notice_args"] = canvas_note_args
+        # if the site redirected us, say so - a title/text from a different page
+        # otherwise looks like a parser bug
+        try:
+            req = urllib.parse.urlparse(url)
+            fin = urllib.parse.urlparse(final_url)
+            if fin.netloc and (fin.netloc != req.netloc or fin.path.rstrip("/") != req.path.rstrip("/")):
+                res["notice"] = "The page redirected to %s - the data below belongs to that page"
+                res["notice_args"] = [final_url]
+        except Exception:
+            pass
+        if opt.get("html"):
+            res["html_saved"] = True
+            if len(html) > HTML_CAP:
+                res["html"] = html[:HTML_CAP]
+                res["html_truncated"] = True
+            else:
+                res["html"] = html
+        if PROGRESS_PATH:
+            # started by `start` (the web UI): publish a REDUCED result, because
+            # the whole thing (base64 screenshot + 800 KB of HTML) does not fit
+            # in a ubus reply
+            progress_write(PROGRESS_PATH, {
+                "state": "done", "phase": "done", "url": res["url"],
+                "elapsed": round(time.time() - JOB_START, 1),
+                "result_ready": True, "result": ui_payload(res)})
+            ok({"state": "done", "url": res["url"], "media_count": res["media_count"],
+                "elapsed": res["elapsed"]})
+        ok(res)
+    except SystemExit:
+        raise
+    except Exception as e:
+        first = str(e).splitlines()[0] if str(e) else str(e)
+        if out_of_time():
+            # a page whose own JS wedges the renderer (v.qq.com) can never be
+            # scraped in a headless browser; say so plainly instead of looking
+            # like it is still working
+            die("Time cap reached (%ss): the page kept the browser busy and could not be "
+                "read. The grab was stopped and the browser cleaned up. Raise --max-total "
+                "to wait longer, or use a lighter page.", str(int(JOB_START and _DEADLINE[0] - JOB_START)))
+        die("Grab failed: %s", first)
+    finally:
+        try:
+            if _wd is not None:
+                _wd.cancel()
+        except Exception:
+            pass
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        # 🔴 whatever happened (timeout, exception, kill), never leave a browser
+        # tree behind - orphaned chromes are what made the board unusable
+        kill_browser_tree()
+        # lock is None when started by `start` (the parent already holds the
+        # flock and handed us its descriptor) - os.close(None) raises TypeError,
+        # not OSError, so it must not be attempted at all.
+        if lock is not None:
+            try:
+                os.close(lock)
+            except OSError:
+                pass
+
+
+# --------------------------------------------------------------------------
+# mediaprobe  (headers + HLS/DASH playlist details)
+# --------------------------------------------------------------------------
+
+def http_open(url, method="GET", extra=None, timeout=20, max_bytes=None, referer=None):
+    req = urllib.request.Request(url, method=method)
+    req.add_header("User-Agent", UA)
+    req.add_header("Accept", "*/*")
+    # a media CDN almost always wants the *page's* Referer: the very same URL
+    # answers 403 without it and 206 video/mp4 with it (measured on bilibili)
+    if referer:
+        req.add_header("Referer", referer)
+    for k, v in (extra or {}).items():
+        req.add_header(k, v)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def parse_m3u8(body, base_url):
+    out = {"variants": [], "segments": 0, "first_segments": [],
+           "duration": 0.0, "encryption": "", "live": False, "type": "unknown"}
+    lines = [l.strip() for l in body.splitlines()]
+    segs = []
+    pending = {}
+    for i, l in enumerate(lines):
+        if l.startswith("#EXT-X-STREAM-INF:"):
+            attrs = l.split(":", 1)[1]
+            d = {}
+            for part in attrs.split(","):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    d[k.strip()] = v.strip().strip('"')
+            pending = d
+        elif l.startswith("#EXT-X-MEDIA:") and "URI=" in l:
+            m = re.search(r'URI="([^"]+)"', l)
+            if m:
+                out["variants"].append({"uri": urllib.parse.urljoin(base_url, m.group(1)),
+                                        "bandwidth": "", "resolution": "audio"})
+        elif l.startswith("#EXTINF:"):
+            try:
+                out["duration"] += float(l[8:].split(",")[0])
+            except ValueError:
+                pass
+        elif l.startswith("#EXT-X-KEY:"):
+            m = re.search(r'METHOD=([^,]+)', l)
+            meth = m.group(1) if m else ""
+            mu = re.search(r'URI="([^"]+)"', l)
+            if meth and meth != "NONE":
+                out["encryption"] = meth + (" " + urllib.parse.urljoin(base_url, mu.group(1))
+                                            if mu else "")
+        elif l and not l.startswith("#"):
+            u = urllib.parse.urljoin(base_url, l)
+            if pending:
+                out["type"] = "master"
+                out["variants"].append({
+                    "uri": u,
+                    "bandwidth": pending.get("BANDWIDTH", ""),
+                    "resolution": pending.get("RESOLUTION", "")})
+                pending = {}
+            else:
+                out["type"] = "media"
+                segs.append(u)
+    if not lines or "#EXTM3U" not in lines[0]:
+        out["type"] = "unknown"
+    if out["type"] == "master" and not out["variants"]:
+        out["type"] = "unknown"
+    out["segments"] = len(segs)
+    out["first_segments"] = segs[:12]
+    if "#EXT-X-ENDLIST" not in body:
+        out["live"] = True
+    return out
+
+
+# ---------------------------------------------------------------- codecs ---
+# A DASH track that the network log calls "video/mp4" is very often NOT video:
+# bilibili serves its AAC as ...-1-30216.m4s, and its video as AV1 (av01), which
+# most phones/set-top boxes/older VLC cannot decode at all.  Reading the first
+# bytes of the file is the only reliable way to say what a URL really is.
+AUDIO_FOURCC = ("mp4a", "opus", "flac", "ac-3", "ec-3", "mp3", "vorbis", "alac", "dtsc")
+VIDEO_FOURCC = ("avc1", "avc3", "hev1", "hvc1", "av01", "vp09", "vp08", "dvhe", "dvh1")
+CODEC_NAMES = {"avc1": "H.264", "avc3": "H.264", "hev1": "HEVC", "hvc1": "HEVC",
+               "av01": "AV1", "vp09": "VP9", "vp08": "VP8", "dvhe": "Dolby Vision",
+               "dvh1": "Dolby Vision", "mp4a": "AAC", "opus": "Opus", "flac": "FLAC",
+               "ac-3": "AC-3", "ec-3": "E-AC-3", "mp3": "MP3", "vorbis": "Vorbis",
+               "alac": "ALAC", "dtsc": "DTS"}
+# codecs a plain player (phone / TV box / old VLC) usually chokes on
+PICKY_CODECS = ("av01", "hev1", "hvc1", "vp09", "vp08", "dvhe", "dvh1", "opus", "flac")
+CODEC_PREFER_JS = r"""
+(function () {
+  try {
+    /* A player picks its stream from what the browser claims to support.
+       Headless Chrome 154 does AV1, so bilibili hands it AV1 tracks that most
+       phones/set-top boxes/VLC builds cannot decode.  Reporting no support for
+       AV1/HEVC/Dolby makes the site serve H.264 (avc1) instead. */
+    var bad = /av01|hev1|hvc1|dvh1|dvhe|vp09/i;
+    var ms = window.MediaSource;
+    if (ms && ms.isTypeSupported) {
+      var o = ms.isTypeSupported.bind(ms);
+      ms.isTypeSupported = function (t) { return bad.test(String(t)) ? false : o(t); };
+    }
+    var c = HTMLMediaElement.prototype.canPlayType;
+    HTMLMediaElement.prototype.canPlayType = function (t) {
+      return bad.test(String(t)) ? '' : c.call(this, t);
+    };
+  } catch (e) {}
+})();
+"""
+
+CLICK_JS = r"""
+var sel = arguments[0];
+function byXPath(s, root) {
+  try {
+    var r = (root || document).evaluate(s, (root || document), null,
+              XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+    if (r && r.singleNodeValue) return r.singleNodeValue;
+  } catch (e) {}
+  return null;
+}
+function deepQuery(s) {
+  /* 🔴 an XPath (DevTools: right click -> Copy full XPath) as well: the play
+     button of ximalaya's player is a bare <i> with no class at all, so no CSS
+     pattern can find it - only its position (/html/.../xm-player/div/i) can. */
+  if (String(s).charAt(0) === '/') {
+    var xe = byXPath(s, document);
+    if (xe) return xe;
+    var rts = [];
+    (function collect2(node) {
+      try {
+        var all = node.querySelectorAll('*');
+        for (var i = 0; i < all.length; i++) {
+          if (all[i].shadowRoot) { rts.push(all[i].shadowRoot); collect2(all[i].shadowRoot); }
+        }
+      } catch (e) {}
+    })(document);
+    for (var z = 0; z < rts.length; z++) {
+      var x2 = byXPath(s, rts[z]);
+      if (x2) return x2;
+    }
+    return null;
+  }
+  try { var r = document.querySelector(s); if (r) return r; } catch (e) {}
+  var roots = [];
+  (function collect(node) {
+    try {
+      var all = node.querySelectorAll('*');
+      for (var i = 0; i < all.length; i++) {
+        if (all[i].shadowRoot) { roots.push(all[i].shadowRoot); collect(all[i].shadowRoot); }
+      }
+    } catch (e) {}
+  })(document);
+  for (var i = 0; i < roots.length; i++) {
+    try { var e1 = roots[i].querySelector(s); if (e1) return e1; } catch (e) {}
+  }
+  /* a selector copied out of DevTools pierces shadow roots, so it will never
+     resolve against document - retry with the last step of the path instead */
+  var last = String(s).split('>').pop().trim();
+  for (var j = 0; j < roots.length; j++) {
+    try { var e2 = roots[j].querySelector(last); if (e2) return e2; } catch (e) {}
+  }
+  try { var e3 = document.querySelector(last); if (e3) return e3; } catch (e) {}
+  return null;
+}
+var el = deepQuery(sel);
+if (!el) return { ok: false, why: 'not found' };
+try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
+var r = el.getBoundingClientRect();
+var lbl = (el.tagName + ' ' + (el.className || '')).slice(0, 60);
+var m = el.querySelector ? el.querySelector('audio,video') : null;
+if (m) { try { m.muted = true; m.play(); } catch (e) {} }
+/* 🔴 click it through JS as well: a JS click works even when the element has no
+   box (0x0, below the fold, inside a re-rendered list) - the working ximalaya
+   script clicks its episode play icons exactly this way */
+
+/* 🔴 resolution-independent pressing.  A click at (x,y) breaks the moment the
+   window size, zoom, scroll or layout changes; pressing the ELEMENT does not.
+   el.click() alone is ignored by some controls, so a full mouse sequence is
+   dispatched on the element as well. */
+function press(el) {
+  if (!el) return '';
+  var r = null;
+  try { r = el.getBoundingClientRect(); } catch (e) {}
+  var x = r ? r.left + Math.max(1, r.width) / 2 : 1;
+  var y = r ? r.top + Math.max(1, r.height) / 2 : 1;
+  var opts = { bubbles: true, cancelable: true, composed: true, view: window,
+               clientX: x, clientY: y, screenX: x, screenY: y, button: 0, buttons: 1 };
+  try { el.click(); } catch (e) {}
+  var seq = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+  for (var i = 0; i < seq.length; i++) {
+    try {
+      var t = seq[i];
+      var ev = (t.indexOf('pointer') === 0 && window.PointerEvent)
+        ? new PointerEvent(t, opts) : new MouseEvent(t, opts);
+      el.dispatchEvent(ev);
+    } catch (e) {}
+  }
+  return (el.tagName || '').toLowerCase() + '.' + (typeof el.className === 'string' ? el.className : '');
+}
+var jsok = !!press(el);
+/* the caller ALSO sends a real (trusted) mouse click - but only when the
+   coordinates mean something (a 0x0 rect would land at the screen corner) */
+var hit = false;
+try {
+  var top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+  hit = !!(top && (top === el || el.contains(top) || top.contains(el)));
+} catch (e) {}
+return { ok: true, tag: lbl, x: r.left + r.width / 2, y: r.top + r.height / 2,
+         w: r.width, h: r.height, js: jsok, hit: hit };
+"""
+
+WAKE_JS = r"""
+/* arguments[0]: -1 -> just report (start every media element, list candidates)
+                 >=0 -> scroll candidate #n into view and return its coordinates */
+var idx = arguments[0];
+var out = { played: [], media: 0, n: 0, tag: '', x: null, y: null };
+function cls(e) {
+  var c = e.className;
+  if (c && c.baseVal !== undefined) c = c.baseVal;
+  return (typeof c === 'string') ? c : '';
+}
+/* 🔴 ONE traversal that collects the shadow roots, reused by every selector.
+   Rescanning the whole document per pattern (16 of them) cost minutes on a big
+   page like v.qq.com; this is a single pass with a hard node budget. */
+var _roots = [];
+(function collectRoots(node, depth) {
+  if (depth > 6 || _roots.length > 200) return;
+  try {
+    var all = node.querySelectorAll('*');
+    var cap = Math.min(all.length, 12000);
+    for (var i = 0; i < cap; i++) {
+      var sr = all[i].shadowRoot;
+      if (sr) { _roots.push(sr); collectRoots(sr, depth + 1); }
+    }
+  } catch (e) {}
+})(document, 0);
+function walk(sel, root, acc) {
+  acc = acc || [];
+  var scopes = [root || document];
+  for (var r = 0; r < _roots.length; r++) scopes.push(_roots[r]);
+  for (var s2 = 0; s2 < scopes.length; s2++) {
+    try {
+      var l = scopes[s2].querySelectorAll(sel);
+      for (var i = 0; i < l.length && i < 200; i++) acc.push(l[i]);
+    } catch (e) {}
+  }
+  return acc;
+}
+function escapes(e) {
+  var n = e, hops = 0;
+  while (n && hops < 4) {
+    if (n.tagName && n.tagName.toLowerCase() === 'a') {
+      var h = n.getAttribute('href') || '';
+      if (!h || h.charAt(0) === '#' || h.indexOf('javascript:') === 0) return false;
+      try {
+        var u = new URL(h, location.href);
+        var same = (u.host === location.host && u.pathname === location.pathname);
+        return !same;          /* a link to another path navigates away */
+      } catch (err) { return false; }
+    }
+    n = n.parentElement;
+    hops++;
+  }
+  return false;
+}
+function size(e) {
+  if (!e) return null;
+  var r = e.getBoundingClientRect();
+  /* ximalaya has ten 0x0 <xm-player> placeholders - an empty custom element is
+     not a button, ignore anything that tiny */
+  if (r.width < 8 || r.height < 8) return null;
+  return r;
+}
+var med = walk('audio,video', document);
+out.media = med.length;
+for (var i = 0; i < med.length; i++) {
+  try {
+    med[i].muted = true;
+    var pr = med[i].play();
+    if (pr && pr.catch) pr.catch(function () {});
+    out.played.push(med[i].tagName.toLowerCase());
+  } catch (e) {}
+}
+var pats = ['a.play', '.play', 'xm-player i', 'xm-player div i', 'xm-player > div > i',
+            '[class*="playIcon"]', '[class*="album_btn_play"]',
+            '[class*="web_album"]', '[class*="btn_play"]', '[class*="btn-play"]',
+            '[class*="play-btn"]', '[class*="play_big"]', '[class*="play-icon"]',
+            '[class*="icon-play"]', '[class*="play-layer"]', '.play-button',
+            '[aria-label*="\u64ad\u653e"]', '[title*="\u64ad\u653e"]',
+            '[aria-label*="Play"]', '[title*="Play"]'];
+var seen = [], ranked = [];
+for (var k = 0; k < pats.length; k++) {
+  var els = walk(pats[k], document);
+  for (var n = 0; n < els.length && n < 8; n++) {
+    var e = els[n];
+    if (seen.indexOf(e) >= 0) continue;
+    var r = size(e);
+    /* 🔴 a play control with NO box (0x0, below the fold, in a re-rendered list)
+       is still a play control: ximalaya's episode icon is exactly that and only a
+       JS click ever does anything on it.  Keep it, without coordinates. */
+    var nobox = !r;
+    seen.push(e);
+    /* 🔴 A play-LOOKING element that is really a link to another page (album
+       covers: <a href="/album/..."><div class="album-play-layer">) must never be
+       clicked - clicking it navigates away and the whole grab then describes a
+       different page (this is exactly what produced "页面数据都是错的"). */
+    if (escapes(e)) continue;
+    ranked.push({ e: e, area: r ? r.width * r.height : 0,
+                  tag: (e.tagName.toLowerCase() + '.' + cls(e)).slice(0, 40),
+                  cx: r ? (r.left + r.width / 2) : 0, cy: r ? (r.top + r.height / 2) : 0,
+                  nobox: nobox });
+  }
+}
+/* the button that belongs to the player is the one closest to the media
+   element; on ximalaya the biggest candidate is an album-cover link that only
+   navigates away */
+var mv = med.length ? med[0] : document.querySelector('video,audio');
+if (mv) {
+  var mr = mv.getBoundingClientRect();
+  var mx = mr.left + mr.width / 2, my = mr.top + mr.height / 2;
+  for (var q = 0; q < ranked.length; q++) {
+    ranked[q].d = Math.sqrt(Math.pow(ranked[q].cx - mx, 2) + Math.pow(ranked[q].cy - my, 2));
+    /* a no-box play control first: it is the one ximalaya wants clicked, and the
+       function has no coordinates so the caller must use the JS click */
+    if (ranked[q].nobox) ranked[q].d = -1;
+  }
+  ranked.sort(function (x, y) { return (x.d - y.d) || (y.area - x.area); });
+} else {
+  ranked.sort(function (x, y) { return y.area - x.area; });
+}
+out.n = ranked.length;
+if (idx >= 0 && idx < ranked.length) {
+  var t = ranked[idx];
+  try { t.e.scrollIntoView({ block: 'center' }); } catch (e) {}
+  var r2 = t.e.getBoundingClientRect();
+  out.tag = t.tag;
+  /* null = "no usable box": the caller falls back to the JS click instead of
+     firing a mouse click at the screen corner */
+  out.x = (r2.width >= 4 && r2.height >= 4) ? (r2.left + r2.width / 2) : null;
+  out.y = (r2.height >= 4) ? (r2.top + r2.height / 2) : null;
+  /* 🔴 never fire a coordinate click blindly: if the element under that point is
+     not this candidate (layout moved, resolution changed, an overlay is in the
+     way) the click would land on something else - just skip the mouse click and
+     rely on the element-level press */
+  try { t.e.setAttribute('data-cg-click', '1'); } catch (e) {}
+  out.hit = false;
+  if (out.x !== null && out.y !== null) {
+    try {
+      var top = document.elementFromPoint(out.x, out.y);
+      out.hit = !!(top && (top === t.e || t.e.contains(top) || top.contains(t.e)));
+    } catch (e) {}
+  }
+}
+return out;
+"""
+
+# 🔴 Document sites (doc88, 百度文库, many 文库/文档站) do NOT give you a URL for
+# the page content: the page is painted onto a <canvas>.  There is nothing to
+# parse - but the canvas itself can be exported to PNG, and that IS the data.
+CANVAS_LIST_JS = r"""
+var out = [];
+var cs = document.querySelectorAll('canvas');
+for (var i = 0; i < cs.length; i++) {
+  var r = cs[i].getBoundingClientRect();
+  if (r.width >= 200 && r.height >= 200) {
+    out.push({ i: i, w: Math.round(r.width), h: Math.round(r.height),
+               id: String(cs[i].id || ''), cls: String(cs[i].className || '') });
+  }
+}
+return out;
+"""
+
+CANVAS_SHOT_JS = r"""
+var cs = document.querySelectorAll('canvas');
+var i = arguments[0];
+if (i < 0 || i >= cs.length) return '';
+try {
+  return cs[i].toDataURL('image/png');
+} catch (e) {
+  return 'ERR ' + (e && e.name ? e.name : 'error');
+}
+"""
+
+# 🔴 Login walls: douyin & friends pop a passport/modal overlay over the player and
+# nothing plays (and no media is requested) until it is dismissed.  Detect the
+# overlay, then click the small "close" control inside it - or, when the site does
+# not have one, send Escape (the conventional way out of a modal).
+# 🔴 抖音专用：它每次打开都弹登录框，不关掉播放器根本不会加载（用户实测确认）。
+# 通用启发式在它上面失效（点了 div.arXOQVuK 框还在 ✗），所以先跑这组针对性选择器。
+DOUYIN_CLOSE_JS = r"""
+var out = { tried: [], big: 0, gone: false, cleared: [] };
+function cgCls(e) { var c = e.className; if (c && c.baseVal !== undefined) c = c.baseVal;
+  return (typeof c === 'string') ? c : ''; }
+function cgPress(e) {
+  try { e.scrollIntoView({ block: 'center' }); } catch (x) {}
+  try { e.click(); } catch (x) {}
+  try { var r = e.getBoundingClientRect();
+    e.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window,
+      clientX: r.x + r.width / 2, clientY: r.y + r.height / 2 })); } catch (x) {}
+}
+var sels = ['[data-e2e="modal-close"]', '[data-e2e="close"]', '.dy-account-close',
+            '[aria-label="关闭"]', '[aria-label="Close"]', '[aria-label="close"]',
+            '[class*="account-close"]', '[class*="modal"] [class*="close"]',
+            '[class*="Close"]', '[class*="close"]'];
+for (var i = 0; i < sels.length && out.tried.length < 6; i++) {
+  var els; try { els = document.querySelectorAll(sels[i]); } catch (x) { continue; }
+  for (var j = 0; j < els.length && out.tried.length < 6; j++) {
+    var e = els[j], r = e.getBoundingClientRect();
+    if (r.width * r.height <= 0 || r.width > 140 || r.height > 140) continue;   /* 关闭控件一定很小 */
+    cgPress(e);
+    out.tried.push(sels[i] + '=' + (cgCls(e) || e.tagName).slice(0, 24));
+  }
+}
+var all = document.querySelectorAll('*');
+for (var i = 0; i < all.length; i++) {
+  var e = all[i], cs = getComputedStyle(e), r = e.getBoundingClientRect();
+  if (cs.position === 'fixed' && r.width > 600 && r.height > 400 && parseInt(cs.zIndex || 0) > 50) {
+    out.big++;
+    if (cgCls(e)) out.cleared.push(cgCls(e).slice(0, 30));
+  }
+}
+out.gone = (out.big === 0);
+return out;
+"""
+
+CLOSE_JS = r"""
+/* Find a login wall and the click that dismisses it.
+   Douyin (and many others) do not use "modal"/"login" in their class names, so
+   the dialog is recognised by shape + content instead: a big box that is roughly
+   centred on the screen, is the top-most thing at its own centre, and whose text
+   talks about logging in. */
+var out = { overlay: '', pct: 0, cands: [], html: '', box: '' };
+function cls(e) {
+  var c = e.className;
+  if (c && c.baseVal !== undefined) c = c.baseVal;
+  return (typeof c === 'string') ? c : '';
+}
+function grabHtml(e) {
+  try {
+    if (!e) return;
+    var h = e.outerHTML || '';
+    if (h.length > 20000) h = h.slice(0, 20000) + '<!--truncated-->';
+    out.html = h;
+    var r = e.getBoundingClientRect();
+    out.box = [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)].join(',');
+  } catch (x) {}
+}
+function desc(e) {
+  return (cls(e) + ' ' + (e.id || '') + ' ' +
+          (e.getAttribute ? (e.getAttribute('aria-label') || e.getAttribute('title') || '') : '')).toLowerCase();
+}
+function box(e) {
+  if (!e) return null;
+  try {
+    var r = e.getBoundingClientRect();
+    if (r.width < 24 || r.height < 24) return null;
+    if (getComputedStyle(e).visibility === 'hidden' || getComputedStyle(e).display === 'none') return null;
+    return r;
+  } catch (err) { return null; }
+}
+var vw = window.innerWidth, vh = window.innerHeight, sarea = vw * vh;
+var LOGIN = ['\u767b\u5f55', '\u626b\u7801', '\u5bc6\u7801', '\u624b\u673a\u53f7',
+             '\u9a8c\u8bc1\u7801', 'login', 'sign in', 'signin', 'passport'];
+var best = null, bestR = null, bestArea = 1e18;
+var all = document.querySelectorAll('div,section,aside,form,article');
+for (var i = 0; i < all.length && i < 5000; i++) {
+  var e = all[i], r = box(e);
+  if (!r) continue;
+  if (r.width < vw * 0.15 || r.height < vh * 0.12) continue;
+  var a = r.width * r.height;
+  if (a < sarea * 0.05) continue;                     /* ignore small popups */
+  var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  if (Math.abs(cx - vw / 2) > vw * 0.25) continue;    /* must be centred */
+  if (Math.abs(cy - vh / 2) > vh * 0.32) continue;
+  var top = null;
+  try { top = document.elementFromPoint(Math.round(cx), Math.round(cy)); } catch (err2) {}
+  if (!top || !(e === top || e.contains(top))) continue;   /* must be on top */
+  var txt = desc(e);
+  try { txt += ' ' + String(e.innerText || '').slice(0, 600).toLowerCase(); } catch (err3) {}
+  var isLogin = false;
+  for (var k = 0; k < LOGIN.length; k++) if (txt.indexOf(LOGIN[k]) >= 0) { isLogin = true; break; }
+  if (!isLogin) continue;
+  if (a < bestArea) { bestArea = a; best = e; bestR = r; }   /* innermost such box */
+}
+
+/* 🔴 resolution-independent pressing.  A click at (x,y) breaks the moment the
+   window size, zoom, scroll or layout changes; pressing the ELEMENT does not.
+   el.click() alone is ignored by some controls, so a full mouse sequence is
+   dispatched on the element as well. */
+function press(el) {
+  if (!el) return '';
+  var r = null;
+  try { r = el.getBoundingClientRect(); } catch (e) {}
+  var x = r ? r.left + Math.max(1, r.width) / 2 : 1;
+  var y = r ? r.top + Math.max(1, r.height) / 2 : 1;
+  var opts = { bubbles: true, cancelable: true, composed: true, view: window,
+               clientX: x, clientY: y, screenX: x, screenY: y, button: 0, buttons: 1 };
+  try { el.click(); } catch (e) {}
+  var seq = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+  for (var i = 0; i < seq.length; i++) {
+    try {
+      var t = seq[i];
+      var ev = (t.indexOf('pointer') === 0 && window.PointerEvent)
+        ? new PointerEvent(t, opts) : new MouseEvent(t, opts);
+      el.dispatchEvent(ev);
+    } catch (e) {}
+  }
+  return (el.tagName || '').toLowerCase() + '.' + (typeof el.className === 'string' ? el.className : '');
+}
+if (best) {
+  out.overlay = (cls(best) || best.id || 'dialog').slice(0, 40);
+  grabHtml(best);   /* 把真实 HTML 带回去，供针对该站写关闭选择器 */
+  out.pct = Math.round(bestArea / sarea * 100);
+  var CL = ['close', 'clos', '\u5173\u95ed', 'icon-close', 'btn-close', 'cancel', 'guanbi'];
+  var small = [], scope = best.querySelectorAll('*');
+  for (var j = 0; j < scope.length && j < 4000; j++) {
+    var c = scope[j], cr = box(c);
+    if (!cr) continue;
+    if (cr.width > 64 || cr.height > 64) continue;     /* a close control is small */
+    var cd = desc(c), pat = false;
+    for (var m = 0; m < CL.length; m++) if (cd.indexOf(CL[m]) >= 0) { pat = true; break; }
+    var d = Math.abs(cr.right - bestR.right) + Math.abs(cr.top - bestR.top);
+    if (!pat && d > 160) continue;                     /* else it is not the X */
+    small.push({ r: cr, pat: pat, d: d,
+                 tag: (c.tagName.toLowerCase() + '.' + cls(c)).slice(0, 34) });
+  }
+  small.sort(function (x, y) { return (y.pat - x.pat) || (x.d - y.d); });
+  var cds = [];
+  for (var n = 0; n < small.length && n < 3; n++) {
+    cds.push(small[n]);
+    out.cands.push({ tag: small[n].tag, x: small[n].r.left + small[n].r.width / 2,
+                     y: small[n].r.top + small[n].r.height / 2 });
+  }
+  /* mode: arguments[0] = candidate index -> press it (element level, no
+     coordinates) and report; the caller re-scans the overlay afterwards */
+  var pick = arguments[0];
+  if (typeof pick === 'number' && pick >= 0) {
+    if (pick < cds.length) return { pressed: press(cds[pick].e), tag: cds[pick].tag };
+    return { pressed: '', tag: '' };
+  }
+}
+return out;
+"""
+
+SNIFF_BYTES = 131072      # how much of a file we read to find its codec
+SNIFF_MAX = 4             # up to how many streams per grab (each one is a probe)
+
+# 🔴 A grab must ALWAYS finish.  Some pages (v.qq.com and friends) keep loading
+# forever - endless autoplay/scroll feeds - and a CN CDN can leave a probe socket
+# hanging for its whole timeout, so "a bit slow" turns into "never returns".
+# Every risky phase checks this deadline (set by cmd_grab) and bails out with what
+# it already has.
+_DEADLINE = [0.0]
+
+
+def kill_browser_tree(why=""):
+    """SIGKILL the chromedriver/chrome processes of a grab.
+
+    🔴 The last resort that makes "it never stops" impossible: a page whose own JS
+    loops forever (v.qq.com) can wedge the renderer so hard that neither
+    set_page_load_timeout nor set_script_timeout ever returns, and killing only the
+    python process leaves the whole browser tree running (which is how orphans
+    piled up and the board reached load 9).  Killing the tree unblocks whatever
+    call is waiting on it.
+    """
+    import signal
+    n = 0
+    victims = []
+    try:
+        for d in glob.glob("/proc/[0-9]*"):
+            pid = int(d.split("/")[-1])
+            try:
+                with open(d + "/cmdline", "rb") as f:
+                    cl = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+            except OSError:
+                continue
+            if ("chrome-headless-shell" in cl or "chromedriver" in cl
+                    or "/opt/chrome/chrome" in cl):
+                victims.append(pid)
+    except Exception:
+        pass
+    for pid in victims:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            n += 1
+        except OSError:
+            pass
+    if n:
+        warn("killed %d browser process(es)%s" % (n, (" - " + why) if why else ""))
+    return n
+
+
+def time_left():
+    d = _DEADLINE[0]
+    return 1e9 if not d else (d - time.time())
+
+
+def out_of_time():
+    return time_left() <= 0
+
+
+# ---------------------------------------------------------------------------
+# v.qq.com: the site's OWN API instead of the browser.
+#
+# Measured: a plain HTTP call returns the quality list, the CDN directory, the
+# file stem (fn) and vt in about a second, and getkey (with the NUMERIC quality
+# id as "format") returns the vkey - while the headless browser wedges on that
+# page (its player saturates the renderer, so nothing is ever requested).
+# One getinfo + one getkey per grab: the API is rate limited (a burst of calls
+# answers em=60), so no retries.
+# ---------------------------------------------------------------------------
+QQ_URL_RE = re.compile(r"^https?://[^/]*v\.qq\.com/", re.I)
+QQ_VID_RE = re.compile(r"/([A-Za-z0-9_]{8,})\.html|[?&](?:vid|vids)=([A-Za-z0-9_]{8,})")
+
+
+
+def mp4_duration(url, hdrs, head_bytes=700000):
+    """(seconds, total_bytes) read straight from the file: Content-Range gives the
+    size, the moov/mvhd box gives the real duration.  Zero guessing."""
+    import struct
+    try:
+        req = urllib.request.Request(url)
+        for k, v in (hdrs or {}).items():
+            req.add_header(k, v)
+        req.add_header("Range", "bytes=0-%d" % (head_bytes - 1))
+        r = urllib.request.urlopen(req, timeout=20)
+        buf = r.read(head_bytes)
+        hdr = dict(r.headers)
+    except Exception:
+        return 0.0, 0
+    total = 0
+    m = re.search(r"/(\d+)\s*$", hdr.get("Content-Range") or "")
+    if m:
+        total = int(m.group(1))
+    try:
+        off, end = 0, len(buf)
+        while off + 8 <= end:
+            size = struct.unpack(">I", buf[off:off + 4])[0]
+            typ = buf[off + 4:off + 8].decode("latin1", "replace")
+            if size < 8:
+                break
+            if typ == "moov":
+                o2, e2 = off + 8, min(off + size, end)
+                while o2 + 8 <= e2:
+                    s2 = struct.unpack(">I", buf[o2:o2 + 4])[0]
+                    t2 = buf[o2 + 4:o2 + 8].decode("latin1", "replace")
+                    if s2 < 8:
+                        break
+                    if t2 == "mvhd":
+                        ver = buf[o2 + 8]
+                        pp = o2 + 12
+                        if ver == 1:
+                            ts = struct.unpack(">I", buf[pp + 16:pp + 20])[0]
+                            du = struct.unpack(">Q", buf[pp + 20:pp + 28])[0]
+                        else:
+                            ts = struct.unpack(">I", buf[pp + 8:pp + 12])[0]
+                            du = struct.unpack(">I", buf[pp + 12:pp + 16])[0]
+                        return (du / float(ts or 1)), total
+                    o2 += s2
+            off += size
+    except Exception:
+        pass
+    return 0.0, total
+
+
+def tencent_probe(url, cookie="", warn=None, timeout=12):
+    """(media_items, note) - pure HTTP, no browser."""
+    items, note = [], ""
+    m = QQ_VID_RE.search(url)
+    vid = ""
+    if m:
+        vid = next((g for g in m.groups() if g), "")
+    if not vid:
+        return items, "no vid in the URL"
+    guid = "%032x" % random.getrandbits(128)
+    hdrs = {"Referer": "https://v.qq.com/", "User-Agent": UA}
+    if cookie:
+        hdrs["Cookie"] = cookie
+    # ask for the BEST quality the API is willing to give (it tells us the list)
+    _order = ("fhd", "shd", "hd", "sd")
+    _defn = "shd"
+    q = ("https://vv.video.qq.com/getinfo?vids=%s&platform=101001&charge=0&otype=json"
+         "&defn=shd&defaultfmt=auto&defnpayver=1&sdtfrom=v1010&guid=%s" % (vid, guid))
+    try:
+        raw = http_open(q, "GET", timeout=timeout, extra=hdrs).read()
+    except Exception as e:
+        return items, "getinfo failed: %s" % str(e).splitlines()[0][:70]
+    body = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+    jm = re.search(r"=\s*(\{.*\})\s*;?\s*$", body.strip(), re.S)
+    if not jm:
+        jm = re.search(r"(\{.*\})", body.strip(), re.S)
+    if not jm:
+        return items, "getinfo: unparsable answer"
+    try:
+        j = json.loads(jm.group(1))
+    except ValueError:
+        return items, "getinfo: bad json"
+    if str(j.get("s") or "").lower() == "f" or j.get("em"):
+        return items, "getinfo refused (em=%s exem=%s msg=%s)" % (
+            j.get("em"), j.get("exem"), str(j.get("msg") or "")[:60])
+    quals = [f for f in ((j.get("fl") or {}).get("fi") or []) if isinstance(f, dict)]
+    vis = [v for v in ((j.get("vl") or {}).get("vi") or []) if isinstance(v, dict)]
+    if not vis:
+        return items, "getinfo: no track"
+    vi = vis[0]
+    fn = vi.get("fn") or ""
+    host, vt = "", ""
+    for u in ((vi.get("ul") or {}).get("ui") or []):
+        if isinstance(u, dict) and u.get("url"):
+            host, vt = u["url"], str(u.get("vt") or "")
+            break
+    if not (fn and host):
+        return items, "getinfo: no url"
+    # 🔴 each track carries its OWN vkey (fvkey) and the fn already includes the
+    # extension (.f10217.mp4).  Using getkey's key with another quality's id (the
+    # old code asked for format=100001 = sd, which often does not even exist for a
+    # track) is why every mirror answered 403.
+    # 🔴 measured: asking for a better defn does NOT help - the API clamps an
+    # anonymous request to the highest quality it wants to give (720P here) and
+    # returns the very same file (fn ...f10217.mp4) whatever defn we ask for.  So
+    # no second call (that just burns the rate limit); we report what exists.
+    fn = vi.get("fn") or fn
+    best = vi.get("fvkey") or ""
+    if not best:
+        best = key
+    qname = {}
+    for f in quals:
+        if isinstance(f, dict):
+            qname[str(f.get("id"))] = "%s %s" % ((f.get("name") or "").upper(),
+                                                 (f.get("resolution") or ""))
+    hosts = [h for h in [u.get("url") for u in ((vi.get("ul") or {}).get("ui") or [])
+                         if isinstance(u, dict)] if h]
+    if not hosts:
+        hosts = [host]
+    m_svp = re.search(r"svp_(\d+)", hosts[0] or "")
+    svp = m_svp.group(1) if m_svp else ""
+    seen_paths = []
+    for h in hosts[:2]:
+        base = h.rstrip("/") + "/"
+        for path in (base + fn + "?vkey=" + best,
+                     base + fn + "?vkey=" + best + "&br=" + str(vi.get("br") or ""),
+                     base + fn + "?vkey=" + best + "&br=" + str(vi.get("br") or "") +
+                     "&platform=101001&charge=0&otype=json",
+                     base + fn + "&vkey=" + best,
+                     (base + fn.replace(".mp4", ".m3u8") + "?vkey=" + best) if fn.endswith(".mp4") else ""):
+            if path and path not in seen_paths:
+                seen_paths.append(path)
+    _alts = []
+    for v3 in vis[1:]:
+        f3 = v3.get("fn") or ""
+        k3 = v3.get("fvkey") or best
+        if f3:
+            _alts.append(f3 + "?vkey=" + k3)
+    for a in _alts:
+        for h in hosts[:1]:
+            pp = h.rstrip("/") + "/" + a
+            if pp not in seen_paths:
+                seen_paths.insert(len(seen_paths), pp)
+    # every quality the API returned, best first
+    tracks = []
+    for v2 in vis:
+        n2 = v2.get("fn") or ""
+        q2 = ""
+        mm = re.search(r"\.f(\d+)\.", n2)
+        if mm:
+            q2 = qname.get(mm.group(1), "")
+        tracks.append((q2, n2, v2.get("fvkey") or best))
+    added = set()
+    for c in seen_paths:
+        try:
+            st, hdr, _n = http_head_probe(c, hdrs, timeout=timeout)
+        except Exception:
+            st, hdr = 0, {}
+        if st not in (200, 206):
+            continue
+        d = re.search(r"\.f(\d+)\.", c)
+        label = qname.get(d.group(1), "") if d else ""
+        # one entry per quality: strip the vkey to dedupe the same file on mirrors
+        # dedupe by the FILE (host-independent): the same file is served by several
+        # mirrors and listing all of them is just noise
+        key_free = c.split("?")[0].split("/")[-1]
+        if key_free in added:
+            continue
+        added.add(key_free)
+        items.append({"url": c, "kind": "video",
+                      "mime": hdr.get("Content-Type") or "video/mp4",
+                      "status": st, "source": "api", "tag": "tencent-api", "type": "",
+                      "title": ("Tencent video  " + label).strip(),
+                      "size": int(hdr.get("Content-Length") or 0) or 0})
+    if items:
+        _up = [("%s %s" % ((f.get("name") or "").upper(), f.get("resolution") or ""))
+               for f in quals if isinstance(f, dict)]
+        note = "tencent API: %s, fvkey ok (%s)" % (
+            "/".join(_up), ", ".join(m["title"].split("  ")[-1] for m in items)[:40])
+        # which quality did we actually get, and is a better one merely locked?
+        _res = []
+        for f in quals:
+            if isinstance(f, dict):
+                r = f.get("resolution") or ""
+                if r.endswith("P") and r[:-1].isdigit():
+                    _res.append(int(r[:-1]))
+        _got_res = 0
+        try:
+            _gm = re.search(r"\.f(\d+)\.", items[0]["url"])
+            if _gm:
+                for f in quals:
+                    if isinstance(f, dict) and str(f.get("id")) == _gm.group(1):
+                        _got_res = int((f.get("resolution") or "0P")[:-1] or 0)
+        except Exception:
+            _got_res = 0
+        if _res and _got_res and max(_res) > _got_res:
+            note += " (%s offered, serving %dP)" % ("/".join(_up), _got_res)
+        # 🔴 measured on a real file: the MP4 we serve is COMPLETE (moov+mdat
+        # intact, mvhd duration == file duration).  The API's td/tail are NOT this
+        # episode's length (2931 s there vs 205 s in the file: it is the whole
+        # short-drama series), so no "preview" claims - show the file's own facts.
+        _dur, _tot = mp4_duration(items[0]["url"], hdrs)
+        if _tot:
+            items[0]["size"] = _tot      # the probe's own Content-Length is just the
+                                         # 2 KB we asked for - use the real file size
+        if _dur:
+            _mm, _ss = divmod(int(round(_dur)), 60)
+            items[0]["title"] = "%s · %d:%02d" % (items[0]["title"], _mm, _ss)
+            note += " · %d:%02d, %.1f MB (verified from the file itself)" % (
+                _mm, _ss, (_tot or items[0].get("size") or 0) / 1048576.0)
+
+    if not items and tracks:
+        note = "tencent API: mirrors tried (%d), none served bytes" % len(seen_paths)
+    if not items:
+        note = ("tencent API: got the vkey but no candidate path served bytes "
+                "(mirrors tried: %d)" % len([x for x in cands if x]))
+    return items, note
+
+
+def http_head_probe(url, hdrs, timeout=10):
+    """ranged GET -> (status, headers, first bytes)"""
+    req = urllib.request.Request(url)
+    for k, v in (hdrs or {}).items():
+        req.add_header(k, v)
+    req.add_header("Range", "bytes=0-2047")
+    try:
+        r = urllib.request.urlopen(req, timeout=timeout)
+        return getattr(r, "status", 200), dict(r.headers), r.read(64)
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers or {}), b""
+    except Exception:
+        return 0, {}, b""
+
+
+def sniff_codec(url, referer="", limit=SNIFF_BYTES):
+    """ranged GET of the first bytes -> (codec, kind, total_bytes).
+
+    Reads into memory only - nothing is written anywhere, this is a probe.
+    """
+    try:
+        resp = http_open(url, "GET", {"Range": "bytes=0-%d" % (limit - 1)},
+                         timeout=5, referer=referer)     # a hanging CDN socket must
+                                                          # not eat the whole grab
+        head = resp.read(limit)
+        cr = resp.headers.get("Content-Range") or ""
+        m = re.search(r"/(\d+)$", cr)
+        total = int(m.group(1)) if m else -1
+        resp.close()
+    except Exception:
+        return ("", "", -1)
+    for f in VIDEO_FOURCC:
+        if f.encode("ascii") in head:
+            return (f, "video", total)
+    for f in AUDIO_FOURCC:
+        if f.encode("ascii") in head:
+            return (f, "audio", total)
+    return ("", "", total)
+
+
+PLAYINFO_RE = re.compile(r"window\.__playinfo__\s*=\s*(\{.*?\})\s*</script>", re.S)
+
+
+def collect_playinfo_media(html, page_url, maxn):
+    """The page's own DASH manifest (bilibili's window.__playinfo__) - the only
+    place that lists EVERY quality with its codec, so a track a normal player can
+    actually decode (avc1/H.264) can be offered next to the AV1/HEVC ones.  Some
+    videos also carry data.durl, a single complete file with audio+video.
+    """
+    out = []
+    m = PLAYINFO_RE.search(html or "")
+    if not m:
+        return out
+    try:
+        d = json.loads(m.group(1))
+    except ValueError:
+        return out
+    data = d.get("data") or {}
+    dash = data.get("dash") or {}
+    for a in (dash.get("video") or [])[:maxn]:
+        u = a.get("baseUrl") or a.get("base_url") or ""
+        if not u:
+            continue
+        cs = (a.get("codecs") or "").split(".")[0].strip().lower()
+        nm = CODEC_NAMES.get(cs, cs.upper() or "-")
+        res = "%sx%s" % (a.get("width") or "?", a.get("height") or "?")
+        out.append({"url": u, "kind": "video", "mime": a.get("mimeType") or "video/mp4",
+                    "source": "page", "codec": cs, "codec_name": nm,
+                    "picky": cs in PICKY_CODECS, "size": -1, "status": 0,
+                    "title": "%s %s" % (res, nm), "note": "dash-video"})
+    for a in (dash.get("audio") or [])[:maxn]:
+        u = a.get("baseUrl") or a.get("base_url") or ""
+        if not u:
+            continue
+        cs = (a.get("codecs") or "").split(".")[0].strip().lower()
+        nm = CODEC_NAMES.get(cs, cs.upper() or "-")
+        bw = a.get("bandwidth") or 0
+        out.append({"url": u, "kind": "audio", "mime": a.get("mimeType") or "audio/mp4",
+                    "source": "page", "codec": cs, "codec_name": nm,
+                    "picky": cs in PICKY_CODECS, "size": -1, "status": 0,
+                    "title": "音频 %s%s" % (nm, (" %dK" % round(bw / 1000)) if bw else ""),
+                    "note": "dash-audio"})
+    dl = data.get("durl") or []
+    for i, a in enumerate(dl[:maxn]):
+        u = a.get("url") or ""
+        if not u:
+            continue
+        out.append({"url": u, "kind": "video", "mime": "video/mp4", "source": "page",
+                    "codec": "", "codec_name": "", "picky": False,
+                    "size": a.get("size") or -1, "status": 0, "note": "durl",
+                    "title": "完整文件" + ("" if len(dl) == 1 else " #%d" % (i + 1))})
+    return out
+
+
+def _count_streams(logs):
+    """how many media responses are in these CDP performance entries"""
+    n = 0
+    for e in logs or []:
+        try:
+            m = json.loads(e.get("message", "")).get("message", {})
+        except (ValueError, AttributeError):
+            continue
+        if m.get("method") != "Network.responseReceived":
+            continue
+        r = (m.get("params") or {}).get("response", {})
+        if kind_of(r.get("url", ""), r.get("mimeType", "")) in (
+                "hls", "dash", "ts", "video", "audio", "flash"):
+            n += 1
+    return n
+
+
+MEDIA_SRC_JS = r"""
+var out = [];
+/* 🔴 ONE traversal that collects the shadow roots, reused by every selector.
+   Rescanning the whole document per pattern (16 of them) cost minutes on a big
+   page like v.qq.com; this is a single pass with a hard node budget. */
+var _roots = [];
+(function collectRoots(node, depth) {
+  if (depth > 6 || _roots.length > 200) return;
+  try {
+    var all = node.querySelectorAll('*');
+    var cap = Math.min(all.length, 12000);
+    for (var i = 0; i < cap; i++) {
+      var sr = all[i].shadowRoot;
+      if (sr) { _roots.push(sr); collectRoots(sr, depth + 1); }
+    }
+  } catch (e) {}
+})(document, 0);
+function walk(sel, root, acc) {
+  acc = acc || [];
+  var scopes = [root || document];
+  for (var r = 0; r < _roots.length; r++) scopes.push(_roots[r]);
+  for (var s2 = 0; s2 < scopes.length; s2++) {
+    try {
+      var l = scopes[s2].querySelectorAll(sel);
+      for (var i = 0; i < l.length && i < 200; i++) acc.push(l[i]);
+    } catch (e) {}
+  }
+  return acc;
+}
+var els = walk('audio,video', document);
+for (var i = 0; i < els.length; i++) {
+  var s = '';
+  try { s = els[i].currentSrc || els[i].src || els[i].getAttribute('src') || ''; } catch (e) {}
+  if (s) out.push(s);
+}
+return out;
+"""
+
+
+EACH_PRESS_JS = r"""
+/* press the i-th element of a selector, re-querying every time (the working
+   ximalaya script does find_elements(sel)[i] in a loop) */
+var sel = arguments[0], i = arguments[1];
+function cls3(e) { var c = e.className; if (c && c.baseVal !== undefined) c = c.baseVal;
+  return (typeof c === 'string') ? c : ''; }
+/* the element-level press (same as in CLICK_JS) - resolution independent */
+function press(el) {
+  if (!el) return '';
+  var r = null;
+  try { r = el.getBoundingClientRect(); } catch (e) {}
+  var x = r ? r.left + Math.max(1, r.width) / 2 : 1;
+  var y = r ? r.top + Math.max(1, r.height) / 2 : 1;
+  var opts = { bubbles: true, cancelable: true, composed: true, view: window,
+               clientX: x, clientY: y, screenX: x, screenY: y, button: 0, buttons: 1 };
+  try { el.click(); } catch (e) {}
+  var seq = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+  for (var i = 0; i < seq.length; i++) {
+    try {
+      var t = seq[i];
+      var ev = (t.indexOf('pointer') === 0 && window.PointerEvent)
+        ? new PointerEvent(t, opts) : new MouseEvent(t, opts);
+      el.dispatchEvent(ev);
+    } catch (e) {}
+  }
+  return (el.tagName || '').toLowerCase();
+}
+var els;
+try { els = document.querySelectorAll(sel); } catch (e) { return { ok: false, total: 0 }; }
+if (i >= els.length) return { ok: false, total: els.length };
+var el = els[i];
+try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
+var told;
+try { told = getComputedStyle(el).display; } catch (e) { told = ''; }
+try { press(el); } catch (e) { return { ok: false, total: els.length, err: String(e) }; }
+return { ok: true, total: els.length, tag: (el.tagName.toLowerCase() + '.' + cls3(el)).slice(0, 40) };
+"""
+
+
+PRESS_MARKED_JS = r"""
+/* press exactly the element WAKE_JS marked with data-cg-click */
+function press(el) {
+  if (!el) return '';
+  var r = null;
+  try { r = el.getBoundingClientRect(); } catch (e) {}
+  var x = r ? r.left + Math.max(1, r.width) / 2 : 1;
+  var y = r ? r.top + Math.max(1, r.height) / 2 : 1;
+  var opts = { bubbles: true, cancelable: true, composed: true, view: window,
+               clientX: x, clientY: y, screenX: x, screenY: y, button: 0, buttons: 1 };
+  try { el.click(); } catch (e) {}
+  var seq = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+  for (var i = 0; i < seq.length; i++) {
+    try {
+      var t = seq[i];
+      var ev = (t.indexOf('pointer') === 0 && window.PointerEvent)
+        ? new PointerEvent(t, opts) : new MouseEvent(t, opts);
+      el.dispatchEvent(ev);
+    } catch (e) {}
+  }
+  return (el.tagName || '').toLowerCase();
+}
+function clsX(e) { var c = e.className; if (c && c.baseVal !== undefined) c = c.baseVal;
+  return (typeof c === 'string') ? c : ''; }
+var el = document.querySelector('[data-cg-click]');
+if (!el) return { ok: false, tag: '' };
+var tag = (el.tagName.toLowerCase() + '.' + clsX(el)).slice(0, 44);
+try { press(el); } catch (e) {}
+try { el.removeAttribute('data-cg-click'); } catch (e) {}
+return { ok: true, tag: tag };
+"""
+
+
+WAKE_CLICK_JS = r"""
+/* plain element.click() on the same candidate list WAKE_JS builds */
+function cls2(e) { var c = e.className; if (c && c.baseVal !== undefined) c = c.baseVal;
+  return (typeof c === 'string') ? c : ''; }
+var PLAY = ['xuicon-web_album_btn_play_s', 'playIcon', 'btn_play', 'a.play',
+            'icon-play', 'play-btn', 'svg'];
+/* ximalaya's player: <xm-player><div><i> - the <i> carries no class at all */
+var XM_I = [];
+try {
+  var xp = document.querySelectorAll('xm-player i, xm-player div i');
+  for (var q = 0; q < xp.length; q++) XM_I.push(xp[q]);
+} catch (e) {}
+var cands = [];
+var all = document.querySelectorAll('i,div,span,a,svg,button');
+for (var i = 0; i < all.length && i < 6000; i++) {
+  var e = all[i], r;
+  try { r = e.getBoundingClientRect(); } catch (err) { continue; }
+  /* no size gate: el.click() works on 0x0 controls (ximalaya's episode icon) */
+  if (r.width > 400 || r.height > 400) continue;
+  var d = (cls2(e) + ' ' + (e.id || '')).toLowerCase(), hit = false;
+  for (var k = 0; k < PLAY.length; k++) if (d.indexOf(PLAY[k].toLowerCase()) >= 0) { hit = true; break; }
+  if (hit) cands.push(e);
+}
+var el = cands[arguments[0]];
+if (!el) return { ok: false };
+
+/* 🔴 resolution-independent pressing.  A click at (x,y) breaks the moment the
+   window size, zoom, scroll or layout changes; pressing the ELEMENT does not.
+   el.click() alone is ignored by some controls, so a full mouse sequence is
+   dispatched on the element as well. */
+function press(el) {
+  if (!el) return '';
+  var r = null;
+  try { r = el.getBoundingClientRect(); } catch (e) {}
+  var x = r ? r.left + Math.max(1, r.width) / 2 : 1;
+  var y = r ? r.top + Math.max(1, r.height) / 2 : 1;
+  var opts = { bubbles: true, cancelable: true, composed: true, view: window,
+               clientX: x, clientY: y, screenX: x, screenY: y, button: 0, buttons: 1 };
+  try { el.click(); } catch (e) {}
+  var seq = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+  for (var i = 0; i < seq.length; i++) {
+    try {
+      var t = seq[i];
+      var ev = (t.indexOf('pointer') === 0 && window.PointerEvent)
+        ? new PointerEvent(t, opts) : new MouseEvent(t, opts);
+      el.dispatchEvent(ev);
+    } catch (e) {}
+  }
+  return (el.tagName || '').toLowerCase() + '.' + (typeof el.className === 'string' ? el.className : '');
+}
+try { press(el); } catch (e2) { return { ok: false, err: String(e2) }; }
+return { ok: true, tag: (el.tagName.toLowerCase() + '.' + cls2(el)).slice(0, 40) };
+"""
+
+
+def _click_at(driver, x, y):
+    """Click through CDP so the event is TRUSTED.
+
+    A programmatic el.click() has isTrusted=false and players routinely ignore
+    it (this is why the first ximalaya attempt found no media at all);
+    Input.dispatchMouseEvent produces a real input event at real coordinates.
+    """
+    if x is None or y is None:
+        return False
+    for t in ("mouseMoved", "mousePressed", "mouseReleased"):
+        try:
+            driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                "type": t, "x": int(x), "y": int(y),
+                "button": "left", "clickCount": 1 if t != "mouseMoved" else 0})
+        except Exception as e:
+            warn("cdp click failed: %s" % str(e).splitlines()[0][:80])
+            return False
+    return True
+
+
+def _last_page_url():
+    """the page of the last grab - the correct Referer for its resources"""
+    try:
+        with open(JOB, "r", errors="replace") as f:
+            return json.load(f).get("url") or ""
+    except (OSError, ValueError):
+        return ""
+
+
+# query parameters that make a URL signed / time limited (bilibili and friends
+# hand out PlayURLs that 403 without a Referer and stop working after `deadline`)
+AUTH_PARAMS= tuple("deadline expire expires token sign signature auth_key authkey wssecret wstime ekey hmac e=".split())
+
+
+
+def _auth_info(url):
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    hits = {}
+    for k, v in q.items():
+        if any(t in k.lower() for t in AUTH_PARAMS):
+            hits[k] = v[0]
+    expires = 0
+    for k in ("deadline", "expires", "expire", "wstime"):
+        if k in q:
+            try:
+                expires = int(float(q[k][0]))
+            except (ValueError, TypeError):
+                expires = 0
+    return hits, expires
+
+
+def _head_status(url, referer, extra=None, timeout=20):
+    """-> (status, content_type, size, error-string)"""
+    try:
+        resp = http_open(url, "HEAD", extra, timeout=timeout, referer=referer)
+        hdr = resp.headers
+        cl = hdr.get("Content-Length")
+        out = (resp.status, (hdr.get("Content-Type") or "").split(";")[0].strip(),
+               int(cl) if cl and cl.isdigit() else -1, resp.geturl(), "")
+        resp.close()
+        return out
+    except urllib.error.HTTPError as e:
+        return (e.code, (e.headers.get("Content-Type") or "").split(";")[0].strip(), -1, url, "")
+    except Exception as e1:
+        # HEAD is often refused: fall back to a 1-byte ranged GET
+        try:
+            resp = http_open(url, "GET", dict(extra or {}, **{"Range": "bytes=0-1"}),
+                             timeout=timeout, referer=referer)
+            hdr = resp.headers
+            cr = hdr.get("Content-Range") or ""
+            m = re.search(r"/(\d+)$", cr)
+            out = (resp.status, (hdr.get("Content-Type") or "").split(";")[0].strip(),
+                   int(m.group(1)) if m else -1, resp.geturl(), "")
+            resp.close()
+            return out
+        except urllib.error.HTTPError as e:
+            return (e.code, "", -1, url, "")
+        except Exception as e2:
+            return (0, "", -1, url, str(e2).splitlines()[0])
+
+
+def cmd_mediaprobe(argv):
+    """headers + HLS playlist details + whether a Referer / signed params are
+    needed to actually use the URL.
+
+    A media URL lifted out of a page is very often: (a) fetched by Chrome with a
+    Range request, so the log says 206 while the URL is perfectly normal, and
+    (b) refused (403) unless the request carries the *page's* Referer, and
+    (c) signed with an expiry.  Reporting all three is what makes the extracted
+    address usable - "打不开" is usually a missing Referer, not a bad URL.
+    """
+    if not argv:
+        die("No URL given")
+    url = argv[0]
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        url = "http://" + url
+    opt = parse_args(argv[1:], {"referer": (True, None), "no-referer": (False, None)})
+
+    page = _last_page_url()
+    if opt.get("no-referer"):
+        ref = ""
+    else:
+        ref = opt.get("referer") or page
+
+    auth, expires = _auth_info(url)
+    res = {"url": url, "kind": "", "content_type": "", "size": -1,
+           "final_url": url, "playlist": None, "note": "",
+           "referer": ref, "status": 0, "status_no_referer": 0,
+           "needs_referer": False, "auth_params": auth, "expires": expires,
+           "codec": "", "codec_name": "", "picky": False}
+
+    status, ctype, size, final, err = _head_status(url, ref)
+    res["status"] = status
+    res["final_url"] = final
+    res["content_type"] = ctype
+    res["size"] = size
+    if status >= 400 or status == 0:
+        # maybe it is the Referer that is wrong/needed - ask without one
+        st2, ct2, sz2, fin2, err2 = _head_status(url, "")
+        res["status_no_referer"] = st2
+        if 200 <= st2 < 400:
+            # no referer needed; the *with referer* attempt was the odd one
+            res["status"] = st2
+            res["content_type"] = ct2 or ctype
+            res["size"] = sz2 if sz2 >= 0 else size
+            res["final_url"] = fin2
+            res["referer"] = ""
+        else:
+            res["needs_referer"] = True
+            if st2:
+                res["status_no_referer"] = st2
+    elif ref:
+        # with-referer works: check whether it is actually required
+        st2, _ct2, _sz2, _fin2, _err2 = _head_status(url, "")
+        res["status_no_referer"] = st2
+        if st2 >= 400 or st2 == 0:
+            res["needs_referer"] = True
+
+    res["kind"] = kind_of(res["final_url"], res["content_type"]) or kind_of(url) or ""
+    if err and res["status"] == 0:
+        res["note"] = err
+
+    if res["status"] and res["status"] < 400 and res["kind"] in ("video", "audio", "dash", "ts"):
+        c, k, total = sniff_codec(res["final_url"], ref or res["final_url"])
+        if c:
+            res["codec"] = c
+            res["codec_name"] = CODEC_NAMES.get(c, c.upper())
+            res["picky"] = c in PICKY_CODECS
+            if k:
+                res["kind"] = k
+            if total > 0:
+                res["size"] = total
+
+    if res["kind"] == "hls" or res["final_url"].split("?")[0].endswith(".m3u8"):
+        try:
+            resp = http_open(res["final_url"], "GET", timeout=25, referer=ref)
+            body = resp.read(2 * 1024 * 1024).decode("utf-8", "replace")
+            resp.close()
+            res["playlist"] = parse_m3u8(body, res["final_url"])
+            res["kind"] = "hls"
+        except Exception as e:
+            res["note"] = (res["note"] + " | " if res["note"] else "") + \
+                          "playlist download failed: %s" % str(e).splitlines()[0]
+    ok(res)
+
+
+# --------------------------------------------------------------------------
+# fetch (download a media resource onto the device)
+# --------------------------------------------------------------------------
+
+# Headers that must stay the client's own.  Replaying them is what turned a
+# logged-in ximalaya page into a blank one: "Cache-Control: no-cache" + "Pragma:
+# no-cache" made every subresource a fresh WAF check, "Accept: text/html,..." was
+# sent on XHRs too, and "sec-fetch-*" described a navigation that was not
+# happening - the page's JavaScript never came up (0 XHR).  Measured on the same
+# URL: replaying ONLY the Cookie gives a logged-in page with 12 XHRs; replaying
+# the whole copied header set gives a blank page.
+DROP_ALWAYS = ("host", "content-length", "connection", "transfer-encoding",
+               "accept-encoding", "te", "upgrade", "upgrade-insecure-requests", "expect")
+BROWSER_OWNED = ("accept-language", "cache-control", "pragma", "dnt",
+                 "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "sec-fetch-user",
+                 "if-none-match", "if-modified-since", "if-range")
+
+
+def clean_headers(d):
+    """Keep only the headers that carry identity/state.
+
+    cookie / authorization / x-* / referer / origin / user-agent / sec-ch-ua*
+    survive; the ones the browser must own are dropped (see above).
+    """
+    out = {}
+    for k, v in (d or {}).items():
+        k = str(k).strip()
+        v = str(v or "").strip()
+        kl = k.lower()
+        if not k or not v or kl.startswith(":") or kl in DROP_ALWAYS or kl in BROWSER_OWNED:
+            continue
+        if kl == "accept" and "text/html" in v.lower():
+            continue      # a page-navigation Accept makes an API/page answer with HTML
+        out[k] = v
+    return out
+
+
+def parse_header_text(txt):
+    """Parse pasted request headers into a dict ready to replay.
+
+    Accepts what tools actually hand you: the headers.txt this app exports
+    ("# comment" lines are skipped), a plain "Name: value" list, or a whole
+    "Copy as cURL" command (its -H arguments are extracted).
+    """
+    txt = str(txt or "")
+    out = {}
+    if re.search(r"\bcurl\b", txt, re.I) or re.search(r"-H\s+['\"]", txt):
+        for m in re.finditer(r"""-H\s+(?:'([^']*)'|"([^"]*)"|([^\s'"]+))""", txt):
+            val = m.group(1) or m.group(2) or m.group(3) or ""
+            if ":" in val:
+                k, v = val.split(":", 1)
+                out[k.strip()] = v.strip()
+        if out:
+            return clean_headers(out)
+    # 🔴 one line = one header.  NEVER split on ';': a Cookie header is
+    # "a=1; b=2; c=3" and cutting it at the first semicolon throws away every
+    # cookie but the first - which is how "I copied the login headers but the
+    # request is still refused" happens.
+    for line in txt.replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith("//"):
+            continue
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        out[k.strip()] = v.strip()
+    return clean_headers(out)
+
+
+def parse_curl(txt):
+    """Everything a pasted "Copy as cURL" carries: url, method, body, headers.
+
+    Taking the URL from the SAME paste as the headers is the whole point - the
+    headers of one request replayed against another request's URL is the classic
+    "it is still refused" trap.
+    """
+    out = {"url": "", "method": "", "data": "", "headers": {}}
+    t = str(txt or "")
+    if not re.search(r"\bcurl\b", t, re.I):
+        return out
+    m = re.search(r"""curl\s+(?:-[^\s]+\s+)*['"]([^'"]+)['"]""", t)
+    if not m:
+        m = re.search(r"""curl\s+((?:https?|ftp)://[^\s'"]+)""", t)
+    if m:
+        out["url"] = m.group(1)
+    m = re.search(r"""(?:-X|--request)\s+['"]?(\w+)['"]?""", t)
+    if m:
+        out["method"] = m.group(1).upper()
+    m = re.search(r"""(?:--data-raw|--data-binary|--data|-d)\s+(?:'([^']*)'|"([^"]*)")""", t)
+    if m:
+        out["data"] = m.group(1) if m.group(1) is not None else (m.group(2) or "")
+        if not out["method"]:
+            out["method"] = "POST"
+    for m in re.finditer(r"""-H\s+(?:'([^']*)'|"([^"]*)"|([^\s'"]+))""", t):
+        val = m.group(1) or m.group(2) or m.group(3) or ""
+        if ":" in val:
+            k, v = val.split(":", 1)
+            out["headers"][k.strip()] = v.strip()
+    return out
+
+
+def _json_dumps_cell(v):
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return "" if v is None else v
+    try:
+        return json.dumps(v, ensure_ascii=False)
+    except Exception:
+        return str(v)
+
+
+def _json_flatten(obj, prefix="", out=None, depth=0):
+    """把嵌套对象压成 dot.path -> 值（深度<=3，更深的整体 JSON 化）"""
+    if out is None:
+        out = {}
+    if isinstance(obj, dict) and depth < 3:
+        for k, v in obj.items():
+            kk = ("%s.%s" % (prefix, k)) if prefix else str(k)
+            if isinstance(v, dict) and depth < 2:
+                _json_flatten(v, kk, out, depth + 1)
+            elif isinstance(v, list):
+                if v and all(isinstance(x, (str, int, float, bool, type(None))) for x in v):
+                    out[kk] = ", ".join(_json_dumps_cell(x) and str(_json_dumps_cell(x)) or "" for x in v)
+                else:
+                    out[kk] = json.dumps(v, ensure_ascii=False)[:2000]
+            else:
+                out[kk] = v
+    else:
+        out[prefix or "value"] = obj
+    return out
+
+
+def _json_table(obj):
+    """推断 (columns, rows)。返回 (columns, rows) 或 None。"""
+    def objs(v):
+        return isinstance(v, list) and v and all(isinstance(x, dict) for x in v[:30])
+
+    if objs(obj):
+        return obj
+    if isinstance(obj, dict):
+        best = None
+        for k, v in obj.items():
+            if objs(v):
+                if best is None or len(v) > len(best):
+                    best = v
+            elif isinstance(v, dict):
+                for v2 in v.values():
+                    if objs(v2) and (best is None or len(v2) > len(best)):
+                        best = v2
+        if best is not None:
+            return best
+    return None
+
+
+def cmd_csv(argv):
+    """纯 JSON 的返回 -> CSV 表格（列 = 键，行 = 记录；中文用 UTF-8 BOM，Excel 直接打开）"""
+    if not argv:
+        die("No URL given")
+    url = argv[0]
+    opt = parse_args(argv[1:], {"out": (True, None), "referer": (True, None),
+                                "no-referer": (False, None), "headers": (True, None),
+                                "headers-file": (True, None), "max-bytes": (True, None)})
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        url = "http://" + url
+    ref = "" if opt.get("no-referer") else (opt.get("referer") or _last_page_url())
+    hdrs = clean_headers(parse_header_text(opt.get("headers") or ""))
+    hf = os.path.basename(opt.get("headers-file") or "")
+    if hf:
+        try:
+            with open(os.path.join(WORKDIR, hf), encoding="utf-8", errors="replace") as f:
+                for k, v in parse_header_text(f.read()).items():
+                    hdrs.setdefault(k, v)
+        except OSError as e:
+            warn("headers file %s: %s" % (hf, e))
+    if any(k.lower() == "referer" for k in hdrs):
+        ref = ""
+
+    maxb = int(opt.get("max-bytes", 0) or 0) or 32 * 1024 * 1024
+    try:
+        resp = http_open(url, extra=(hdrs or None), timeout=30, max_bytes=maxb, referer=ref)
+        raw = resp.read()
+    except Exception as e:
+        die("Cannot fetch %s: %s", url, str(e)[:160])
+
+    text = raw.decode("utf-8", "replace")
+    t = text.lstrip("\ufeff \t\r\n")
+    # 容忍 JSONP / xxx={...}; 这类包装（很多国内接口都这样）
+    m = re.search(r"[\{\[]", t)
+    if m and m.start() > 0:
+        t = t[m.start():]
+    t = t.strip()
+    if t.endswith(";"):
+        t = t[:-1]
+    try:
+        obj = json.loads(t)
+    except Exception as e:
+        die("The response is not pure JSON (%s) - first bytes: %s", str(e)[:70], t[:80])
+
+    table = _json_table(obj)
+    rows = []
+    if table is not None:
+        flat = [_json_flatten(r) for r in table]
+        cols = []
+        for f in flat:
+            for k in f:
+                if k not in cols:
+                    cols.append(k)
+        for f in flat:
+            rows.append([_json_dumps_cell(f.get(c)) for c in cols])
+    elif isinstance(obj, dict):
+        f = _json_flatten(obj)
+        cols = ["key", "value"]
+        rows = [[k, _json_dumps_cell(v)] for k, v in f.items()]
+    elif isinstance(obj, list):
+        cols = ["value"]
+        rows = [[_json_dumps_cell(v)] for v in obj]
+    else:
+        die("The JSON has no table-like structure (top level is %s)", type(obj).__name__)
+
+    out = opt.get("out") or os.path.join(WORKDIR, "data.csv")
+    if not out.lower().endswith(".csv"):
+        out += ".csv"
+    d = os.path.dirname(out)
+    if d:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError as e:
+            die("Cannot create the output directory: %s", e)
+    import csv as _csv
+    try:
+        # 🔴 utf-8-sig：带 BOM，Excel 打开中文才不乱码
+        with open(out, "w", newline="", encoding="utf-8-sig") as f:
+            w = _csv.writer(f, lineterminator="\r\n")
+            w.writerow(cols)
+            w.writerows(rows)
+    except OSError as e:
+        die("Cannot write %s: %s", out, e)
+
+    print(json.dumps({"ok": True, "file": os.path.basename(out), "path": out,
+                      "rows": len(rows), "cols": len(cols), "columns": cols[:24],
+                      "bytes": os.path.getsize(out), "source": url,
+                      "shape": ("records" if table is not None else
+                                ("object" if isinstance(obj, dict) else "list"))},
+                     ensure_ascii=False))
+    return 0
+
+
+def cmd_fetch(argv):
+    if not argv:
+        die("No URL given")
+    url = argv[0]
+    if url == "-":
+        url = ""          # "take it from the pasted cURL" (must not gain a scheme)
+    elif not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        url = "http://" + url
+    opt = parse_args(argv[1:], {"out": (True, None), "max-bytes": (True, None),
+                               "referer": (True, None), "no-referer": (False, None),
+                               "headers": (True, None), "headers-file": (True, None)})
+    maxb = int(opt.get("max-bytes", 0) or 0)
+    ref = "" if opt.get("no-referer") else (opt.get("referer") or _last_page_url())
+
+    out = opt.get("out") or ""
+    if not out:
+        name = os.path.basename(urllib.parse.urlparse(url).path) or "download"
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:80] or "download"
+        out = os.path.join(WORKDIR, name)
+    d = os.path.dirname(out)
+    if d:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError as e:
+            die("Cannot create the output directory: %s", e)
+
+    # 🔴 login-gated resources: the caller pastes the request headers the browser
+    # sent (tokens + cookie) and we replay them.  Without this the server answers
+    # a login page (or 403) instead of the resource.
+    raw = opt.get("headers") or ""
+    curl = parse_curl(raw)
+    if (not url or url == "-") and curl.get("url"):
+        url = curl["url"]
+        warn("fetch: taking the URL from the pasted cURL: %s" % url[:90])
+    if curl.get("headers"):
+        # a cURL paste: headers (+ method/body) belong to that exact request
+        hdrs0 = parse_header_text(raw) if not curl["headers"] else dict(curl["headers"])
+    else:
+        hdrs0 = parse_header_text(raw)
+    hdrs = clean_headers(hdrs0)
+    method = (curl.get("method") or "GET").upper()
+    body = (curl.get("data") or "").encode("utf-8") if curl.get("data") else None
+    
+    hf = os.path.basename(opt.get("headers-file") or "")
+    if hf:
+        try:
+            with open(os.path.join(WORKDIR, hf), encoding="utf-8", errors="replace") as f:
+                for k, v in parse_header_text(f.read()).items():
+                    hdrs.setdefault(k, v)
+        except OSError as e:
+            warn("headers file %s: %s" % (hf, e))
+    # 🔴 do NOT clobber what the user pasted: a login-gated CDN checks Referer/
+    # Origin, and swapping in "the page of the last grab" is a silent 403.
+    if any(k.lower() == "referer" for k in hdrs):
+        ref = ""
+    if body is not None and not any(k.lower() == "content-type" for k in hdrs):
+        hdrs["Content-Type"] = "application/x-www-form-urlencoded"
+    if hdrs:
+        warn("fetch: sending %d custom header(s): %s" % (len(hdrs), ", ".join(sorted(hdrs))[:120]))
+
+    # 🔴 an opener WITH a cookie jar: login flows answer "Set-Cookie + redirect",
+    # and a plain urlopen() throws that cookie away and arrives at the target
+    # logged out (the "跳转后就不对了" case).  The chain is recorded so the user can
+    # see where the request was sent.
+    import http.cookiejar
+
+    chain = []
+
+    class _Rec(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            chain.append({"status": code, "from": req.full_url[:160], "to": newurl[:160]})
+            return urllib.request.HTTPRedirectHandler.redirect_request(
+                self, req, fp, code, msg, headers, newurl)
+
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar), _Rec)
+
+    n = 0
+    try:
+        req = urllib.request.Request(url, data=body, method=method)
+        req.add_header("User-Agent", UA)
+        req.add_header("Accept", "*/*")
+        if ref:
+            req.add_header("Referer", ref)
+        for k, v in hdrs.items():
+            req.add_header(k, v)
+        resp = opener.open(req, timeout=45)
+        with open(out, "wb") as f:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                f.write(chunk)
+                n += len(chunk)
+                if maxb and n >= maxb:
+                    break
+        resp.close()
+    except urllib.error.HTTPError as e:
+        # 4xx/5xx: the body is the interesting part (an API answers with a JSON
+        # explaining what it did not like), so report it instead of a bare error
+        try:
+            raw = e.read()
+            with open(out, "wb") as f:
+                f.write(raw)
+            n = len(raw)
+        except Exception:
+            n = 0
+        status_code = getattr(e, "code", 0)
+        ctype = (e.headers.get("Content-Type") or "").split(";")[0].strip() if e.headers else ""
+        body_txt = ""
+        try:
+            body_txt = raw.decode("utf-8", "replace")[:1200]
+        except Exception:
+            pass
+        ok({"url": url, "path": out, "bytes": n, "file": os.path.basename(out),
+            "status": status_code, "final_url": url, "content_type": ctype,
+            "headers_sent": sorted(hdrs), "header_count": len(hdrs),
+            "preview": body_txt, "looks_login": False, "method": method,
+            "chain": chain, "cookies_set": sorted({c.name for c in jar}),
+            "http_error": True, "stopped_early": False})
+        return
+    except Exception as e:
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
+        die("Download failed: %s", str(e).splitlines()[0])
+    # a failed fetch has to explain itself: status, where it ended up, and (for
+    # text answers) a snippet - a login page looks nothing like the resource
+    status = getattr(resp, "status", 0)
+    ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+    try:
+        final = resp.geturl() or url
+    except Exception:
+        final = url
+    preview, looks_login = "", False
+    if (ctype.startswith("text/") or "json" in ctype or "xml" in ctype) and 0 < n < 400000:
+        try:
+            with open(out, "rb") as f:
+                preview = f.read(1200).decode("utf-8", "replace")
+            low = preview.lower()
+            looks_login = any(k in low for k in (
+                "login", "sign in", "unauthorized", "forbidden", "captcha",
+                "\u767b\u5f55", "\u8bf7\u5148\u767b\u5f55", "\u9a8c\u8bc1\u7801", "\u65e0\u6743\u9650"))
+        except OSError:
+            pass
+    ok({"url": url, "path": out, "bytes": n,
+        "file": os.path.basename(out) if os.path.dirname(out) == WORKDIR else "",
+        "status": status, "final_url": final, "content_type": ctype,
+        "method": method, "chain": chain, "cookies_set": sorted({c.name for c in jar}),
+        "headers_sent": sorted(hdrs), "header_count": len(hdrs),
+        "preview": preview, "looks_login": looks_login,
+        "stopped_early": bool(maxb and n >= maxb)})
+
+
+# --------------------------------------------------------------------------
+
+def cmd_start(argv):
+    """Detach a grab worker.
+
+    The web UI must not sit on a blocking RPC for the whole page load, so this
+    returns immediately and the worker publishes its progress (and finally the
+    result) to /tmp/chromeui/job.json, which the UI polls with `chromeui job`.
+    """
+    if not argv:
+        die("No URL given")
+    url = argv[0]
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        url = "http://" + url
+    # parse the options here as well, so a typo comes straight back to the user
+    opt = parse_args(argv[1:], GRAB_SPEC)
+    for bad in ("progress", "nolock"):
+        if opt.get(bad):
+            die("Unknown argument: --%s", bad)
+    if not os.access(ROOT + CHROME_BIN, os.X_OK):
+        die("chrome-headless-shell is not installed (%s)", ROOT + CHROME_BIN)
+    if not os.access(CDRV, os.X_OK):
+        die("chromedriver is not installed (%s)", CDRV)
+
+    os.makedirs(WORKDIR, exist_ok=True)
+    lock = acquire_lock()
+    if lock is None:
+        die("Another grab is already running, wait for it to finish")
+
+    progress_write(JOB, {"state": "running", "phase": "queued", "url": url,
+                         "started": int(time.time()), "elapsed": 0})
+    wargv = [sys.executable, os.path.abspath(__file__), "grab", url,
+             "--progress", JOB, "--nolock"] + argv[1:]
+    try:
+        logf = open(WORKER_LOG, "wb")
+    except OSError:
+        logf = subprocess.DEVNULL
+    # pass_fds keeps our flock alive for the worker's whole lifetime, even
+    # though this process exits right away; stdout/stderr go to a file (not to
+    # rpcd's pipe) or the caller would block until the worker had finished.
+    try:
+        p = subprocess.Popen(wargv, stdin=subprocess.DEVNULL, stdout=logf,
+                             stderr=subprocess.STDOUT, close_fds=True,
+                             start_new_session=True, pass_fds=(lock,))
+    except OSError as e:
+        try:
+            logf.close()
+        except (OSError, AttributeError):
+            pass
+        die("Cannot start the browser worker: %s", e)
+    # start_new_session puts the worker in its own process group, so `stop` can
+    # take chrome and chromedriver down with a single killpg().  The pid is only
+    # ever signalled after /proc/<pid>/cmdline has been checked to still be a
+    # chromeui worker, so a recycled pid can never be hit.
+    try:
+        with open(PIDFILE, "w") as f:
+            f.write(str(p.pid))
+    except OSError as e:
+        warn("cannot write the pid file: %s" % e)
+    try:
+        os.close(lock)          # the worker inherited it; it holds the lock now
+    except OSError:
+        pass
+    ok({"started": True, "job": JOB, "url": url})
+
+
+def cmd_stop():
+    """abort the running grab (worker + chrome + chromedriver)"""
+    try:
+        with open(JOB, "r", errors="replace") as f:
+            j = json.load(f)
+    except (OSError, ValueError):
+        j = {}
+    if j.get("state") != "running":
+        die("No job is currently running")
+    try:
+        with open(PIDFILE, "r", errors="replace") as f:
+            pid = int((f.read() or "0").strip() or 0)
+    except (OSError, ValueError):
+        pid = 0
+    if not pid:
+        die("No job is currently running")
+    # never signal a recycled pid: it must still be a chromeui worker
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            cmdline = f.read().decode("utf-8", "replace")
+    except OSError:
+        die("The job already ended")
+    if "chromeui" not in cmdline:
+        die("The job already ended")
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except OSError as e:
+        die("Cannot stop the job: %s", e)
+    for _ in range(15):
+        time.sleep(0.2)
+        try:
+            os.killpg(pid, 0)
+        except OSError:
+            break
+    else:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    progress_write(JOB, {"state": "stopped", "phase": "stopped",
+                         "url": j.get("url", ""), "elapsed": j.get("elapsed", 0)})
+    ok({"stopped": True, "pid": pid})
+
+
+def cmd_job():
+    """progress only - this one is polled every 1.5 s, so it must stay tiny"""
+    try:
+        with open(JOB, "r", errors="replace") as f:
+            j = json.load(f)
+    except (OSError, ValueError):
+        j = {"state": "idle"}
+    # 🔴 a grab that was killed (or died) leaves "running" behind forever, and the
+    # UI then spins on a job that will never finish.  Check the worker that owns it:
+    # if that process is gone, the job is over.
+    if j.get("state") == "running":
+        alive = False
+        try:
+            with open(PIDFILE, "r", errors="replace") as f:
+                wpid = int((f.read() or "0").strip() or 0)
+        except (OSError, ValueError):
+            wpid = 0
+        if wpid:
+            try:
+                os.kill(wpid, 0)
+                alive = True
+            except OSError:
+                alive = False
+        else:
+            alive = True          # no pid recorded (older job): leave it alone
+        if not alive:
+            j = {"state": "interrupted", "phase": "done", "elapsed": j.get("elapsed", 0),
+                 "url": j.get("url", ""),
+                 "error": "The last grab was interrupted (its browser was cleaned up). "
+                          "Start it again."}
+            try:
+                with open(JOB, "w") as f:
+                    json.dump(j, f)
+            except OSError:
+                pass
+            try:
+                os.remove(PIDFILE)
+            except OSError:
+                pass
+    j.pop("result", None)
+    ok(j)
+
+
+def cmd_result():
+    """the reduced view of the last grab (the full data stays on the device)"""
+    try:
+        with open(JOB, "r", errors="replace") as f:
+            j = json.load(f)
+    except (OSError, ValueError):
+        j = {"state": "idle"}
+    res = j.get("result")
+    if not res:
+        die("No grabbed page yet - fetch one first")
+    ok({"state": j.get("state", ""), "url": j.get("url", ""),
+        "elapsed": j.get("elapsed", 0), "result": res})
+
+
+def _trim_utf8(b):
+    """drop a trailing incomplete multi-byte sequence so text chunks never split
+    a character (the caller continues from the returned length)."""
+    while b:
+        try:
+            b.decode("utf-8")
+            return b
+        except UnicodeDecodeError:
+            b = b[:-1]
+    return b
+
+
+def cmd_filedata(argv):
+    """chunked reader for the big artefacts (screenshot / text / html).
+
+    The ubus reply carrying a call's stdout is capped (~128 KB measured), so a
+    300 KB screenshot cannot come back in one piece - it is read in CHUNK byte
+    slices instead, and the browser glues them together.
+    """
+    opt = parse_args(argv, {"file": (True, None), "offset": (True, None),
+                            "len": (True, None), "b64": (False, None)})
+    name = os.path.basename(opt.get("file") or "")
+    if not name:
+        die("No file given")
+    # only files we create, in our own directory (basename() above already
+    # removed any path component)
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*\."
+                    r"(png|jpe?g|webp|gif|bmp|svg|ico"
+                    r"|mp4|m4s|m4a|m4v|mp3|aac|flac|wav|ogg|opus|weba"
+                    r"|ts|webm|mkv|flv|mov|avi|mpd|m3u8|m3u"
+                    r"|vtt|srt|ass|ssa|json|xml|csv|zip|gz|pdf|bin|dat"
+                    r"|txt|html?)$", name):
+        die("Invalid file name: %s", name)
+    path = os.path.join(WORKDIR, name)
+    try:
+        total = os.path.getsize(path)
+    except OSError:
+        die("File not found: %s", name)
+    try:
+        offset = int(opt.get("offset", 0) or 0)
+        n = int(opt.get("len", CHUNK) or CHUNK)
+    except ValueError:
+        die("Invalid number: %s", opt.get("offset") or opt.get("len"))
+    offset = max(0, offset)
+    n = max(1, min(n, CHUNK))
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = f.read(n)
+    except OSError as e:
+        die("Cannot read %s (%s)", name, e)
+    if not opt.get("b64"):
+        data = _trim_utf8(data)
+    nxt = offset + len(data)
+    out = {"file": name, "offset": offset, "len": len(data), "total": total,
+           "next": nxt, "done": nxt >= total}
+    if opt.get("b64"):
+        out["b64"] = base64.b64encode(data).decode("ascii")
+    else:
+        out["text"] = data.decode("utf-8", "replace")
+    ok(out)
+
+
+def export_headers_file(opt):
+    """write the request headers collected by the last grab as headers.txt
+
+    Format is exactly what --headers / --headers-file consumes, so the file can be
+    fed straight back in: a "# page:" line, then for each resource a "# <url>"
+    comment followed by "Name: value" lines.
+    """
+    try:
+        with open(JOB, "r", errors="replace") as f:
+            j = json.load(f)
+    except (OSError, ValueError):
+        die("No grabbed page yet - fetch one first")
+    res = j.get("result") or {}
+    hdrs = res.get("hdrs") or []
+    media = res.get("media") or []
+    if not hdrs:
+        die("The last grab captured no request headers for this page")
+    out = opt.get("out") or os.path.join(WORKDIR, "headers.txt")
+    lines = ["# request headers seen by the headless browser",
+             "# page: %s" % (res.get("url") or ""),
+             "# %d header set(s) - pick the one of the resource you want" % len(hdrs), ""]
+    for i, hs in enumerate(hdrs):
+        users = [m.get("url") for m in media if m.get("hdr") == i]
+        lines.append("# --- set %d%s ---" % (i + 1, (":" + (users[0] or "")) if users else ""))
+        for k in sorted(hs):
+            lines.append("%s: %s" % (k, hs[k]))
+        lines.append("")
+    try:
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+    except OSError as e:
+        die("Cannot write %s: %s", out, e)
+    ok({"path": out, "bytes": os.path.getsize(out), "sets": len(hdrs),
+        "file": os.path.basename(out) if os.path.dirname(out) == WORKDIR else ""})
+
+
+def cmd_export(argv):
+    """m3u playlist (default) or the captured request headers"""
+    if argv and argv[0] == "headers":
+        opt = parse_args(argv[1:], {"out": (True, None)})
+        return export_headers_file(opt)
+    """write the last grab's media list out as an .m3u playlist"""
+    opt = parse_args(argv, {"out": (True, None), "all": (False, None)})
+    try:
+        with open(JOB, "r", errors="replace") as f:
+            j = json.load(f)
+    except (OSError, ValueError):
+        die("No grabbed page yet - fetch one first")
+    res = j.get("result") or {}
+    media = res.get("media") or []
+    if not media:
+        die("The last grab found no media resources")
+    items = media if opt.get("all") else [m for m in media if m.get("kind") in STREAM_KINDS]
+    if not items:
+        die("The last grab found no audio/video streams (use --all to include images too)")
+    out = opt.get("out") or os.path.join(WORKDIR, "media.m3u")
+    d = os.path.dirname(out)
+    if d:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError as e:
+            die("Cannot create the output directory: %s", e)
+    page_url = res.get("url") or ""
+    page = res.get("title") or urllib.parse.urlparse(page_url).netloc or "chromeui"
+    # These CDNs answer 403 unless the request carries the page as Referer, so
+    # the playlist tells the player what to send (VLC/ffmpeg understand these);
+    # without them every entry in the file is dead.
+    lines = ["#EXTM3U", "#EXTENC:UTF-8"]
+    if page_url:
+        lines.append("# playlist extracted from: %s" % page_url)
+    hdrs = res.get("hdrs") or []
+    if hdrs:
+        lines.append("# request headers that were needed (ffmpeg: -headers \"K: V\r\n...\")")
+        for k, v in sorted(hdrs[0].items()):
+            lines.append("#   %s: %s" % (k, v[:200]))
+    for m in items:
+        u = m.get("url") or ""
+        nm = m.get("title") or ""
+        if not nm:
+            nm = urllib.parse.unquote(os.path.basename(urllib.parse.urlparse(u).path))
+        if not nm:
+            nm = m.get("kind") or "media"
+        if m.get("title"):
+            nm = "%s [%s]" % (m["title"], nm)
+        if m.get("codec_name"):
+            nm += " (%s%s)" % (m["codec_name"], " - needs a decoder" if m.get("picky") else "")
+        if m.get("kind") != "image":
+            if page_url:
+                lines.append("#EXTVLCOPT:http-referrer=" + page_url)
+            lines.append("#EXTVLCOPT:http-user-agent=" + UA)
+        lines.append("#EXTINF:-1,%s - %s" % (page, nm))
+        lines.append(u)
+    try:
+        with open(out, "w") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError as e:
+        die("Cannot write %s (%s)", out, e)
+    ok({"path": out, "count": len(items), "bytes": os.path.getsize(out)})
+
+
+# --------------------------------------------------------------------------
+USAGE = ("usage: chromeui {version|status|selftest|grab <url> [opt]|start <url> [opt]|"
+         "job|result|filedata --file N|stop|mediaprobe <url>|fetch <url> [--out P]|"
+         "csv <url> [--out P.csv] [--headers T|--headers-file F]|"
+         "export [--out P]}")
+
+
+def main():
+    if len(sys.argv) < 2:
+        die("usage: %s", USAGE.replace("usage: ", ""))
+    c = sys.argv[1]
+    if c == "i18n":
+        cmd_i18n(sys.argv[2:])
+    elif c == "version":
+        cmd_version()
+    elif c == "status":
+        cmd_status()
+    elif c == "selftest":
+        cmd_selftest()
+    elif c == "grab":
+        cmd_grab(sys.argv[2:])
+    elif c == "start":
+        cmd_start(sys.argv[2:])
+    elif c == "job":
+        cmd_job()
+    elif c == "result":
+        cmd_result()
+    elif c == "filedata":
+        cmd_filedata(sys.argv[2:])
+    elif c == "stop":
+        cmd_stop()
+    elif c == "export":
+        cmd_export(sys.argv[2:])
+    elif c == "mediaprobe":
+        cmd_mediaprobe(sys.argv[2:])
+    elif c == "csv":
+        cmd_csv(sys.argv[2:])
+    elif c == "fetch":
+        cmd_fetch(sys.argv[2:])
+    elif c in ("-h", "--help", "help"):
+        die("usage: %s", USAGE.replace("usage: ", ""))
+    else:
+        die("Unknown argument: %s", c)
+
+
+if __name__ == "__main__":
+    main()

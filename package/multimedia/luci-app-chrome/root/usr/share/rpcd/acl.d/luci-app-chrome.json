@@ -1,0 +1,40 @@
+{
+ "luci-app-chrome": {
+  "description": "Grant access to the headless Chrome page grabber",
+  "read": {
+   "file": {
+    "/usr/bin/chromeui": [
+     "exec"
+    ],
+    "/usr/bin/chromeui *": [
+     "exec"
+    ],
+    "/tmp/chromeui/*": [
+     "read"
+    ],
+    "/usr/bin/qqurl": [
+     "exec"
+    ],
+    "/usr/bin/qqurl *": [
+     "exec"
+    ]
+   }
+  },
+  "write": {
+   "file": {
+    "/usr/bin/chromeui": [
+     "exec"
+    ],
+    "/usr/bin/chromeui *": [
+     "exec"
+    ],
+    "/usr/bin/qqurl": [
+     "exec"
+    ],
+    "/usr/bin/qqurl *": [
+     "exec"
+    ]
+   }
+  }
+ }
+}

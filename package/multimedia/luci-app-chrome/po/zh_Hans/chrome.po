@@ -1,0 +1,694 @@
+# Chinese (Simplified) translation for luci-app-chrome.
+# This file is distributed under the same license as the package.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: luci-app-chrome\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-10-01\n"
+"PO-Revision-Date: 2026-10-01\n"
+"Last-Translator: Panther X2 Project\n"
+"Language-Team: Chinese (Simplified)\n"
+"Language: zh_Hans\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "%s URLs copied."
+msgstr "已复制 %s 个 URL"
+
+msgid "%s characters"
+msgstr "%s 个字符"
+
+msgid "%s resources in total"
+msgstr "共 %s 个资源"
+
+msgid "(no title)"
+msgstr "(无标题)"
+
+msgid "Abort"
+msgstr "中止"
+
+msgid "Aborted."
+msgstr "已中止。"
+
+msgid "All components responded."
+msgstr "全部组件响应正常。"
+
+msgid "All request headers copied."
+msgstr "已复制全部请求头。"
+
+msgid "Analyze URL"
+msgstr "解析此资源"
+
+msgid "Analyzing…"
+msgstr "解析中…"
+
+msgid "Another grab is already running, wait for it to finish"
+msgstr "已有抓取任务在运行，请等它结束"
+
+msgid "Audio / video streams"
+msgstr "音视频 / 流"
+
+msgid "Audio file"
+msgstr "音频文件"
+
+msgid "Bind mounts"
+msgstr "绑定挂载"
+
+msgid "Building the CSV…"
+msgstr "正在生成 CSV…"
+
+msgid "CSV ready"
+msgstr "CSV 已生成"
+
+msgid "Cannot create the output directory: %s"
+msgstr "无法创建输出目录：%s"
+
+msgid "Cannot display the screenshot"
+msgstr "无法显示截图"
+
+msgid "Cannot open %s (%s)"
+msgstr "无法打开 %s（%s）"
+
+msgid "Cannot reach %s (%s)"
+msgstr "无法访问 %s（%s）"
+
+msgid "Cannot read the status (is chromeui installed?)"
+msgstr "读不到状态（chromeui 装了吗？）"
+
+msgid "Cannot start the browser session: %s || driver log: %s"
+msgstr "无法创建浏览器会话：%s || 驱动日志：%s"
+
+msgid "Cannot start the browser worker: %s"
+msgstr "无法启动抓取进程：%s"
+
+msgid "Cannot stop the job: %s"
+msgstr "无法停止任务：%s"
+
+msgid "Cannot write %s (%s)"
+msgstr "无法写入 %s（%s）"
+
+msgid "Capture a screenshot"
+msgstr "抓取时截图"
+
+msgid "Carries authentication parameters - it may expire"
+msgstr "带鉴权参数，可能会过期"
+
+msgid "Chromedriver port 9515"
+msgstr "chromedriver 端口 9515"
+
+msgid "Click this selector before collecting (optional)"
+msgstr "抓取前先点击这个选择器（可选）"
+
+msgid "Collecting resources"
+msgstr "正在收集资源"
+
+msgid "Component self-test failed."
+msgstr "组件自检失败。"
+
+msgid "Copy"
+msgstr "复制"
+
+msgid "Copy HTML"
+msgstr "复制 HTML"
+
+msgid "Copy URL"
+msgstr "复制 URL"
+
+msgid "Copy all URLs"
+msgstr "复制全部 URL"
+
+msgid "Copy all headers"
+msgstr "复制全部请求头"
+
+msgid "Copy all request headers"
+msgstr "复制全部请求头"
+
+msgid "Copy all text"
+msgstr "复制全部文本"
+
+msgid "Copy as curl"
+msgstr "复制为 curl"
+
+msgid "Copy as ffmpeg"
+msgstr "复制为 ffmpeg"
+
+msgid "Copy failed - select the text manually."
+msgstr "复制失败，请手动选择文本。"
+
+msgid "Copy headers"
+msgstr "复制请求头"
+
+msgid "Disk"
+msgstr "磁盘"
+
+msgid "Download .m3u to this computer"
+msgstr "下载 .M3U 到电脑"
+
+msgid "Download failed"
+msgstr "下载失败"
+
+msgid "Download failed: %s"
+msgstr "下载失败：%s"
+
+msgid "Download headers.txt"
+msgstr "下载 headers.txt"
+
+msgid "Download started"
+msgstr "已开始下载"
+
+msgid "Download to computer"
+msgstr "下载到电脑"
+
+msgid "Download with these headers"
+msgstr "带这些请求头下载"
+
+msgid "Element %s did not appear within %ss"
+msgstr "元素 %s 在 %s 秒内没有出现"
+
+msgid "Enter a URL first."
+msgstr "请先填 URL。"
+
+msgid "Enter a URL, or paste a \"Copy as cURL\" command (its URL will be used)"
+msgstr "请填 URL，或者直接粘贴「Copy as cURL」命令（会用命令里的 URL）"
+
+msgid "Error"
+msgstr "错误"
+
+msgid "Everything"
+msgstr "全部"
+
+msgid "Export request headers (HEADERS.TXT)"
+msgstr "导出请求头（HEADERS.TXT）"
+
+msgid "Fetch a page"
+msgstr "抓取网页"
+
+msgid "Fetch page"
+msgstr "开始抓取"
+
+msgid "Fetch this address"
+msgstr "访问这个地址"
+
+msgid "Fetched"
+msgstr "已保存到设备"
+
+msgid "Fetching the playlist…"
+msgstr "正在取回清单…"
+
+msgid "Fetching with these headers…"
+msgstr "正在带请求头取回…"
+
+msgid "Fetching…"
+msgstr "正在访问…"
+
+msgid "Final URL"
+msgstr "最终 URL"
+
+msgid "Finished"
+msgstr "已完成"
+
+msgid "Finished in %s s"
+msgstr "完成，用时 %s 秒"
+
+msgid "First segments"
+msgstr "前几个分片"
+
+msgid "Grab failed: %s"
+msgstr "抓取失败：%s"
+
+msgid "Grab will send your pasted headers"
+msgstr "本次抓取会带上你粘贴的请求头"
+
+msgid "HEAD refused, used a 1-byte ranged GET (%s)"
+msgstr "HEAD 被拒，改用 1 字节范围 GET（%s）"
+
+msgid "HEADERS.TXT downloaded"
+msgstr "HEADERS.TXT 已下载"
+
+msgid "HTML copied."
+msgstr "HTML 已复制。"
+
+msgid "HTML source"
+msgstr "HTML 源码"
+
+msgid "HTTP 206 just means Chrome fetched it in ranges - the URL itself is fine"
+msgstr "HTTP 206 只说明 Chrome 是分段取回的，地址本身没问题"
+
+msgid "Header set"
+msgstr "请求头组"
+
+msgid "Headers copied."
+msgstr "请求头已复制。"
+
+msgid "Headers sent"
+msgstr "已发送的请求头"
+
+msgid "Headless Chrome on the device · page grabber and media resource extractor"
+msgstr "设备上的无头 Chrome · 网页抓取与多媒体资源提取"
+
+msgid "Idle"
+msgstr "空闲"
+
+msgid "Image file"
+msgstr "图片文件"
+
+msgid "Images only"
+msgstr "只看图片"
+
+msgid "Interfaces the page called"
+msgstr "页面调用的接口"
+
+msgid "Invalid number: %s"
+msgstr "数字不合法：%s"
+
+msgid "Keep on device"
+msgstr "存到设备"
+
+msgid "Loading the page"
+msgstr "正在加载页面"
+
+msgid "Loading the screenshot…"
+msgstr "正在加载截图…"
+
+msgid "Make a CSV table from this JSON"
+msgstr "把这个 JSON 生成 CSV 表格"
+
+msgid "Media resources"
+msgstr "多媒体资源"
+
+msgid "Missing value for --%s"
+msgstr "--%s 缺少取值"
+
+msgid "Needs the page as Referer - without it the CDN answers 403, so a plain browser window cannot open it"
+msgstr "需要以「页面地址」作为 Referer（不带会返回 403），所以浏览器直接打开会失败"
+
+msgid "No URL given"
+msgstr "没有给出 URL"
+
+msgid "No grabbed page yet - fetch one first"
+msgstr "还没有抓取过页面，请先抓一个"
+
+msgid "No headers yet."
+msgstr "还没有请求头。"
+
+msgid "No job is currently running"
+msgstr "当前没有运行中的任务"
+
+msgid "No playlist could be downloaded (it may need a referer/token)."
+msgstr "播放列表下载不到（可能需要 referer/token）。"
+
+msgid "No request headers were captured for this page."
+msgstr "这次抓取没有采到该页面的请求头。"
+
+msgid "No resources yet."
+msgstr "还没有资源。"
+
+msgid "No screenshot captured (tick the screenshot box before fetching)."
+msgstr "未截图（勾选「截图」后再抓取）。"
+
+msgid "No task yet."
+msgstr "还没有任务。"
+
+msgid "No text."
+msgstr "没有文本。"
+
+msgid "Not fetched (tick \"HTML source\" before fetching)."
+msgstr "未抓取（抓取前勾选“HTML 源码”）。"
+
+msgid "Nothing matches the current filter."
+msgstr "当前筛选下没有内容。"
+
+msgid "Nothing to copy."
+msgstr "没有可复制的内容。"
+
+msgid "On the device"
+msgstr "设备上的位置"
+
+msgid "Paste here: DevTools -> Network -> the request that returns the resource -> Copy as cURL (or Copy request headers)"
+msgstr "在这里粘贴：开发者工具 → Network → 找到那个（返回资源的）请求 → Copy as cURL（或 Copy request headers）"
+
+msgid "Paste my own request headers (for pages that need a login)"
+msgstr "粘贴我自己的请求头（登录后才能访问的网页用）"
+
+msgid "Players that only load the media after a play click (ximalaya and other web-component players) are started automatically; give an exact selector here if that is not enough"
+msgstr "点了播放才加载的网站（喜马拉雅等自定义播放器）会自动尝试唤醒；不够时可在上面填要点击的元素选择器"
+
+msgid "Playlist URL copied."
+msgstr "清单地址已复制"
+
+msgid "Playlist output path"
+msgstr "播放列表输出路径"
+
+msgid "Playlist type"
+msgstr "播放列表类型"
+
+msgid "Playlist written"
+msgstr "播放列表已写入"
+
+msgid "Put a v.qq.com page URL in the box above first."
+msgstr "请先在上面的输入框里填一个 v.qq.com 的页面地址。"
+
+msgid "Queued"
+msgstr "排队中"
+
+msgid "Reading from the device…"
+msgstr "正在从设备读取…"
+
+msgid "Reading status…"
+msgstr "正在读取状态…"
+
+msgid "Reading the file from the device…"
+msgstr "正在从设备读取文件…"
+
+msgid "Referer used"
+msgstr "已带 Referer"
+
+msgid "Refresh status"
+msgstr "刷新状态"
+
+msgid "Request chain"
+msgstr "跳转链（从 → 到）"
+
+msgid "Request headers actually sent (tokens/cookies come from the page JS)"
+msgstr "实际发出的请求头（token/cookie 由页面 JS 生成）"
+
+msgid "Resource filter"
+msgstr "资源筛选"
+
+msgid "Response preview"
+msgstr "返回内容预览"
+
+msgid "Running"
+msgstr "运行中"
+
+msgid "Running…"
+msgstr "运行中…"
+
+msgid "Save .m3u on the device"
+msgstr "导出 .M3U（存到设备）"
+
+msgid "Saved on the device"
+msgstr "已保存在设备上"
+
+msgid "Screenshot"
+msgstr "截图"
+
+msgid "Scroll to load lazy content"
+msgstr "滚动以加载懒加载内容"
+
+msgid "See /tmp/chromeui/worker.log on the device for details."
+msgstr "详情见设备上的 /tmp/chromeui/worker.log。"
+
+msgid "Self-test"
+msgstr "组件自检"
+
+msgid "Signed URL, valid until"
+msgstr "带鉴权地址，有效期至"
+
+msgid "Some components are missing - install chrome-headless-shell / chromedriver / chrome-glibc-runtime."
+msgstr "有组件缺失 —— 请安装 chrome-headless-shell / chromedriver / chrome-glibc-runtime。"
+
+msgid "Starting the browser"
+msgstr "正在启动浏览器"
+
+msgid "Starting…"
+msgstr "正在启动…"
+
+msgid "Stop requested…"
+msgstr "已发出中止请求…"
+
+msgid "Stopped"
+msgstr "已中止"
+
+msgid "Stored on the device"
+msgstr "已存在设备上"
+
+msgid "Subtitle file"
+msgstr "字幕文件"
+
+msgid "Subtitles only"
+msgstr "只看字幕"
+
+msgid "Taking the screenshot"
+msgstr "正在截图"
+
+msgid "Tencent (v.qq.com) only: press the button above to ask the API for the whole-episode playlist URL."
+msgstr "仅用于腾讯(v.qq.com)：点上面的按钮，向 API 要整集的清单地址。"
+
+msgid "Tencent API failed"
+msgstr "腾讯 API 失败"
+
+msgid "Tencent: get the whole-episode URL"
+msgstr "腾讯：取整集地址（v.qq.com）"
+
+msgid "Text copied."
+msgstr "文本已复制。"
+
+msgid "The browser is still running an older page script - press Ctrl+Shift+R to reload it"
+msgstr "浏览器还在用旧的页面脚本 —— 按 Ctrl+Shift+R 强制刷新（手机：用无痕窗口）"
+
+msgid "The exported .m3u carries the page Referer and a browser user-agent, so VLC/ffmpeg can fetch these URLs directly"
+msgstr "导出的 .m3u 已内置该页面的 Referer 和浏览器 UA，VLC/ffmpeg 可直接拉流"
+
+msgid "The file is too large to read."
+msgstr "文件太大，读不完。"
+
+msgid "The job already ended"
+msgstr "任务已经结束"
+
+msgid "The last grab found no audio/video streams (use --all to include images too)"
+msgstr "上次抓取没有找到音视频流（加 --all 可包含图片）"
+
+msgid "The last grab found no media resources"
+msgstr "上次抓取没有找到多媒体资源"
+
+msgid "The last grab was interrupted (its browser was cleaned up). Start it again."
+msgstr "上次抓取被中断（浏览器已清理），请重新开始。"
+
+msgid "The page did not finish loading within %ss - showing what has rendered so far"
+msgstr "页面在 %s 秒内没有加载完 —— 以下只包含已渲染的内容"
+
+msgid "The page redirected to %s - the data below belongs to that page"
+msgstr "页面被跳转到了 %s —— 以下数据属于那个页面"
+
+msgid "The server answered with a login / no-permission page - the cookie is probably expired, or a needed header is missing"
+msgstr "服务器返回的是登录页/无权限提示 —— cookie 可能已过期，或缺少某个必需的请求头"
+
+msgid "This document is painted on a canvas - it has no per-page URL. %s page image(s) were exported and can be downloaded"
+msgstr "这个文档是用 canvas 画的，没有可解析的每页 URL；已导出 %s 张页面图为 PNG，可逐张下载"
+
+msgid "This episode does not play on its own page (the site blocks that). It belongs to the album %s - grab the album page instead, and tick 'Walk every episode' to press each one."
+msgstr "这一集在单集页无法播放（站点拦截）。它属于专辑 %s —— 请改用该专辑页抓取，并勾选「逐集点击」把每一集都点一遍。"
+
+msgid "This is a DASH/fMP4 segment (a video-only or audio-only track), not a complete file"
+msgstr "这是 DASH/fMP4 分片（只有视频或只有音频），不是完整文件"
+
+msgid "This track uses a codec many players cannot decode (AV1/HEVC/Opus) - it may refuse to open"
+msgstr "这条轨道的编码很多播放器解不了（AV1/HEVC/Opus），可能打不开"
+
+msgid "Tick the box, paste your request headers (cookie/token) and try again."
+msgstr "请勾选并粘贴请求头（含 cookie/token）后再试。"
+
+msgid "Time cap reached (%ss): the page kept the browser busy and could not be read. The grab was stopped and the browser cleaned up. Raise --max-total to wait longer, or use a lighter page."
+msgstr "已达时间上限（%s 秒）：这个页面一直占着浏览器、读不出来。已强制停止并清理浏览器进程。可以加大 --max-total 再等，或换更轻的页面。"
+
+msgid "Timed out after %ss"
+msgstr "%s 秒后超时"
+
+msgid "Timeout (s)"
+msgstr "超时(秒)"
+
+msgid "Title"
+msgstr "标题"
+
+msgid "URL"
+msgstr "URL"
+
+msgid "URL copied."
+msgstr "URL 已复制。"
+
+msgid "Unknown argument: %s"
+msgstr "未知参数：%s"
+
+msgid "Unknown argument: --%s"
+msgstr "未知参数：--%s"
+
+msgid "Unknown error, please check the log"
+msgstr "未知错误，请看日志"
+
+msgid "Video file"
+msgstr "视频文件"
+
+msgid "Visible text"
+msgstr "可见文本"
+
+msgid "Wait for a CSS selector"
+msgstr "等待 CSS 选择器"
+
+msgid "Wait for the whole page (slow)"
+msgstr "等待整页加载完成（慢）"
+
+msgid "Whole-episode playlist"
+msgstr "整集清单"
+
+msgid "Window height"
+msgstr "窗口高"
+
+msgid "Window width"
+msgstr "窗口宽"
+
+msgid "Without Referer"
+msgstr "不带 Referer 时"
+
+msgid "Working"
+msgstr "进行中"
+
+msgid "a direct file/api URL, not a page"
+msgstr "直链文件/接口地址，不是网页"
+
+msgid "bytes"
+msgstr "字节"
+
+msgid "cached"
+msgstr "缓存"
+
+msgid "chrome-headless-shell is not installed (%s)"
+msgstr "chrome-headless-shell 未安装（%s）"
+
+msgid "chromedriver is not installed (%s)"
+msgstr "chromedriver 未安装（%s）"
+
+msgid "columns"
+msgstr "列"
+
+msgid "cookies set by the server"
+msgstr "服务器下发的 cookie"
+
+msgid "curl command copied."
+msgstr "curl 命令已复制"
+
+msgid "duration"
+msgstr "时长"
+
+msgid "elapsed"
+msgstr "已用"
+
+msgid "encrypted"
+msgstr "已加密"
+
+msgid "ffmpeg command copied."
+msgstr "ffmpeg 命令已复制"
+
+msgid "full HTML on the device"
+msgstr "完整 HTML 在设备上"
+
+msgid "full text on the device"
+msgstr "完整文本在设备上"
+
+msgid "header set(s)"
+msgstr "组请求头"
+
+msgid "header(s) pasted"
+msgstr "个请求头已粘贴"
+
+msgid "headers used"
+msgstr "将使用的请求头"
+
+msgid "interface response"
+msgstr "接口响应"
+
+msgid "lines"
+msgstr "行"
+
+msgid "listening"
+msgstr "在监听"
+
+msgid "live"
+msgstr "直播"
+
+msgid "master (variant streams)"
+msgstr "主列表（多码率流）"
+
+msgid "media (segments)"
+msgstr "媒体列表（分片）"
+
+msgid "network request"
+msgstr "网络请求"
+
+msgid "not listening"
+msgstr "未监听"
+
+msgid "nothing pasted yet"
+msgstr "还没有粘贴内容"
+
+msgid "page canvas"
+msgstr "页面画布"
+
+msgid "page data"
+msgstr "页面数据"
+
+msgid "page element"
+msgstr "页面元素"
+
+msgid "page script"
+msgstr "页面脚本"
+
+msgid "page source"
+msgstr "页面源码"
+
+msgid "partial"
+msgstr "部分内容"
+
+msgid "playlist download failed: %s"
+msgstr "播放列表下载失败：%s"
+
+msgid "redirected to"
+msgstr "被重定向到"
+
+msgid "request(s)"
+msgstr "个请求"
+
+msgid "rows"
+msgstr "行"
+
+msgid "segments"
+msgstr "段"
+
+msgid "send"
+msgstr "发送"
+
+msgid "showing the first %s"
+msgstr "只显示前 %s 条"
+
+msgid "signed / temporary"
+msgstr "带鉴权/临时"
+
+msgid "size unknown"
+msgstr "大小未知"
+
+msgid "timeout"
+msgstr "超时"
+
+msgid "truncated"
+msgstr "已截断"
+
+msgid "usage: %s"
+msgstr "用法：%s"
+
+msgid "using the URL/method/body from the pasted cURL"
+msgstr "使用粘贴的 cURL 里的 URL/方法/POST 数据"
+
+msgid "v.qq.com: its public API only hands over one segment (%s) - for the WHOLE episode press the Tencent button in the media card (it asks /usr/bin/qqurl for the HLS playlist)."
+msgstr "v.qq.com：它自己的公开接口只给一段（%s）——整集请点媒体卡片里的“腾讯：取整集地址”按钮（它去问 /usr/bin/qqurl 要 HLS 清单）。"
+
+msgid "v.qq.com: the address comes from the site's own API (no browser needed). %s"
+msgstr "v.qq.com：地址直接来自站点自己的接口（无需浏览器）。%s"
+
+msgid "v.qq.com: the site's own API answered (%s) but did not hand over a playable address. These videos usually need your login Cookie - paste your request headers and retry."
+msgstr "v.qq.com：它自己的公开接口只给一段（%s）——整集请点媒体卡片里的“腾讯：取整集地址”按钮（它去问 /usr/bin/qqurl 要 HLS 清单）。"
+
+msgid "with headers"
+msgstr "带请求头"

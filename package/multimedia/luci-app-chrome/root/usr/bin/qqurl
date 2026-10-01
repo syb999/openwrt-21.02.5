@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""qqurl -- 腾讯视频(v.qq.com) 整集资源地址 API（只给 URL，不下载）
+
+为什么是独立程序
+----------------
+腾讯公开的 PC 接口 (vv.video.qq.com/getinfo, platform=101001) 只给一小段 mp4
+（实测 16.3MB/205s，而同一响应自报整轨 253MB/2931s），整集走的是 HLS+TS，
+清单地址里带"播放器会话目录"这一段，只能用真浏览器听网络拿不到的那部分字段；
+它的签名接口 (vd6.l.qq.com/proxyhttp, sphls=6/encryptVer/cKey) 脚本伪造不了。
+设备上的 chrome-headless-shell 实测有两条硬约束（2026-10 在 Panther X2 上量出来的）：
+
+  1. 🔴 **必须 `--disable-gpu`**（否则 GPU 进程起不来会拖住合成，播放器永远不进正片）；
+  2. 🔴 **全程绝不调用 `Runtime.evaluate`/execute_script**（一调就把页面顶死，之后连广告都取不到）。
+
+满足这两条，设备自己就能拿到正片分片（实测：150 秒窗口，`svp_50112` 目录 9 个分片 ✓、
+还出现 `*.ts.m3u8` 清单请求 ✓）。所以本程序只做：
+开页面 -> 等 -> 只听网络 -> 由分片名反推清单 -> 校验。
+
+    segment : <dir>/0287_gzc_1000102_<keyid>.f321002.10.ts?index=287&...&token=...
+    playlist: <dir>/gzc_1000102_<keyid>.f321002.ts.m3u8?ver=4      <- HTTP 200，整集
+
+用法
+----
+    qqurl <page-url>            一次性：打印 JSON
+    qqurl --serve [--port N]    HTTP API：GET /?url=<page-url>  -> JSON
+    qqurl --start <page-url>                后台跑（立刻返回）—— 界面用这个
+    qqurl --job                             读任务状态/结果（秒回）—— 界面用它轮询
+    qqurl --put <playlist-url> [page-url]   收下外部拿到的清单地址（校验+缓存）
+
+    {"ok":true,"kind":"hls","playlist":"https://…/xxx.f321002.ts.m3u8?ver=4",
+     "segments":292,"duration_s":2918.5,"vid":"u4102ixc2j0","took":61.2,"cached":false}
+    {"ok":false,"error":"…","stage":"launch|navigate|listen|derive"}
+"""
+import glob
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36")
+WORK = "/tmp/qqurl"
+CACHE = WORK + "/cache.json"
+JOB = WORK + "/job.json"
+TTL = 900                       # 清单里的分片 token 会过期 -> 缓存 15 分钟
+PROFILE = WORK + "/prof"
+PORT = 9666                      # 默认值；实际每次跑用一个【空闲端口】(见 free_port)
+LAUNCH = ["/bin/sh", "/opt/chrome-root/run-chrome.sh"]     # glibc chroot 启动器
+LISTEN_SECONDS = 210       # 🔴 上限；广告链长短不定（实测 1~3 条），正片分片要在广告之后才发
+EPISODE_MIN_S = 120        # 🔴 判据用【清单时长】而非分片数：广告 15~30s，正片 2918s
+EPISODE_HINT = 4           # 某目录攒到这么多段就【取一次它的清单看时长】
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+def kill_chrome(wait=True):
+    """设备上没有 pkill，自己扫 /proc。
+
+    🔴 同时清掉**别的 qqurl 实例**：实测多个实例抢同一个视频会互相干扰 ——
+    我用 ssh 跑了几轮被掐断后残留了 3 个 qqurl / 9 个 chrome，那几轮全都只拿到广告清单。
+    """
+    me = os.getpid()
+    n = 0
+
+    def _victims():
+        out = []
+        for d in glob.glob("/proc/[0-9]*"):
+            try:
+                pid = int(d.split("/")[-1])
+                if pid == me:
+                    continue
+                cl = open(d + "/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace")
+            except Exception:
+                continue
+            if any(k in cl for k in ("chrome-headless-shell", "chromedriver")):
+                out.append(pid)
+            elif "qqurl" in cl and "python3" in cl and "/usr/bin/qqurl" not in cl.split()[0]:
+                out.append(pid)          # 另一个 qqurl 实例（别杀自己）
+        return out
+
+    for pid in _victims():
+        try:
+            os.kill(pid, signal.SIGKILL)
+            n += 1
+        except Exception:
+            pass
+    if wait and n:
+        for _ in range(20):              # 等它们真的消失，避免新起的一起被影响
+            if not _victims():
+                break
+            time.sleep(0.5)
+        log("cleaned %d leftover process(es) from earlier runs" % n)
+    return n
+
+
+def http_get(url, timeout=25):
+    r = urllib.request.Request(url)
+    r.add_header("User-Agent", UA)
+    r.add_header("Referer", "https://v.qq.com/")
+    try:
+        with urllib.request.urlopen(r, timeout=timeout) as x:
+            return getattr(x, "status", 200), x.read(400000)
+    except Exception:
+        return 0, b""
+
+
+def vid_of(url):
+    m = re.search(r"/([A-Za-z0-9_]{8,})\.html", url) or re.search(r"[?&](?:vid|vids)=([A-Za-z0-9_]+)", url)
+    return m.group(1) if m else ""
+
+
+def cache_get(vid):
+    try:
+        c = json.load(open(CACHE))
+    except Exception:
+        return None
+    e = c.get(vid)
+    if e and time.time() - e.get("at", 0) < TTL:
+        e["cached"] = True
+        return e
+    return None
+
+
+def cache_put(vid, res):
+    try:
+        os.makedirs(WORK, exist_ok=True)
+        try:
+            c = json.load(open(CACHE))
+        except Exception:
+            c = {}
+        c[vid] = dict(res, at=time.time())
+        json.dump(c, open(CACHE, "w"))
+    except Exception:
+        pass
+
+
+def free_port(prefer=PORT):
+    """🔴 每轮换端口：固定端口 + 残留浏览器 = CDP 连到上一轮那个旧浏览器
+    （带着旧会话/广告缓存），实测那就是"只拿到广告"的成因之一。
+    探测版每轮用新端口 -> 3/3 拿到正片；qqurl 固定 9666 -> 0/5。"""
+    import socket as _s
+    for cand in [prefer] + list(range(9670, 9800)) + [0]:
+        try:
+            sk = _s.socket()
+            sk.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
+            sk.bind(("127.0.0.1", cand))
+            port = sk.getsockname()[1]
+            sk.close()
+            return port
+        except OSError:
+            continue
+    return prefer
+
+
+def listen(url, seconds=LISTEN_SECONDS):
+    """开页面，只听网络（绝不 execute_script，避免渲染器被占死）"""
+    import websocket
+    shutil.rmtree(PROFILE, ignore_errors=True)
+    os.makedirs(WORK, exist_ok=True)
+    kill_chrome()
+    time.sleep(2)          # 让被杀掉的浏览器真正退出、释放端口/文件
+    port = free_port()
+    log("chromium on CDP port %d" % port)
+    proc = subprocess.Popen(LAUNCH + [
+        "--no-sandbox", "--disable-gpu", "--disable-software-rasterizer", "--disable-dev-shm-usage", "--headless=old",
+        "--autoplay-policy=no-user-gesture-required", "--mute-audio", "--no-first-run",
+        "--user-agent=" + UA, "--lang=zh-CN", "--user-data-dir=" + PROFILE,
+        "--remote-debugging-port=%d" % port, "--window-size=1280,800", "about:blank"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ws = None
+    try:
+        for _ in range(80):
+            try:
+                t = json.load(urllib.request.urlopen("http://127.0.0.1:%d/json" % port,
+                                                     timeout=2))
+                pg = [x for x in t if x["type"] == "page"][0]
+                ws = websocket.create_connection(pg["webSocketDebuggerUrl"], timeout=30,
+                                                 max_size=20 * 10 ** 6, suppress_origin=True)
+                break
+            except Exception:
+                time.sleep(0.5)
+        if not ws:
+            return {"ok": False, "error": "browser did not start (CDP unreachable)",
+                    "stage": "launch", "segments": 0}
+        i = [0]
+
+        def nowait(m, p=None):
+            i[0] += 1
+            ws.send(json.dumps({"id": i[0], "method": m, "params": p or {}}))
+
+        nowait("Network.enable")
+        nowait("Page.enable")
+        nowait("Page.navigate", {"url": url})
+        segs, m3us, total, dirs = set(), set(), 0, {}
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            ws.settimeout(0.8)
+            try:
+                m = json.loads(ws.recv())
+            except Exception:
+                continue
+            if m.get("method") == "Network.requestWillBeSent":
+                u = ((m.get("params") or {}).get("request") or {}).get("url") or ""
+                total += 1
+                if re.search(r"\.ts\?", u):
+                    if u not in segs:
+                        segs.add(u)
+                        try:                       # 只做计数，不发任何请求（照抄 3/3 成功的探测）
+                            dirs[u.split("/")[-2]] = dirs.get(u.split("/")[-2], 0) + 1
+                        except Exception:
+                            pass
+                elif ".m3u8" in u:
+                    m3us.add(u)
+        return {"ok": True, "segments_seen": len(segs), "m3u8_seen": len(m3us),
+                "requests": total, "segs": sorted(segs), "m3u8": sorted(m3us),
+                "by_dir": dirs}
+    finally:
+        try:
+            if ws:
+                ws.close()
+        except Exception:
+            pass
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        kill_chrome()
+        shutil.rmtree(PROFILE, ignore_errors=True)
+
+
+def derive(segs, m3us, episode=None, by_dir=None):
+    if episode:                      # listen 阶段已按"时长"确认是正片
+        return {"ok": True, "kind": "hls", "playlist": episode["playlist"],
+                "segments": episode["segments"], "duration_s": episode["duration_s"]}
+    """由分片名/清单请求反推整集清单地址并校验"""
+    cands = []
+    for u in m3us:                     # 播放器自己取过的清单最可信
+        cands.append(u)
+    cnt = {}
+    for u in segs:
+        m = re.match(r"(https?://\S+?/)(\d{2,4})_(gzc_\d+_[0-9a-zA-Z]+)\.(f\d+)\.\d+\.ts\?", u)
+        if m:
+            cnt[m.group(1)] = cnt.get(m.group(1), 0) + 1
+    # 目录里分片多的是正片，少的通常是广告 -> 先试正片的
+    for u in sorted(segs, key=lambda x: -cnt.get(x.rsplit("/", 1)[0] + "/", 0)):
+        m = re.match(r"(https?://\S+?/)(\d{2,4})_(gzc_\d+_[0-9a-zA-Z]+)\.(f\d+)\.\d+\.ts\?", u)
+        if m:
+            cands.append("%s%s.%s.ts.m3u8?ver=4" % (m.group(1), m.group(3), m.group(4)))
+    best = None
+    seen_dirs = set()
+    for c in dict.fromkeys(cands):
+        seen_dirs.add(c.rsplit("/", 1)[0][-24:])
+        st, b = http_get(c)
+        n = b.count(b"#EXTINF")
+        if st == 200 and n:
+            starts = [int(x) for x in re.findall(rb"start=(\d+)", b)]
+            dur = (max(starts) / 1000.0) if starts else 0.0
+            if not best or n > best["segments"]:
+                best = {"ok": True, "kind": "hls", "playlist": c, "segments": n,
+                        "duration_s": round(dur, 1)}
+    if best:
+        best["dirs_seen"] = len(seen_dirs)
+        best["by_dir"] = len(by_dir)
+        if best["segments"] < 5:
+            best["note"] = "only a very short playlist was found (an ad?) - try again"
+    return best
+
+
+def put(playlist, pageurl=""):
+    """把外部拿到的清单地址收进来：校验 + 缓存（LuCI 只认这一个入口）"""
+    st, b = http_get(playlist)
+    n = b.count(b"#EXTINF")
+    if st != 200 or not n:
+        return {"ok": False, "stage": "put", "error": "that URL is not a playlist (HTTP %s)" % st}
+    starts = [int(x) for x in re.findall(rb"start=(\d+)", b)]
+    res = {"ok": True, "kind": "hls", "playlist": playlist, "segments": n,
+           "duration_s": round((max(starts) / 1000.0) if starts else 0.0, 1),
+           "vid": vid_of(pageurl) or "", "took": 0.0, "cached": False, "source": "put"}
+    if res["vid"]:
+        cache_put(res["vid"], res)
+    return res
+
+
+def one_shot(url, force=False):
+    """两次尝试：站点喂的广告链长短不定（实测同一小时内 A 轮 50 秒就出正片、B 轮 213 秒只有广告），
+    所以第一轮只拿到广告就重开浏览器再来一轮；判定标准始终是【清单时长 >= EPISODE_MIN_S】。"""
+    t0 = time.time()
+    vid = vid_of(url)
+    if vid and not force:
+        c = cache_get(vid)
+        if c:
+            c["took"] = round(time.time() - t0, 1)
+            return c
+    last = None
+    for attempt in (1, 2):
+        secs = LISTEN_SECONDS if attempt == 1 else 150
+        log("attempt %d: listening up to %ds" % (attempt, secs))
+        r = listen(url, seconds=secs)
+        if not r.get("ok"):
+            last = r
+            continue
+        best = derive(r.get("segs") or [], r.get("m3u8") or [], r.get("episode"), r.get("by_dir"))
+        if best and best.get("duration_s", 0) >= EPISODE_MIN_S:
+            best.update({"vid": vid, "took": round(time.time() - t0, 1), "cached": False,
+                         "attempts": attempt})
+            if vid:
+                cache_put(vid, best)
+            return best
+        last = {"ok": False, "stage": "derive", "attempt": attempt,
+                "requests": r.get("requests", 0), "segments_seen": r.get("segments_seen", 0),
+                "dirs_seen": (best or {}).get("dirs_seen"),
+                "error": ("only ad-length playlists were seen in attempt %d (%d media requests); "
+                          "no full-episode playlist. Try again (the ad chain varies), or run "
+                          "qqurl on a PC with a full Chrome and use "
+                          "qqurl --put <playlist url> <page url>." % (attempt, r.get("requests", 0)))}
+    return last or {"ok": False, "stage": "listen", "error": "no result"}
+
+
+def job_write(obj):
+    try:
+        os.makedirs(WORK, exist_ok=True)
+        obj["at"] = time.time()
+        json.dump(obj, open(JOB, "w"))
+    except Exception:
+        pass
+
+
+def cmd_job():
+    """给界面轮询用：只读一个小文件，必须秒回"""
+    try:
+        j = json.load(open(JOB))
+    except Exception:
+        j = {"state": "idle"}
+    print(json.dumps(j, ensure_ascii=False))
+
+
+def cmd_worker(url):
+    """真正的干活进程（被 --start 派生出来，脱离调用方）"""
+    vid = vid_of(url)
+    job_write({"state": "running", "phase": "start", "url": url, "vid": vid})
+
+    def _note(msg):
+        job_write({"state": "running", "phase": str(msg)[:120], "url": url, "vid": vid})
+
+    # listen() 里的 log() 走 stderr；这里把关键阶段也写进 job
+    try:
+        c = cache_get(vid) if vid else None
+        if c:
+            c["state"] = "done"
+            job_write(c)
+            return
+        for attempt in (1, 2):
+            _note("attempt %d/2 (each up to %ds)" % (attempt, LISTEN_SECONDS))
+            r = listen(url, seconds=LISTEN_SECONDS if attempt == 1 else 150)
+            if not r.get("ok"):
+                job_write({"state": "error", "error": r.get("error", "browser failed"),
+                           "stage": r.get("stage"), "url": url, "vid": vid})
+                return
+            _note("attempt %d: %d media request(s), checking playlists"
+                  % (attempt, r.get("requests", 0)))
+            best = derive(r.get("segs") or [], r.get("m3u8") or [], r.get("episode"),
+                          r.get("by_dir"))
+            if best and best.get("duration_s", 0) >= EPISODE_MIN_S:
+                best.update({"state": "done", "vid": vid, "cached": False, "attempts": attempt})
+                if vid:
+                    cache_put(vid, {k: v for k, v in best.items() if k != "state"})
+                job_write(best)
+                return
+            err = ("only ad-length playlists were seen in attempt %d (%d media requests) - "
+                   "the ad chain varies, try again" % (attempt, r.get("requests", 0)))
+        job_write({"state": "error", "error": err, "url": url, "vid": vid})
+    except Exception as e:
+        job_write({"state": "error", "error": str(e)[:200], "url": url, "vid": vid})
+
+
+def cmd_start(url):
+    """立刻返回，把真正的活派给一个脱离的 worker（LuCI 的 XHR 只等几秒）"""
+    os.makedirs(WORK, exist_ok=True)
+    existing = {}
+    try:
+        existing = json.load(open(JOB))
+    except Exception:
+        pass
+    if existing.get("state") == "running" and time.time() - existing.get("at", 0) < 600:
+        print(json.dumps({"ok": True, "already_running": True, **existing}))
+        return 0
+    try:
+        os.remove(JOB)
+    except OSError:
+        pass
+    job_write({"state": "running", "phase": "queued", "url": url, "vid": vid_of(url)})
+    subprocess.Popen([sys.executable, "-u", os.path.abspath(__file__), "--worker", url],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     stdin=subprocess.DEVNULL, start_new_session=True)
+    print(json.dumps({"ok": True, "started": True, "url": url}))
+    return 0
+
+
+def serve(port):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from urllib.parse import urlparse, parse_qs
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = parse_qs(urlparse(self.path).query)
+            if self.path.startswith("/health"):
+                body = json.dumps({"ok": True}).encode()
+            else:
+                url = (q.get("url") or [""])[0]
+                if not url:
+                    body = json.dumps({"ok": False, "error": "pass ?url=<page url>"}).encode()
+                else:
+                    try:
+                        body = json.dumps(one_shot(url, force=bool(q.get("force")))).encode()
+                    except Exception as e:
+                        body = json.dumps({"ok": False, "error": str(e)[:200],
+                                           "stage": "internal"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    log("qqurl API listening on http://127.0.0.1:%d/  (GET /?url=<page url>)" % port)
+    HTTPServer(("0.0.0.0", port), H).serve_forever()
+
+
+def main():
+    a = sys.argv[1:]
+    if not a:
+        print(__doc__)
+        return 2
+    if a[0] == "--start":
+        return cmd_start([x for x in a[1:] if not x.startswith("--")][0])
+    if a[0] == "--worker":
+        cmd_worker(a[1]); return 0
+    if a[0] == "--job":
+        cmd_job(); return 0
+    if a[0] == "--put":
+        pl = a[1]
+        page = a[2] if len(a) > 2 else ""
+        res = put(pl, page)
+        print(json.dumps(res, ensure_ascii=False))
+        return 0 if res.get("ok") else 1
+    if a[0] == "--serve":
+        port = PORT if "--port" not in a else int(a[a.index("--port") + 1])
+        serve(port)
+        return 0
+    force = "--force" in a
+    url = [x for x in a if not x.startswith("--")][0]
+    if not re.match(r"^https?://", url):
+        url = "https://" + url
+    res = one_shot(url, force=force)
+    print(json.dumps(res, ensure_ascii=False))
+    return 0 if res.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
