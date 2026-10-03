@@ -1,0 +1,23 @@
+msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "PON"
+msgstr ""
+
+msgid "PON status"
+msgstr ""
+
+msgid "Counters"
+msgstr ""
+
+msgid "Data path"
+msgstr ""
+
+msgid "Recent events"
+msgstr ""
+
+msgid "Line mode"
+msgstr ""
+
+msgid "loading"
+msgstr ""
