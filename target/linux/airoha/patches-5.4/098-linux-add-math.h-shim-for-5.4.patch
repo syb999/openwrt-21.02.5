@@ -1,0 +1,24 @@
+--- /dev/null
++++ b/include/linux/math.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * 5.4 shim for <linux/math.h>
++ *
++ * Upstream split the math/bit helpers out of <linux/kernel.h> into
++ * <linux/math.h> in v5.8.  Backported drivers (e.g. the Airoha AN7581/AN7583
++ * PCS driver) include <linux/math.h> unconditionally, so provide a thin
++ * forwarding header on 5.4.
++ */
++#ifndef _LINUX_MATH_H
++#define _LINUX_MATH_H
++
++#include <linux/kernel.h>
++
++/* Upstream v6.x helper */
++#ifndef abs_diff
++#define abs_diff(a, b) ({ typeof(a) __a = (a); typeof(b) __b = (b); \
++			  __a > __b ? (__a - __b) : (__b - __a); })
++#endif
++
++#endif /* _LINUX_MATH_H */

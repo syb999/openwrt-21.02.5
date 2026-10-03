@@ -1,0 +1,252 @@
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -1936,4 +1936,9 @@
+ } \
+ device_initcall(__driver##_init);
+ 
++/* ===== 5.4 shim: dev_err_ptr_probe() (upstream v6.x) ===== */
++#define dev_err_ptr_probe(dev, err, fmt, ...) \
++	ERR_PTR(dev_err_probe(dev, err, fmt, ##__VA_ARGS__))
++
+ #endif /* _DEVICE_H_ */
++
+--- a/include/linux/reset.h
++++ b/include/linux/reset.h
+@@ -579,4 +579,22 @@
+ 	return 0;
+ }
+ 
++/* 5.4 shim: bulk "optional exclusive" reset helpers (upstream ~v6.7) */
++static inline int __must_check
++devm_reset_control_bulk_get_optional_exclusive(struct device *dev, int num_rstcs,
++					       struct reset_control_bulk_data *rstcs)
++{
++	int i;
++
++	for (i = 0; i < num_rstcs; i++) {
++		rstcs[i].rstc = devm_reset_control_get_optional_exclusive(dev,
++									 rstcs[i].id);
++		if (IS_ERR(rstcs[i].rstc))
++			return PTR_ERR(rstcs[i].rstc);
++	}
++
++	return 0;
++}
++
+ #endif
++
+--- a/include/linux/phylink.h
++++ b/include/linux/phylink.h
+@@ -111,6 +111,10 @@
+ #define PHYLINK_PCS_NEG_INBAND_ENABLED	(PHYLINK_PCS_NEG_INBAND | \
+ 					 PHYLINK_PCS_NEG_ENABLED)
+ 
++/* 6.14 in-band capability flags (backported) */
++#define LINK_INBAND_DISABLE	BIT(0)
++#define LINK_INBAND_ENABLE	BIT(1)
++
+ struct phylink_pcs_ops;
+ 
+ /**
+@@ -124,6 +128,7 @@
+  * and will be passed between phylink and the PCS.
+  */
+ struct phylink_pcs {
++	DECLARE_PHY_INTERFACE_MASK(supported_interfaces);
+ 	const struct phylink_pcs_ops *ops;
+ 	struct phylink *phylink;
+ 	bool neg_mode;
+@@ -144,6 +149,8 @@
+  * @pcs_link_down: torn down link between MAC and PCS.
+  */
+ struct phylink_pcs_ops {
++	unsigned int (*pcs_inband_caps)(struct phylink_pcs *pcs,
++					phy_interface_t interface);
+ 	int (*pcs_validate)(struct phylink_pcs *pcs, unsigned long *supported,
+ 			    const struct phylink_link_state *state);
+ 	int (*pcs_enable)(struct phylink_pcs *pcs);
+@@ -152,7 +159,7 @@
+ 			       phy_interface_t interface);
+ 	int (*pcs_post_config)(struct phylink_pcs *pcs,
+ 			       phy_interface_t interface);
+-	void (*pcs_get_state)(struct phylink_pcs *pcs,
++	void (*pcs_get_state)(struct phylink_pcs *pcs, unsigned int neg_mode,
+ 			      struct phylink_link_state *state);
+ 	int (*pcs_config)(struct phylink_pcs *pcs, unsigned int neg_mode,
+ 			  phy_interface_t interface,
+@@ -426,7 +433,7 @@
+  */
+ int phylink_get_link_timer_ns(phy_interface_t interface);
+ 
+-void phylink_mii_c22_pcs_decode_state(struct phylink_link_state *state,
++void phylink_mii_c22_pcs_decode_state(struct phylink_link_state *state, unsigned int neg_mode,
+ 				      u16 bmsr, u16 lpa);
+ void phylink_mii_c22_pcs_get_state(struct mdio_device *pcs,
+ 				   struct phylink_link_state *state);
+--- a/include/linux/nvmem-consumer.h
++++ b/include/linux/nvmem-consumer.h
+@@ -226,4 +226,39 @@
+ }
+ #endif /* CONFIG_NVMEM && CONFIG_OF */
+ 
++/* 5.4 shim: nvmem_cell_read_variable_le_u32() (upstream v6.x) */
++#include <linux/slab.h>
++static inline int nvmem_cell_read_variable_le_u32(struct device *dev,
++						  const char *cell_id, u32 *val)
++{
++	struct nvmem_cell *cell;
++	size_t len;
++	u8 *buf;
++
++	cell = nvmem_cell_get(dev, cell_id);
++	if (IS_ERR(cell))
++		return PTR_ERR(cell);
++
++	buf = nvmem_cell_read(cell, &len);
++	nvmem_cell_put(cell);
++	if (IS_ERR(buf))
++		return PTR_ERR(buf);
++
++	if (len != 1 && len != 2 && len != 4) {
++		kfree(buf);
++		return -EINVAL;
++	}
++
++	*val = 0;
++	switch (len) {
++	case 4: *val |= buf[3] << 24; fallthrough;
++	case 2: *val |= buf[1] << 8;  fallthrough;
++	case 1: *val |= buf[0];       break;
++	}
++
++	kfree(buf);
++	return 0;
++}
++
+ #endif  /* ifndef _LINUX_NVMEM_CONSUMER_H */
++
+--- a/drivers/net/phy/phylink.c
++++ b/drivers/net/phy/phylink.c
+@@ -545,7 +545,7 @@
+ 
+ 	if (pl->pcs && pl->pcs->ops->pcs_get_state &&
+ 	    !pl->ops->mac_link_state) {
+-		pl->pcs->ops->pcs_get_state(pl->pcs, state);
++		pl->pcs->ops->pcs_get_state(pl->pcs, pl->pcs->neg_mode, state);
+ 		return 0;
+ 	}
+ 
+@@ -2261,7 +2261,7 @@
+ 		state->duplex = DUPLEX_HALF;
+ }
+ 
+-void phylink_mii_c22_pcs_decode_state(struct phylink_link_state *state,
++void phylink_mii_c22_pcs_decode_state(struct phylink_link_state *state, unsigned int neg_mode,
+ 				      u16 bmsr, u16 lpa)
+ {
+ 	state->link = !!(bmsr & BMSR_LSTATUS);
+@@ -2308,7 +2308,7 @@
+ 		return;
+ 	}
+ 
+-	phylink_mii_c22_pcs_decode_state(state, bmsr, lpa);
++	phylink_mii_c22_pcs_decode_state(state, 0, bmsr, lpa);
+ }
+ 
+ int phylink_mii_c22_pcs_encode_advertisement(phy_interface_t interface,
+--- a/drivers/net/pcs/airoha/pcs-an7581.c
++++ b/drivers/net/pcs/airoha/pcs-an7581.c
+@@ -705,8 +705,7 @@
+ 	/* Setup LDO */
+ 	usleep_range(200, 300);
+ 
+-	regmap_field_set_bits(pcs_ana_fields[AN7581_PCS_JCPLL_SPARE_L],
+-			      AIROHA_PCS_ANA_JCPLL_SPARE_L_LDO);
++	regmap_field_update_bits(pcs_ana_fields[AN7581_PCS_JCPLL_SPARE_L], AIROHA_PCS_ANA_JCPLL_SPARE_L_LDO, AIROHA_PCS_ANA_JCPLL_SPARE_L_LDO);
+ 
+ 	/* Setup RSTB */
+ 	regmap_field_write(pcs_ana_fields[AN7581_PCS_JCPLL_RST_DLY],
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -11,6 +11,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/tcp.h>
+ #include <linux/pcs/pcs-airoha.h>
++#include <linux/pcs/pcs.h>
+ #include <linux/u64_stats_sync.h>
+ #include <net/dst_metadata.h>
+ #include <net/page_pool/helpers.h>
+@@ -2533,6 +2534,29 @@
+ 	return 0;
+ }
+ 
++
++/* ===== 5.4 compat: 6.18 replaced airoha_pcs_create()/destroy() with a
++ * firmware-node provider model.  The PCS is described by the "pcs-handle"
++ * property of each MAC node and obtained through fwnode_pcs_get().
++ * PCS is optional (internal GDM ports have no pcs-handle) -> NULL is valid.
++ */
++static struct phylink_pcs *airoha_pcs_get(struct device_node *np)
++{
++	struct fwnode_handle *pcs_fwnode;
++	struct phylink_pcs *pcs;
++
++	pcs_fwnode = fwnode_find_reference(of_fwnode_handle(np), "pcs-handle", 0);
++	if (IS_ERR(pcs_fwnode))
++		return NULL;
++
++	pcs = fwnode_pcs_get(pcs_fwnode, 0);
++	fwnode_handle_put(pcs_fwnode);
++	if (IS_ERR(pcs))
++		return NULL;
++
++	return pcs;
++}
++
+ static int airoha_setup_phylink(struct net_device *dev)
+ {
+ 	struct airoha_gdm_port *port = netdev_priv(dev);
+@@ -2564,9 +2588,8 @@
+ 	__set_bit(PHY_INTERFACE_MODE_10GBASER,
+ 		  port->phylink_config.supported_interfaces);
+ 
+-	port->pcs = airoha_pcs_create(&dev->dev);
+-	if (IS_ERR(port->pcs))
+-		return PTR_ERR(port->pcs);
++	port->pcs = airoha_pcs_get(np);
++	/* PCS is optional: internal GDM ports have no "pcs-handle" */
+ 
+ 	phylink = phylink_create(&port->phylink_config,
+ 				 of_fwnode_handle(np),
+@@ -2782,7 +2805,7 @@
+ 			airoha_metadata_dst_free(port);
+ 			if (airhoa_is_phy_external(port)) {
+ 				phylink_destroy(port->phylink);
+-				airoha_pcs_destroy(port->pcs);
++				/* provider model: PCS lifetime owned by the PCS driver */
+ 			}
+ 		}
+ 	}
+@@ -2813,7 +2836,7 @@
+ 		airoha_metadata_dst_free(port);
+ 		if (airhoa_is_phy_external(port)) {
+ 			phylink_destroy(port->phylink);
+-			airoha_pcs_destroy(port->pcs);
++			/* provider model: PCS lifetime owned by the PCS driver */
+ 		}
+ 	}
+ 	free_netdev(eth->napi_dev);
+--- a/include/linux/rcupdate.h
++++ b/include/linux/rcupdate.h
+@@ -896,4 +896,11 @@
+ 	return false;
+ }
+ 
++/* 5.4 shim: rcu_replace_pointer() (upstream ~v5.9) */
++#ifndef rcu_replace_pointer
++#define rcu_replace_pointer(rcu_ptr, ptr, cond) \
++	(({ typeof(ptr) __old = rcu_dereference_protected(rcu_ptr, cond); \
++	    rcu_assign_pointer(rcu_ptr, ptr); __old; }))
++#endif
++
+ #endif /* __LINUX_RCUPDATE_H */

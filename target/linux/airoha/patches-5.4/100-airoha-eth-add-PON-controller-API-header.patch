@@ -1,0 +1,108 @@
+--- /dev/null
++++ b/include/linux/airoha-eth.h
+@@ -0,0 +1,105 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_AIROHA_ETH_H_
++#define _LINUX_AIROHA_ETH_H_
++
++#include <linux/types.h>
++
++struct net_device;
++struct sk_buff;
++
++/* PON control metadata; skb->data carries the raw OMCI or OAM PDU. */
++struct airoha_pon_ctrl_rx_info {
++	u16 id;		/* XG-PON OMCC/GEM Port-ID; EPON LLID value */
++	u8 channel;	/* EPON LLID table index; normally zero for XG-PON */
++	bool oam;	/* QDMA descriptor carries the OAM/OMCI flag */
++	bool no_mic;	/* Downstream OMCI MIC validation is pending */
++};
++
++enum airoha_pon_ctrl_type {
++	AIROHA_PON_CTRL_OMCI,
++	AIROHA_PON_CTRL_EPON_OAM,
++};
++
++/* Protocol fields describe the frame; airoha_eth builds the QDMA descriptor. */
++struct airoha_pon_ctrl_tx_info {
++	enum airoha_pon_ctrl_type type;
++	u16 id;		/* OMCI OMCC ID or EPON OAM LLID value */
++	u8 channel;	/* Zero for OMCI; EPON LLID table index */
++	u8 key_index;	/* OMCI OIK group; zero for EPON */
++};
++
++#define AIROHA_PON_VID_ANY	0xffff
++#define AIROHA_PON_MAX_QDMA_CHANNELS	32
++
++/*
++ * QDMA is the shared data plane for all PON protocols. Counters accumulate
++ * over the pon netdev lifetime and span one registration and service cycle.
++ */
++struct airoha_pon_datapath_stats {
++	u64 tx_packets_submitted;
++	u64 tx_bytes_submitted;
++	u64 tx_packets_completed;
++	u64 tx_bytes_completed;
++	u64 tx_packets_hw_dropped;
++	u64 tx_busy;
++	u64 tx_dropped;
++	u64 tx_no_mapping;
++	u64 rx_data_packets;
++	u64 rx_control_packets;
++	u64 rx_control_fallback;
++	u64 rx_packets_delivered;
++	u64 rx_descriptors_dropped;
++	u64 rx_crc_errors;
++	u64 rx_runt_frames;
++	u64 rx_long_frames;
++	u64 tx_channel_packets[AIROHA_PON_MAX_QDMA_CHANNELS];
++	u64 rx_channel_packets[AIROHA_PON_MAX_QDMA_CHANNELS];
++	u32 last_tx_msg0;
++	u32 last_tx_msg1;
++	u32 last_rx_msg0;
++	u32 last_rx_msg1;
++};
++
++/* XG-PON upstream classifier keyed by vlan_id and pbit_mask. */
++struct airoha_pon_flow_config {
++	u16 gem_id;
++	u16 vlan_id;
++	u8 tcont;
++	u8 pbit_mask;
++};
++
++/* Start the line asynchronously and drain control work and IRQs in stop(). */
++struct airoha_pon_link_ops {
++	int (*start)(void *priv);
++	void (*stop)(void *priv);
++	/* Protocol state and descriptor ID classify control frames without OAM flags. */
++	bool (*match_control)(void *priv,
++			      const struct airoha_pon_ctrl_rx_info *info);
++	/* rx_control() takes skb ownership before returning to airoha_eth. */
++	void (*rx_control)(void *priv, struct sk_buff *skb,
++			   const struct airoha_pon_ctrl_rx_info *info);
++	/* Wake protocol control netdevs when the shared QDMA ring recovers. */
++	void (*wake_control_tx)(void *priv);
++};
++
++/* Configure the T-CONT and GEM Port-ID mapping used by QDMA TX descriptors. */
++int airoha_eth_pon_configure(struct net_device *netdev, u8 tcont,
++			     u16 gem_id, bool valid);
++int airoha_eth_pon_replace_flows(
++	struct net_device *netdev, const struct airoha_pon_flow_config *flows,
++	unsigned int count);
++int airoha_eth_pon_configure_epon(struct net_device *netdev, u8 channel,
++				  bool valid);
++int airoha_eth_pon_get_datapath_stats(
++	struct net_device *netdev, struct airoha_pon_datapath_stats *stats);
++/* Send control_netdev frames through the pon_netdev QDMA ring. */
++int airoha_eth_pon_xmit_control(
++	struct net_device *pon_netdev, struct net_device *control_netdev,
++	struct sk_buff *skb, const struct airoha_pon_ctrl_tx_info *info);
++int airoha_eth_pon_register_controller(
++	struct net_device *netdev, const struct airoha_pon_link_ops *ops,
++	void *priv);
++void airoha_eth_pon_unregister_controller(struct net_device *netdev,
++					  void *priv);
++
++#endif

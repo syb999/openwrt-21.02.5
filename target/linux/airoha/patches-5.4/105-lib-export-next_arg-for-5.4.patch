@@ -1,0 +1,7 @@
+--- a/lib/cmdline.c
++++ b/lib/cmdline.c
+@@ -247,3 +247,4 @@
+ 	/* Chew up trailing spaces. */
+ 	return skip_spaces(next);
+ }
++EXPORT_SYMBOL(next_arg);

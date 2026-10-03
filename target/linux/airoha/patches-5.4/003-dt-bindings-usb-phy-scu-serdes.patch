@@ -1,0 +1,34 @@
+diff --git a/include/dt-bindings/phy/airoha,an7581-usb-phy.h b/include/dt-bindings/phy/airoha,an7581-usb-phy.h
+new file mode 100644
+index 000000000..efbb0ae75
+--- /dev/null
++++ b/include/dt-bindings/phy/airoha,an7581-usb-phy.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause */
++
++#ifndef _DT_BINDINGS_AIROHA_AN7581_USB_PHY_H_
++#define _DT_BINDINGS_AIROHA_AN7581_USB_PHY_H_
++
++#define AIROHA_USB2_MONCLK_SEL0                 0
++#define AIROHA_USB2_MONCLK_SEL1                 1
++#define AIROHA_USB2_MONCLK_SEL2                 2
++#define AIROHA_USB2_MONCLK_SEL3                 3
++
++#endif
+diff --git a/include/dt-bindings/soc/airoha,scu-ssr.h b/include/dt-bindings/soc/airoha,scu-ssr.h
+new file mode 100644
+index 000000000..915f3cde7
+--- /dev/null
++++ b/include/dt-bindings/soc/airoha,scu-ssr.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++
++#ifndef __DT_BINDINGS_AIROHA_SCU_SSR_H
++#define __DT_BINDINGS_AIROHA_SCU_SSR_H
++
++#define AIROHA_SCU_SERDES_WIFI1		0
++#define AIROHA_SCU_SERDES_WIFI2		1
++#define AIROHA_SCU_SERDES_USB1		2
++#define AIROHA_SCU_SERDES_USB2		3
++
++#endif /* __DT_BINDINGS_AIROHA_SCU_SSR_H */

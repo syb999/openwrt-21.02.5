@@ -1,0 +1,174 @@
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 9c4d3b526..dbc3608eb 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -754,6 +754,7 @@ struct sk_buff {
+ 				fclone:2,
+ 				peeked:1,
+ 				head_frag:1,
++				pp_recycle:1, /* page_pool recycle indicator */
+ 				pfmemalloc:1;
+ #ifdef CONFIG_SKB_EXTENSIONS
+ 	__u8			active_extensions;
+@@ -4564,4 +4565,28 @@ static inline void skb_reset_redirect(struct sk_buff *skb)
+ }
+ 
+ #endif	/* __KERNEL__ */
++
++#ifndef napi_build_skb
++static inline void skb_mark_for_recycle(struct sk_buff *skb)
++{
++#ifdef CONFIG_PAGE_POOL
++	skb->pp_recycle = 1;
++#endif
++}
++
++/*
++ * napi_build_skb - build an skb from a page_pool page and mark it for
++ * recycling (backport from Linux 5.6+ for the Airoha target)
++ */
++static inline struct sk_buff *napi_build_skb(void *data, unsigned int frag_size)
++{
++	struct sk_buff *skb = build_skb(data, frag_size);
++
++	if (likely(skb))
++		skb_mark_for_recycle(skb);
++
++	return skb;
++}
++#endif
++
+ #endif	/* _LINUX_SKBUFF_H */
+diff --git a/include/net/page_pool.h b/include/net/page_pool.h
+index cf086e13b..18c9ec352 100644
+--- a/include/net/page_pool.h
++++ b/include/net/page_pool.h
+@@ -35,6 +35,9 @@
+ #include <linux/dma-direction.h>
+ 
+ #define PP_FLAG_DMA_MAP 1 /* Should page_pool do the DMA map/unmap */
++/* Airoha backport: flags used by newer drivers (inert on 5.4) */
++#define PP_FLAG_DMA_SYNC_DEV	2 /* driver syncs DMA itself */
++#define PP_FLAG_PAGE_FRAG	4 /* page is split into fragments */
+ #define PP_FLAG_ALL	PP_FLAG_DMA_MAP
+ 
+ /*
+@@ -162,6 +165,11 @@ static inline void page_pool_put_page(struct page_pool *pool,
+ 	__page_pool_put_page(pool, page, allow_direct);
+ #endif
+ }
++#ifndef page_pool_put_full_page
++#define page_pool_put_full_page(_pool, _page, _allow_direct) \
++	page_pool_put_page((_pool), (_page), (_allow_direct))
++#endif
++
+ /* Very limited use-cases allow recycle direct */
+ static inline void page_pool_recycle_direct(struct page_pool *pool,
+ 					    struct page *page)
+@@ -212,4 +220,15 @@ static inline bool page_pool_put(struct page_pool *pool)
+ 	return refcount_dec_and_test(&pool->user_cnt);
+ }
+ 
++
++/* Backport for the Airoha target: return a page_pool page held by an skb */
++#ifdef CONFIG_PAGE_POOL
++bool page_pool_return_skb_page(struct page *page);
++#else
++static inline bool page_pool_return_skb_page(struct page *page)
++{
++	return false;
++}
++#endif
++
+ #endif /* _NET_PAGE_POOL_H */
+diff --git a/include/net/page_pool/helpers.h b/include/net/page_pool/helpers.h
+new file mode 100644
+index 000000000..349d9866c
+--- /dev/null
++++ b/include/net/page_pool/helpers.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Airoha backport shim: on Linux 5.4 the page_pool helpers still live in
++ * include/net/page_pool.h (the split into helpers.h/types.h happened later).
++ */
++#ifndef _NET_PAGE_POOL_HELPERS_H
++#define _NET_PAGE_POOL_HELPERS_H
++
++#include <net/page_pool.h>
++
++#endif /* _NET_PAGE_POOL_HELPERS_H */
+diff --git a/net/core/page_pool.c b/net/core/page_pool.c
+index 335f68eaa..999576b04 100644
+--- a/net/core/page_pool.c
++++ b/net/core/page_pool.c
+@@ -303,6 +303,15 @@ void __page_pool_put_page(struct page_pool *pool,
+ 		}
+ 		return;
+ 	}
++	/* Frag pages: a page is handed out in several fragments, so the
++	 * extra references are only released to the pool once the last
++	 * fragment user returns it (Airoha backport).
++	 */
++	if (pool->p.flags & PP_FLAG_PAGE_FRAG) {
++		put_page(page);
++		return;
++	}
++
+ 	/* Fallback/non-XDP mode: API user have elevated refcnt.
+ 	 *
+ 	 * Many drivers split up the page into fragments, and some
+@@ -427,3 +436,21 @@ void page_pool_destroy(struct page_pool *pool)
+ 	schedule_delayed_work(&pool->release_dw, DEFER_TIME);
+ }
+ EXPORT_SYMBOL(page_pool_destroy);
++
++/* ------------------------------------------------------------------
++ * Backport for the Airoha target: pages handed to the network stack via
++ * build_skb()/napi_build_skb() are tagged with their owning pool in
++ * page->private and returned here when the skb is freed.
++ * ------------------------------------------------------------------ */
++bool page_pool_return_skb_page(struct page *page)
++{
++	struct page_pool *pool = (struct page_pool *)page->private;
++
++	if (!pool)
++		return false;
++
++	page_pool_put_page(pool, page, true);
++
++	return true;
++}
++EXPORT_SYMBOL(page_pool_return_skb_page);
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 5b42811f2..1a99c1099 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -51,6 +51,7 @@
+ #endif
+ #include <linux/string.h>
+ #include <linux/skbuff.h>
++#include <net/page_pool.h>
+ #include <linux/splice.h>
+ #include <linux/cache.h>
+ #include <linux/rtnetlink.h>
+@@ -611,10 +612,17 @@ static void skb_free_head(struct sk_buff *skb)
+ {
+ 	unsigned char *head = skb->head;
+ 
+-	if (skb->head_frag)
++	if (skb->head_frag) {
++		/* Page pool pages are returned to their pool instead of being
++		 * freed as regular fragments (Airoha backport).
++		 */
++		if (skb->pp_recycle &&
++		    page_pool_return_skb_page(virt_to_head_page(head)))
++			return;
+ 		skb_free_frag(head);
+-	else
++	} else {
+ 		kfree(head);
++	}
+ }
+ 
+ static void skb_release_data(struct sk_buff *skb)

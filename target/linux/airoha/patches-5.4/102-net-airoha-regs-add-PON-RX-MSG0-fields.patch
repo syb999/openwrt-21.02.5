@@ -1,0 +1,17 @@
+--- a/drivers/net/ethernet/airoha/airoha_regs.h
++++ b/drivers/net/ethernet/airoha/airoha_regs.h
+@@ -888,6 +888,14 @@
+ #define QDMA_ETH_TXMSG_ACNT_G0_MASK	GENMASK(5, 0)	/* 0x3f do not count */
+ 
+ /* RX MSG0 */
++/* PON (backported from ponwrt 922) */
++#define QDMA_ETH_RXMSG_CHANNEL_MASK	GENMASK(7, 3)
++#define QDMA_ETH_RXMSG_OAM_MASK		BIT(8)
++#define QDMA_ETH_RXMSG_CRC_ERR_MASK	BIT(11)
++#define QDMA_ETH_RXMSG_RUNT_MASK		BIT(12)
++#define QDMA_ETH_RXMSG_LONG_MASK		BIT(13)
++#define QDMA_ETH_RXMSG_GEM_MASK		GENMASK(29, 14)
++#define QDMA_ETH_RXMSG_NO_MIC_MASK	BIT(30)
+ #define QDMA_ETH_RXMSG_SPTAG		GENMASK(21, 14)
+ /* RX MSG1 */
+ #define QDMA_ETH_RXMSG_DEI_MASK		BIT(31)

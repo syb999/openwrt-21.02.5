@@ -1,0 +1,767 @@
+diff --git a/drivers/base/core.c b/drivers/base/core.c
+index 1b016fdd1..5a9c8722c 100644
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -3509,3 +3509,39 @@ int device_match_any(struct device *dev, const void *unused)
+ 	return 1;
+ }
+ EXPORT_SYMBOL_GPL(device_match_any);
++
++
++/**
++ * dev_err_probe - probe error check and log helper
++ * (backport from Linux 5.9 for the Airoha target)
++ */
++int dev_err_probe(const struct device *dev, int err, const char *fmt, ...)
++{
++	struct va_format vaf;
++	va_list args;
++
++	va_start(args, fmt);
++	vaf.fmt = fmt;
++	vaf.va = &args;
++
++	if (err != -EPROBE_DEFER)
++		dev_err(dev, "error %pe: %pV", ERR_PTR(err), &vaf);
++	else
++		dev_dbg(dev, "error %pe: %pV", ERR_PTR(err), &vaf);
++
++	va_end(args);
++
++	return err;
++}
++EXPORT_SYMBOL_GPL(dev_err_probe);
++
++/**
++ * device_set_node - set the fwnode and of_node of a device
++ * (backport from Linux 6.2 for the Airoha target)
++ */
++void device_set_node(struct device *dev, struct fwnode_handle *fwnode)
++{
++	dev->fwnode = fwnode;
++	dev->of_node = to_of_node(fwnode);
++}
++EXPORT_SYMBOL_GPL(device_set_node);
+diff --git a/drivers/mfd/syscon.c b/drivers/mfd/syscon.c
+index 660723276..d373007c2 100644
+--- a/drivers/mfd/syscon.c
++++ b/drivers/mfd/syscon.c
+@@ -204,6 +204,36 @@ struct regmap *syscon_regmap_lookup_by_compatible(const char *s)
+ }
+ EXPORT_SYMBOL_GPL(syscon_regmap_lookup_by_compatible);
+ 
++/* Backport from Linux 5.15 for the Airoha target */
++struct regmap *syscon_regmap_lookup_by_phandle_args(struct device_node *np,
++						   const char *property,
++						   int arg_count,
++						   unsigned int *out_args)
++{
++	struct device_node *syscon_np;
++	struct of_phandle_args args;
++	struct regmap *regmap;
++	unsigned int index;
++	int rc;
++
++	rc = of_parse_phandle_with_fixed_args(np, property, arg_count,
++					      0, &args);
++	if (rc)
++		return ERR_PTR(rc);
++
++	syscon_np = args.np;
++	if (!syscon_np)
++		return ERR_PTR(-ENODEV);
++
++	regmap = syscon_node_to_regmap(syscon_np);
++	for (index = 0; index < arg_count; index++)
++		out_args[index] = args.args[index];
++	of_node_put(syscon_np);
++
++	return regmap;
++}
++EXPORT_SYMBOL_GPL(syscon_regmap_lookup_by_phandle_args);
++
+ struct regmap *syscon_regmap_lookup_by_phandle(struct device_node *np,
+ 					const char *property)
+ {
+diff --git a/include/linux/bitfield.h b/include/linux/bitfield.h
+index 4f1c0f8e1..f7ffc5de7 100644
+--- a/include/linux/bitfield.h
++++ b/include/linux/bitfield.h
+@@ -107,6 +107,24 @@
+  * FIELD_GET() extracts the field specified by @_mask from the
+  * bitfield passed in as @_reg by masking and shifting it down.
+  */
++#ifndef FIELD_MAX
++#define FIELD_MAX(_mask)						\
++	((typeof(_mask))((_mask) >> __bf_shf(_mask)))
++#endif
++
++#ifndef FIELD_FIT
++#define FIELD_FIT(_mask, _val)						\
++	(__builtin_choose_expr(						\
++		__builtin_constant_p(_val),				\
++		(((_val) << __bf_shf(_mask)) & ~(_mask)) == 0,		\
++		true))
++#endif
++
++#ifndef FIELD_PREP_CONST
++#define FIELD_PREP_CONST(_mask, _val)					\
++	(((typeof(_val))(_val) << __bf_shf(_mask)) & (_mask))
++#endif
++
+ #define FIELD_GET(_mask, _reg)						\
+ 	({								\
+ 		__BF_FIELD_CHECK(_mask, _reg, 0U, "FIELD_GET: ");	\
+diff --git a/include/linux/bitmap.h b/include/linux/bitmap.h
+index 29fc933df..4aa0ffb9a 100644
+--- a/include/linux/bitmap.h
++++ b/include/linux/bitmap.h
+@@ -491,4 +491,21 @@ static inline void bitmap_from_u64(unsigned long *dst, u64 mask)
+ 
+ #endif /* __ASSEMBLY__ */
+ 
++
++/* Backport from Linux 6.1 for the Airoha target */
++#ifndef bitmap_read
++static inline unsigned long bitmap_read(const unsigned long *map,
++					unsigned int start,
++					unsigned int nbits)
++{
++	unsigned long result = 0;
++	int i;
++
++	for (i = nbits - 1; i >= 0; i--)
++		result = (result << 1) | test_bit(start + i, map);
++
++	return result;
++}
++#endif
++
+ #endif /* __LINUX_BITMAP_H */
+diff --git a/include/linux/clk.h b/include/linux/clk.h
+index 18b7b95a8..534009ee5 100644
+--- a/include/linux/clk.h
++++ b/include/linux/clk.h
+@@ -429,6 +429,8 @@ struct clk *devm_clk_get(struct device *dev, const char *id);
+  */
+ struct clk *devm_clk_get_optional(struct device *dev, const char *id);
+ 
++
++
+ /**
+  * devm_get_clk_from_child - lookup and obtain a managed reference to a
+  *			     clock producer from child node.
+@@ -982,4 +984,43 @@ static inline struct clk *of_clk_get_from_provider(struct of_phandle_args *clksp
+ }
+ #endif
+ 
++#ifndef devm_clk_get_enabled
++/**
++ * devm_clk_get_enabled - devm managed version of clk_prepare_enable
++ * (backport from Linux 5.16 for the Airoha target)
++ */
++static inline struct clk *devm_clk_get_enabled(struct device *dev,
++					       const char *id)
++{
++	struct clk *clk;
++	int ret;
++
++	clk = devm_clk_get(dev, id);
++	if (IS_ERR(clk))
++		return clk;
++
++	ret = clk_prepare_enable(clk);
++	if (ret) {
++		devm_clk_put(dev, clk);
++		return ERR_PTR(ret);
++	}
++
++	return clk;
++}
++
++static inline struct clk *
++devm_clk_get_optional_enabled(struct device *dev, const char *id)
++{
++	struct clk *clk;
++
++	clk = devm_clk_get_optional(dev, id);
++	if (IS_ERR(clk))
++		return clk;
++	if (!clk)
++		return NULL;
++
++	return devm_clk_get_enabled(dev, id);
++}
+ #endif
++
++#endif
+\ No newline at end of file
+diff --git a/include/linux/device.h b/include/linux/device.h
+index 3414b5a67..68edd13ec 100644
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -1525,8 +1525,14 @@ extern void unlock_device_hotplug(void);
+ extern int lock_device_hotplug_sysfs(void);
+ extern int device_offline(struct device *dev);
+ extern int device_online(struct device *dev);
++
++#ifndef dev_err_probe
++int dev_err_probe(const struct device *dev, int err, const char *fmt, ...);
++#endif
++
+ extern void set_primary_fwnode(struct device *dev, struct fwnode_handle *fwnode);
+ extern void set_secondary_fwnode(struct device *dev, struct fwnode_handle *fwnode);
++void device_set_node(struct device *dev, struct fwnode_handle *fwnode);
+ void device_set_of_node_from_dev(struct device *dev, const struct device *dev2);
+ 
+ static inline int dev_num_vf(struct device *dev)
+diff --git a/include/linux/iopoll.h b/include/linux/iopoll.h
+index 35e15dfd4..b60ca5fca 100644
+--- a/include/linux/iopoll.h
++++ b/include/linux/iopoll.h
+@@ -138,4 +138,61 @@
+ #define readq_relaxed_poll_timeout_atomic(addr, val, cond, delay_us, timeout_us) \
+ 	readx_poll_timeout_atomic(readq_relaxed, addr, val, cond, delay_us, timeout_us)
+ 
++
++/* Backport from Linux 5.5 for the Airoha target */
++#ifndef read_poll_timeout
++#define read_poll_timeout(op, val, cond, sleep_us, timeout_us, \
++			  sleep_before_read, args...) \
++({ \
++	u64 __timeout_us = (timeout_us); \
++	unsigned long __sleep_us = (sleep_us); \
++	ktime_t __timeout = ktime_add_us(ktime_get(), __timeout_us); \
++	int __ret; \
++	if ((sleep_before_read) && (__sleep_us)) \
++		usleep_range((__sleep_us >> 2) + 1, __sleep_us); \
++	for (;;) { \
++		(val) = op(args); \
++		if (cond) \
++			break; \
++		if (__timeout_us && ktime_compare(ktime_get(), __timeout) > 0) { \
++			(val) = op(args); \
++			__ret = -ETIMEDOUT; \
++			break; \
++		} \
++		if (__sleep_us) \
++			usleep_range((__sleep_us >> 2) + 1, __sleep_us); \
++		cpu_relax(); \
++	} \
++	__ret; \
++})
++#endif
++
++/* Backport from Linux 5.5 for the Airoha target */
++#ifndef read_poll_timeout_atomic
++#define read_poll_timeout_atomic(op, val, cond, delay_us, timeout_us, \
++				 sleep_before_read, args...) \
++({ \
++	u64 __timeout_us = (timeout_us); \
++	unsigned long __delay_us = (delay_us); \
++	ktime_t __timeout = ktime_add_us(ktime_get(), __timeout_us); \
++	int __ret; \
++	if ((sleep_before_read) && (__delay_us)) \
++		udelay(__delay_us); \
++	for (;;) { \
++		(val) = op(args); \
++		if (cond) \
++			break; \
++		if (__timeout_us && ktime_compare(ktime_get(), __timeout) > 0) { \
++			(val) = op(args); \
++			__ret = -ETIMEDOUT; \
++			break; \
++		} \
++		if (__delay_us) \
++			udelay(__delay_us); \
++		cpu_relax(); \
++	} \
++	__ret; \
++})
++#endif
++
+ #endif /* _LINUX_IOPOLL_H */
+diff --git a/include/linux/irq.h b/include/linux/irq.h
+index 5655da9eb..93cb4d1bb 100644
+--- a/include/linux/irq.h
++++ b/include/linux/irq.h
+@@ -555,6 +555,7 @@ enum {
+ 	IRQCHIP_SUPPORTS_LEVEL_MSI	= (1 <<  7),
+ 	IRQCHIP_SUPPORTS_NMI		= (1 <<  8),
+ 	IRQCHIP_AFFINITY_PRE_STARTUP	= (1 << 10),
++	IRQCHIP_IMMUTABLE			= (1 << 11),
+ };
+ 
+ #include <linux/irqdesc.h>
+diff --git a/include/linux/irqdesc.h b/include/linux/irqdesc.h
+index d6e2ab538..3a3110ab8 100644
+--- a/include/linux/irqdesc.h
++++ b/include/linux/irqdesc.h
+@@ -157,6 +157,8 @@ static inline void generic_handle_irq_desc(struct irq_desc *desc)
+ }
+ 
+ int generic_handle_irq(unsigned int irq);
++/* Backport from Linux 5.10 for the Airoha target */
++int generic_handle_domain_irq(struct irq_domain *domain, unsigned int hwirq);
+ 
+ #ifdef CONFIG_HANDLE_DOMAIN_IRQ
+ /*
+@@ -279,4 +281,6 @@ __irq_set_preflow_handler(unsigned int irq, irq_preflow_handler_t handler)
+ }
+ #endif
+ 
++
++
+ #endif
+diff --git a/include/linux/math64.h b/include/linux/math64.h
+index 65bef21cd..a3548449f 100644
+--- a/include/linux/math64.h
++++ b/include/linux/math64.h
+@@ -298,3 +298,8 @@ static inline u64 mul_u64_u32_div(u64 a, u32 mul, u32 divisor)
+ 	({ u64 _tmp = (divisor); div64_u64((dividend) + _tmp / 2, _tmp); })
+ 
+ #endif /* _LINUX_MATH64_H */
++
++/* Backport from Linux 6.6 for the Airoha target */
++#ifndef DIV_U64_ROUND_UP
++#define DIV_U64_ROUND_UP(ll, d)		div_u64((ll) + (d) - 1, (d))
++#endif
+diff --git a/include/linux/mfd/syscon.h b/include/linux/mfd/syscon.h
+index 112dc6626..b016224f3 100644
+--- a/include/linux/mfd/syscon.h
++++ b/include/linux/mfd/syscon.h
+@@ -20,6 +20,12 @@ struct device_node;
+ extern struct regmap *device_node_to_regmap(struct device_node *np);
+ extern struct regmap *syscon_node_to_regmap(struct device_node *np);
+ extern struct regmap *syscon_regmap_lookup_by_compatible(const char *s);
++extern struct regmap *syscon_regmap_lookup_by_phandle_args(
++	struct device_node *np,
++	const char *property,
++	int arg_count,
++	unsigned int *out_args);
++
+ extern struct regmap *syscon_regmap_lookup_by_phandle(
+ 					struct device_node *np,
+ 					const char *property);
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 672f8cf34..20e4c7eef 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -4970,4 +4970,35 @@ do {								\
+ 
+ extern struct net_device *blackhole_netdev;
+ 
++
++/*
++ * netif_napi_add_tx - add a NAPI context for TX (backport from Linux 6.1)
++ */
++#ifndef netif_napi_add_tx
++#define netif_napi_add_tx(dev, napi, poll) \
++	netif_napi_add((dev), (napi), (poll), NAPI_POLL_WEIGHT)
++#endif
++
++/*
++ * netdev_tx_reset_subqueue - reset a transmit queue (backport from Linux 6.1)
++ */
++#ifndef netdev_tx_reset_subqueue
++static inline void netdev_tx_reset_subqueue(struct net_device *dev,
++					    u16 queue_index)
++{
++	struct netdev_queue *txq = netdev_get_tx_queue(dev, queue_index);
++
++	netdev_tx_reset_queue(txq);
++}
++#endif
++
++/* Backport from Linux 6.1 for the Airoha target */
++#ifndef alloc_netdev_dummy
++static inline struct net_device *alloc_netdev_dummy(unsigned int sizeof_priv)
++{
++	return alloc_netdev(sizeof_priv, "dummy%d", NET_NAME_UNKNOWN,
++			    ether_setup);
++}
++#endif
++
+ #endif	/* _LINUX_NETDEVICE_H */
+diff --git a/include/linux/of.h b/include/linux/of.h
+index a7621e2b4..667e44bd3 100644
+--- a/include/linux/of.h
++++ b/include/linux/of.h
+@@ -1179,6 +1179,12 @@ static inline bool of_property_read_bool(const struct device_node *np,
+ 	return prop ? true : false;
+ }
+ 
++static inline bool of_property_present(const struct device_node *np,
++				       const char *propname)
++{
++	return of_property_read_bool(np, propname);
++}
++
+ static inline int of_property_read_u8(const struct device_node *np,
+ 				       const char *propname,
+ 				       u8 *out_value)
+diff --git a/include/linux/of_device.h b/include/linux/of_device.h
+index 8d31e39dd..817c27e89 100644
+--- a/include/linux/of_device.h
++++ b/include/linux/of_device.h
+@@ -114,4 +114,14 @@ static inline int of_dma_configure(struct device *dev,
+ }
+ #endif /* CONFIG_OF */
+ 
++
++/* Backport from Linux 6.1 for the Airoha target */
++#ifndef device_is_compatible
++static inline int device_is_compatible(const struct device *dev,
++				       const char *compat)
++{
++	return of_device_is_compatible(dev->of_node, compat);
++}
++#endif
++
+ #endif /* _LINUX_OF_DEVICE_H */
+diff --git a/include/linux/pci.h b/include/linux/pci.h
+index fc343d123..786288abc 100644
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -2406,4 +2406,9 @@ void pci_uevent_ers(struct pci_dev *pdev, enum  pci_ers_result err_type);
+ #define pci_info_ratelimited(pdev, fmt, arg...) \
+ 	dev_info_ratelimited(&(pdev)->dev, fmt, ##arg)
+ 
++
++/* Backport from Linux 6.x for the Airoha target */
++#ifndef PCIE_T_PVPERL_MS
++#define PCIE_T_PVPERL_MS		100
++#endif
+ #endif /* LINUX_PCI_H */
+diff --git a/include/linux/pinctrl/pinctrl.h b/include/linux/pinctrl/pinctrl.h
+index 7ce23450a..55a9a3749 100644
+--- a/include/linux/pinctrl/pinctrl.h
++++ b/include/linux/pinctrl/pinctrl.h
+@@ -26,6 +26,26 @@ struct pin_config_item;
+ struct gpio_chip;
+ struct device_node;
+ 
++/**
++ * struct pingroup - provides information on pingroup
++ * @name: a name for pingroup
++ * @pins: an array of pins in the pingroup
++ * @npins: number of pins in the pingroup
++ */
++struct pingroup {
++	const char *name;
++	const unsigned int *pins;
++	size_t npins;
++};
++
++/* Convenience macro to define a single named or anonymous pingroup */
++#define PINCTRL_PINGROUP(_name, _pins, _npins)	\
++(struct pingroup) {				\
++	.name = _name,				\
++	.pins = _pins,				\
++	.npins = _npins,			\
++}
++
+ /**
+  * struct pinctrl_pin_desc - boards/machines provide information on their
+  * pins, pads or other muxable units in this struct
+diff --git a/include/linux/platform_device.h b/include/linux/platform_device.h
+index 569f44650..7ae2ad55a 100644
+--- a/include/linux/platform_device.h
++++ b/include/linux/platform_device.h
+@@ -380,4 +380,20 @@ extern int platform_dma_configure(struct device *dev);
+ #define USE_PLATFORM_PM_SLEEP_OPS
+ #endif
+ 
++
++#ifndef devm_platform_ioremap_resource_byname
++/**
++ * devm_platform_ioremap_resource_byname - call devm_ioremap_resource for a
++ * platform device resource with a given name (backport from Linux 5.5)
++ */
++static inline void __iomem *
++devm_platform_ioremap_resource_byname(struct platform_device *pdev,
++				      const char *name)
++{
++	struct resource *res;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++	return devm_ioremap_resource(&pdev->dev, res);
++}
++#endif
+ #endif /* _PLATFORM_DEVICE_H_ */
+diff --git a/include/linux/pm.h b/include/linux/pm.h
+index eb28c8025..c505b8f94 100644
+--- a/include/linux/pm.h
++++ b/include/linux/pm.h
+@@ -355,6 +355,28 @@ const struct dev_pm_ops name = { \
+ 	SET_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn) \
+ }
+ 
++#ifndef pm_ptr
++#ifdef CONFIG_PM
++#define pm_ptr(_ptr) (_ptr)
++#define pm_runtime_ptr(_ptr) (_ptr)
++#else
++#define pm_ptr(_ptr) NULL
++#define pm_runtime_ptr(_ptr) NULL
++#endif
++#ifdef CONFIG_PM_SLEEP
++#define pm_sleep_ptr(_ptr) (_ptr)
++#else
++#define pm_sleep_ptr(_ptr) NULL
++#endif
++#endif
++
++#ifndef DEFINE_SIMPLE_DEV_PM_OPS
++#define DEFINE_SIMPLE_DEV_PM_OPS(_name, _suspend, _resume)		\
++	const struct dev_pm_ops _name = {				\
++		SET_SYSTEM_SLEEP_PM_OPS(_suspend, _resume)		\
++	}
++#endif
++
+ /*
+  * Use this for defining a set of PM operations to be used in all situations
+  * (system suspend, hibernation or runtime PM).
+@@ -811,4 +833,10 @@ enum dpm_order {
+ 	DPM_ORDER_DEV_LAST,
+ };
+ 
++
++/* Backport from Linux 6.4 for the Airoha target */
++#ifndef NOIRQ_SYSTEM_SLEEP_PM_OPS
++#define NOIRQ_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn) \
++	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn)
++#endif
+ #endif /* _LINUX_PM_H */
+diff --git a/include/linux/regmap.h b/include/linux/regmap.h
+index bff53a1c2..f6f0f06ce 100644
+--- a/include/linux/regmap.h
++++ b/include/linux/regmap.h
+@@ -83,6 +83,16 @@ struct reg_sequence {
+ #define	regmap_write_bits(map, reg, mask, val) \
+ 	regmap_update_bits_base(map, reg, mask, val, NULL, false, true)
+ 
++#ifndef regmap_set_bits
++#define	regmap_set_bits(map, reg, bits) \
++	regmap_update_bits_base(map, reg, bits, bits, NULL, false, false)
++#endif
++
++#ifndef regmap_clear_bits
++#define	regmap_clear_bits(map, reg, bits) \
++	regmap_update_bits_base(map, reg, bits, 0, NULL, false, false)
++#endif
++
+ #define	regmap_field_write(field, val) \
+ 	regmap_field_update_bits_base(field, ~0, val, NULL, false, false)
+ #define	regmap_field_force_write(field, val) \
+@@ -1469,4 +1479,32 @@ static inline struct device *regmap_get_device(struct regmap *map)
+ 
+ #endif
+ 
++
++/* Backport from Linux 5.10 for the Airoha target */
++#ifndef regmap_read_poll_timeout_atomic
++#define regmap_read_poll_timeout_atomic(map, addr, val, cond, delay_us, timeout_us) \
++({ \
++	u64 __timeout_us = (timeout_us); \
++	unsigned long __delay_us = (delay_us); \
++	ktime_t __timeout = ktime_add_us(ktime_get(), __timeout_us); \
++	int __ret; \
++	for (;;) { \
++		__ret = regmap_read(map, addr, &val); \
++		if (__ret) \
++			break; \
++		if (cond) \
++			break; \
++		if (__timeout_us && ktime_compare(ktime_get(), __timeout) > 0) { \
++			regmap_read(map, addr, &val); \
++			__ret = -ETIMEDOUT; \
++			break; \
++		} \
++		if (__delay_us) \
++			udelay(__delay_us); \
++		cpu_relax(); \
++	} \
++	__ret; \
++})
++#endif
++
+ #endif
+diff --git a/include/linux/reset.h b/include/linux/reset.h
+index eb597e8aa..359926d57 100644
+--- a/include/linux/reset.h
++++ b/include/linux/reset.h
+@@ -495,4 +495,88 @@ of_reset_control_array_get_optional_shared(struct device_node *node)
+ {
+ 	return of_reset_control_array_get(node, true, true, true);
+ }
++
++/**
++ * struct reset_control_bulk_data - Data used for bulk reset control operations.
++ * (backported from Linux 5.19 for the Airoha target)
++ */
++struct reset_control_bulk_data {
++	const char *id;
++	struct reset_control *rstc;
++};
++
++static inline int reset_control_bulk_assert(int num_rstcs,
++					    struct reset_control_bulk_data *rstcs)
++{
++	int i, ret;
++
++	for (i = 0; i < num_rstcs; i++) {
++		ret = reset_control_assert(rstcs[i].rstc);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static inline int reset_control_bulk_deassert(int num_rstcs,
++					      struct reset_control_bulk_data *rstcs)
++{
++	int i, ret;
++
++	for (i = 0; i < num_rstcs; i++) {
++		ret = reset_control_deassert(rstcs[i].rstc);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static inline int reset_control_bulk_reset(int num_rstcs,
++					   struct reset_control_bulk_data *rstcs)
++{
++	int i, ret;
++
++	for (i = 0; i < num_rstcs; i++) {
++		ret = reset_control_reset(rstcs[i].rstc);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static inline int __must_check
++devm_reset_control_bulk_get_optional_shared(struct device *dev, int num_rstcs,
++					    struct reset_control_bulk_data *rstcs)
++{
++	int i;
++
++	for (i = 0; i < num_rstcs; i++) {
++		rstcs[i].rstc = devm_reset_control_get_optional_shared(dev,
++								       rstcs[i].id);
++		if (IS_ERR(rstcs[i].rstc))
++			return PTR_ERR(rstcs[i].rstc);
++	}
++
++	return 0;
++}
++
++static inline int __must_check
++devm_reset_control_bulk_get_exclusive(struct device *dev, int num_rstcs,
++				      struct reset_control_bulk_data *rstcs)
++{
++	int i;
++
++	for (i = 0; i < num_rstcs; i++) {
++		rstcs[i].rstc = devm_reset_control_get_exclusive(dev,
++								 rstcs[i].id);
++		if (IS_ERR(rstcs[i].rstc))
++			return PTR_ERR(rstcs[i].rstc);
++	}
++
++	return 0;
++}
++
+ #endif
+diff --git a/include/linux/resource_ext.h b/include/linux/resource_ext.h
+index 06da59b23..64dcf6dcf 100644
+--- a/include/linux/resource_ext.h
++++ b/include/linux/resource_ext.h
+@@ -66,4 +66,20 @@ resource_list_destroy_entry(struct resource_entry *entry)
+ #define resource_list_for_each_entry_safe(entry, tmp, list)	\
+ 	list_for_each_entry_safe((entry), (tmp), (list), node)
+ 
++
++/* Backport from Linux 5.15 for the Airoha target */
++#ifndef resource_list_first_type
++static inline struct resource_entry *
++resource_list_first_type(struct list_head *list, unsigned long type)
++{
++	struct resource_entry *entry;
++
++	resource_list_for_each_entry(entry, list) {
++		if (resource_type(entry->res) == type)
++			return entry;
++	}
++
++	return NULL;
++}
++#endif
+ #endif /* _LINUX_RESOURCE_EXT_H */
+diff --git a/include/linux/spi/spi.h b/include/linux/spi/spi.h
+index 7067f85ce..6e34da746 100644
+--- a/include/linux/spi/spi.h
++++ b/include/linux/spi/spi.h
+@@ -685,6 +685,13 @@ static inline struct spi_controller *devm_spi_alloc_slave(struct device *dev,
+ 	return __devm_spi_alloc_controller(dev, size, true);
+ }
+ 
++/* Linux 6.3 renamed spi_alloc_master()/devm_spi_alloc_master() to *_host() */
++#ifndef devm_spi_alloc_host
++#define spi_alloc_host()			spi_alloc_master(NULL, sizeof(struct spi_controller))
++#define devm_spi_alloc_host(dev, size)		devm_spi_alloc_master((dev), (size))
++#define devm_spi_alloc_target(dev, size)	devm_spi_alloc_master((dev), (size))
++#endif
++
+ extern int spi_register_controller(struct spi_controller *ctlr);
+ extern int devm_spi_register_controller(struct device *dev,
+ 					struct spi_controller *ctlr);
+diff --git a/include/linux/stddef.h b/include/linux/stddef.h
+index 998a4ba28..d625a1cbf 100644
+--- a/include/linux/stddef.h
++++ b/include/linux/stddef.h
+@@ -37,3 +37,14 @@ enum {
+ 	(offsetof(TYPE, MEMBER)	+ sizeof_field(TYPE, MEMBER))
+ 
+ #endif
++
++#ifndef DECLARE_FLEX_ARRAY
++#ifndef __have_flexible_array_member
++/* Backport from Linux 5.16 for the Airoha target */
++#define DECLARE_FLEX_ARRAY(TYPE, NAME)			\
++	struct {					\
++		struct { } __empty_ ## NAME;		\
++		TYPE NAME[];				\
++	}
++#endif
++#endif
+diff --git a/kernel/irq/irqdesc.c b/kernel/irq/irqdesc.c
+index 172b5e6bc..06b7dc99f 100644
+--- a/kernel/irq/irqdesc.c
++++ b/kernel/irq/irqdesc.c
+@@ -637,6 +637,18 @@ void irq_init_desc(unsigned int irq)
+  * @irq:	The irq number to handle
+  *
+  */
++/* Backport from Linux 5.10 for the Airoha target */
++int generic_handle_domain_irq(struct irq_domain *domain, unsigned int hwirq)
++{
++	unsigned int irq = irq_find_mapping(domain, hwirq);
++
++	if (!irq)
++		return -EINVAL;
++
++	return generic_handle_irq(irq);
++}
++EXPORT_SYMBOL_GPL(generic_handle_domain_irq);
++
+ int generic_handle_irq(unsigned int irq)
+ {
+ 	struct irq_desc *desc = irq_to_desc(irq);

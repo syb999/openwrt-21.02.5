@@ -1,0 +1,880 @@
+diff --git a/drivers/net/phy/phylink.c b/drivers/net/phy/phylink.c
+index 496c95e47..c95761de5 100644
+--- a/drivers/net/phy/phylink.c
++++ b/drivers/net/phy/phylink.c
+@@ -11,6 +11,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/of.h>
+ #include <linux/of_mdio.h>
++#include <linux/mdio.h>
+ #include <linux/phy.h>
+ #include <linux/phy_fixed.h>
+ #include <linux/phylink.h>
+@@ -46,6 +47,8 @@ struct phylink {
+ 	unsigned int old_link_state:1;
+ 
+ 	unsigned long phylink_disable_state; /* bitmask of disables */
++	struct phylink_pcs *pcs;
++	unsigned int pcs_neg_mode;
+ 	struct phy_device *phydev;
+ 	phy_interface_t link_interface;	/* PHY_INTERFACE_xxx */
+ 	u8 cfg_link_an_mode;		/* MLO_AN_xxx */
+@@ -334,6 +337,122 @@ static int phylink_parse_mode(struct phylink *pl, struct fwnode_handle *fwnode)
+ 	return 0;
+ }
+ 
++/* ------------------------------------------------------------------
++ * PHYLINK PCS support, backported from Linux 6.6 for the Airoha AN7581
++ * ------------------------------------------------------------------ */
++
++static int phylink_mdio_modify(struct mii_bus *bus, int addr, u32 reg,
++			       u16 mask, u16 set)
++{
++	int val;
++
++	val = mdiobus_read(bus, addr, reg);
++	if (val < 0)
++		return val;
++
++	if ((val & mask) == set)
++		return 0;
++
++	if (mdiobus_write(bus, addr, reg, (val & ~mask) | set) < 0)
++		return -EIO;
++
++	return 1;
++}
++
++static void linkmode_resolve_pause(const unsigned long *local_adv,
++				   const unsigned long *partner_adv,
++				   bool *tx_pause, bool *rx_pause)
++{
++	__ETHTOOL_DECLARE_LINK_MODE_MASK(m);
++
++	linkmode_and(m, local_adv, partner_adv);
++	if (linkmode_test_bit(ETHTOOL_LINK_MODE_Pause_BIT, m)) {
++		*tx_pause = true;
++		*rx_pause = true;
++	} else if (linkmode_test_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT, m)) {
++		*tx_pause = linkmode_test_bit(ETHTOOL_LINK_MODE_Pause_BIT,
++					      partner_adv);
++		*rx_pause = linkmode_test_bit(ETHTOOL_LINK_MODE_Pause_BIT,
++					      local_adv);
++	} else {
++		*tx_pause = false;
++		*rx_pause = false;
++	}
++}
++
++static void phylink_resolve_an_pause(struct phylink_link_state *state)
++{
++	bool tx_pause, rx_pause;
++
++	if (state->duplex == DUPLEX_FULL) {
++		linkmode_resolve_pause(state->advertising,
++				       state->lp_advertising,
++				       &tx_pause, &rx_pause);
++		if (tx_pause)
++			state->pause |= MLO_PAUSE_TX;
++		if (rx_pause)
++			state->pause |= MLO_PAUSE_RX;
++	}
++}
++
++static void phylink_pcs_pre_config(struct phylink_pcs *pcs,
++				   phy_interface_t interface)
++{
++	if (pcs && pcs->ops->pcs_pre_config)
++		pcs->ops->pcs_pre_config(pcs, interface);
++}
++
++static int phylink_pcs_post_config(struct phylink_pcs *pcs,
++				   phy_interface_t interface)
++{
++	int err = 0;
++
++	if (pcs && pcs->ops->pcs_post_config)
++		err = pcs->ops->pcs_post_config(pcs, interface);
++
++	return err;
++}
++
++static void phylink_pcs_disable(struct phylink_pcs *pcs)
++{
++	if (pcs && pcs->ops->pcs_disable)
++		pcs->ops->pcs_disable(pcs);
++}
++
++static int phylink_pcs_enable(struct phylink_pcs *pcs)
++{
++	int err = 0;
++
++	if (pcs && pcs->ops->pcs_enable)
++		err = pcs->ops->pcs_enable(pcs);
++
++	return err;
++}
++
++static int phylink_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
++			      const struct phylink_link_state *state,
++			      bool permit_pause_to_mac)
++{
++	if (!pcs || !pcs->ops->pcs_config)
++		return 0;
++
++	return pcs->ops->pcs_config(pcs, neg_mode, state->interface,
++				    state->advertising, permit_pause_to_mac);
++}
++
++static void phylink_pcs_link_up(struct phylink_pcs *pcs, unsigned int neg_mode,
++				phy_interface_t interface, int speed, int duplex)
++{
++	if (pcs && pcs->ops->pcs_link_up)
++		pcs->ops->pcs_link_up(pcs, neg_mode, interface, speed, duplex);
++}
++
++static void phylink_pcs_link_down(struct phylink_pcs *pcs)
++{
++	if (pcs && pcs->ops->pcs_link_down)
++		pcs->ops->pcs_link_down(pcs);
++}
++
+ static void phylink_mac_config(struct phylink *pl,
+ 			       const struct phylink_link_state *state)
+ {
+@@ -346,7 +465,48 @@ static void phylink_mac_config(struct phylink *pl,
+ 		    __ETHTOOL_LINK_MODE_MASK_NBITS, state->advertising,
+ 		    state->pause, state->link, state->an_enabled);
+ 
++	pl->pcs_neg_mode = phylink_pcs_neg_mode(pl->cur_link_an_mode,
++						state->interface,
++						state->advertising);
++
++	if (pl->ops->mac_select_pcs) {
++		struct phylink_pcs *pcs;
++
++		pcs = pl->ops->mac_select_pcs(pl->config, state->interface);
++		if (IS_ERR(pcs)) {
++			phylink_err(pl, "mac_select_pcs unexpectedly failed: %pe\n",
++				    pcs);
++			return;
++		}
++
++		if (pcs && pl->pcs != pcs) {
++			phylink_pcs_disable(pl->pcs);
++
++			if (pl->pcs)
++				pl->pcs->phylink = NULL;
++
++			pcs->phylink = pl;
++			pl->pcs = pcs;
++
++			phylink_pcs_enable(pl->pcs);
++		}
++	}
++
++	phylink_pcs_pre_config(pl->pcs, state->interface);
++
+ 	pl->ops->mac_config(pl->config, pl->cur_link_an_mode, state);
++
++	phylink_pcs_post_config(pl->pcs, state->interface);
++
++	if (pl->pcs) {
++		unsigned int neg_mode = pl->cur_link_an_mode;
++
++		if (pl->pcs->neg_mode)
++			neg_mode = pl->pcs_neg_mode;
++
++		phylink_pcs_config(pl->pcs, neg_mode, state,
++				   !!(pl->link_config.pause & MLO_PAUSE_AN));
++	}
+ }
+ 
+ static void phylink_mac_config_up(struct phylink *pl,
+@@ -358,8 +518,15 @@ static void phylink_mac_config_up(struct phylink *pl,
+ 
+ static void phylink_mac_an_restart(struct phylink *pl)
+ {
++	if (pl->pcs && linkmode_test_bit(ETHTOOL_LINK_MODE_Autoneg_BIT,
++					 pl->link_config.advertising) &&
++	    phy_interface_mode_is_8023z(pl->link_config.interface) &&
++	    phylink_autoneg_inband(pl->cur_link_an_mode))
++		pl->pcs->ops->pcs_an_restart(pl->pcs);
++
+ 	if (pl->link_config.an_enabled &&
+-	    phy_interface_mode_is_8023z(pl->link_config.interface))
++	    phy_interface_mode_is_8023z(pl->link_config.interface) &&
++	    pl->ops->mac_an_restart)
+ 		pl->ops->mac_an_restart(pl->config);
+ }
+ 
+@@ -376,6 +543,15 @@ static int phylink_get_mac_state(struct phylink *pl, struct phylink_link_state *
+ 	state->an_complete = 0;
+ 	state->link = 1;
+ 
++	if (pl->pcs && pl->pcs->ops->pcs_get_state &&
++	    !pl->ops->mac_link_state) {
++		pl->pcs->ops->pcs_get_state(pl->pcs, state);
++		return 0;
++	}
++
++	if (!pl->ops->mac_link_state)
++		return -EOPNOTSUPP;
++
+ 	return pl->ops->mac_link_state(pl->config, state);
+ }
+ 
+@@ -445,10 +621,24 @@ static void phylink_mac_link_up(struct phylink *pl,
+ 				struct phylink_link_state link_state)
+ {
+ 	struct net_device *ndev = pl->netdev;
++	int speed = link_state.speed;
++	int duplex = link_state.duplex;
++	bool tx_pause = !!(link_state.pause & MLO_PAUSE_TX);
++	bool rx_pause = !!(link_state.pause & MLO_PAUSE_RX);
++	unsigned int neg_mode;
+ 
+ 	pl->cur_interface = link_state.interface;
+-	pl->ops->mac_link_up(pl->config, pl->cur_link_an_mode,
+-			     pl->cur_interface, pl->phydev);
++
++	neg_mode = pl->cur_link_an_mode;
++	if (pl->pcs && pl->pcs->neg_mode)
++		neg_mode = pl->pcs_neg_mode;
++
++	phylink_pcs_link_up(pl->pcs, neg_mode, pl->cur_interface, speed,
++			    duplex);
++
++	pl->ops->mac_link_up(pl->config, pl->phydev, pl->cur_link_an_mode,
++			     pl->cur_interface, speed, duplex, tx_pause,
++			     rx_pause);
+ 
+ 	if (ndev)
+ 		netif_carrier_on(ndev);
+@@ -468,6 +658,7 @@ static void phylink_mac_link_down(struct phylink *pl)
+ 		netif_carrier_off(ndev);
+ 	pl->ops->mac_link_down(pl->config, pl->cur_link_an_mode,
+ 			       pl->cur_interface);
++	phylink_pcs_link_down(pl->pcs);
+ 	phylink_info(pl, "Link is Down\n");
+ }
+ 
+@@ -990,6 +1181,7 @@ void phylink_start(struct phylink *pl)
+ 	phylink_mac_an_restart(pl);
+ 
+ 	clear_bit(PHYLINK_DISABLE_STOPPED, &pl->phylink_disable_state);
++	phylink_pcs_enable(pl->pcs);
+ 	phylink_run_resolve(pl);
+ 
+ 	if (pl->cfg_link_an_mode == MLO_AN_FIXED && pl->link_gpio) {
+@@ -1039,6 +1231,7 @@ void phylink_stop(struct phylink *pl)
+ 		pl->link_irq = 0;
+ 	}
+ 
++	phylink_pcs_disable(pl->pcs);
+ 	phylink_run_resolve_and_disable(pl, PHYLINK_DISABLE_STOPPED);
+ }
+ EXPORT_SYMBOL_GPL(phylink_stop);
+@@ -1945,3 +2138,266 @@ void phylink_helper_basex_speed(struct phylink_link_state *state)
+ EXPORT_SYMBOL_GPL(phylink_helper_basex_speed);
+ 
+ MODULE_LICENSE("GPL v2");
++
++/* ------------------------------------------------------------------
++ * Backported PHYLINK PCS helpers (Linux 6.6)
++ * ------------------------------------------------------------------ */
++
++void phylink_pcs_change(struct phylink_pcs *pcs, bool up)
++{
++	struct phylink *pl = pcs->phylink;
++
++	if (pl)
++		phylink_run_resolve(pl);
++}
++EXPORT_SYMBOL_GPL(phylink_pcs_change);
++
++static void phylink_decode_c37_word(struct phylink_link_state *state,
++				    uint16_t config_reg, int speed)
++{
++	int fd_bit;
++
++	if (speed == SPEED_2500)
++		fd_bit = ETHTOOL_LINK_MODE_2500baseX_Full_BIT;
++	else
++		fd_bit = ETHTOOL_LINK_MODE_1000baseX_Full_BIT;
++
++	mii_lpa_mod_linkmode_x(state->lp_advertising, config_reg, fd_bit);
++
++	if (linkmode_test_bit(fd_bit, state->advertising) &&
++	    linkmode_test_bit(fd_bit, state->lp_advertising)) {
++		state->speed = speed;
++		state->duplex = DUPLEX_FULL;
++	} else {
++		/* negotiation failure */
++		state->link = false;
++	}
++
++	phylink_resolve_an_pause(state);
++}
++
++static void phylink_decode_sgmii_word(struct phylink_link_state *state,
++				      uint16_t config_reg)
++{
++	if (!(config_reg & LPA_SGMII_LINK)) {
++		state->link = false;
++		return;
++	}
++
++	switch (config_reg & LPA_SGMII_SPD_MASK) {
++	case LPA_SGMII_10:
++		state->speed = SPEED_10;
++		break;
++	case LPA_SGMII_100:
++		state->speed = SPEED_100;
++		break;
++	case LPA_SGMII_1000:
++		state->speed = SPEED_1000;
++		break;
++	default:
++		state->link = false;
++		return;
++	}
++	if (config_reg & LPA_SGMII_FULL_DUPLEX)
++		state->duplex = DUPLEX_FULL;
++	else
++		state->duplex = DUPLEX_HALF;
++}
++
++void phylink_decode_usxgmii_word(struct phylink_link_state *state,
++				 uint16_t lpa)
++{
++	switch (lpa & MDIO_USXGMII_SPD_MASK) {
++	case MDIO_USXGMII_10:
++		state->speed = SPEED_10;
++		break;
++	case MDIO_USXGMII_100:
++		state->speed = SPEED_100;
++		break;
++	case MDIO_USXGMII_1000:
++		state->speed = SPEED_1000;
++		break;
++	case MDIO_USXGMII_2500:
++		state->speed = SPEED_2500;
++		break;
++	case MDIO_USXGMII_5000:
++		state->speed = SPEED_5000;
++		break;
++	case MDIO_USXGMII_10G:
++		state->speed = SPEED_10000;
++		break;
++	default:
++		state->link = false;
++		return;
++	}
++
++	if (lpa & MDIO_USXGMII_FULL_DUPLEX)
++		state->duplex = DUPLEX_FULL;
++	else
++		state->duplex = DUPLEX_HALF;
++}
++
++static void phylink_decode_usgmii_word(struct phylink_link_state *state,
++				       uint16_t lpa)
++{
++	switch (lpa & MDIO_USXGMII_SPD_MASK) {
++	case MDIO_USXGMII_10:
++		state->speed = SPEED_10;
++		break;
++	case MDIO_USXGMII_100:
++		state->speed = SPEED_100;
++		break;
++	case MDIO_USXGMII_1000:
++		state->speed = SPEED_1000;
++		break;
++	default:
++		state->link = false;
++		return;
++	}
++
++	if (lpa & MDIO_USXGMII_FULL_DUPLEX)
++		state->duplex = DUPLEX_FULL;
++	else
++		state->duplex = DUPLEX_HALF;
++}
++
++void phylink_mii_c22_pcs_decode_state(struct phylink_link_state *state,
++				      u16 bmsr, u16 lpa)
++{
++	state->link = !!(bmsr & BMSR_LSTATUS);
++	state->an_complete = !!(bmsr & BMSR_ANEGCOMPLETE);
++	/* If there is no link or autonegotiation is disabled, the LP advertisement
++	 * data is not meaningful, so don't go any further.
++	 */
++	if (!state->link || !linkmode_test_bit(ETHTOOL_LINK_MODE_Autoneg_BIT,
++					       state->advertising))
++		return;
++
++	switch (state->interface) {
++	case PHY_INTERFACE_MODE_1000BASEX:
++		phylink_decode_c37_word(state, lpa, SPEED_1000);
++		break;
++
++	case PHY_INTERFACE_MODE_2500BASEX:
++		phylink_decode_c37_word(state, lpa, SPEED_2500);
++		break;
++
++	case PHY_INTERFACE_MODE_SGMII:
++	case PHY_INTERFACE_MODE_QSGMII:
++		phylink_decode_sgmii_word(state, lpa);
++		break;
++	case PHY_INTERFACE_MODE_QUSGMII:
++		phylink_decode_usgmii_word(state, lpa);
++		break;
++
++	default:
++		state->link = false;
++		break;
++	}
++}
++
++void phylink_mii_c22_pcs_get_state(struct mdio_device *pcs,
++				   struct phylink_link_state *state)
++{
++	int bmsr, lpa;
++
++	bmsr = mdiobus_read(pcs->bus, pcs->addr, MII_BMSR);
++	lpa = mdiobus_read(pcs->bus, pcs->addr, MII_LPA);
++	if (bmsr < 0 || lpa < 0) {
++		state->link = false;
++		return;
++	}
++
++	phylink_mii_c22_pcs_decode_state(state, bmsr, lpa);
++}
++
++int phylink_mii_c22_pcs_encode_advertisement(phy_interface_t interface,
++					     const unsigned long *advertising)
++{
++	u16 adv;
++
++	switch (interface) {
++	case PHY_INTERFACE_MODE_1000BASEX:
++	case PHY_INTERFACE_MODE_2500BASEX:
++		adv = ADVERTISE_1000XFULL;
++		if (linkmode_test_bit(ETHTOOL_LINK_MODE_Pause_BIT,
++				      advertising))
++			adv |= ADVERTISE_1000XPAUSE;
++		if (linkmode_test_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT,
++				      advertising))
++			adv |= ADVERTISE_1000XPSE_ASYM;
++		return adv;
++	case PHY_INTERFACE_MODE_SGMII:
++	case PHY_INTERFACE_MODE_QSGMII:
++		return 0x0001;
++	default:
++		/* Nothing to do for other modes */
++		return -EINVAL;
++	}
++}
++
++int phylink_mii_c22_pcs_config(struct mdio_device *pcs,
++			       phy_interface_t interface,
++			       const unsigned long *advertising,
++			       unsigned int neg_mode)
++{
++	bool changed = 0;
++	u16 bmcr;
++	int ret, adv;
++
++	adv = phylink_mii_c22_pcs_encode_advertisement(interface, advertising);
++	if (adv >= 0) {
++		ret = phylink_mdio_modify(pcs->bus, pcs->addr,
++					  MII_ADVERTISE, 0xffff, adv);
++		if (ret < 0)
++			return ret;
++		changed = ret;
++	}
++
++	if (neg_mode == PHYLINK_PCS_NEG_INBAND_ENABLED)
++		bmcr = BMCR_ANENABLE;
++	else
++		bmcr = 0;
++
++	/* Configure the inband state. Ensure ISOLATE bit is disabled */
++	ret = mdiobus_read(pcs->bus, pcs->addr, MII_BMCR);
++	if (ret < 0)
++		return ret;
++	ret = mdiobus_write(pcs->bus, pcs->addr, MII_BMCR,
++			    (ret & ~(BMCR_ANENABLE | BMCR_ISOLATE)) | bmcr);
++	if (ret < 0)
++		return ret;
++
++	return changed;
++}
++
++void phylink_mii_c22_pcs_an_restart(struct mdio_device *pcs)
++{
++	int val = mdiobus_read(pcs->bus, pcs->addr, MII_BMCR);
++
++	if (val >= 0) {
++		val |= BMCR_ANRESTART;
++
++		mdiobus_write(pcs->bus, pcs->addr, MII_BMCR, val);
++	}
++}
++/**
++ * phylink_get_link_timer_ns - return the PCS link timer value
++ */
++int phylink_get_link_timer_ns(phy_interface_t interface)
++{
++	switch (interface) {
++	case PHY_INTERFACE_MODE_SGMII:
++	case PHY_INTERFACE_MODE_QSGMII:
++	case PHY_INTERFACE_MODE_USXGMII:
++		return 1600000;
++
++	case PHY_INTERFACE_MODE_1000BASEX:
++	case PHY_INTERFACE_MODE_2500BASEX:
++		return 10000000;
++
++	default:
++		return -EINVAL;
++	}
++}
++EXPORT_SYMBOL_GPL(phylink_get_link_timer_ns);
+diff --git a/include/linux/mii.h b/include/linux/mii.h
+index 4ce8901a1..77efaee32 100644
+--- a/include/linux/mii.h
++++ b/include/linux/mii.h
+@@ -524,4 +524,17 @@ static inline u8 mii_resolve_flowctrl_fdx(u16 lcladv, u16 rmtadv)
+ 	return cap;
+ }
+ 
++static inline void mii_lpa_mod_linkmode_x(unsigned long *linkmodes, u16 lpa,
++					 int fd_bit)
++{
++	linkmode_mod_bit(ETHTOOL_LINK_MODE_Autoneg_BIT, linkmodes,
++			 lpa & LPA_LPACK);
++	linkmode_mod_bit(ETHTOOL_LINK_MODE_Pause_BIT, linkmodes,
++			 lpa & LPA_1000XPAUSE);
++	linkmode_mod_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT, linkmodes,
++			 lpa & LPA_1000XPAUSE_ASYM);
++	linkmode_mod_bit(fd_bit, linkmodes,
++			 lpa & LPA_1000XFULL);
++}
++
+ #endif /* __LINUX_MII_H__ */
+diff --git a/include/linux/phy.h b/include/linux/phy.h
+index 19444cd96..039ad4644 100644
+--- a/include/linux/phy.h
++++ b/include/linux/phy.h
+@@ -102,8 +102,44 @@ typedef enum {
+ 	/* 10GBASE-KR, XFI, SFI - single lane 10G Serdes */
+ 	PHY_INTERFACE_MODE_10GKR,
+ 	PHY_INTERFACE_MODE_USXGMII,
++	PHY_INTERFACE_MODE_QUSGMII,
++	PHY_INTERFACE_MODE_5GBASER,
++	PHY_INTERFACE_MODE_10GBASER,
++
+ 	PHY_INTERFACE_MODE_MAX,
+ } phy_interface_t;
++/* Backported from Linux 5.19 for the Airoha target */
++#define DECLARE_PHY_INTERFACE_MASK(name) \
++	DECLARE_BITMAP(name, PHY_INTERFACE_MODE_MAX)
++
++static inline void phy_interface_zero(unsigned long *intf)
++{
++	bitmap_zero(intf, PHY_INTERFACE_MODE_MAX);
++}
++
++static inline bool phy_interface_empty(const unsigned long *intf)
++{
++	return bitmap_empty(intf, PHY_INTERFACE_MODE_MAX);
++}
++
++static inline void phy_interface_and(unsigned long *dst, const unsigned long *a,
++				     const unsigned long *b)
++{
++	bitmap_and(dst, a, b, PHY_INTERFACE_MODE_MAX);
++}
++
++static inline void phy_interface_or(unsigned long *dst, const unsigned long *a,
++				    const unsigned long *b)
++{
++	bitmap_or(dst, a, b, PHY_INTERFACE_MODE_MAX);
++}
++
++static inline bool phy_interface_intersects(const unsigned long *a,
++					    const unsigned long *b)
++{
++	return bitmap_intersects(a, b, PHY_INTERFACE_MODE_MAX);
++}
++
+ 
+ /**
+  * phy_supported_speeds - return all speeds currently supported by a phy device
+@@ -179,6 +215,8 @@ static inline const char *phy_modes(phy_interface_t interface)
+ 		return "10gbase-kr";
+ 	case PHY_INTERFACE_MODE_USXGMII:
+ 		return "usxgmii";
++	case PHY_INTERFACE_MODE_QUSGMII:
++		return "qusgmii";
+ 	default:
+ 		return "unknown";
+ 	}
+diff --git a/include/linux/phylink.h b/include/linux/phylink.h
+index 300ecdb67..2fda789fb 100644
+--- a/include/linux/phylink.h
++++ b/include/linux/phylink.h
+@@ -24,6 +24,32 @@ enum {
+ 	MLO_AN_INBAND,	/* In-band protocol */
+ };
+ 
++/* MAC capabilities (backported from Linux 5.19) */
++enum {
++	MAC_SYM_PAUSE	= BIT(0),
++	MAC_ASYM_PAUSE	= BIT(1),
++	MAC_10HD	= BIT(2),
++	MAC_10FD	= BIT(3),
++	MAC_10		= MAC_10HD | MAC_10FD,
++	MAC_100HD	= BIT(4),
++	MAC_100FD	= BIT(5),
++	MAC_100		= MAC_100HD | MAC_100FD,
++	MAC_1000HD	= BIT(6),
++	MAC_1000FD	= BIT(7),
++	MAC_1000	= MAC_1000HD | MAC_1000FD,
++	MAC_2500FD	= BIT(8),
++	MAC_5000FD	= BIT(9),
++	MAC_10000FD	= BIT(10),
++	MAC_20000FD	= BIT(11),
++	MAC_25000FD	= BIT(12),
++	MAC_40000FD	= BIT(13),
++	MAC_50000FD	= BIT(14),
++	MAC_56000FD	= BIT(15),
++	MAC_100000FD	= BIT(16),
++	MAC_200000FD	= BIT(17),
++	MAC_400000FD	= BIT(18),
++};
++
+ static inline bool phylink_autoneg_inband(unsigned int mode)
+ {
+ 	return mode == MLO_AN_INBAND;
+@@ -67,8 +93,115 @@ enum phylink_op_type {
+ struct phylink_config {
+ 	struct device *dev;
+ 	enum phylink_op_type type;
++	bool poll_fixed_state;
++	bool mac_managed_pm;
++	bool ovr_an_inband;
++	DECLARE_PHY_INTERFACE_MASK(supported_interfaces);
++	unsigned long mac_capabilities;
++};
++
++/*
++ * PCS negotiation mode (backported from Linux 6.6)
++ */
++#define PHYLINK_PCS_NEG_NONE		0
++#define PHYLINK_PCS_NEG_ENABLED		BIT(4)
++#define PHYLINK_PCS_NEG_OUTBAND		BIT(5)
++#define PHYLINK_PCS_NEG_INBAND		BIT(6)
++#define PHYLINK_PCS_NEG_INBAND_DISABLED	PHYLINK_PCS_NEG_INBAND
++#define PHYLINK_PCS_NEG_INBAND_ENABLED	(PHYLINK_PCS_NEG_INBAND | \
++					 PHYLINK_PCS_NEG_ENABLED)
++
++struct phylink_pcs_ops;
++
++/**
++ * struct phylink_pcs - PHYLINK PCS instance
++ * @ops: a pointer to the &struct phylink_pcs_ops structure
++ * @phylink: pointer to &struct phylink_config
++ * @neg_mode: provide PCS neg mode via "mode" argument
++ * @poll: poll the PCS for link changes
++ *
++ * This structure is designed to be embedded within the PCS private data,
++ * and will be passed between phylink and the PCS.
++ */
++struct phylink_pcs {
++	const struct phylink_pcs_ops *ops;
++	struct phylink *phylink;
++	bool neg_mode;
++	bool poll;
++};
++
++/**
++ * struct phylink_pcs_ops - MAC PCS operations structure.
++ * @pcs_validate: validate the link configuration.
++ * @pcs_enable: enable the PCS.
++ * @pcs_disable: disable the PCS.
++ * @pcs_pre_config: pre-mac_config method (for errata)
++ * @pcs_post_config: post-mac_config method (for arrata)
++ * @pcs_get_state: read the current MAC PCS link state from the hardware.
++ * @pcs_config: configure the MAC PCS for the selected mode and state.
++ * @pcs_an_restart: restart 802.3z BaseX autonegotiation.
++ * @pcs_link_up: program the PCS for the resolved link configuration.
++ * @pcs_link_down: torn down link between MAC and PCS.
++ */
++struct phylink_pcs_ops {
++	int (*pcs_validate)(struct phylink_pcs *pcs, unsigned long *supported,
++			    const struct phylink_link_state *state);
++	int (*pcs_enable)(struct phylink_pcs *pcs);
++	void (*pcs_disable)(struct phylink_pcs *pcs);
++	void (*pcs_pre_config)(struct phylink_pcs *pcs,
++			       phy_interface_t interface);
++	int (*pcs_post_config)(struct phylink_pcs *pcs,
++			       phy_interface_t interface);
++	void (*pcs_get_state)(struct phylink_pcs *pcs,
++			      struct phylink_link_state *state);
++	int (*pcs_config)(struct phylink_pcs *pcs, unsigned int neg_mode,
++			  phy_interface_t interface,
++			  const unsigned long *advertising,
++			  bool permit_pause_to_mac);
++	void (*pcs_an_restart)(struct phylink_pcs *pcs);
++	void (*pcs_link_up)(struct phylink_pcs *pcs, unsigned int neg_mode,
++			    phy_interface_t interface, int speed, int duplex);
++	void (*pcs_link_down)(struct phylink_pcs *pcs);
+ };
+ 
++/*
++ * \brief helper to determine PCS inband mode
++ */
++static inline unsigned int phylink_pcs_neg_mode(unsigned int mode,
++						phy_interface_t interface,
++						const unsigned long *advertising)
++{
++	unsigned int neg_mode;
++
++	switch (interface) {
++	case PHY_INTERFACE_MODE_SGMII:
++	case PHY_INTERFACE_MODE_QSGMII:
++	case PHY_INTERFACE_MODE_USXGMII:
++		if (!phylink_autoneg_inband(mode))
++			neg_mode = PHYLINK_PCS_NEG_OUTBAND;
++		else
++			neg_mode = PHYLINK_PCS_NEG_INBAND_ENABLED;
++		break;
++
++	case PHY_INTERFACE_MODE_1000BASEX:
++	case PHY_INTERFACE_MODE_2500BASEX:
++		if (!phylink_autoneg_inband(mode))
++			neg_mode = PHYLINK_PCS_NEG_OUTBAND;
++		else if (linkmode_test_bit(ETHTOOL_LINK_MODE_Autoneg_BIT,
++					   advertising))
++			neg_mode = PHYLINK_PCS_NEG_INBAND_ENABLED;
++		else
++			neg_mode = PHYLINK_PCS_NEG_INBAND_DISABLED;
++		break;
++
++	default:
++		neg_mode = PHYLINK_PCS_NEG_NONE;
++		break;
++	}
++
++	return neg_mode;
++}
++
+ /**
+  * struct phylink_mac_ops - MAC operations structure.
+  * @validate: Validate and update the link configuration.
+@@ -91,9 +224,12 @@ struct phylink_mac_ops {
+ 	void (*mac_an_restart)(struct phylink_config *config);
+ 	void (*mac_link_down)(struct phylink_config *config, unsigned int mode,
+ 			      phy_interface_t interface);
+-	void (*mac_link_up)(struct phylink_config *config, unsigned int mode,
+-			    phy_interface_t interface,
+-			    struct phy_device *phy);
++	void (*mac_link_up)(struct phylink_config *config,
++			    struct phy_device *phy, unsigned int mode,
++			    phy_interface_t interface, int speed, int duplex,
++			    bool tx_pause, bool rx_pause);
++	struct phylink_pcs *(*mac_select_pcs)(struct phylink_config *config,
++					      phy_interface_t interface);
+ };
+ 
+ #if 0 /* For kernel-doc purposes only. */
+@@ -279,4 +415,28 @@ int phylink_mii_ioctl(struct phylink *, struct ifreq *, int);
+ void phylink_set_port_modes(unsigned long *bits);
+ void phylink_helper_basex_speed(struct phylink_link_state *state);
+ 
++void phylink_pcs_change(struct phylink_pcs *pcs, bool up);
++
++/**
++ * phylink_get_link_timer_ns - return the PCS link timer value
++ * @interface: link &typedef phy_interface_t mode
++ *
++ * Return the PCS link timer setting in nanoseconds for the PHY @interface
++ * mode, or -EINVAL if not appropriate.
++ */
++int phylink_get_link_timer_ns(phy_interface_t interface);
++
++void phylink_mii_c22_pcs_decode_state(struct phylink_link_state *state,
++				      u16 bmsr, u16 lpa);
++void phylink_mii_c22_pcs_get_state(struct mdio_device *pcs,
++				   struct phylink_link_state *state);
++int phylink_mii_c22_pcs_encode_advertisement(phy_interface_t interface,
++					     const unsigned long *advertising);
++int phylink_mii_c22_pcs_config(struct mdio_device *pcs,
++			       phy_interface_t interface,
++			       const unsigned long *advertising,
++			       unsigned int neg_mode);
++void phylink_mii_c22_pcs_an_restart(struct mdio_device *pcs);
++void phylink_decode_usxgmii_word(struct phylink_link_state *state,
++				 uint16_t lpa);
+ #endif
+diff --git a/include/uapi/linux/mdio.h b/include/uapi/linux/mdio.h
+index 4bcb41c71..b3aa388d7 100644
+--- a/include/uapi/linux/mdio.h
++++ b/include/uapi/linux/mdio.h
+@@ -324,4 +324,29 @@ static inline __u16 mdio_phy_id_c45(int prtad, int devad)
+ 	return MDIO_PHY_ID_C45 | (prtad << 5) | devad;
+ }
+ 
++#define MDIO_USXGMII_EEE_CLK_STP	0x0080	/* EEE clock stop supported */
++#define MDIO_USXGMII_EEE		0x0100	/* EEE supported */
++#define MDIO_USXGMII_SPD_MASK		0x0e00	/* USXGMII speed mask */
++#define MDIO_USXGMII_FULL_DUPLEX	0x1000	/* USXGMII full duplex */
++#define MDIO_USXGMII_DPX_SPD_MASK	0x1e00	/* USXGMII duplex and speed bits */
++#define MDIO_USXGMII_10			0x0000	/* 10Mbps */
++#define MDIO_USXGMII_10HALF		0x0000	/* 10Mbps half-duplex */
++#define MDIO_USXGMII_10FULL		0x1000	/* 10Mbps full-duplex */
++#define MDIO_USXGMII_100		0x0200	/* 100Mbps */
++#define MDIO_USXGMII_100HALF		0x0200	/* 100Mbps half-duplex */
++#define MDIO_USXGMII_100FULL		0x1200	/* 100Mbps full-duplex */
++#define MDIO_USXGMII_1000		0x0400	/* 1000Mbps */
++#define MDIO_USXGMII_1000HALF		0x0400	/* 1000Mbps half-duplex */
++#define MDIO_USXGMII_1000FULL		0x1400	/* 1000Mbps full-duplex */
++#define MDIO_USXGMII_10G		0x0600	/* 10Gbps */
++#define MDIO_USXGMII_10GHALF		0x0600	/* 10Gbps half-duplex */
++#define MDIO_USXGMII_10GFULL		0x1600	/* 10Gbps full-duplex */
++#define MDIO_USXGMII_2500		0x0800	/* 2500Mbps */
++#define MDIO_USXGMII_2500HALF		0x0800	/* 2500Mbps half-duplex */
++#define MDIO_USXGMII_2500FULL		0x1800	/* 2500Mbps full-duplex */
++#define MDIO_USXGMII_5000		0x0a00	/* 5000Mbps */
++#define MDIO_USXGMII_5000HALF		0x0a00	/* 5000Mbps half-duplex */
++#define MDIO_USXGMII_5000FULL		0x1a00	/* 5000Mbps full-duplex */
++#define MDIO_USXGMII_LINK		0x8000	/* PHY link with copper-side partner */
++
+ #endif /* _UAPI__LINUX_MDIO_H__ */
+diff --git a/include/uapi/linux/mii.h b/include/uapi/linux/mii.h
+index 51b48e4be..d11c83552 100644
+--- a/include/uapi/linux/mii.h
++++ b/include/uapi/linux/mii.h
+@@ -163,4 +163,19 @@ struct mii_ioctl_data {
+ 	__u16		val_out;
+ };
+ 
++#define LPA_SGMII		0x0001	/* PHY can do SGMII            */
++#define LPA_SGMII_SPD_MASK	0x0c00	/* SGMII speed mask            */
++#define LPA_SGMII_FULL_DUPLEX	0x1000	/* SGMII full duplex           */
++#define LPA_SGMII_DPX_SPD_MASK	0x1C00	/* SGMII duplex and speed bits */
++#define LPA_SGMII_10		0x0000	/* 10Mbps                      */
++#define LPA_SGMII_10HALF	0x0000	/* Can do 10mbps half-duplex   */
++#define LPA_SGMII_10FULL	0x1000	/* Can do 10mbps full-duplex   */
++#define LPA_SGMII_100		0x0400	/* 100Mbps                     */
++#define LPA_SGMII_100HALF	0x0400	/* Can do 100mbps half-duplex  */
++#define LPA_SGMII_100FULL	0x1400	/* Can do 100mbps full-duplex  */
++#define LPA_SGMII_1000		0x0800	/* 1000Mbps                    */
++#define LPA_SGMII_1000HALF	0x0800	/* Can do 1000mbps half-duplex */
++#define LPA_SGMII_1000FULL	0x1800	/* Can do 1000mbps full-duplex */
++#define LPA_SGMII_LINK		0x8000	/* PHY link with copper-side partner */
++
+ #endif /* _UAPI__LINUX_MII_H__ */

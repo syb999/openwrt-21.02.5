@@ -1,0 +1,109 @@
+diff --git a/drivers/net/phy/Kconfig b/drivers/net/phy/Kconfig
+index 3d8e32d6b..8af49bead 100644
+--- a/drivers/net/phy/Kconfig
++++ b/drivers/net/phy/Kconfig
+@@ -346,6 +346,12 @@ config ADIN_PHY
+ 	  - ADIN1300 - Robust,Industrial, Low Latency 10/100/1000 Gigabit
+ 	    Ethernet PHY
+ 
++config AIROHA_GE_SOC_PHY
++	tristate "Airoha SoC Ethernet PHYs"
++	depends on ARCH_AIROHA || COMPILE_TEST
++	help
++	  Supports the Airoha SoC built-in Gigabit Ethernet PHYs (AN7581).
++
+ config AMD_PHY
+ 	tristate "AMD PHYs"
+ 	---help---
+diff --git a/drivers/net/phy/Makefile b/drivers/net/phy/Makefile
+index fddf61584..b51b119b2 100644
+--- a/drivers/net/phy/Makefile
++++ b/drivers/net/phy/Makefile
+@@ -109,3 +109,4 @@ obj-$(CONFIG_STE10XP)		+= ste10Xp.o
+ obj-$(CONFIG_TERANETICS_PHY)	+= teranetics.o
+ obj-$(CONFIG_VITESSE_PHY)	+= vitesse.o
+ obj-$(CONFIG_XILINX_GMII2RGMII) += xilinx_gmii2rgmii.o
++obj-$(CONFIG_AIROHA_GE_SOC_PHY)	+= airoha-ge-soc.o
+diff --git a/drivers/net/phy/airoha-ge-soc.c b/drivers/net/phy/airoha-ge-soc.c
+new file mode 100644
+index 000000000..73b07623a
+--- /dev/null
++++ b/drivers/net/phy/airoha-ge-soc.c
+@@ -0,0 +1,77 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Driver for the Airoha AN7581 built-in Gigabit Ethernet PHYs (backport)
++ *
++ * The AN7581 ships a MT753x based switch whose internal GPHYs report the
++ * PHY ID 0x03a294c1. Unlike the MediaTek MT7981/MT7988 GPHYs these do not
++ * need efuse based calibration; the only board specific handling is
++ * selecting the "gbe-led" pinctrl state so that the PHY LEDs are driven.
++ *
++ * On Linux 5.4 the generic genphy helpers have to be wired up explicitly.
++ *
++ * Copyright (c) 2025 Airoha Inc
++ * Author: Lorenzo Bianconi <lorenzo@kernel.org>
++ * Author: Christian Marangi <ansuelsmth@gmail.com>
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/err.h>
++#include <linux/mdio.h>
++#include <linux/of.h>
++#include <linux/phy.h>
++#include <linux/pinctrl/consumer.h>
++#include <linux/slab.h>
++
++#define AIROHA_GPHY_ID_AN7581		0x03a294c1
++
++struct airoha_socphy_priv {
++	/* Placeholder: no calibration data required for the AN7581 */
++	int unused;
++};
++
++static int an7581_phy_probe(struct phy_device *phydev)
++{
++	struct airoha_socphy_priv *priv;
++	struct pinctrl *pinctrl;
++
++	/* Toggle pinctrl to enable the PHY LED pins */
++	pinctrl = devm_pinctrl_get_select(&phydev->mdio.dev, "gbe-led");
++	if (IS_ERR(pinctrl))
++		dev_dbg(&phydev->mdio.dev, "no gbe-led pinctrl state\n");
++
++	priv = devm_kzalloc(&phydev->mdio.dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	phydev->priv = priv;
++
++	return 0;
++}
++
++static struct phy_driver airoha_socphy_drivers[] = {
++	{
++		PHY_ID_MATCH_EXACT(AIROHA_GPHY_ID_AN7581),
++		.name			= "Airoha AN7581 PHY",
++		.probe			= an7581_phy_probe,
++		.config_aneg		= genphy_config_aneg,
++		.aneg_done		= genphy_aneg_done,
++		.read_status		= genphy_read_status,
++		.soft_reset		= genphy_soft_reset,
++		.suspend		= genphy_suspend,
++		.resume			= genphy_resume,
++	},
++};
++
++module_phy_driver(airoha_socphy_drivers);
++
++static struct mdio_device_id __maybe_unused airoha_socphy_tbl[] = {
++	{ PHY_ID_MATCH_EXACT(AIROHA_GPHY_ID_AN7581) },
++	{ }
++};
++
++MODULE_DEVICE_TABLE(mdio, airoha_socphy_tbl);
++
++MODULE_DESCRIPTION("Airoha SoC Gigabit Ethernet PHYs (AN7581)");
++MODULE_AUTHOR("Lorenzo Bianconi <lorenzo@kernel.org>");
++MODULE_LICENSE("GPL");

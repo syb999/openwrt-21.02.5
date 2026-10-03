@@ -1,0 +1,23 @@
+#!/bin/sh
+# POSIX-sh equivalent of the upstream ucode version (OpenWrt 21.02 has no ucode
+# package).  Dumps the U-Boot environment into /var/run/uboot-env/<name> so that
+# /etc/board.d/05_fw_defaults can pick up factory-provisioned values
+# (owrt_ssid, owrt_wifi_key, owrt_country, ...).
+path=/var/run/uboot-env
+
+if [ -d "$path" ]; then
+	echo "env has already been loaded to $path" >&2
+	exit 0
+fi
+
+raw="$(fw_printenv 2>/dev/null)"
+[ -n "$raw" ] || exit 0
+
+mkdir -p "$path"
+printf '%s\n' "$raw" | while IFS= read -r line; do
+	key="${line%%=*}"
+	[ "$key" = "$line" ] && continue
+	[ -n "$key" ] || continue
+	printf '%s' "${line#*=}" > "$path/$key"
+done
+exit 0

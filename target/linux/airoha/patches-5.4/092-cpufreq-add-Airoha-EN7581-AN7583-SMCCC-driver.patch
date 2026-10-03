@@ -1,0 +1,212 @@
+--- /dev/null
++++ b/drivers/cpufreq/airoha-cpufreq.c
+@@ -0,0 +1,188 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Airoha AN7581/AN7583 CPUFreq driver
++ *
++ * Copyright (C) 2025 Christian Marangi <ansuelsmth@gmail.com>
++ *
++ * Backported to Linux 5.4:
++ *  - the 6.x dev_pm_opp_config / dev_pm_opp_set_config() API is replaced by the
++ *    5.4 dev_pm_opp_attach_genpd() call.
++ *  - the 6.x "config_clks = nop" trick has no 5.4 equivalent; simply not
++ *    registering a clock name makes the OPP core skip clk_set_rate(), which is
++ *    exactly the behaviour we want (the SoC's ATF/SMCCC firmware owns the clock).
++ */
++
++#include <linux/bitfield.h>
++#include <linux/cpu.h>
++#include <linux/cpufreq.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/platform_device.h>
++#include <linux/pm_opp.h>
++#include <linux/pm_runtime.h>
++#include <linux/slab.h>
++
++#include "cpufreq-dt.h"
++
++struct airoha_cpufreq_priv {
++	struct device *cpu_dev;
++	struct opp_table *opp_table;
++	struct device **virt_devs;
++	struct platform_device *cpufreq_dt;
++};
++
++static struct platform_device *cpufreq_pdev;
++
++static const char * const airoha_cpufreq_pd_names[] = { "perf", NULL };
++
++static int airoha_cpufreq_probe(struct platform_device *pdev)
++{
++	struct platform_device *cpufreq_dt;
++	struct airoha_cpufreq_priv *priv;
++	struct device *dev = &pdev->dev;
++	struct opp_table *opp_table;
++	struct device **virt_devs;
++	struct device *cpu_dev;
++	int ret;
++
++	/* CPUs refer to the same OPP table */
++	cpu_dev = get_cpu_device(0);
++	if (!cpu_dev)
++		return -ENODEV;
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->cpu_dev = cpu_dev;
++
++	/* Attach the "perf" power domain for OPP ACTIVE state (5.4 API) */
++	opp_table = dev_pm_opp_attach_genpd(cpu_dev, airoha_cpufreq_pd_names, &virt_devs);
++	if (IS_ERR(opp_table))
++		return dev_err_probe(dev, PTR_ERR(opp_table), "Failed to attach genpd\n");
++
++	priv->opp_table = opp_table;
++	priv->virt_devs = virt_devs;
++
++	/* Keep the attached power domains active while cpufreq is in use */
++	{
++		const char * const *name = airoha_cpufreq_pd_names;
++		int i, j;
++
++		for (i = 0; *name; i++, name++) {
++			ret = pm_runtime_get_sync(virt_devs[i]);
++			if (ret < 0) {
++				pm_runtime_put_noidle(virt_devs[i]);
++				dev_err(cpu_dev, "failed to resume %s: %d\n",
++					*name, ret);
++
++				/* Rollback previous PM runtime calls */
++				name = airoha_cpufreq_pd_names;
++				for (j = 0; *name && j < i; j++, name++)
++					pm_runtime_put(virt_devs[j]);
++
++				goto err_attach_genpd;
++			}
++		}
++	}
++
++	cpufreq_dt = platform_device_register_simple("cpufreq-dt", -1, NULL, 0);
++	ret = PTR_ERR_OR_ZERO(cpufreq_dt);
++	if (ret) {
++		dev_err(dev, "failed to create cpufreq-dt device: %d\n", ret);
++		goto err_register_cpufreq;
++	}
++
++	priv->cpufreq_dt = cpufreq_dt;
++	platform_set_drvdata(pdev, priv);
++
++	return 0;
++
++err_register_cpufreq:
++	{
++		const char * const *name = airoha_cpufreq_pd_names;
++		int i;
++
++		for (i = 0; *name; i++, name++)
++			if (virt_devs && virt_devs[i])
++				pm_runtime_put(virt_devs[i]);
++	}
++err_attach_genpd:
++	dev_pm_opp_detach_genpd(opp_table);
++
++	return ret;
++}
++
++static int airoha_cpufreq_remove(struct platform_device *pdev)
++{
++	struct airoha_cpufreq_priv *priv = platform_get_drvdata(pdev);
++	const char * const *name = airoha_cpufreq_pd_names;
++	int i;
++
++	platform_device_unregister(priv->cpufreq_dt);
++
++	for (i = 0; *name; i++, name++)
++		if (priv->virt_devs && priv->virt_devs[i])
++			pm_runtime_put(priv->virt_devs[i]);
++
++	dev_pm_opp_detach_genpd(priv->opp_table);
++
++	return 0;
++}
++
++static struct platform_driver airoha_cpufreq_driver = {
++	.probe = airoha_cpufreq_probe,
++	.remove = airoha_cpufreq_remove,
++	.driver = {
++		.name = "airoha-cpufreq",
++	},
++};
++
++static const struct of_device_id airoha_cpufreq_match_list[] = {
++	{ .compatible = "airoha,an7583" },
++	{ .compatible = "airoha,en7581" },
++	{},
++};
++MODULE_DEVICE_TABLE(of, airoha_cpufreq_match_list);
++
++static struct platform_device *airoha_cpufreq_pdev;
++
++static int __init airoha_cpufreq_init(void)
++{
++	struct device_node *np = of_find_node_by_path("/");
++	const struct of_device_id *match;
++	int ret;
++
++	if (!np)
++		return -ENODEV;
++
++	match = of_match_node(airoha_cpufreq_match_list, np);
++	of_node_put(np);
++	if (!match)
++		return -ENODEV;
++
++	ret = platform_driver_register(&airoha_cpufreq_driver);
++	if (unlikely(ret < 0))
++		return ret;
++
++	airoha_cpufreq_pdev = platform_device_register_data(NULL, "airoha-cpufreq",
++							    -1, match, sizeof(*match));
++	ret = PTR_ERR_OR_ZERO(airoha_cpufreq_pdev);
++	if (ret)
++		platform_driver_unregister(&airoha_cpufreq_driver);
++
++	return ret;
++}
++module_init(airoha_cpufreq_init);
++
++static void __exit airoha_cpufreq_exit(void)
++{
++	platform_device_unregister(airoha_cpufreq_pdev);
++	platform_driver_unregister(&airoha_cpufreq_driver);
++}
++module_exit(airoha_cpufreq_exit);
++
++MODULE_AUTHOR("Christian Marangi <ansuelsmth@gmail.com>");
++MODULE_DESCRIPTION("CPUfreq driver for Airoha SoCs");
++MODULE_LICENSE("GPL");
+--- a/drivers/cpufreq/Kconfig.arm
++++ b/drivers/cpufreq/Kconfig.arm
+@@ -339,3 +339,11 @@
+ 	  This add the CPUFreq driver support for Intel PXA2xx SOCs.
+ 
+ 	  If in doubt, say N.
++
++config ARM_AIROHA_SOC_CPUFREQ
++	tristate "Airoha EN7581/AN7583 SoC CPUFreq support"
++	depends on ARCH_AIROHA
++	select PM_OPP
++	default y
++	help
++	  This adds cpufreq driver support for Airoha SoCs (AN7581/AN7583).
+--- a/drivers/cpufreq/Makefile
++++ b/drivers/cpufreq/Makefile
+@@ -111,3 +111,4 @@
+ obj-$(CONFIG_SPARC_US2E_CPUFREQ)	+= sparc-us2e-cpufreq.o
+ obj-$(CONFIG_SPARC_US3_CPUFREQ)		+= sparc-us3-cpufreq.o
+ obj-$(CONFIG_UNICORE32)			+= unicore2-cpufreq.o
++obj-$(CONFIG_ARM_AIROHA_SOC_CPUFREQ) += airoha-cpufreq.o

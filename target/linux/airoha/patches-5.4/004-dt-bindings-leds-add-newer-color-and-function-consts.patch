@@ -1,0 +1,27 @@
+diff -u -r a/include/dt-bindings/leds/common.h b/include/dt-bindings/leds/common.h
+--- a/include/dt-bindings/leds/common.h	2026-10-02 10:55:02.197643246 +0800
++++ b/include/dt-bindings/leds/common.h	2026-10-02 18:07:04.714840479 +0800
+@@ -76,3 +76,23 @@
+ #define LED_FUNCTION_WPS "wps"
+ 
+ #endif /* __DT_BINDINGS_LEDS_H */
++
++/* ---- added by OpenWrt airoha target: newer LED bindings used by an7581/an7583 DTS ---- */
++#define LED_COLOR_ID_CYAN			13
++#define LED_COLOR_ID_LIME			14
++#define LED_COLOR_ID_ORANGE			11
++#define LED_COLOR_ID_PINK			12
++#define LED_COLOR_ID_PURPLE			10
++#define LED_FUNCTION_FNLOCK			"fnlock"
++#define LED_FUNCTION_MOBILE			"mobile"
++#define LED_FUNCTION_PLAYER1			"player-1"
++#define LED_FUNCTION_PLAYER2			"player-2"
++#define LED_FUNCTION_PLAYER3			"player-3"
++#define LED_FUNCTION_PLAYER4			"player-4"
++#define LED_FUNCTION_PLAYER5			"player-5"
++#define LED_FUNCTION_SPEED_LAN			"speed-lan"
++#define LED_FUNCTION_SPEED_WAN			"speed-wan"
++#define LED_FUNCTION_WAN_ONLINE			"wan-online"
++#define LED_FUNCTION_WLAN_2GHZ			"wlan-2ghz"
++#define LED_FUNCTION_WLAN_5GHZ			"wlan-5ghz"
++#define LED_FUNCTION_WLAN_6GHZ			"wlan-6ghz"

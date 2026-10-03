@@ -1,0 +1,91 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+/ {
+	aliases {
+		label-mac-device = &gdm1;
+
+		led-boot = &led_power_green;
+		led-failsafe = &led_power_green;
+		led-running = &led_power_green;
+		led-upgrade = &led_power_green;
+
+		serial0 = &uart1;
+	};
+
+	chosen {
+		bootargs = "console=ttyS0,115200 earlycon";
+		stdout-path = "serial0:115200n8";
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x0 0x80000000 0x0 0x20000000>;
+	};
+};
+
+&eth {
+	status = "okay";
+};
+
+&eth_pcs {
+	status = "okay";
+};
+
+&i2c0 {
+	status = "okay";
+};
+
+&npu {
+	status = "okay";
+};
+
+&pon_pcs {
+	status = "okay";
+};
+
+&xpon_mac {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pon_pins>;
+	optical-front-end = <&en7572>;
+	nvmem-cells = <&pon_serial>;
+	nvmem-cell-names = "pon-serial";
+	/* data-path references the GDM carrying service GEM traffic. */
+	data-path = <&gdm2>;
+	status = "okay";
+};
+
+&gdm2 {
+	/* GDM2 carries the PON GEM data plane on AN7581 and AN7583. */
+	airoha,pon-data-path;
+	/* WAN uses the eth0 MAC stored at RI offset 0x3e. */
+	nvmem-cell-names = "mac-address";
+	nvmem-cells = <&macaddr_factory_3e 0>;
+	status = "okay";
+};
+
+&snfi {
+	status = "okay";
+};
+
+&spi_nand {
+	/*
+	 * Bootloader stores pages without host ECC, so Linux uses
+	 * NAND_ECC_NONE for the same page layout.
+	 */
+	nand-ecc-mode = "none";
+	nand-ecc-step-size = <2048>;
+	nand-ecc-strength = <0>;
+
+	partitions: partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+	};
+};
+
+&gdm1 {
+	status = "okay";
+
+	nvmem-cell-names = "mac-address";
+	nvmem-cells = <&macaddr_factory_3e 1>;
+};

@@ -1,0 +1,14 @@
+ARCH:=aarch64
+SUBTARGET:=an7581
+BOARDNAME:=AN7581 / AN7566 / AN7551
+CPU_TYPE:=cortex-a53
+KERNELNAME:=Image dtbs
+FEATURES+=pwm
+
+define Target/Description
+	Build firmware images for Airoha an7581 ARM based boards.
+endef
+
+# Ported from pbs05/ponwrt.  Upstream also lists kmod-nf-conntrack-bridge, airoha-en7581-npu-firmware,
+# which this tree does not provide yet.
+DEFAULT_PACKAGES += uboot-envtools
