@@ -1,0 +1,95 @@
+--- a/drivers/net/phy/mdio-airoha.c	2026-10-03 03:36:00.037272657 +0800
++++ b/drivers/net/phy/mdio-airoha.c	2026-10-03 03:36:00.037272657 +0800
+@@ -4,6 +4,7 @@
+  * Copyright (C) 2025 Christian Marangi <ansuelsmth@gmail.com>
+  */
+ 
++#include <linux/bitfield.h>
+ #include <linux/clk.h>
+ #include <linux/delay.h>
+ #include <linux/kernel.h>
+@@ -15,6 +16,11 @@
+ #include <linux/regmap.h>
+ #include <linux/reset.h>
+ 
++/* FIELD_PREP_CONST() only exists since v5.11; this tree is 5.4. */
++#ifndef FIELD_PREP_CONST
++#define FIELD_PREP_CONST(_mask, _val)	FIELD_PREP(_mask, _val)
++#endif
++
+ /* MII address register definitions */
+ #define   AN7583_MII_BUSY			BIT(31)
+ #define   AN7583_MII_RDY			BIT(30) /* RO signal BUS is ready */
+@@ -44,6 +50,11 @@
+ 	struct reset_control *reset;
+ };
+ 
++static int airoha_mdio_cl45_read(struct mii_bus *bus, int addr, int devnum,
++				 int regnum);
++static int airoha_mdio_cl45_write(struct mii_bus *bus, int addr, int devnum,
++				  int regnum, u16 value);
++
+ static int airoha_mdio_wait_busy(struct airoha_mdio_data *priv)
+ {
+ 	u32 busy;
+@@ -77,6 +88,11 @@
+ 	u32 val;
+ 	int ret;
+ 
++	/* 5.4 has no mii_bus->read_c45/write_c45: dispatch on the C45 flag here. */
++	if (regnum & MII_ADDR_C45)
++		return airoha_mdio_cl45_read(bus, addr,
++			(regnum >> MII_DEVADDR_C45_SHIFT) & 0x1f, regnum & 0xffff);
++
+ 	airoha_mdio_reset(priv);
+ 
+ 	val = AN7583_MII_BUSY | AN7583_MII_ST_CL22 |
+@@ -106,6 +122,11 @@
+ 	u32 val;
+ 	int ret;
+ 
++	if (regnum & MII_ADDR_C45)
++		return airoha_mdio_cl45_write(bus, addr,
++			(regnum >> MII_DEVADDR_C45_SHIFT) & 0x1f, regnum & 0xffff,
++			value);
++
+ 	val = AN7583_MII_BUSY | AN7583_MII_ST_CL22 |
+ 	      AN7583_MII_CMD_CL22_WRITE;
+ 	val |= FIELD_PREP(AN7583_MII_PHY_ADDR, addr);
+@@ -200,6 +221,11 @@
+ 	return ret;
+ }
+ 
++static void airoha_mdio_unregister(void *data)
++{
++	mdiobus_unregister(data);
++}
++
+ static int airoha_mdio_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -235,8 +261,6 @@
+ 	bus->parent = dev;
+ 	bus->read = airoha_mdio_read;
+ 	bus->write = airoha_mdio_write;
+-	bus->read_c45 = airoha_mdio_cl45_read;
+-	bus->write_c45 = airoha_mdio_cl45_write;
+ 
+ 	/* Check if a custom frequency is defined in DT or default to 2.5 MHz */
+ 	if (of_property_read_u32(dev->of_node, "clock-frequency", &freq))
+@@ -246,7 +270,14 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = devm_of_mdiobus_register(dev, bus, dev->of_node);
++	/* 5.4 has no devm_of_mdiobus_register(): register then tie the undo to devres. */
++	ret = of_mdiobus_register(bus, dev->of_node);
++	if (ret) {
++		reset_control_assert(priv->reset);
++		return ret;
++	}
++
++	ret = devm_add_action_or_reset(dev, airoha_mdio_unregister, bus);
+ 	if (ret) {
+ 		reset_control_assert(priv->reset);
+ 		return ret;

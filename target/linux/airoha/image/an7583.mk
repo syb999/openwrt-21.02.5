@@ -50,9 +50,11 @@ define Device/nokia_xg-040g-mf-common
   BLOCKSIZE := 128k
   PAGESIZE := 2048
   UBINIZE_OPTS := -E 5
-  # Ported from pbs05/ponwrt.  Upstream also lists kmod-phy-airoha-en8811h and
-  # kmod-regulator-userspace-consumer, which do not exist in this 5.4 tree yet.
-  DEVICE_PACKAGES := kmod-usb3 kmod-usb-ledtrig-usbport \
+    # Ported from pbs05/ponwrt.  The EN8811H PHY driver (upstream's
+    # kmod-phy-airoha-en8811h) is built into the kernel here via
+    # CONFIG_AIR_EN8811H_PHY=y, so only its firmware package is listed.
+    # kmod-regulator-userspace-consumer does not exist in this 5.4 tree yet.
+  DEVICE_PACKAGES := airoha-an7583-npu-firmware airoha-en8811h-firmware i2c-tools kmod-usb3 kmod-usb-ledtrig-usbport \
 	kmod-airoha-en7572 kmod-airoha-xpon kmod-airoha-pon-frontend \
 	airoha-ponctl airoha-pond uboot-envtools $(AIROHA_USB_STORAGE_PACKAGES)
 endef

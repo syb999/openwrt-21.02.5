@@ -1,0 +1,1125 @@
+--- a/include/linux/leds.h
++++ b/include/linux/leds.h
+@@ -147,9 +147,53 @@
+ #endif
+ 
+ 	/* Ensures consistent access to the LED Flash Class device */
+-	struct mutex		led_access;
++	struct mutex		led_access;	struct led_hw_trigger_type	*trigger_type;
++
++	/* Unique trigger name supported by LED set in hw control mode */
++	const char		*hw_control_trigger;
++	/*
++	 * Check if the LED driver supports the requested mode provided by the
++	 * defined supported trigger to setup the LED to hw control mode.
++	 *
++	 * Return 0 on success. Return -EOPNOTSUPP when the passed flags are not
++	 * supported and software fallback needs to be used.
++	 * Return a negative error number on any other case  for check fail due
++	 * to various reason like device not ready or timeouts.
++	 */
++	int			(*hw_control_is_supported)(struct led_classdev *led_cdev,
++							   unsigned long flags);
++	/*
++	 * Activate hardware control, LED driver will use the provided flags
++	 * from the supported trigger and setup the LED to be driven by hardware
++	 * following the requested mode from the trigger flags.
++	 * Deactivate hardware blink control by setting brightness to LED_OFF via
++	 * the brightness_set() callback.
++	 *
++	 * Return 0 on success, a negative error number on flags apply fail.
++	 */
++	int			(*hw_control_set)(struct led_classdev *led_cdev,
++						  unsigned long flags);
++	/*
++	 * Get from the LED driver the current mode that the LED is set in hw
++	 * control mode and put them in flags.
++	 * Trigger can use this to get the initial state of a LED already set in
++	 * hardware blink control.
++	 *
++	 * Return 0 on success, a negative error number on failing parsing the
++	 * initial mode. Error from this function is NOT FATAL as the device
++	 * may be in a not supported initial state by the attached LED trigger.
++	 */
++	int			(*hw_control_get)(struct led_classdev *led_cdev,
++						  unsigned long *flags);
++	/*
++	 * Get the device this LED blinks in response to.
++	 * e.g. for a PHY LED, it is the network device. If the LED is
++	 * not yet associated to a device, return NULL.
++	 */
++	struct device		*(*hw_control_get_device)(struct led_classdev *led_cdev);
+ };
+ 
++
+ /**
+  * led_classdev_register_ext - register a new object of LED class with
+  *			       init data
+@@ -596,4 +640,29 @@
+ }
+ #endif
+ 
++struct led_hw_trigger_type {
++	int dummy;
++};
++
++enum led_trigger_netdev_modes {
++	TRIGGER_NETDEV_LINK = 0,
++	TRIGGER_NETDEV_LINK_10,
++	TRIGGER_NETDEV_LINK_100,
++	TRIGGER_NETDEV_LINK_1000,
++	TRIGGER_NETDEV_LINK_2500,
++	TRIGGER_NETDEV_LINK_5000,
++	TRIGGER_NETDEV_LINK_10000,
++	TRIGGER_NETDEV_HALF_DUPLEX,
++	TRIGGER_NETDEV_FULL_DUPLEX,
++	TRIGGER_NETDEV_TX,
++	TRIGGER_NETDEV_RX,
++
++	/* Keep last */
++	__TRIGGER_NETDEV_MAX,
++};
++
++
++void led_blink_set_nosleep(struct led_classdev *led_cdev, unsigned long delay_on,
++			   unsigned long delay_off);
++
+ #endif		/* __LINUX_LEDS_H_INCLUDED */
+--- a/drivers/leds/led-core.c
++++ b/drivers/leds/led-core.c
+@@ -231,6 +231,20 @@
+ }
+ EXPORT_SYMBOL_GPL(led_blink_set_oneshot);
+ 
++
++/* 5.4 equivalent of 6.6's led_blink_set_nosleep(): the 6.x version defers to the
++ * set_brightness_work queue when the driver has both blink_set and
++ * brightness_set_blocking (using its separate delayed_delay_on/off fields).
++ * In 5.4 led_blink_set() itself already either calls the hardware blink_set()
++ * directly or arms the software blink timer - neither sleeps - so delegating to
++ * it is behaviourally equivalent here. */
++void led_blink_set_nosleep(struct led_classdev *led_cdev, unsigned long delay_on,
++			   unsigned long delay_off)
++{
++	led_blink_set(led_cdev, &delay_on, &delay_off);
++}
++EXPORT_SYMBOL_GPL(led_blink_set_nosleep);
++
+ void led_stop_software_blink(struct led_classdev *led_cdev)
+ {
+ 	del_timer_sync(&led_cdev->blink_timer);
+--- a/drivers/leds/trigger/ledtrig-netdev.c
++++ b/drivers/leds/trigger/ledtrig-netdev.c
+@@ -13,6 +13,7 @@
+ #include <linux/atomic.h>
+ #include <linux/ctype.h>
+ #include <linux/device.h>
++#include <linux/ethtool.h>
+ #include <linux/init.h>
+ #include <linux/jiffies.h>
+ #include <linux/kernel.h>
+@@ -20,10 +21,13 @@
+ #include <linux/list.h>
+ #include <linux/module.h>
+ #include <linux/netdevice.h>
+-#include <linux/spinlock.h>
++#include <linux/mutex.h>
++#include <linux/rtnetlink.h>
+ #include <linux/timer.h>
+ #include "../leds.h"
+ 
++#define NETDEV_LED_DEFAULT_INTERVAL	50
++
+ /*
+  * Configurable sysfs attributes:
+  *
+@@ -37,7 +41,7 @@
+  */
+ 
+ struct led_netdev_data {
+-	spinlock_t lock;
++	struct mutex lock;
+ 
+ 	struct delayed_work work;
+ 	struct notifier_block notifier;
+@@ -50,16 +54,11 @@
+ 	unsigned int last_activity;
+ 
+ 	unsigned long mode;
+-#define NETDEV_LED_LINK	0
+-#define NETDEV_LED_TX	1
+-#define NETDEV_LED_RX	2
+-#define NETDEV_LED_MODE_LINKUP	3
+-};
++	int link_speed;
++	u8 duplex;
+ 
+-enum netdev_led_attr {
+-	NETDEV_ATTR_LINK,
+-	NETDEV_ATTR_TX,
+-	NETDEV_ATTR_RX
++	bool carrier_link_up;
++	bool hw_control;
+ };
+ 
+ static void set_baseline_state(struct led_netdev_data *trigger_data)
+@@ -67,16 +66,60 @@
+ 	int current_brightness;
+ 	struct led_classdev *led_cdev = trigger_data->led_cdev;
+ 
++	/* Already validated, hw control is possible with the requested mode */
++	if (trigger_data->hw_control) {
++		led_cdev->hw_control_set(led_cdev, trigger_data->mode);
++
++		return;
++	}
++
+ 	current_brightness = led_cdev->brightness;
+ 	if (current_brightness)
+ 		led_cdev->blink_brightness = current_brightness;
+ 	if (!led_cdev->blink_brightness)
+ 		led_cdev->blink_brightness = led_cdev->max_brightness;
+ 
+-	if (!test_bit(NETDEV_LED_MODE_LINKUP, &trigger_data->mode))
++	if (!trigger_data->carrier_link_up) {
+ 		led_set_brightness(led_cdev, LED_OFF);
+-	else {
+-		if (test_bit(NETDEV_LED_LINK, &trigger_data->mode))
++	} else {
++		bool blink_on = false;
++
++		if (test_bit(TRIGGER_NETDEV_LINK, &trigger_data->mode))
++			blink_on = true;
++
++		if (test_bit(TRIGGER_NETDEV_LINK_10, &trigger_data->mode) &&
++		    trigger_data->link_speed == SPEED_10)
++			blink_on = true;
++
++		if (test_bit(TRIGGER_NETDEV_LINK_100, &trigger_data->mode) &&
++		    trigger_data->link_speed == SPEED_100)
++			blink_on = true;
++
++		if (test_bit(TRIGGER_NETDEV_LINK_1000, &trigger_data->mode) &&
++		    trigger_data->link_speed == SPEED_1000)
++			blink_on = true;
++
++		if (test_bit(TRIGGER_NETDEV_LINK_2500, &trigger_data->mode) &&
++		    trigger_data->link_speed == SPEED_2500)
++			blink_on = true;
++
++		if (test_bit(TRIGGER_NETDEV_LINK_5000, &trigger_data->mode) &&
++		    trigger_data->link_speed == SPEED_5000)
++			blink_on = true;
++
++		if (test_bit(TRIGGER_NETDEV_LINK_10000, &trigger_data->mode) &&
++		    trigger_data->link_speed == SPEED_10000)
++			blink_on = true;
++
++		if (test_bit(TRIGGER_NETDEV_HALF_DUPLEX, &trigger_data->mode) &&
++		    trigger_data->duplex == DUPLEX_HALF)
++			blink_on = true;
++
++		if (test_bit(TRIGGER_NETDEV_FULL_DUPLEX, &trigger_data->mode) &&
++		    trigger_data->duplex == DUPLEX_FULL)
++			blink_on = true;
++
++		if (blink_on)
+ 			led_set_brightness(led_cdev,
+ 					   led_cdev->blink_brightness);
+ 		else
+@@ -85,44 +128,129 @@
+ 		/* If we are looking for RX/TX start periodically
+ 		 * checking stats
+ 		 */
+-		if (test_bit(NETDEV_LED_TX, &trigger_data->mode) ||
+-		    test_bit(NETDEV_LED_RX, &trigger_data->mode))
++		if (test_bit(TRIGGER_NETDEV_TX, &trigger_data->mode) ||
++		    test_bit(TRIGGER_NETDEV_RX, &trigger_data->mode))
+ 			schedule_delayed_work(&trigger_data->work, 0);
+ 	}
+ }
+ 
++static bool supports_hw_control(struct led_classdev *led_cdev)
++{
++	if (!led_cdev->hw_control_get || !led_cdev->hw_control_set ||
++	    !led_cdev->hw_control_is_supported)
++		return false;
++
++	return !strcmp(led_cdev->hw_control_trigger, led_cdev->trigger->name);
++}
++
++/*
++ * Validate the configured netdev is the same as the one associated with
++ * the LED driver in hw control.
++ */
++static bool validate_net_dev(struct led_classdev *led_cdev,
++			     struct net_device *net_dev)
++{
++	struct device *dev = led_cdev->hw_control_get_device(led_cdev);
++	struct net_device *ndev;
++
++	if (!dev)
++		return false;
++
++	ndev = to_net_dev(dev);
++
++	return ndev == net_dev;
++}
++
++static bool can_hw_control(struct led_netdev_data *trigger_data)
++{
++	unsigned long default_interval = msecs_to_jiffies(NETDEV_LED_DEFAULT_INTERVAL);
++	unsigned int interval = atomic_read(&trigger_data->interval);
++	struct led_classdev *led_cdev = trigger_data->led_cdev;
++	int ret;
++
++	if (!supports_hw_control(led_cdev))
++		return false;
++
++	/*
++	 * Interval must be set to the default
++	 * value. Any different value is rejected if in hw
++	 * control.
++	 */
++	if (interval != default_interval)
++		return false;
++
++	/*
++	 * net_dev must be set with hw control, otherwise no
++	 * blinking can be happening and there is nothing to
++	 * offloaded. Additionally, for hw control to be
++	 * valid, the configured netdev must be the same as
++	 * netdev associated to the LED.
++	 */
++	if (!validate_net_dev(led_cdev, trigger_data->net_dev))
++		return false;
++
++	/* Check if the requested mode is supported */
++	ret = led_cdev->hw_control_is_supported(led_cdev, trigger_data->mode);
++	/* Fall back to software blinking if not supported */
++	if (ret == -EOPNOTSUPP)
++		return false;
++	if (ret) {
++		dev_warn(led_cdev->dev,
++			 "Current mode check failed with error %d\n", ret);
++		return false;
++	}
++
++	return true;
++}
++
++static void get_device_state(struct led_netdev_data *trigger_data)
++{
++	struct ethtool_link_ksettings cmd;
++
++	trigger_data->carrier_link_up = netif_carrier_ok(trigger_data->net_dev);
++	if (!trigger_data->carrier_link_up)
++		return;
++
++	if (!__ethtool_get_link_ksettings(trigger_data->net_dev, &cmd)) {
++		trigger_data->link_speed = cmd.base.speed;
++		trigger_data->duplex = cmd.base.duplex;
++	}
++}
++
+ static ssize_t device_name_show(struct device *dev,
+ 				struct device_attribute *attr, char *buf)
+ {
+ 	struct led_netdev_data *trigger_data = led_trigger_get_drvdata(dev);
+ 	ssize_t len;
+ 
+-	spin_lock_bh(&trigger_data->lock);
++	mutex_lock(&trigger_data->lock);
+ 	len = sprintf(buf, "%s\n", trigger_data->device_name);
+-	spin_unlock_bh(&trigger_data->lock);
++	mutex_unlock(&trigger_data->lock);
+ 
+ 	return len;
+ }
+ 
+-static ssize_t device_name_store(struct device *dev,
+-				 struct device_attribute *attr, const char *buf,
+-				 size_t size)
++static int set_device_name(struct led_netdev_data *trigger_data,
++			   const char *name, size_t size)
+ {
+-	struct led_netdev_data *trigger_data = led_trigger_get_drvdata(dev);
+-
+ 	if (size >= IFNAMSIZ)
+ 		return -EINVAL;
+ 
+ 	cancel_delayed_work_sync(&trigger_data->work);
+ 
+-	spin_lock_bh(&trigger_data->lock);
++	/*
++	 * Take RTNL lock before trigger_data lock to prevent potential
++	 * deadlock with netdev notifier registration.
++	 */
++	rtnl_lock();
++	mutex_lock(&trigger_data->lock);
+ 
+ 	if (trigger_data->net_dev) {
+ 		dev_put(trigger_data->net_dev);
+ 		trigger_data->net_dev = NULL;
+ 	}
+ 
+-	memcpy(trigger_data->device_name, buf, size);
++	memcpy(trigger_data->device_name, name, size);
+ 	trigger_data->device_name[size] = 0;
+ 	if (size > 0 && trigger_data->device_name[size - 1] == '\n')
+ 		trigger_data->device_name[size - 1] = 0;
+@@ -131,36 +259,56 @@
+ 		trigger_data->net_dev =
+ 		    dev_get_by_name(&init_net, trigger_data->device_name);
+ 
+-	clear_bit(NETDEV_LED_MODE_LINKUP, &trigger_data->mode);
+-	if (trigger_data->net_dev != NULL)
+-		if (netif_carrier_ok(trigger_data->net_dev))
+-			set_bit(NETDEV_LED_MODE_LINKUP, &trigger_data->mode);
++	trigger_data->carrier_link_up = false;
++	trigger_data->link_speed = SPEED_UNKNOWN;
++	trigger_data->duplex = DUPLEX_UNKNOWN;
++	if (trigger_data->net_dev)
++		get_device_state(trigger_data);
+ 
+ 	trigger_data->last_activity = 0;
+ 
+ 	set_baseline_state(trigger_data);
+-	spin_unlock_bh(&trigger_data->lock);
++	mutex_unlock(&trigger_data->lock);
++	rtnl_unlock();
++
++	return 0;
++}
++
++static ssize_t device_name_store(struct device *dev,
++				 struct device_attribute *attr, const char *buf,
++				 size_t size)
++{
++	struct led_netdev_data *trigger_data = led_trigger_get_drvdata(dev);
++	int ret;
+ 
++	ret = set_device_name(trigger_data, buf, size);
++
++	if (ret < 0)
++		return ret;
+ 	return size;
+ }
+ 
+ static DEVICE_ATTR_RW(device_name);
+ 
+ static ssize_t netdev_led_attr_show(struct device *dev, char *buf,
+-	enum netdev_led_attr attr)
++				    enum led_trigger_netdev_modes attr)
+ {
+ 	struct led_netdev_data *trigger_data = led_trigger_get_drvdata(dev);
+ 	int bit;
+ 
+ 	switch (attr) {
+-	case NETDEV_ATTR_LINK:
+-		bit = NETDEV_LED_LINK;
+-		break;
+-	case NETDEV_ATTR_TX:
+-		bit = NETDEV_LED_TX;
+-		break;
+-	case NETDEV_ATTR_RX:
+-		bit = NETDEV_LED_RX;
++	case TRIGGER_NETDEV_LINK:
++	case TRIGGER_NETDEV_LINK_10:
++	case TRIGGER_NETDEV_LINK_100:
++	case TRIGGER_NETDEV_LINK_1000:
++	case TRIGGER_NETDEV_LINK_2500:
++	case TRIGGER_NETDEV_LINK_5000:
++	case TRIGGER_NETDEV_LINK_10000:
++	case TRIGGER_NETDEV_HALF_DUPLEX:
++	case TRIGGER_NETDEV_FULL_DUPLEX:
++	case TRIGGER_NETDEV_TX:
++	case TRIGGER_NETDEV_RX:
++		bit = attr;
+ 		break;
+ 	default:
+ 		return -EINVAL;
+@@ -170,10 +318,10 @@
+ }
+ 
+ static ssize_t netdev_led_attr_store(struct device *dev, const char *buf,
+-	size_t size, enum netdev_led_attr attr)
++				     size_t size, enum led_trigger_netdev_modes attr)
+ {
+ 	struct led_netdev_data *trigger_data = led_trigger_get_drvdata(dev);
+-	unsigned long state;
++	unsigned long state, mode = trigger_data->mode;
+ 	int ret;
+ 	int bit;
+ 
+@@ -182,72 +330,71 @@
+ 		return ret;
+ 
+ 	switch (attr) {
+-	case NETDEV_ATTR_LINK:
+-		bit = NETDEV_LED_LINK;
+-		break;
+-	case NETDEV_ATTR_TX:
+-		bit = NETDEV_LED_TX;
+-		break;
+-	case NETDEV_ATTR_RX:
+-		bit = NETDEV_LED_RX;
++	case TRIGGER_NETDEV_LINK:
++	case TRIGGER_NETDEV_LINK_10:
++	case TRIGGER_NETDEV_LINK_100:
++	case TRIGGER_NETDEV_LINK_1000:
++	case TRIGGER_NETDEV_LINK_2500:
++	case TRIGGER_NETDEV_LINK_5000:
++	case TRIGGER_NETDEV_LINK_10000:
++	case TRIGGER_NETDEV_HALF_DUPLEX:
++	case TRIGGER_NETDEV_FULL_DUPLEX:
++	case TRIGGER_NETDEV_TX:
++	case TRIGGER_NETDEV_RX:
++		bit = attr;
+ 		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+ 
+-	cancel_delayed_work_sync(&trigger_data->work);
+-
+ 	if (state)
+-		set_bit(bit, &trigger_data->mode);
++		set_bit(bit, &mode);
+ 	else
+-		clear_bit(bit, &trigger_data->mode);
+-
+-	set_baseline_state(trigger_data);
++		clear_bit(bit, &mode);
+ 
+-	return size;
+-}
+-
+-static ssize_t link_show(struct device *dev,
+-	struct device_attribute *attr, char *buf)
+-{
+-	return netdev_led_attr_show(dev, buf, NETDEV_ATTR_LINK);
+-}
+-
+-static ssize_t link_store(struct device *dev,
+-	struct device_attribute *attr, const char *buf, size_t size)
+-{
+-	return netdev_led_attr_store(dev, buf, size, NETDEV_ATTR_LINK);
+-}
+-
+-static DEVICE_ATTR_RW(link);
+-
+-static ssize_t tx_show(struct device *dev,
+-	struct device_attribute *attr, char *buf)
+-{
+-	return netdev_led_attr_show(dev, buf, NETDEV_ATTR_TX);
+-}
++	if (test_bit(TRIGGER_NETDEV_LINK, &mode) &&
++	    (test_bit(TRIGGER_NETDEV_LINK_10, &mode) ||
++	     test_bit(TRIGGER_NETDEV_LINK_100, &mode) ||
++	     test_bit(TRIGGER_NETDEV_LINK_1000, &mode) ||
++	     test_bit(TRIGGER_NETDEV_LINK_2500, &mode) ||
++	     test_bit(TRIGGER_NETDEV_LINK_5000, &mode) ||
++	     test_bit(TRIGGER_NETDEV_LINK_10000, &mode)))
++		return -EINVAL;
+ 
+-static ssize_t tx_store(struct device *dev,
+-	struct device_attribute *attr, const char *buf, size_t size)
+-{
+-	return netdev_led_attr_store(dev, buf, size, NETDEV_ATTR_TX);
+-}
++	cancel_delayed_work_sync(&trigger_data->work);
+ 
+-static DEVICE_ATTR_RW(tx);
++	trigger_data->mode = mode;
++	trigger_data->hw_control = can_hw_control(trigger_data);
+ 
+-static ssize_t rx_show(struct device *dev,
+-	struct device_attribute *attr, char *buf)
+-{
+-	return netdev_led_attr_show(dev, buf, NETDEV_ATTR_RX);
+-}
++	set_baseline_state(trigger_data);
+ 
+-static ssize_t rx_store(struct device *dev,
+-	struct device_attribute *attr, const char *buf, size_t size)
+-{
+-	return netdev_led_attr_store(dev, buf, size, NETDEV_ATTR_RX);
++	return size;
+ }
+ 
+-static DEVICE_ATTR_RW(rx);
++#define DEFINE_NETDEV_TRIGGER(trigger_name, trigger) \
++	static ssize_t trigger_name##_show(struct device *dev, \
++		struct device_attribute *attr, char *buf) \
++	{ \
++		return netdev_led_attr_show(dev, buf, trigger); \
++	} \
++	static ssize_t trigger_name##_store(struct device *dev, \
++		struct device_attribute *attr, const char *buf, size_t size) \
++	{ \
++		return netdev_led_attr_store(dev, buf, size, trigger); \
++	} \
++	static DEVICE_ATTR_RW(trigger_name)
++
++DEFINE_NETDEV_TRIGGER(link, TRIGGER_NETDEV_LINK);
++DEFINE_NETDEV_TRIGGER(link_10, TRIGGER_NETDEV_LINK_10);
++DEFINE_NETDEV_TRIGGER(link_100, TRIGGER_NETDEV_LINK_100);
++DEFINE_NETDEV_TRIGGER(link_1000, TRIGGER_NETDEV_LINK_1000);
++DEFINE_NETDEV_TRIGGER(link_2500, TRIGGER_NETDEV_LINK_2500);
++DEFINE_NETDEV_TRIGGER(link_5000, TRIGGER_NETDEV_LINK_5000);
++DEFINE_NETDEV_TRIGGER(link_10000, TRIGGER_NETDEV_LINK_10000);
++DEFINE_NETDEV_TRIGGER(half_duplex, TRIGGER_NETDEV_HALF_DUPLEX);
++DEFINE_NETDEV_TRIGGER(full_duplex, TRIGGER_NETDEV_FULL_DUPLEX);
++DEFINE_NETDEV_TRIGGER(tx, TRIGGER_NETDEV_TX);
++DEFINE_NETDEV_TRIGGER(rx, TRIGGER_NETDEV_RX);
+ 
+ static ssize_t interval_show(struct device *dev,
+ 			     struct device_attribute *attr, char *buf)
+@@ -266,6 +413,9 @@
+ 	unsigned long value;
+ 	int ret;
+ 
++	if (trigger_data->hw_control)
++		return -EINVAL;
++
+ 	ret = kstrtoul(buf, 0, &value);
+ 	if (ret)
+ 		return ret;
+@@ -283,12 +433,31 @@
+ 
+ static DEVICE_ATTR_RW(interval);
+ 
++static ssize_t offloaded_show(struct device *dev,
++			      struct device_attribute *attr, char *buf)
++{
++	struct led_netdev_data *trigger_data = led_trigger_get_drvdata(dev);
++
++	return sprintf(buf, "%d\n", trigger_data->hw_control);
++}
++
++static DEVICE_ATTR_RO(offloaded);
++
+ static struct attribute *netdev_trig_attrs[] = {
+ 	&dev_attr_device_name.attr,
+ 	&dev_attr_link.attr,
++	&dev_attr_link_10.attr,
++	&dev_attr_link_100.attr,
++	&dev_attr_link_1000.attr,
++	&dev_attr_link_2500.attr,
++	&dev_attr_link_5000.attr,
++	&dev_attr_link_10000.attr,
++	&dev_attr_full_duplex.attr,
++	&dev_attr_half_duplex.attr,
+ 	&dev_attr_rx.attr,
+ 	&dev_attr_tx.attr,
+ 	&dev_attr_interval.attr,
++	&dev_attr_offloaded.attr,
+ 	NULL
+ };
+ ATTRIBUTE_GROUPS(netdev_trig);
+@@ -313,16 +482,19 @@
+ 
+ 	cancel_delayed_work_sync(&trigger_data->work);
+ 
+-	spin_lock_bh(&trigger_data->lock);
++	mutex_lock(&trigger_data->lock);
+ 
+-	clear_bit(NETDEV_LED_MODE_LINKUP, &trigger_data->mode);
++	trigger_data->carrier_link_up = false;
++	trigger_data->link_speed = SPEED_UNKNOWN;
++	trigger_data->duplex = DUPLEX_UNKNOWN;
+ 	switch (evt) {
+ 	case NETDEV_CHANGENAME:
+ 	case NETDEV_REGISTER:
+-		if (trigger_data->net_dev)
+-			dev_put(trigger_data->net_dev);
++		dev_put(trigger_data->net_dev);
+ 		dev_hold(dev);
+ 		trigger_data->net_dev = dev;
++		if (evt == NETDEV_CHANGENAME)
++			get_device_state(trigger_data);
+ 		break;
+ 	case NETDEV_UNREGISTER:
+ 		dev_put(trigger_data->net_dev);
+@@ -330,14 +502,13 @@
+ 		break;
+ 	case NETDEV_UP:
+ 	case NETDEV_CHANGE:
+-		if (netif_carrier_ok(dev))
+-			set_bit(NETDEV_LED_MODE_LINKUP, &trigger_data->mode);
++		get_device_state(trigger_data);
+ 		break;
+ 	}
+ 
+ 	set_baseline_state(trigger_data);
+ 
+-	spin_unlock_bh(&trigger_data->lock);
++	mutex_unlock(&trigger_data->lock);
+ 
+ 	return NOTIFY_DONE;
+ }
+@@ -360,21 +531,29 @@
+ 	}
+ 
+ 	/* If we are not looking for RX/TX then return  */
+-	if (!test_bit(NETDEV_LED_TX, &trigger_data->mode) &&
+-	    !test_bit(NETDEV_LED_RX, &trigger_data->mode))
++	if (!test_bit(TRIGGER_NETDEV_TX, &trigger_data->mode) &&
++	    !test_bit(TRIGGER_NETDEV_RX, &trigger_data->mode))
+ 		return;
+ 
+ 	dev_stats = dev_get_stats(trigger_data->net_dev, &temp);
+ 	new_activity =
+-	    (test_bit(NETDEV_LED_TX, &trigger_data->mode) ?
++	    (test_bit(TRIGGER_NETDEV_TX, &trigger_data->mode) ?
+ 		dev_stats->tx_packets : 0) +
+-	    (test_bit(NETDEV_LED_RX, &trigger_data->mode) ?
++	    (test_bit(TRIGGER_NETDEV_RX, &trigger_data->mode) ?
+ 		dev_stats->rx_packets : 0);
+ 
+ 	if (trigger_data->last_activity != new_activity) {
+ 		led_stop_software_blink(trigger_data->led_cdev);
+ 
+-		invert = test_bit(NETDEV_LED_LINK, &trigger_data->mode);
++		invert = test_bit(TRIGGER_NETDEV_LINK, &trigger_data->mode) ||
++			 test_bit(TRIGGER_NETDEV_LINK_10, &trigger_data->mode) ||
++			 test_bit(TRIGGER_NETDEV_LINK_100, &trigger_data->mode) ||
++			 test_bit(TRIGGER_NETDEV_LINK_1000, &trigger_data->mode) ||
++			 test_bit(TRIGGER_NETDEV_LINK_2500, &trigger_data->mode) ||
++			 test_bit(TRIGGER_NETDEV_LINK_5000, &trigger_data->mode) ||
++			 test_bit(TRIGGER_NETDEV_LINK_10000, &trigger_data->mode) ||
++			 test_bit(TRIGGER_NETDEV_HALF_DUPLEX, &trigger_data->mode) ||
++			 test_bit(TRIGGER_NETDEV_FULL_DUPLEX, &trigger_data->mode);
+ 		interval = jiffies_to_msecs(
+ 				atomic_read(&trigger_data->interval));
+ 		/* base state is ON (link present) */
+@@ -392,13 +571,15 @@
+ static int netdev_trig_activate(struct led_classdev *led_cdev)
+ {
+ 	struct led_netdev_data *trigger_data;
++	unsigned long mode = 0;
++	struct device *dev;
+ 	int rc;
+ 
+ 	trigger_data = kzalloc(sizeof(struct led_netdev_data), GFP_KERNEL);
+ 	if (!trigger_data)
+ 		return -ENOMEM;
+ 
+-	spin_lock_init(&trigger_data->lock);
++	mutex_init(&trigger_data->lock);
+ 
+ 	trigger_data->notifier.notifier_call = netdev_trig_notify;
+ 	trigger_data->notifier.priority = 10;
+@@ -410,9 +591,26 @@
+ 	trigger_data->device_name[0] = 0;
+ 
+ 	trigger_data->mode = 0;
+-	atomic_set(&trigger_data->interval, msecs_to_jiffies(50));
++	atomic_set(&trigger_data->interval, msecs_to_jiffies(NETDEV_LED_DEFAULT_INTERVAL));
+ 	trigger_data->last_activity = 0;
+ 
++	/* Check if hw control is active by default on the LED.
++	 * Init already enabled mode in hw control.
++	 */
++	if (supports_hw_control(led_cdev)) {
++		dev = led_cdev->hw_control_get_device(led_cdev);
++		if (dev) {
++			const char *name = dev_name(dev);
++
++			set_device_name(trigger_data, name, strlen(name));
++			trigger_data->hw_control = true;
++
++			rc = led_cdev->hw_control_get(led_cdev, &mode);
++			if (!rc)
++				trigger_data->mode = mode;
++		}
++	}
++
+ 	led_set_trigger_data(led_cdev, trigger_data);
+ 
+ 	rc = register_netdevice_notifier(&trigger_data->notifier);
+@@ -430,8 +628,9 @@
+ 
+ 	cancel_delayed_work_sync(&trigger_data->work);
+ 
+-	if (trigger_data->net_dev)
+-		dev_put(trigger_data->net_dev);
++	led_set_brightness(led_cdev, LED_OFF);
++
++	dev_put(trigger_data->net_dev);
+ 
+ 	kfree(trigger_data);
+ }
+@@ -443,18 +642,7 @@
+ 	.groups = netdev_trig_groups,
+ };
+ 
+-static int __init netdev_trig_init(void)
+-{
+-	return led_trigger_register(&netdev_led_trigger);
+-}
+-
+-static void __exit netdev_trig_exit(void)
+-{
+-	led_trigger_unregister(&netdev_led_trigger);
+-}
+-
+-module_init(netdev_trig_init);
+-module_exit(netdev_trig_exit);
++module_led_trigger(netdev_led_trigger);
+ 
+ MODULE_AUTHOR("Ben Whitten <ben.whitten@gmail.com>");
+ MODULE_AUTHOR("Oliver Jowett <oliver@opencloud.com>");
+--- a/include/linux/phy.h
++++ b/include/linux/phy.h
+@@ -14,6 +14,7 @@
+ #include <linux/compiler.h>
+ #include <linux/spinlock.h>
+ #include <linux/ethtool.h>
++#include <linux/leds.h>
+ #include <linux/linkmode.h>
+ #include <linux/mdio.h>
+ #include <linux/mii.h>
+@@ -454,6 +455,7 @@
+ 	u32 eee_broken_modes;
+ 
+ #ifdef CONFIG_LED_TRIGGER_PHY
++	struct list_head leds;
+ 	struct phy_led_trigger *phy_led_triggers;
+ 	unsigned int phy_num_led_triggers;
+ 	struct phy_led_trigger *last_triggered;
+@@ -512,6 +514,24 @@
+  * and be freed up by an interrupt (The MPC85xx has this ability,
+  * though it is not currently supported in the driver).
+  */
++/* Modes for PHY LED configuration */
++enum phy_led_modes {
++	PHY_LED_ACTIVE_HIGH = 0,
++	PHY_LED_ACTIVE_LOW = 1,
++	PHY_LED_INACTIVE_HIGH_IMPEDANCE = 2,
++	/* keep it last */
++	__PHY_LED_MODES_NUM,
++};
++
++struct phy_led {
++	struct list_head list;
++	struct phy_device *phydev;
++	struct led_classdev led_cdev;
++	u8 index;
++};
++
++#define to_phy_led(d) container_of(d, struct phy_led, led_cdev)
++
+ struct phy_driver {
+ 	struct mdio_driver_common mdiodrv;
+ 	u32 phy_id;
+@@ -682,7 +702,74 @@
+ 			    struct ethtool_tunable *tuna,
+ 			    const void *data);
+ 	int (*set_loopback)(struct phy_device *dev, bool enable);
++	/**
++	 * @led_brightness_set: Set a PHY LED brightness. Index
++	 * indicates which of the PHYs led should be set. Value
++	 * follows the standard LED class meaning, e.g. LED_OFF,
++	 * LED_HALF, LED_FULL.
++	 */
++	int (*led_brightness_set)(struct phy_device *dev,
++				  u8 index, enum led_brightness value);
++
++	/**
++	 * @led_blink_set: Set a PHY LED blinking.  Index indicates
++	 * which of the PHYs led should be configured to blink. Delays
++	 * are in milliseconds and if both are zero then a sensible
++	 * default should be chosen.  The call should adjust the
++	 * timings in that case and if it can't match the values
++	 * specified exactly.
++	 */
++	int (*led_blink_set)(struct phy_device *dev, u8 index,
++			     unsigned long *delay_on,
++			     unsigned long *delay_off);
++	/**
++	 * @led_hw_is_supported: Can the HW support the given rules.
++	 * @dev: PHY device which has the LED
++	 * @index: Which LED of the PHY device
++	 * @rules The core is interested in these rules
++	 *
++	 * Return 0 if yes,  -EOPNOTSUPP if not, or an error code.
++	 */
++	int (*led_hw_is_supported)(struct phy_device *dev, u8 index,
++				   unsigned long rules);
++	/**
++	 * @led_hw_control_set: Set the HW to control the LED
++	 * @dev: PHY device which has the LED
++	 * @index: Which LED of the PHY device
++	 * @rules The rules used to control the LED
++	 *
++	 * Returns 0, or a an error code.
++	 */
++	int (*led_hw_control_set)(struct phy_device *dev, u8 index,
++				  unsigned long rules);
++	/**
++	 * @led_hw_control_get: Get how the HW is controlling the LED
++	 * @dev: PHY device which has the LED
++	 * @index: Which LED of the PHY device
++	 * @rules Pointer to the rules used to control the LED
++	 *
++	 * Set *@rules to how the HW is currently blinking. Returns 0
++	 * on success, or a error code if the current blinking cannot
++	 * be represented in rules, or some other error happens.
++	 */
++	int (*led_hw_control_get)(struct phy_device *dev, u8 index,
++				  unsigned long *rules);
++	/**
++	 * @led_polarity_set: Set the LED polarity modes
++	 * @dev: PHY device which has the LED
++	 * @index: Which LED of the PHY device
++	 * @modes: bitmap of LED polarity modes
++	 *
++	 * Configure LED with all the required polarity modes in @modes
++	 * to make it correctly turn ON or OFF.
++	 *
++	 * Returns 0, or an error code.
++	 */
++	int (*led_polarity_set)(struct phy_device *dev, int index,
++				unsigned long modes);
+ };
++
++
+ #define to_phy_driver(d) container_of(to_mdio_common_driver(d),		\
+ 				      struct phy_driver, mdiodrv)
+ 
+--- a/drivers/net/phy/phy_device.c
++++ b/drivers/net/phy/phy_device.c
+@@ -21,7 +21,8 @@
+ #include <linux/etherdevice.h>
+ #include <linux/skbuff.h>
+ #include <linux/mm.h>
+-#include <linux/module.h>
++#include <linux/of_mdio.h>
++#include <linux/of_net.h>
+ #include <linux/mii.h>
+ #include <linux/ethtool.h>
+ #include <linux/bitmap.h>
+@@ -1259,6 +1260,208 @@
+  *     change.  The phy_device is returned to the attaching driver.
+  *     This function takes a reference on the phy device.
+  */
++static int phy_led_set_brightness(struct led_classdev *led_cdev,
++				  enum led_brightness value)
++{
++	struct phy_led *phyled = to_phy_led(led_cdev);
++	struct phy_device *phydev = phyled->phydev;
++	int err;
++
++	mutex_lock(&phydev->lock);
++	err = phydev->drv->led_brightness_set(phydev, phyled->index, value);
++	mutex_unlock(&phydev->lock);
++
++	return err;
++}
++
++static int phy_led_blink_set(struct led_classdev *led_cdev,
++			     unsigned long *delay_on,
++			     unsigned long *delay_off)
++{
++	struct phy_led *phyled = to_phy_led(led_cdev);
++	struct phy_device *phydev = phyled->phydev;
++	int err;
++
++	mutex_lock(&phydev->lock);
++	err = phydev->drv->led_blink_set(phydev, phyled->index,
++					 delay_on, delay_off);
++	mutex_unlock(&phydev->lock);
++
++	return err;
++}
++
++static __maybe_unused struct device *
++phy_led_hw_control_get_device(struct led_classdev *led_cdev)
++{
++	struct phy_led *phyled = to_phy_led(led_cdev);
++	struct phy_device *phydev = phyled->phydev;
++
++	if (phydev->attached_dev)
++		return &phydev->attached_dev->dev;
++	return NULL;
++}
++
++static int __maybe_unused
++phy_led_hw_control_get(struct led_classdev *led_cdev,
++		       unsigned long *rules)
++{
++	struct phy_led *phyled = to_phy_led(led_cdev);
++	struct phy_device *phydev = phyled->phydev;
++	int err;
++
++	mutex_lock(&phydev->lock);
++	err = phydev->drv->led_hw_control_get(phydev, phyled->index, rules);
++	mutex_unlock(&phydev->lock);
++
++	return err;
++}
++
++static int __maybe_unused
++phy_led_hw_control_set(struct led_classdev *led_cdev,
++		       unsigned long rules)
++{
++	struct phy_led *phyled = to_phy_led(led_cdev);
++	struct phy_device *phydev = phyled->phydev;
++	int err;
++
++	mutex_lock(&phydev->lock);
++	err = phydev->drv->led_hw_control_set(phydev, phyled->index, rules);
++	mutex_unlock(&phydev->lock);
++
++	return err;
++}
++
++static __maybe_unused int phy_led_hw_is_supported(struct led_classdev *led_cdev,
++						  unsigned long rules)
++{
++	struct phy_led *phyled = to_phy_led(led_cdev);
++	struct phy_device *phydev = phyled->phydev;
++	int err;
++
++	mutex_lock(&phydev->lock);
++	err = phydev->drv->led_hw_is_supported(phydev, phyled->index, rules);
++	mutex_unlock(&phydev->lock);
++
++	return err;
++}
++
++static void phy_leds_unregister(struct phy_device *phydev)
++{
++	struct phy_led *phyled, *tmp;
++
++	list_for_each_entry_safe(phyled, tmp, &phydev->leds, list) {
++		led_classdev_unregister(&phyled->led_cdev);
++		list_del(&phyled->list);
++	}
++}
++
++static int of_phy_led(struct phy_device *phydev,
++		      struct device_node *led)
++{
++	struct device *dev = &phydev->mdio.dev;
++	struct led_init_data init_data = {};
++	struct led_classdev *cdev;
++	unsigned long modes = 0;
++	struct phy_led *phyled;
++	u32 index;
++	int err;
++
++	phyled = devm_kzalloc(dev, sizeof(*phyled), GFP_KERNEL);
++	if (!phyled)
++		return -ENOMEM;
++
++	cdev = &phyled->led_cdev;
++	phyled->phydev = phydev;
++
++	err = of_property_read_u32(led, "reg", &index);
++	if (err)
++		return err;
++	if (index > U8_MAX)
++		return -EINVAL;
++
++	if (of_property_read_bool(led, "active-high"))
++		set_bit(PHY_LED_ACTIVE_HIGH, &modes);
++	if (of_property_read_bool(led, "active-low"))
++		set_bit(PHY_LED_ACTIVE_LOW, &modes);
++	if (of_property_read_bool(led, "inactive-high-impedance"))
++		set_bit(PHY_LED_INACTIVE_HIGH_IMPEDANCE, &modes);
++
++	if (WARN_ON(modes & BIT(PHY_LED_ACTIVE_LOW) &&
++		    modes & BIT(PHY_LED_ACTIVE_HIGH)))
++		return -EINVAL;
++
++	if (modes) {
++		/* Return error if asked to set polarity modes but not supported */
++		if (!phydev->drv->led_polarity_set)
++			return -EINVAL;
++
++		err = phydev->drv->led_polarity_set(phydev, index, modes);
++		if (err)
++			return err;
++	}
++
++	phyled->index = index;
++	if (phydev->drv->led_brightness_set)
++		cdev->brightness_set_blocking = phy_led_set_brightness;
++	if (phydev->drv->led_blink_set)
++		cdev->blink_set = phy_led_blink_set;
++
++#ifdef CONFIG_LEDS_TRIGGERS
++	if (phydev->drv->led_hw_is_supported &&
++	    phydev->drv->led_hw_control_set &&
++	    phydev->drv->led_hw_control_get) {
++		cdev->hw_control_is_supported = phy_led_hw_is_supported;
++		cdev->hw_control_set = phy_led_hw_control_set;
++		cdev->hw_control_get = phy_led_hw_control_get;
++		cdev->hw_control_trigger = "netdev";
++	}
++
++	cdev->hw_control_get_device = phy_led_hw_control_get_device;
++#endif
++	cdev->max_brightness = 1;
++	init_data.devicename = dev_name(&phydev->mdio.dev);
++	init_data.fwnode = of_fwnode_handle(led);
++	init_data.devname_mandatory = true;
++
++	err = led_classdev_register_ext(dev, cdev, &init_data);
++	if (err)
++		return err;
++
++	list_add(&phyled->list, &phydev->leds);
++
++	return 0;
++}
++
++static int of_phy_leds(struct phy_device *phydev)
++{
++	struct device_node *node = phydev->mdio.dev.of_node;
++	struct device_node *leds, *led;
++	int err;
++
++	if (!IS_ENABLED(CONFIG_OF_MDIO))
++		return 0;
++
++	if (!node)
++		return 0;
++
++	leds = of_get_child_by_name(node, "leds");
++	if (!leds)
++		return 0;
++
++	for_each_available_child_of_node(leds, led) {
++		err = of_phy_led(phydev, led);
++		if (err) {
++			of_node_put(led);
++			of_node_put(leds);
++			phy_leds_unregister(phydev);
++			return err;
++		}
++	}
++
++	of_node_put(leds);
++	return 0;
++}
++
+ int phy_attach_direct(struct net_device *dev, struct phy_device *phydev,
+ 		      u32 flags, phy_interface_t interface)
+ {
+@@ -1365,6 +1568,12 @@
+ 
+ 	phy_resume(phydev);
+ 	phy_led_triggers_register(phydev);
++	err = of_phy_leds(phydev);
++	if (err) {
++		phy_leds_unregister(phydev);
++	phy_led_triggers_unregister(phydev);
++		return err;
++	}
+ 
+ 	return err;
+ 
