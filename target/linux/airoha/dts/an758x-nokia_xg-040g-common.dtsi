@@ -48,10 +48,13 @@
 };
 
 &npu {
-	/* 测试：PPE（硬件转发引擎）可能把用户口的帧直接投给 CPU 网口、
-	 * 绕过交换机的特殊标签，导致 eth0 收到无标签帧而 DSA 全丢。
-	 * 先关掉它，验证标签路径。 */
-	status = "disabled";
+	/*
+	 * NPU/PPE（硬件转发引擎）需要开启：LAN 走 DSA 时它不参与，
+	 * 而 PON 的 GEM 转发与 offload 元数据依赖它（见 patches-5.4/925）。
+	 * 早前为排查标签路径临时关过，已排除 —— 真正的标签问题在 DSA
+	 * 的 hw-port-mux 元数据（补丁 126），与 NPU 无关。
+	 */
+	status = "okay";
 };
 
 &pon_pcs {

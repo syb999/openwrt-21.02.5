@@ -1,0 +1,53 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: ethernet: airoha: create the PON data netdev (pon%d)
+
+The board DTS marks GDM2 with "airoha,pon-data-path" but the port was still
+allocated as a regular ethernet device named ethN with a phylink instance,
+so no pon0 ever appeared: ponctl reported "PON device 'pon0' was not found
+or has no xpon binding" and the LuCI PON pages failed.
+
+Honour the property: flag the port, name it pon%d, keep carrier off (the
+xpon side owns carrier state) and skip phylink - this port has no PHY.
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-11 13:06:58.019597375 +0800
++++ b/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-11 13:06:58.023597791 +0800
+@@ -3098,6 +3098,21 @@
+ 	port->id = id;
+ 	eth->ports[p] = port;
+ 
++	/* GDM2 with "airoha,pon-data-path" is the PON service path: name it
++	 * pon%d, keep carrier off (airoha-xpon owns carrier state) and do not
++	 * create a phylink instance - there is no PHY on this port.
++	 */
++	if (of_property_read_bool(np, "airoha,pon-data-path")) {
++		if (id != AIROHA_GDM2_IDX) {
++			dev_err(eth->dev,
++				"airoha,pon-data-path is valid only on GDM2\n");
++			return -EINVAL;
++		}
++		port->flags |= AIROHA_PRIV_F_PON;
++		strscpy(dev->name, "pon%d", IFNAMSIZ);
++		netif_carrier_off(dev);
++	}
++
+ 	err = airoha_metadata_dst_alloc(port);
+ 	if (err)
+ 		return err;
+@@ -3110,9 +3125,11 @@
+ 	 * the FE never set up the special-tag handling for the frames the
+ 	 * switch sends towards the host.
+ 	 */
+-	err = airoha_setup_phylink(dev);
+-	if (err)
+-		goto free_metadata_dst;
++	if (!(port->flags & AIROHA_PRIV_F_PON)) {
++		err = airoha_setup_phylink(dev);
++		if (err)
++			goto free_metadata_dst;
++	}
+ 
+ 	err = register_netdev(dev);
+ 	if (err)

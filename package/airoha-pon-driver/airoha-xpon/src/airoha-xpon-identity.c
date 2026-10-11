@@ -57,13 +57,19 @@ int airoha_xpon_identity_init(struct device *dev, struct airoha_xpon *xpon)
 		cell = devm_nvmem_cell_get(dev, "pon-serial");
 		if (IS_ERR(cell)) {
 			ret = PTR_ERR(cell);
-			if (ret == -EPROBE_DEFER)
-				return ret;
-			if (ret != -ENOENT)
-				dev_warn(
-					dev,
-					"default PON serial is unavailable: %pe\n",
-					ERR_PTR(ret));
+
+			/*
+			 * Do NOT propagate -EPROBE_DEFER: the provider behind this
+			 * cell is the nvmem-layout/fixed-layout on the "ri" UBI
+			 * volume, a framework 5.4 does not have, so it can never
+			 * appear.  Deferring here made airoha_xpon_probe() spin
+			 * forever and pon0 never got its xpon binding.  Fall through
+			 * and let the identity default to "none" instead.
+			 */
+			dev_warn(
+				dev,
+				"default PON serial is unavailable (%pe); continuing without it\n",
+				ERR_PTR(ret));
 		} else {
 			identity = nvmem_cell_read(cell, &identity_len);
 			if (IS_ERR(identity)) {

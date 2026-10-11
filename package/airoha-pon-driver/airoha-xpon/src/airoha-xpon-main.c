@@ -574,6 +574,8 @@ static int airoha_xpon_probe(struct platform_device *pdev)
 	struct airoha_xpon *xpon;
 	int ret;
 
+	dev_info(dev, "XPONDBG probe entry\n");
+
 	xpon = devm_kzalloc(dev, sizeof(*xpon), GFP_KERNEL);
 	if (!xpon)
 		return -ENOMEM;

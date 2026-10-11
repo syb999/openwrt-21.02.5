@@ -1,30 +1,26 @@
 From: airoha-port <airoha@local>
-Subject: [PATCH] net: ethernet: airoha: hardcode the build tag in the boot banner
+Subject: [PATCH] net: ethernet: airoha: print the build identity at probe
 
-CONFIG_LOCALVERSION is rewritten by the OpenWrt kconfig merge, so it never
-reached the built kernel and "uname -r" stayed plain "5.4.215".  Emit the tag
-literally instead; bump it on every release so the boot log unambiguously
-identifies the running kernel.
+CONFIG_LOCALVERSION is rewritten by the OpenWrt kconfig merge and never
+reaches the built kernel, so print the release tag literally and bump it every
+time.  Seeing it in dmesg is the reliable proof of which kernel runs.
 
 Signed-off-by: airoha-port <airoha@local>
 ---
 diff -ruN a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
---- a/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-11 12:24:40.474100930 +0800
-+++ b/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-11 12:24:40.474100930 +0800
-@@ -3,7 +3,6 @@
-  * Copyright (c) 2024 AIROHA Inc
-  * Author: Lorenzo Bianconi <lorenzo@kernel.org>
-  */
--#include <linux/utsname.h>
- #include <linux/bitfield.h>
- #include <linux/of.h>
- #include <linux/of_device.h>
-@@ -3139,7 +3138,7 @@
- 	 * that failed to update the kernel becomes obvious at a glance
- 	 * instead of needing an image comparison.
- 	 */
--	pr_info("AIROHA-BUILD: %s\n", init_uts_ns.name.release);
-+	pr_info("AIROHA-BUILD: 5.4.215-rb209\n");
+--- a/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-11 13:01:20.217965524 +0800
++++ b/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-11 13:01:20.217965524 +0800
+@@ -2822,6 +2822,13 @@
+ 	struct airoha_eth *eth;
+ 	int i, err;
  
++	/* Build identity in the boot log.  CONFIG_LOCALVERSION is rewritten by
++	 * the OpenWrt kconfig merge and never reaches the built kernel, so the
++	 * tag is written literally here and bumped on every release.  Seeing
++	 * it in dmesg proves which kernel is actually running.
++	 */
++	pr_info("AIROHA-BUILD: 5.4.215-rb210\n");
++
  	eth = devm_kzalloc(&pdev->dev, sizeof(*eth), GFP_KERNEL);
  	if (!eth)
+ 		return -ENOMEM;

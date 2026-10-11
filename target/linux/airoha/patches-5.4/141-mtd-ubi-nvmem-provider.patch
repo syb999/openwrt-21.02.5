@@ -1,0 +1,241 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] mtd: ubi: backport the NVMEM volume provider
+
+Self-contained 6.18 driver: it hooks the UBI volume notifier and registers any
+volume that has an "nvmem-layout" child as an NVMEM device, which is what lets
+the fixed-layout provider expose the Airoha PON calibration ("bosa") and PON
+serial ("ri") cells.
+
+5.4 adaptations: <linux/module.h> include, no NVMEM_DEVID_NONE (5.4 has no
+NVEM_DEVID_* constants), no nvmem_config.of_node (5.4 derives it from
+config.dev), no UBI_VOLUME_SHUTDOWN event, and neither root_only-present
+semantics differences nor ignore_wp (both dropped already).
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/mtd/ubi/Kconfig b/drivers/mtd/ubi/Kconfig
+--- a/drivers/mtd/ubi/Kconfig	2026-10-11 16:17:12.980068027 +0800
++++ b/drivers/mtd/ubi/Kconfig	2026-10-11 17:15:28.818204783 +0800
+@@ -104,4 +104,15 @@
+ 
+ 	   If in doubt, say "N".
+ 
++config MTD_UBI_NVMEM
++	tristate "UBI volume NVMEM provider"
++	depends on MTD_UBI
++	depends on NVMEM
++	help
++	  Expose UBI volumes that carry an nvmem-layout child node as NVMEM
++	  devices.  Backported from 6.18 so the Airoha PON "bosa"/"ri" volumes
++	  can provide their calibration and PON serial number as NVMEM cells.
++
++	  If unsure, say N.
++
+ endif # MTD_UBI
+diff -ruN a/drivers/mtd/ubi/Makefile b/drivers/mtd/ubi/Makefile
+--- a/drivers/mtd/ubi/Makefile	2026-10-11 16:17:12.980068027 +0800
++++ b/drivers/mtd/ubi/Makefile	2026-10-11 16:17:12.980068027 +0800
+@@ -7,3 +7,4 @@
+ ubi-$(CONFIG_MTD_UBI_BLOCK) += block.o
+ 
+ obj-$(CONFIG_MTD_UBI_GLUEBI) += gluebi.o
++obj-$(CONFIG_MTD_UBI_NVMEM)	+= nvmem.o
+diff -ruN a/drivers/mtd/ubi/nvmem.c b/drivers/mtd/ubi/nvmem.c
+--- a/drivers/mtd/ubi/nvmem.c	1970-01-01 08:00:00.000000000 +0800
++++ b/drivers/mtd/ubi/nvmem.c	2026-10-11 17:27:34.714251816 +0800
+@@ -0,0 +1,195 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Copyright (c) 2023 Daniel Golle <daniel@makrotopia.org>
++ */
++
++/* UBI NVMEM provider (backported from 6.18)
++ *
++ * 5.4's nvmem_config has neither root_only nor ignore_wp, so those two
++ * assignments are dropped.  Everything else - the volume notifier, the
++ * read callback and the nvmem registration - is unchanged, which is what
++ * makes the "bosa"/"ri" UBI volumes appear as nvmem devices so the
++ * nvmem-layout/fixed-layout provider can expose their calibration and
++ * PON serial cells.
++ */
++#include <linux/module.h>
++#include <linux/nvmem-provider.h>
++#include "ubi.h"
++
++/* List of all NVMEM devices */
++static LIST_HEAD(nvmem_devices);
++static DEFINE_MUTEX(devices_mutex);
++
++struct ubi_nvmem {
++	struct nvmem_device *nvmem;
++	int ubi_num;
++	int vol_id;
++	int usable_leb_size;
++	struct list_head list;
++};
++
++static int ubi_nvmem_reg_read(void *priv, unsigned int from,
++			      void *val, size_t bytes)
++{
++	size_t to_read, bytes_left = bytes;
++	struct ubi_nvmem *unv = priv;
++	struct ubi_volume_desc *desc;
++	uint32_t offs;
++	uint32_t lnum;
++	int err = 0;
++
++	desc = ubi_open_volume(unv->ubi_num, unv->vol_id, UBI_READONLY);
++	if (IS_ERR(desc))
++		return PTR_ERR(desc);
++
++	offs = from % unv->usable_leb_size;
++	lnum = from / unv->usable_leb_size;
++	while (bytes_left) {
++		to_read = unv->usable_leb_size - offs;
++
++		if (to_read > bytes_left)
++			to_read = bytes_left;
++
++		err = ubi_read(desc, lnum, val, offs, to_read);
++		if (err)
++			break;
++
++		lnum += 1;
++		offs = 0;
++		bytes_left -= to_read;
++		val += to_read;
++	}
++	ubi_close_volume(desc);
++
++	if (err)
++		return err;
++
++	return 0;
++}
++
++static int ubi_nvmem_add(struct ubi_volume_info *vi)
++{
++	struct device_node *np = dev_of_node(vi->dev);
++	struct nvmem_config config = {};
++	struct ubi_nvmem *unv;
++	int ret;
++
++	if (!np)
++		return 0;
++
++	if (!of_get_child_by_name(np, "nvmem-layout"))
++		return 0;
++
++	if (WARN_ON_ONCE(vi->usable_leb_size <= 0) ||
++	    WARN_ON_ONCE(vi->size <= 0))
++		return -EINVAL;
++
++	unv = kzalloc(sizeof(struct ubi_nvmem), GFP_KERNEL);
++	if (!unv)
++		return -ENOMEM;
++
++	config.dev = vi->dev;
++	config.name = dev_name(vi->dev);
++	config.owner = THIS_MODULE;
++	config.priv = unv;
++	config.reg_read = ubi_nvmem_reg_read;
++	config.size = vi->usable_leb_size * vi->size;
++	config.word_size = 1;
++	config.stride = 1;
++	config.read_only = true;
++	/* 5.4 derives the nvmem of_node from config.dev (the volume device),
++	 * which already carries the DT node via find_volume_fwnode(). */
++
++	unv->ubi_num = vi->ubi_num;
++	unv->vol_id = vi->vol_id;
++	unv->usable_leb_size = vi->usable_leb_size;
++	unv->nvmem = nvmem_register(&config);
++	if (IS_ERR(unv->nvmem)) {
++		ret = dev_err_probe(vi->dev, PTR_ERR(unv->nvmem),
++				    "Failed to register NVMEM device\n");
++		kfree(unv);
++		return ret;
++	}
++
++	mutex_lock(&devices_mutex);
++	list_add_tail(&unv->list, &nvmem_devices);
++	mutex_unlock(&devices_mutex);
++
++	return 0;
++}
++
++static void ubi_nvmem_remove(struct ubi_volume_info *vi)
++{
++	struct ubi_nvmem *unv_c, *unv = NULL;
++
++	mutex_lock(&devices_mutex);
++	list_for_each_entry(unv_c, &nvmem_devices, list)
++		if (unv_c->ubi_num == vi->ubi_num && unv_c->vol_id == vi->vol_id) {
++			unv = unv_c;
++			break;
++		}
++
++	if (!unv) {
++		mutex_unlock(&devices_mutex);
++		return;
++	}
++
++	list_del(&unv->list);
++	mutex_unlock(&devices_mutex);
++	nvmem_unregister(unv->nvmem);
++	kfree(unv);
++}
++
++/**
++ * nvmem_notify - UBI notification handler.
++ * @nb: registered notifier block
++ * @l: notification type
++ * @ns_ptr: pointer to the &struct ubi_notification object
++ */
++static int nvmem_notify(struct notifier_block *nb, unsigned long l,
++			 void *ns_ptr)
++{
++	struct ubi_notification *nt = ns_ptr;
++
++	switch (l) {
++	case UBI_VOLUME_RESIZED:
++		ubi_nvmem_remove(&nt->vi);
++		fallthrough;
++	case UBI_VOLUME_ADDED:
++		ubi_nvmem_add(&nt->vi);
++		break;
++	default:
++		break;
++	}
++	return NOTIFY_OK;
++}
++
++static struct notifier_block nvmem_notifier = {
++	.notifier_call = nvmem_notify,
++};
++
++static int __init ubi_nvmem_init(void)
++{
++	return ubi_register_volume_notifier(&nvmem_notifier, 0);
++}
++
++static void __exit ubi_nvmem_exit(void)
++{
++	struct ubi_nvmem *unv, *tmp;
++
++	mutex_lock(&devices_mutex);
++	list_for_each_entry_safe(unv, tmp, &nvmem_devices, list) {
++		nvmem_unregister(unv->nvmem);
++		list_del(&unv->list);
++		kfree(unv);
++	}
++	mutex_unlock(&devices_mutex);
++
++	ubi_unregister_volume_notifier(&nvmem_notifier);
++}
++
++module_init(ubi_nvmem_init);
++module_exit(ubi_nvmem_exit);
++MODULE_DESCRIPTION("NVMEM layer over UBI volumes");
++MODULE_AUTHOR("Daniel Golle");
++MODULE_LICENSE("GPL");

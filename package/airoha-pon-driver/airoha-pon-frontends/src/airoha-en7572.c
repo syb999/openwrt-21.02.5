@@ -368,9 +368,17 @@ static int en7572_load_bob(struct device *dev, struct en7572 *en)
 	cell = devm_nvmem_cell_get(dev, "calibration");
 	if (IS_ERR(cell)) {
 		ret = PTR_ERR(cell);
-		if (ret == -EPROBE_DEFER)
-			return ret;
 
+		/*
+		 * -EPROBE_DEFER used to be propagated here, which is correct on
+		 * kernels where the calibration really can appear later (the
+		 * nvmem-layout/fixed-layout provider on the bosa UBI volume).
+		 * 5.4 has no nvmem-layout support at all, so that provider never
+		 * registers: deferring meant en7572 never registered its frontend,
+		 * airoha-xpon then deferred waiting for it, and both probes spun
+		 * forever (~23 ms apart).  Fall through to the stock-compatible
+		 * erased BOB instead so the PON stack can come up.
+		 */
 		dev_warn(
 			dev,
 			"PON calibration NVMEM is unavailable (%d); using erased stock-compatible BOB\n",
@@ -381,9 +389,8 @@ static int en7572_load_bob(struct device *dev, struct en7572 *en)
 	data = nvmem_cell_read(cell, &size);
 	if (IS_ERR(data)) {
 		ret = PTR_ERR(data);
-		if (ret == -EPROBE_DEFER)
-			return ret;
 
+		/* See above: never defer forever on this kernel. */
 		dev_warn(
 			dev,
 			"failed to read EN7572 calibration backup (%d); using erased stock-compatible BOB\n",
@@ -893,6 +900,8 @@ static int en7572_probe(struct i2c_client *client, const struct i2c_device_id *i
 {
 	struct device *dev = &client->dev;
 	struct en7572 *en;
+
+	dev_info(dev, "XPONDBG en7572 probe entry\n");
 	u32 supported_modes =
 		AIROHA_PON_FRONTEND_MODE_BIT(AIROHA_PON_FRONTEND_MODE_GPON) |
 		AIROHA_PON_FRONTEND_MODE_BIT(AIROHA_PON_FRONTEND_MODE_XGPON) |
@@ -932,15 +941,34 @@ static int en7572_probe(struct i2c_client *client, const struct i2c_device_id *i
 			dev, PTR_ERR(en->runtime),
 			"failed to claim the EN7572 runtime address 0x51\n");
 
+	/* The MD32 window answers as soon as the chip is out of reset, but it
+	 * may not be reachable yet while the module is being loaded (the I2C
+	 * bus and the board regulators are brought up around the same time).
+	 * A failed read here is almost always "too early" rather than "not an
+	 * EN7572": treat it as EPROBE_DEFER so the kernel retries instead of
+	 * giving up for good.
+	 */
 	ret = en7572_read_u16(en->runtime, EN7572_CHIP_ID_REG, &en->chip_id);
+	dev_info(dev, "XPONDBG en7572 chip_id read ret=%d id=0x%04x (runtime addr=0x%02x)\n",
+	         ret, ret ? 0 : en->chip_id, en->runtime->addr);
 	if (ret)
-		return dev_err_probe(dev, ret,
-		                     "failed to read the EN7572 chip ID\n");
+		return dev_err_probe(dev, -EPROBE_DEFER,
+		                     "EN7572 chip ID not readable yet (%d)\n", ret);
 
 	ret = en7572_read_u16(en->runtime, EN7572_CHIP_REV_REG, &en->chip_rev);
-	if (ret)
-		return dev_err_probe(
-			dev, ret, "failed to read the EN7572 chip revision\n");
+	dev_info(dev, "XPONDBG en7572 chip_rev read ret=%d rev=0x%04x\n",
+	         ret, ret ? 0 : en->chip_rev);
+	if (ret) {
+		/* The chip ID at 0x51 already proved the part is an EN7572 and is
+		 * out of reset; a revision-read failure must not stall the whole
+		 * PON stack in an endless -EPROBE_DEFER loop (it did: xpon waits
+		 * for this frontend to register, so nothing ever came up).
+		 * Warn once and continue - the revision is informational.
+		 */
+		dev_warn(dev,
+		         "EN7572 chip revision unreadable (%d); continuing\n", ret);
+		en->chip_rev = 0;
+	}
 
 	if (en->chip_id != EN7572_CHIP_ID)
 		return dev_err_probe(
@@ -990,6 +1018,7 @@ static int en7572_probe(struct i2c_client *client, const struct i2c_device_id *i
 	                         &en7572_frontend_ops, en, supported_modes);
 	i2c_set_clientdata(client, &en->frontend);
 	ret = airoha_pon_frontend_register(&en->frontend);
+	dev_info(dev, "XPONDBG en7572 register ret=%d\n", ret);
 	if (ret) {
 		i2c_set_clientdata(client, NULL);
 		return dev_err_probe(

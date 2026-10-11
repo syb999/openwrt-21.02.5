@@ -1,0 +1,41 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: ethernet: airoha: guard phylink calls for the PON port
+
+PON ports deliberately have no phylink instance (134), so port->phylink is
+NULL for them.  airoha_dev_open()/airoha_dev_stop() still dereferenced it:
+
+  Unable to handle kernel NULL pointer dereference at 0x4c
+  pc : phylink_of_phy_connect+0xc/0x108
+  lr : airoha_dev_open+0x2f0/0x328
+  x0 : 0000000000000000
+  Kernel panic - not syncing: Fatal exception
+
+Guard both call sites.  phylink_start() already had its NULL check.
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-11 13:41:03.992486567 +0800
++++ b/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-11 13:41:03.996486843 +0800
+@@ -1928,7 +1928,7 @@
+ 		 * good: ethtool printed only "Link detected: no", the PHY's
+ 		 * read_status was never polled and the copper never linked.
+ 		 */
+-		if (!dev->phydev) {
++		if (port->phylink && !dev->phydev) {
+ 			err = phylink_of_phy_connect(port->phylink,
+ 						     dev->dev.of_node, 0);
+ 			if (err) {
+@@ -2018,8 +2018,10 @@
+ 	}
+ 
+ 	if (airhoa_is_phy_external(port)) {
+-		phylink_stop(port->phylink);
+-		phylink_disconnect_phy(port->phylink);
++		if (port->phylink) {
++			phylink_stop(port->phylink);
++			phylink_disconnect_phy(port->phylink);
++		}
+ 	}
+ 
+ 	return 0;

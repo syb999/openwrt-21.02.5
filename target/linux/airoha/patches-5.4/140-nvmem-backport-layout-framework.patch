@@ -1,0 +1,680 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] nvmem: backport the layout framework (fixed-layout)
+
+5.4 has no nvmem_layout support, so the "nvmem-layout"/"fixed-layout" nodes
+the Airoha PON DTS uses for its calibration ("bosa") and PON serial ("ri")
+cells were inert: every nvmem_cell_get() returned -EPROBE_DEFER forever and
+both the EN7572 frontend and the xpon controller spun in a probe loop.
+
+Ports the 6.18 framework: struct nvmem_layout/_driver, nvmem_layout_register()/
+_unregister(), nvmem_add_one_cell(), nvmem_add_cells_from_dt(),
+drivers/nvmem/layouts.c, the fixed-layout provider, and the extra parent hop
+in of_nvmem_cell_get() that resolves a layout cell to the nvmem device owning
+its "nvmem-layout" container.
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/nvmem/core.c b/drivers/nvmem/core.c
+--- a/drivers/nvmem/core.c	2026-10-11 16:13:12.696445171 +0800
++++ b/drivers/nvmem/core.c	2026-10-11 19:28:16.201527623 +0800
+@@ -249,6 +249,127 @@
+ }
+ EXPORT_SYMBOL_GPL(nvmem_unregister_notifier);
+ 
++/**
++ * nvmem_add_one_cell() - Add one cell to an nvmem device
++ * @nvmem: nvmem device
++ * @info:  cell description
++ *
++ * Backported from 6.18 together with the nvmem layout framework.
++ */
++int nvmem_add_one_cell(struct nvmem_device *nvmem,
++		       const struct nvmem_cell_info *info)
++{
++	struct nvmem_cell *cell;
++	int rval;
++
++	if (!nvmem || !info || !info->name)
++		return -EINVAL;
++
++	cell = kzalloc(sizeof(*cell), GFP_KERNEL);
++	if (!cell)
++		return -ENOMEM;
++
++	/* 5.4 uses struct nvmem_cell + nvmem_cell_add(); 6.18 renamed these to
++	 * nvmem_cell_entry + nvmem_cell_entry_add(). */
++	rval = nvmem_cell_info_to_nvmem_cell(nvmem, info, cell);
++	if (rval) {
++		kfree(cell);
++		return rval;
++	}
++
++	nvmem_cell_add(cell);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(nvmem_add_one_cell);
++
++/**
++ * nvmem_add_cells_from_dt() - Add cells from device tree child nodes
++ * @nvmem: nvmem device
++ * @np:    container node holding one child per cell
++ *
++ * Backported from 6.18; used by the fixed-layout provider so that a UBI
++ * volume's nvmem-layout children become real nvmem cells.
++ */
++int nvmem_add_cells_from_dt(struct nvmem_device *nvmem, struct device_node *np)
++{
++	struct device *dev = &nvmem->dev;
++	struct device_node *child;
++	const __be32 *addr;
++	int len, ret;
++
++	for_each_child_of_node(np, child) {
++		struct nvmem_cell_info info = {0};
++
++		addr = of_get_property(child, "reg", &len);
++		if (!addr)
++			continue;
++		if (len < 2 * sizeof(u32)) {
++			dev_err(dev, "nvmem: invalid reg on %pOF\n", child);
++			of_node_put(child);
++			return -EINVAL;
++		}
++
++		info.offset = be32_to_cpup(addr++);
++		info.bytes = be32_to_cpup(addr);
++		info.name = kasprintf(GFP_KERNEL, "%pOFn", child);
++
++		addr = of_get_property(child, "bits", &len);
++		if (addr && len == (2 * sizeof(u32))) {
++			info.bit_offset = be32_to_cpup(addr++);
++			info.nbits = be32_to_cpup(addr);
++			if (info.bit_offset >= BITS_PER_BYTE * info.bytes ||
++			    info.nbits < 1 ||
++			    info.bit_offset + info.nbits > BITS_PER_BYTE * info.bytes) {
++				dev_err(dev, "nvmem: invalid bits on %pOF\n", child);
++				of_node_put(child);
++				return -EINVAL;
++			}
++		}
++
++		info.np = of_node_get(child);
++
++		if (nvmem->fixup_dt_cell_info)
++			nvmem->fixup_dt_cell_info(nvmem, &info);
++
++		pr_info("NVDBG %s: cell '%s' off=%d bytes=%d\n",
++			dev_name(&nvmem->dev), info.name, info.offset,
++			info.bytes);
++		ret = nvmem_add_one_cell(nvmem, &info);
++		kfree(info.name);
++		if (ret) {
++			of_node_put(child);
++			of_node_put(info.np);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(nvmem_add_cells_from_dt);
++
++int nvmem_layout_register(struct nvmem_layout *layout)
++{
++	int ret;
++
++	if (!layout->add_cells)
++		return -EINVAL;
++
++	/* Populate the cells */
++	ret = layout->add_cells(layout);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(nvmem_layout_register);
++
++void nvmem_layout_unregister(struct nvmem_layout *layout)
++{
++	/* Keep the API; there is nothing to tear down here (see 6.18 too). */
++}
++EXPORT_SYMBOL_GPL(nvmem_layout_unregister);
++
+ static int nvmem_add_cells_from_table(struct nvmem_device *nvmem)
+ {
+ 	const struct nvmem_cell_info *info;
+@@ -451,6 +572,11 @@
+ 	if (rval)
+ 		goto err_remove_cells;
+ 
++	/* nvmem layout providers (e.g. "fixed-layout") add their cells here. */
++	rval = nvmem_populate_layout(nvmem);
++	if (rval)
++		goto err_remove_cells;
++
+ 	blocking_notifier_call_chain(&nvmem_notifier, NVMEM_ADD, nvmem);
+ 
+ 	return nvmem;
+@@ -481,6 +607,7 @@
+ 		device_remove_bin_file(nvmem->base_dev, &nvmem->eeprom);
+ 
+ 	nvmem_device_remove_all_cells(nvmem);
++	nvmem_destroy_layout(nvmem);
+ 	device_del(&nvmem->dev);
+ 	put_device(&nvmem->dev);
+ }
+@@ -804,6 +931,23 @@
+ 	if (!nvmem_np)
+ 		return ERR_PTR(-EINVAL);
+ 
++	/*
++	 * nvmem layouts produce their cells inside the "nvmem-layout"
++	 * container, so the nvmem device answering for that cell is the
++	 * node's *grandparent* (the UBI volume / efuse device), not the
++	 * layout node itself.  Without this extra hop of_nvmem_find() never
++	 * matched and every layout cell lookup ended in -EPROBE_DEFER, which
++	 * is exactly what kept the EN7572 calibration and the xpon serial
++	 * unavailable.
++	 */
++	if (of_node_name_eq(nvmem_np, "nvmem-layout")) {
++		struct device_node *vol_np = of_get_next_parent(nvmem_np);
++
++		if (!vol_np)
++			return ERR_PTR(-EINVAL);
++		nvmem_np = vol_np;
++	}
++
+ 	nvmem = __nvmem_device_get(nvmem_np, NULL);
+ 	of_node_put(nvmem_np);
+ 	if (IS_ERR(nvmem))
+@@ -1369,11 +1513,22 @@
+ 
+ static int __init nvmem_init(void)
+ {
+-	return bus_register(&nvmem_bus_type);
++	int ret;
++
++	ret = bus_register(&nvmem_bus_type);
++	if (ret)
++		return ret;
++
++	ret = nvmem_layout_bus_register();
++	if (ret)
++		bus_unregister(&nvmem_bus_type);
++
++	return ret;
+ }
+ 
+ static void __exit nvmem_exit(void)
+ {
++	nvmem_layout_bus_unregister();
+ 	bus_unregister(&nvmem_bus_type);
+ }
+ 
+diff -ruN a/drivers/nvmem/Kconfig b/drivers/nvmem/Kconfig
+--- a/drivers/nvmem/Kconfig	2026-10-11 16:15:27.453808160 +0800
++++ b/drivers/nvmem/Kconfig	2026-10-11 17:42:04.483586272 +0800
+@@ -230,4 +230,6 @@
+ 
+ 	  If sure, say yes. If unsure, say no.
+ 
++source "drivers/nvmem/layouts/Kconfig"
++
+ endif
+diff -ruN a/drivers/nvmem/layouts/fixed-layout.c b/drivers/nvmem/layouts/fixed-layout.c
+--- a/drivers/nvmem/layouts/fixed-layout.c	1970-01-01 08:00:00.000000000 +0800
++++ b/drivers/nvmem/layouts/fixed-layout.c	2026-10-11 19:12:28.698567703 +0800
+@@ -0,0 +1,64 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright 2026 Bootlin
++ *
++ * Authors: Mathieu Dubois-Briand <mathieu.dubois-briand@bootlin.com>
++ */
++
++#include <linux/module.h>
++#include <linux/nvmem-provider.h>
++#include <linux/of.h>
++
++#include "../nvmem.h"
++
++static int fixed_layout_add_cells(struct nvmem_layout *layout)
++{
++	struct device_node *np;
++	int ret;
++
++	np = of_nvmem_layout_get_container(layout->nvmem);
++	if (!np) {
++		pr_info("NVDBG %s: no nvmem-layout container\n",
++			dev_name(&layout->nvmem->dev));
++		return -ENOENT;
++	}
++
++	ret = nvmem_add_cells_from_dt(layout->nvmem, np);
++	pr_info("NVDBG %s: add_cells_from_dt(%pOF) ret=%d\n",
++		dev_name(&layout->nvmem->dev), np, ret);
++	of_node_put(np);
++
++	return ret;
++}
++
++static int fixed_layout_probe(struct nvmem_layout *layout)
++{
++	layout->add_cells = fixed_layout_add_cells;
++
++	return nvmem_layout_register(layout);
++}
++
++static void fixed_layout_remove(struct nvmem_layout *layout)
++{
++	nvmem_layout_unregister(layout);
++}
++
++static const struct of_device_id fixed_layout_of_match_table[] = {
++	{ .compatible = "fixed-layout", },
++	{},
++};
++
++static struct nvmem_layout_driver fixed_layout_layout = {
++	.driver = {
++		.name = "fixed-layout",
++		.of_match_table = fixed_layout_of_match_table,
++	},
++	.probe = fixed_layout_probe,
++	.remove = fixed_layout_remove,
++};
++module_nvmem_layout_driver(fixed_layout_layout);
++
++MODULE_AUTHOR("Mathieu Dubois-Briand");
++MODULE_LICENSE("GPL");
++MODULE_DEVICE_TABLE(of, fixed_layout_of_match_table);
++MODULE_DESCRIPTION("NVMEM fixed-layout driver");
+diff -ruN a/drivers/nvmem/layouts/Kconfig b/drivers/nvmem/layouts/Kconfig
+--- a/drivers/nvmem/layouts/Kconfig	1970-01-01 08:00:00.000000000 +0800
++++ b/drivers/nvmem/layouts/Kconfig	2026-10-11 17:55:58.753554160 +0800
+@@ -0,0 +1,24 @@
++# SPDX-License-Identifier: GPL-2.0
++# Backported from 6.18 (trimmed to the fixed-layout provider).
++#
++# NVMEM_LAYOUTS defaults to y so the framework is always available with
++# NVMEM: the Airoha PON calibration/PON-serial cells depend on it.
++
++config NVMEM_LAYOUTS
++	bool
++	depends on OF
++	default y
++
++menu "Layout Types"
++
++config NVMEM_LAYOUT_FIXED
++	tristate "NVMEM fixed cells layout"
++	depends on NVMEM_LAYOUTS
++	default y
++	help
++	  Say Y here to support the "fixed-layout" nvmem layout: the nvmem
++	  device's nvmem-layout child nodes describe the cells (reg/bits).
++
++	  If unsure, say N.
++
++endmenu
+diff -ruN a/drivers/nvmem/layouts/Makefile b/drivers/nvmem/layouts/Makefile
+--- a/drivers/nvmem/layouts/Makefile	1970-01-01 08:00:00.000000000 +0800
++++ b/drivers/nvmem/layouts/Makefile	2026-10-11 16:14:51.828389336 +0800
+@@ -0,0 +1,6 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# Makefile for nvmem layouts.
++#
++
++obj-$(CONFIG_NVMEM_LAYOUTS)		+= fixed-layout.o
+diff -ruN a/drivers/nvmem/layouts.c b/drivers/nvmem/layouts.c
+--- a/drivers/nvmem/layouts.c	1970-01-01 08:00:00.000000000 +0800
++++ b/drivers/nvmem/layouts.c	2026-10-11 18:37:44.308409771 +0800
+@@ -0,0 +1,213 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * NVMEM layout bus handling
++ *
++ * Copyright (C) 2023 Bootlin
++ * Author: Miquel Raynal <miquel.raynal@bootlin.com
++ */
++
++#include <linux/device.h>
++#include <linux/module.h>
++#include <linux/dma-mapping.h>
++#include <linux/nvmem-consumer.h>
++#include <linux/nvmem-provider.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/of_irq.h>
++
++#include "nvmem.h"
++
++#define to_nvmem_layout_driver(drv) \
++	(container_of((drv), struct nvmem_layout_driver, driver))
++#define to_nvmem_layout_device(_dev) \
++	container_of((_dev), struct nvmem_layout, dev)
++
++static int nvmem_layout_bus_match(struct device *dev, struct device_driver *drv)
++{
++	return of_driver_match_device(dev, drv);
++}
++
++static int nvmem_layout_bus_probe(struct device *dev)
++{
++	struct nvmem_layout_driver *drv = to_nvmem_layout_driver(dev->driver);
++	struct nvmem_layout *layout = to_nvmem_layout_device(dev);
++
++	if (!drv->probe || !drv->remove)
++		return -EINVAL;
++
++	return drv->probe(layout);
++}
++
++static int nvmem_layout_bus_remove(struct device *dev)
++{
++	struct nvmem_layout_driver *drv = to_nvmem_layout_driver(dev->driver);
++	struct nvmem_layout *layout = to_nvmem_layout_device(dev);
++
++	drv->remove(layout);
++
++	return 0;
++}
++
++static int nvmem_layout_bus_uevent(struct device *dev,
++				   struct kobj_uevent_env *env)
++{
++	int ret;
++
++	ret = of_device_uevent_modalias(dev, env);
++	if (ret != -ENODEV)
++		return ret;
++
++	return 0;
++}
++
++static const struct bus_type nvmem_layout_bus_type = {
++	.name		= "nvmem-layout",
++	.match		= nvmem_layout_bus_match,
++	.probe		= nvmem_layout_bus_probe,
++	.remove		= nvmem_layout_bus_remove,
++	.uevent		= nvmem_layout_bus_uevent,
++};
++
++int __nvmem_layout_driver_register(struct nvmem_layout_driver *drv,
++				   struct module *owner)
++{
++	drv->driver.bus = &nvmem_layout_bus_type;
++	drv->driver.owner = owner;
++
++	return driver_register(&drv->driver);
++}
++EXPORT_SYMBOL_GPL(__nvmem_layout_driver_register);
++
++void nvmem_layout_driver_unregister(struct nvmem_layout_driver *drv)
++{
++	driver_unregister(&drv->driver);
++}
++EXPORT_SYMBOL_GPL(nvmem_layout_driver_unregister);
++
++static void nvmem_layout_release_device(struct device *dev)
++{
++	struct nvmem_layout *layout = to_nvmem_layout_device(dev);
++
++	of_node_put(layout->dev.of_node);
++	kfree(layout);
++}
++
++static int nvmem_layout_create_device(struct nvmem_device *nvmem,
++				      struct device_node *np)
++{
++	struct nvmem_layout *layout;
++	struct device *dev;
++	int ret;
++
++	layout = kzalloc(sizeof(*layout), GFP_KERNEL);
++	if (!layout)
++		return -ENOMEM;
++
++	/* Create a bidirectional link */
++	layout->nvmem = nvmem;
++	nvmem->layout = layout;
++
++	/* Device model registration */
++	dev = &layout->dev;
++	device_initialize(dev);
++	dev->parent = &nvmem->dev;
++	dev->bus = &nvmem_layout_bus_type;
++	dev->release = nvmem_layout_release_device;
++	dev->coherent_dma_mask = DMA_BIT_MASK(32);
++	dev->dma_mask = &dev->coherent_dma_mask;
++	/* 5.4 has no device_set_node()/of_device_make_bus_id()/of_msi_configure().
++	 * of_device_make_bus_id() would derive a *unique* name from the node;
++	 * plain %pOFn is not enough - every nvmem-layout node is called
++	 * "nvmem-layout", so device_add() failed with
++	 *   sysfs: cannot create duplicate filename '/bus/nvmem-layout/devices/nvmem-layout'
++	 * and all but the first volume lost their layout (and thus their cells).
++	 * Qualify it with the parent device name, which is unique per volume.
++	 */
++	dev->of_node = of_node_get(np);
++	dev_set_name(dev, "%s:%pOFn", dev_name(dev->parent), np);
++
++	ret = device_add(dev);
++	if (ret) {
++		put_device(dev);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int nvmem_layout_bus_populate(struct nvmem_device *nvmem,
++				     struct device_node *layout_dn)
++{
++	int ret;
++
++	/* Make sure it has a compatible property */
++	if (!of_property_present(layout_dn, "compatible")) {
++		pr_debug("%s() - skipping %pOF, no compatible prop\n",
++			 __func__, layout_dn);
++		return 0;
++	}
++
++	if (of_node_check_flag(layout_dn, OF_POPULATED_BUS)) {
++		pr_debug("%s() - skipping %pOF, already populated\n",
++			 __func__, layout_dn);
++
++		return 0;
++	}
++
++	/* NVMEM layout buses expect only a single device representing the layout */
++	ret = nvmem_layout_create_device(nvmem, layout_dn);
++	if (ret)
++		return ret;
++
++	of_node_set_flag(layout_dn, OF_POPULATED_BUS);
++
++	return 0;
++}
++
++struct device_node *of_nvmem_layout_get_container(struct nvmem_device *nvmem)
++{
++	return of_get_child_by_name(nvmem->dev.of_node, "nvmem-layout");
++}
++EXPORT_SYMBOL_GPL(of_nvmem_layout_get_container);
++
++/*
++ * Returns the number of devices populated, 0 if the operation was not relevant
++ * for this nvmem device, an error code otherwise.
++ */
++int nvmem_populate_layout(struct nvmem_device *nvmem)
++{
++	struct device_node *layout_dn;
++	int ret;
++
++	layout_dn = of_nvmem_layout_get_container(nvmem);
++	if (!layout_dn)
++		return 0;
++
++	/* Populate the layout device (5.4 has no *_sync_state_pause() helper). */
++	ret = nvmem_layout_bus_populate(nvmem, layout_dn);
++
++	of_node_put(layout_dn);
++	return ret;
++}
++
++void nvmem_destroy_layout(struct nvmem_device *nvmem)
++{
++	struct device *dev;
++
++	if (!nvmem->layout)
++		return;
++
++	dev = &nvmem->layout->dev;
++	of_node_clear_flag(dev->of_node, OF_POPULATED_BUS);
++	device_unregister(dev);
++}
++
++int nvmem_layout_bus_register(void)
++{
++	return bus_register(&nvmem_layout_bus_type);
++}
++
++void nvmem_layout_bus_unregister(void)
++{
++	bus_unregister(&nvmem_layout_bus_type);
++}
+diff -ruN a/drivers/nvmem/Makefile b/drivers/nvmem/Makefile
+--- a/drivers/nvmem/Makefile	2026-10-11 16:13:12.696445171 +0800
++++ b/drivers/nvmem/Makefile	2026-10-11 16:14:51.828389336 +0800
+@@ -9,6 +9,10 @@
+ obj-$(CONFIG_NVMEM_SYSFS)	+= nvmem_sysfs.o
+ nvmem_sysfs-y			:= nvmem-sysfs.o
+ 
++obj-$(CONFIG_NVMEM)		+= nvmem_layouts.o
++nvmem_layouts-y			:= layouts.o
++obj-y				+= layouts/
++
+ # Devices
+ obj-$(CONFIG_NVMEM_BCM_OCOTP)	+= nvmem-bcm-ocotp.o
+ nvmem-bcm-ocotp-y		:= bcm-ocotp.o
+diff -ruN a/drivers/nvmem/nvmem.h b/drivers/nvmem/nvmem.h
+--- a/drivers/nvmem/nvmem.h	2026-10-11 16:13:12.696445171 +0800
++++ b/drivers/nvmem/nvmem.h	2026-10-11 16:14:43.304049947 +0800
+@@ -24,6 +24,9 @@
+ 	struct bin_attribute	eeprom;
+ 	struct device		*base_dev;
+ 	struct list_head	cells;
++	void (*fixup_dt_cell_info)(struct nvmem_device *nvmem,
++				   struct nvmem_cell_info *cell);
++	struct nvmem_layout	*layout;
+ 	nvmem_reg_read_t	reg_read;
+ 	nvmem_reg_write_t	reg_write;
+ 	void *priv;
+@@ -59,4 +62,13 @@
+ }
+ #endif /* CONFIG_NVMEM_SYSFS */
+ 
++/* Backported nvmem layout framework (6.18) internal entry points. */
++int nvmem_add_one_cell(struct nvmem_device *nvmem,
++		       const struct nvmem_cell_info *info);
++int nvmem_populate_layout(struct nvmem_device *nvmem);
++void nvmem_destroy_layout(struct nvmem_device *nvmem);
++struct device_node *of_nvmem_layout_get_container(struct nvmem_device *nvmem);
++int nvmem_layout_bus_register(void);
++void nvmem_layout_bus_unregister(void);
++
+ #endif /* _DRIVERS_NVMEM_H */
+diff -ruN a/include/linux/nvmem-provider.h b/include/linux/nvmem-provider.h
+--- a/include/linux/nvmem-provider.h	2026-10-11 16:33:51.647268772 +0800
++++ b/include/linux/nvmem-provider.h	2026-10-11 16:25:48.602606305 +0800
+@@ -9,6 +9,7 @@
+ #ifndef _LINUX_NVMEM_PROVIDER_H
+ #define _LINUX_NVMEM_PROVIDER_H
+ 
++#include <linux/device.h>
+ #include <linux/err.h>
+ #include <linux/errno.h>
+ 
+@@ -94,6 +95,31 @@
+ 	struct list_head	node;
+ };
+ 
++
++/**
++ * struct nvmem_layout - NVMEM layout definitions
++ *
++ * @dev:		Device-model layout device.
++ * @nvmem:		The underlying NVMEM device
++ * @add_cells:		Called when a nvmem device with this layout is registered.
++ *
++ * A nvmem device can hold a well defined structure (TLV list, name=value
++ * pairs, ...) evaluated at runtime.  A layout parses the device and adds the
++ * cells it describes.  Backported from 6.18 for the Airoha PON BOSA/RI
++ * calibration cells.
++ */
++struct nvmem_layout {
++	struct device dev;
++	struct nvmem_device *nvmem;
++	int (*add_cells)(struct nvmem_layout *layout);
++};
++
++struct nvmem_layout_driver {
++	struct device_driver driver;
++	int (*probe)(struct nvmem_layout *layout);
++	void (*remove)(struct nvmem_layout *layout);
++};
++
+ #if IS_ENABLED(CONFIG_NVMEM)
+ 
+ struct nvmem_device *nvmem_register(const struct nvmem_config *cfg);
+@@ -104,6 +130,22 @@
+ 
+ int devm_nvmem_unregister(struct device *dev, struct nvmem_device *nvmem);
+ 
++int nvmem_add_one_cell(struct nvmem_device *nvmem,
++		       const struct nvmem_cell_info *info);
++int nvmem_add_cells_from_dt(struct nvmem_device *nvmem, struct device_node *np);
++
++int nvmem_layout_register(struct nvmem_layout *layout);
++void nvmem_layout_unregister(struct nvmem_layout *layout);
++
++#define nvmem_layout_driver_register(drv) \
++	__nvmem_layout_driver_register(drv, THIS_MODULE)
++int __nvmem_layout_driver_register(struct nvmem_layout_driver *drv,
++				   struct module *owner);
++void nvmem_layout_driver_unregister(struct nvmem_layout_driver *drv);
++#define module_nvmem_layout_driver(__drv) \
++	module_driver(__drv, nvmem_layout_driver_register, \
++		      nvmem_layout_driver_unregister)
++int nvmem_populate_layout(struct nvmem_device *nvmem);
+ void nvmem_add_cell_table(struct nvmem_cell_table *table);
+ void nvmem_del_cell_table(struct nvmem_cell_table *table);
+ 
+@@ -128,6 +170,24 @@
+ 	return -EOPNOTSUPP;
+ }
+ 
++static inline int nvmem_add_one_cell(struct nvmem_device *nvmem,
++				      const struct nvmem_cell_info *info)
++{
++	return -EOPNOTSUPP;
++}
++static inline int nvmem_add_cells_from_dt(struct nvmem_device *nvmem, struct device_node *np)
++{
++	return -EOPNOTSUPP;
++}
++static inline int nvmem_layout_register(struct nvmem_layout *layout)
++{
++	return -EOPNOTSUPP;
++}
++static inline void nvmem_layout_unregister(struct nvmem_layout *layout) {}
++static inline int nvmem_populate_layout(struct nvmem_device *nvmem)
++{
++	return 0;
++}
+ static inline void nvmem_add_cell_table(struct nvmem_cell_table *table) {}
+ static inline void nvmem_del_cell_table(struct nvmem_cell_table *table) {}
+ 

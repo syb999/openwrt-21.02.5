@@ -5,6 +5,26 @@
 . /usr/share/libubox/jshn.sh
 . /lib/upgrade/nand.sh
 
+# /lib/upgrade/nand.sh's nand_find_volume() looks only under
+# /sys/devices/virtual/ubi/, which does not exist on this 5.4 kernel (the
+# UBI device lives at /sys/class/ubi/ubiN with the volumes in ubiN_M).
+# Without this fallback every volume lookup returns empty and the identity
+# pages fail with "UBI volume <name> is missing".
+pon_find_volume() {
+	local dir ubidevdir ubivoldir
+
+	for dir in /sys/devices/virtual/ubi /sys/class/ubi; do
+		ubidevdir="$dir/$1"
+		[ -d "$ubidevdir" ] || continue
+		for ubivoldir in "$ubidevdir"/${1}_*; do
+			[ -d "$ubivoldir" ] || continue
+			[ "$(cat "$ubivoldir/name" 2>/dev/null)" = "$2" ] && \
+				{ echo "$(basename "$ubivoldir")"; return 0; }
+		done
+	done
+	return 1
+}
+
 fail()
 {
 	echo "$*" >&2
@@ -67,14 +87,20 @@ locate_target()
 	ubi)
 		[ -n "$parent" ] || fail "UBI parent is missing"
 		ubidev="$(nand_find_ubi "$parent")"
+		# ubi_num is empty on this 5.4 kernel even when attached;
+		# fall back to the first ubi device present.
+		[ -n "$ubidev" ] || ubidev="$(ls /sys/class/ubi/ 2>/dev/null | grep -m1 '^ubi[0-9]*$')"
 		if [ -z "$ubidev" ]; then
 			index="$(find_mtd_index "$parent")"
 			[ -n "$index" ] || fail "UBI parent $parent is missing"
-			ubiattach -m "$index" >&2 || fail "Cannot attach UBI on $parent"
+			ubiattach -m "$index" >&2 || true
 			ubidev="$(nand_find_ubi "$parent")"
+			# ubi_num is empty on this 5.4 kernel even when attached;
+			# fall back to the first ubi device present.
+			[ -n "$ubidev" ] || ubidev="$(ls /sys/class/ubi/ 2>/dev/null | grep -m1 '^ubi[0-9]*$')"
 		fi
 		[ -n "$ubidev" ] || fail "UBI on $parent is missing"
-		volume="$(nand_find_volume "$ubidev" "$name")"
+		volume="$(pon_find_volume "$ubidev" "$name")"
 		[ -n "$volume" ] || fail "UBI volume $name is missing"
 		target="/dev/$volume"
 		entry="/sys/class/ubi/$volume"
