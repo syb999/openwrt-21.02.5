@@ -1,0 +1,31 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: ethernet: airoha: create a phylink for every port
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-11 00:02:13.820171258 +0800
++++ b/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-11 00:02:13.824171352 +0800
+@@ -3107,11 +3107,17 @@
+ 	if (err)
+ 		return err;
+ 
+-	if (airhoa_is_phy_external(port)) {
+-		err = airoha_setup_phylink(dev);
+-		if (err)
+-			goto free_metadata_dst;
+-	}
++	/* Create a phylink instance for **every** port.  gdm1 (the CPU port /
++	 * DSA conduit, port->id == 1) is not "external", so it previously got
++	 * no phylink at all: port->phylink stayed NULL and its MAC was never
++	 * configured by phylink.  The reference firmware's
++	 * "airoha_eth eth0: Link is Up - 10Gbps/Full" line never appeared, and
++	 * the FE never set up the special-tag handling for the frames the
++	 * switch sends towards the host.
++	 */
++	err = airoha_setup_phylink(dev);
++	if (err)
++		goto free_metadata_dst;
+ 
+ 	err = register_netdev(dev);
+ 	if (err)

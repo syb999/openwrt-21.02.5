@@ -1,0 +1,87 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] usb: xhci-mtk: optional vbus/vusb33 with NULL-safe regulator calls
+
+The 5V rail is a fixed always-on regulator whose provider can register after
+xhci-mtk probes; the lookup may then fail and the old code bailed out, leaving
+the controller unprobed (lsusb: -99).  Treat any lookup failure as "no supply"
+and guard the regulator_enable/disable calls, because regulator_enable(NULL)
+dereferences the pointer (Oops at regulator_enable+0x14 from xhci_mtk_probe).
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/usb/host/xhci-mtk.c b/drivers/usb/host/xhci-mtk.c
+--- a/drivers/usb/host/xhci-mtk.c	2026-10-11 09:26:39.219744161 +0800
++++ b/drivers/usb/host/xhci-mtk.c	2026-10-11 09:26:39.219744161 +0800
+@@ -364,25 +364,32 @@
+ {
+ 	int ret;
+ 
+-	ret = regulator_enable(mtk->vbus);
+-	if (ret) {
+-		dev_err(mtk->dev, "failed to enable vbus\n");
+-		return ret;
++	if (mtk->vbus) {
++		ret = regulator_enable(mtk->vbus);
++		if (ret) {
++			dev_err(mtk->dev, "failed to enable vbus\n");
++			return ret;
++		}
+ 	}
+ 
+-	ret = regulator_enable(mtk->vusb33);
+-	if (ret) {
+-		dev_err(mtk->dev, "failed to enable vusb33\n");
+-		regulator_disable(mtk->vbus);
+-		return ret;
++	if (mtk->vusb33) {
++		ret = regulator_enable(mtk->vusb33);
++		if (ret) {
++			dev_err(mtk->dev, "failed to enable vusb33\n");
++			if (mtk->vbus)
++				regulator_disable(mtk->vbus);
++			return ret;
++		}
+ 	}
+ 	return 0;
+ }
+ 
+ static void xhci_mtk_ldos_disable(struct xhci_hcd_mtk *mtk)
+ {
+-	regulator_disable(mtk->vbus);
+-	regulator_disable(mtk->vusb33);
++	if (mtk->vbus)
++		regulator_disable(mtk->vbus);
++	if (mtk->vusb33)
++		regulator_disable(mtk->vusb33);
+ }
+ 
+ static void xhci_mtk_quirks(struct device *dev, struct xhci_hcd *xhci)
+@@ -463,17 +470,19 @@
+ 	mtk->dev = dev;
+ 	/* vbus/vusb33 由板级 regulator 提供，注册时机可能晚于本 probe；
+ 	 * 缺失时按可选用 dummy（避免 devm_regulator_get 直接报错/反复重试）。 */
++	/* vbus/vusb33 are optional: the 5V rail here is a fixed always-on
++	 * regulator whose provider may register after this probe runs, so the
++	 * lookup can fail with -EPROBE_DEFER/-ENODEV.  Bailing out left the
++	 * controller unprobed (lsusb: -99), so treat any failure as "no supply"
++	 * and guard every regulator_*() call - regulator_enable(NULL) faults.
++	 */
+ 	mtk->vbus = devm_regulator_get_optional(dev, "vbus");
+-	if (IS_ERR(mtk->vbus)) {
+-		dev_err(dev, "fail to get vbus\n");
+-		return PTR_ERR(mtk->vbus);
+-	}
++	if (IS_ERR(mtk->vbus))
++		mtk->vbus = NULL;
+ 
+-	mtk->vusb33 = devm_regulator_get(dev, "vusb33");
+-	if (IS_ERR(mtk->vusb33)) {
+-		dev_err(dev, "fail to get vusb33\n");
+-		return PTR_ERR(mtk->vusb33);
+-	}
++	mtk->vusb33 = devm_regulator_get_optional(dev, "vusb33");
++	if (IS_ERR(mtk->vusb33))
++		mtk->vusb33 = NULL;
+ 
+ 	ret = xhci_mtk_clks_get(mtk);
+ 	if (ret)

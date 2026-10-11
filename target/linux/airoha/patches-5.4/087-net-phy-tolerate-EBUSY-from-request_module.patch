@@ -1,0 +1,36 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: phy: tolerate -EBUSY from request_module in phy_device_create
+
+phy_request_driver_module() already tolerates -ENOENT (no modprobe in
+initramfs).  request_module() returns -EBUSY when the usermode helper
+cannot be spawned at all; that is equally harmless when the PHY driver
+is built into the kernel, but it currently propagates out of
+phy_device_create() and kills the whole device.
+
+This breaks DT-described PHYs that cannot be probed by reading
+registers, e.g. the AN7583 internal GPHYs which carry an explicit
+ethernet-phy-idXXXX.YYYY compatible.
+
+Signed-off-by: airoha-port <airoha@local>
+---
+--- a/drivers/net/phy/phy_device.c	2026-10-09 17:07:50.415506602 +0800
++++ b/drivers/net/phy/phy_device.c	2026-10-09 17:07:50.415506602 +0800
+@@ -568,9 +568,16 @@
+ 	/* We only check for failures in executing the usermode binary,
+ 	 * not whether a PHY driver module exists for the PHY ID.
+ 	 * Accept -ENOENT because this may occur in case no initramfs exists,
+-	 * then modprobe isn't available.
++	 * then modprobe isn't available.  Also accept -EBUSY: that is what
++	 * request_module() returns when the usermode helper cannot be run
++	 * (e.g. busy or not present).  PHY drivers that are built into the
++	 * kernel do not need a modprobe round-trip at all, and failing the
++	 * whole phy_device_create() over it breaks DT-described PHYs whose
++	 * only means of discovery is an explicit ethernet-phy-idXXXX.YYYY
++	 * compatible (the AN7583 internal GPHYs).
+ 	 */
+-	if (IS_ENABLED(CONFIG_MODULES) && ret < 0 && ret != -ENOENT) {
++	if (IS_ENABLED(CONFIG_MODULES) && ret < 0 && ret != -ENOENT &&
++	    ret != -EBUSY) {
+ 		phydev_err(dev, "error %d loading PHY driver module for ID 0x%08lx\n",
+ 			   ret, (unsigned long)phy_id);
+ 		return ret;

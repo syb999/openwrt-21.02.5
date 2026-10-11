@@ -1,0 +1,33 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: ethernet: airoha: only enable STAG for the DSA conduit
+
+airoha_dev_open() enabled GDM_STAG_EN for any port with id > 2 as well as
+for the DSA conduit.  lan1 is gdm3, which connects directly to the
+EN8811H PHY and never passes through the switch, so enabling the switch
+special tag there makes the driver expect switch tagging and drops every
+frame: the interface reports carrier and correct link speed but both RX
+and TX counters stay at zero.
+
+Upstream 6.18 keys this purely off netdev_uses_dsa().
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-10 08:31:26.891649768 +0800
++++ b/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-10 08:31:26.895650180 +0800
+@@ -1928,8 +1928,13 @@
+ 	if (err)
+ 		return err;
+ 
+-	/* It seems GDM3 and GDM4 needs SPORT enabled to correctly work */
+-	if (netdev_uses_dsa(dev) || port->id > 2)
++	/* Only the DSA conduit needs the special tag.  lan1 is gdm3, which
++	 * is wired straight to the EN8811H and does not pass through the
++	 * switch, so enabling STAG there makes the driver expect switch
++	 * tagging and every frame is dropped (RX/TX stay at zero).
++	 * Upstream (6.18) keys this purely off netdev_uses_dsa().
++	 */
++	if (netdev_uses_dsa(dev))
+ 		airoha_fe_set(qdma->eth, REG_GDM_INGRESS_CFG(port->id),
+ 			      GDM_STAG_EN_MASK);
+ 	else

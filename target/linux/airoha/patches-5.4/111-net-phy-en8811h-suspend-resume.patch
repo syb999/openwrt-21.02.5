@@ -1,0 +1,63 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: phy: en8811h: add suspend/resume power management
+
+Upstream implements en8811h_resume()/en8811h_suspend() as
+clk_restore_context()+genphy_resume() / clk_save_context()+genphy_suspend();
+5.4 provides all four helpers, so the ops port over unchanged.
+
+Without them __phy_resume() does not touch the hardware, so the
+phylink_of_phy_connect() -> phy_attach_direct() -> phy_resume() path left
+the EN8811H powered down.  Re-attaching the PHY (which netifd does when the
+port is added to br-lan) therefore killed the copper link: pcs_get_state
+reported link=1 right after the first attach and link=0 after the second.
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/phy/air_en8811h.c b/drivers/net/phy/air_en8811h.c
+--- a/drivers/net/phy/air_en8811h.c	2026-10-10 19:04:39.330317747 +0800
++++ b/drivers/net/phy/air_en8811h.c	2026-10-10 19:04:50.295617827 +0800
+@@ -11,6 +11,7 @@
+  * Copyright (C) 2023 Airoha Technology Corp.
+  */
+ 
++#include <linux/clk.h>
+ #include <linux/phy.h>
+ #include <linux/delay.h>
+ #include <linux/firmware.h>
+@@ -1121,6 +1122,27 @@
+ 	return IRQ_HANDLED;
+ }
+ 
++/* Power management.  5.4 has clk_save_context()/clk_restore_context() and
++ * genphy_suspend()/genphy_resume(), so upstream's implementation ports over
++ * unchanged.  Without these ops __phy_resume() does not touch the hardware at
++ * all: phylink_of_phy_connect() -> phy_attach_direct() -> phy_resume() ran,
++ * but the EN8811H stayed powered down, so re-attaching the PHY killed the
++ * copper link (pcs_get_state link 1 -> 0).
++ */
++static int en8811h_resume(struct phy_device *phydev)
++{
++	clk_restore_context();
++
++	return genphy_resume(phydev);
++}
++
++static int en8811h_suspend(struct phy_device *phydev)
++{
++	clk_save_context();
++
++	return genphy_suspend(phydev);
++}
++
+ static struct phy_driver en8811h_driver[] = {
+ {
+ 	PHY_ID_MATCH_MODEL(EN8811H_PHY_ID),
+@@ -1130,6 +1152,8 @@
+ 	.config_init		= en8811h_config_init,
+ 	.config_aneg		= en8811h_config_aneg,
+ 	.read_status		= en8811h_read_status,
++	.resume			= en8811h_resume,
++	.suspend		= en8811h_suspend,
+ 	.config_intr		= en8811h_clear_intr,
+ #if AIR_EN8811H_PHY_LED
+ 	.led_hw_is_supported	= en8811h_led_hw_is_supported,

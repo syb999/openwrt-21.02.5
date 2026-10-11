@@ -1,0 +1,51 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: dsa: honour hw-port-mux metadata in dsa_switch_rcv
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/net/dsa/dsa.c b/net/dsa/dsa.c
+--- a/net/dsa/dsa.c	2026-10-11 07:07:45.143870192 +0800
++++ b/net/dsa/dsa.c	2026-10-11 07:07:45.143870192 +0800
+@@ -21,6 +21,8 @@
+ #include <linux/ptp_classify.h>
+ #include <linux/etherdevice.h>
+ 
++#include <net/dst_metadata.h>
++
+ #include "dsa_priv.h"
+ 
+ static LIST_HEAD(dsa_tag_drivers_list);
+@@ -217,7 +219,32 @@
+ 	if (!skb)
+ 		return 0;
+ 
+-	nskb = cpu_dp->rcv(skb, dev, pt);
++	/* A conduit may report the source port through hw-port-mux metadata
++	 * instead of an on-wire tag (backported from 6.18's net/dsa/tag.c).
++	 * The Airoha AN7583 FE does exactly that: the PPE module requires
++	 * untagged packets, so the switch special tag travels in the DMA
++	 * descriptor and airoha_eth hands it over as METADATA_HW_PORT_MUX.
++	 * Without this branch every frame fell through to mtk_tag_rcv(), which
++	 * read the ethertype as the tag, found no source port and dropped the
++	 * frame: eth0 RX grew while lan2/3/4 stayed at RX=0.
++	 */
++	{
++		struct metadata_dst *md_dst = skb_metadata_dst(skb);
++
++		if (md_dst && md_dst->type == METADATA_HW_PORT_MUX) {
++			unsigned int port = md_dst->u.port_info.port_id;
++
++			skb_dst_drop(skb);
++			skb->dev = dsa_master_find_slave(dev, 0, port);
++			if (likely(skb->dev)) {
++				skb->offload_fwd_mark = 1;
++				nskb = skb;
++			}
++		} else {
++			nskb = cpu_dp->rcv(skb, dev, pt);
++		}
++	}
++
+ 	if (!nskb) {
+ 		kfree_skb(skb);
+ 		return 0;

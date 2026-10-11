@@ -88,6 +88,13 @@
 
 	reg_usb_5v: regulator-usb-5v {
 		compatible = "regulator-fixed";
+		/* Keep the 5V rail up.  Nothing claims it (xhci binds vbus-supply
+		 * only on the UBI board), so the regulator core disables it at
+		 * late_initcall ("usb-5v: disabling") and the LAN PHYs lose the
+		 * analog side of their supply: their registers still read/write
+		 * but BMSR bit2 stays 0 and the copper pair never links.
+		 */
+		regulator-always-on;
 		enable-active-high;
 		gpio = <&an7583_pinctrl 30 GPIO_ACTIVE_HIGH>;
 		regulator-boot-on;
@@ -223,10 +230,13 @@
 		compatible = "ethernet-phy-id03a2.a411";
 		reg = <0xf>;
 
+		/* 与上游同款板（an7583-nokia_xg-040g-mf-common.dtsi）逐字一致：
+		 * 复位脚 GPIO 34，拉低 10ms、放开等待 20ms 后再探测 EN8811H（与上游一致）。
+		 * 注意：早前"34 静默/28 才对"的结论是在 pinctrl 与 NAND 尚未修好时测的，
+		 * 结论已被污染；28 会与 SPI 组(28-31)抢脚，34 才是原厂/上游写法。 */
 		reset-gpios = <&an7583_pinctrl 34 GPIO_ACTIVE_LOW>;
-		/* Hold reset for 1 second and wait 100 ms before probing EN8811H. */
-		reset-assert-us = <1000000>;
-		reset-deassert-us = <100000>;
+		reset-assert-us = <10000>;
+		reset-deassert-us = <20000>;
 
 		leds {
 			#address-cells = <1>;
@@ -246,6 +256,7 @@
 &switch {
 	status = "okay";
 
+	/* 与上游一致：MDIO 引脚的 pinctrl 挂在 switch 节点上 */
 	pinctrl-names = "default";
 	pinctrl-0 = <&mdio0_pins>;
 };
@@ -259,7 +270,6 @@
 &gsw_phy2 {
 	status = "okay";
 
-	interrupts = <2>;
 
 	pinctrl-names = "gbe-led";
 	pinctrl-0 = <&gswp2_led0_pins>;
@@ -269,7 +279,6 @@
 	status = "okay";
 
 	color = <LED_COLOR_ID_GREEN>;
-	active-low;
 };
 
 &gsw_port3 {
@@ -281,7 +290,6 @@
 &gsw_phy3 {
 	status = "okay";
 
-	interrupts = <3>;
 
 	pinctrl-names = "gbe-led";
 	pinctrl-0 = <&gswp3_led0_pins>;
@@ -291,7 +299,6 @@
 	status = "okay";
 
 	color = <LED_COLOR_ID_GREEN>;
-	active-low;
 };
 
 &gsw_port4 {
@@ -303,7 +310,6 @@
 &gsw_phy4 {
 	status = "okay";
 
-	interrupts = <4>;
 
 	pinctrl-names = "gbe-led";
 	pinctrl-0 = <&gswp4_led0_pins>;
@@ -313,7 +319,16 @@
 	status = "okay";
 
 	color = <LED_COLOR_ID_GREEN>;
-	active-low;
+};
+
+/*
+ * NPU：官方能跑通的固件里 npu@1e900000 是启用的（其 dmesg 有
+ * "airoha-npu 1e900000.npu: NPU fw version: 0.5"）。fe_init 的多处
+ * 初始化要与 NPU 邮箱交互（PSE/端口配置），NPU 不 probe 会让后续
+ * FE 寄存器写入无人应答，表现为 [DBG] fe_init: mc_vlan_clear ret=-110。
+ */
+&npu {
+	status = "okay";
 };
 
 &gdm3 {
@@ -336,6 +351,14 @@
 	status = "okay";
 
 	vusb33-supply = <&reg_3p3v>;
+
+	/*
+	 * 官方 ponwrt 只给了 vusb33-supply，导致 xhci 的 devm_regulator_get("vbus")
+	 * 走 dummy 分支并每轮 probe 打一条 WARN；本板 usb-power(regulator-output,
+	 * vout-supply=<&reg_usb_5v>)正是给 USB 口供电的那路，挂上它既消掉刷屏，
+	 * 又让 reg_usb_5v 有 xhci 这个真实用电器、不会被 regulator core 关掉(usb-5v: disabling)。
+	 */
+	vbus-supply = <&reg_usb_5v>;
 
 	#address-cells = <1>;
 	#size-cells = <0>;

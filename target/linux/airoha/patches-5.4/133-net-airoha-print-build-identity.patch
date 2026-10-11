@@ -1,0 +1,30 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: ethernet: airoha: hardcode the build tag in the boot banner
+
+CONFIG_LOCALVERSION is rewritten by the OpenWrt kconfig merge, so it never
+reached the built kernel and "uname -r" stayed plain "5.4.215".  Emit the tag
+literally instead; bump it on every release so the boot log unambiguously
+identifies the running kernel.
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-11 12:24:40.474100930 +0800
++++ b/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-11 12:24:40.474100930 +0800
+@@ -3,7 +3,6 @@
+  * Copyright (c) 2024 AIROHA Inc
+  * Author: Lorenzo Bianconi <lorenzo@kernel.org>
+  */
+-#include <linux/utsname.h>
+ #include <linux/bitfield.h>
+ #include <linux/of.h>
+ #include <linux/of_device.h>
+@@ -3139,7 +3138,7 @@
+ 	 * that failed to update the kernel becomes obvious at a glance
+ 	 * instead of needing an image comparison.
+ 	 */
+-	pr_info("AIROHA-BUILD: %s\n", init_uts_ns.name.release);
++	pr_info("AIROHA-BUILD: 5.4.215-rb209\n");
+ 
+ 	eth = devm_kzalloc(&pdev->dev, sizeof(*eth), GFP_KERNEL);
+ 	if (!eth)

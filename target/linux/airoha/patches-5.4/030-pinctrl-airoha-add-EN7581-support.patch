@@ -44,7 +44,7 @@ new file mode 100644
 index 000000000..26e7d3375
 --- /dev/null
 +++ b/drivers/pinctrl/mediatek/pinctrl-airoha.c
-@@ -0,0 +1,3021 @@
+@@ -0,0 +1,3084 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Author: Lorenzo Bianconi <lorenzo@kernel.org>
@@ -77,12 +77,20 @@ index 000000000..26e7d3375
 +#include "../pinconf.h"
 +#include "../pinmux.h"
 +
++/* AN7583 I2C pin-mux bits in REG_GPIO_PON_MODE (from upstream pinctrl-airoha) */
++#define AN7583_I2C1_SDA_GPIO_MODE_MASK		BIT(18)
++#define AN7583_I2C1_SCL_GPIO_MODE_MASK		BIT(17)
++#define AN7583_I2C0_SDA_GPIO_MODE_MASK		BIT(16)
++#define AN7583_I2C0_SCL_GPIO_MODE_MASK		BIT(15)
++#define AN7583_MDC_0_GPIO_MODE_MASK		BIT(25)
++#define AN7583_MDIO_0_GPIO_MODE_MASK		BIT(26)
++
 +#define PINCTRL_PIN_GROUP(id, table)					\
 +	PINCTRL_PINGROUP(id, table##_pins, ARRAY_SIZE(table##_pins))
 +
 +#define PINCTRL_FUNC_DESC(id, table)					\
 +	{								\
-+		.desc = { #id, table##_groups, ARRAY_SIZE(table##_groups) },\
++		.desc = { id, table##_groups, ARRAY_SIZE(table##_groups) },\
 +		.groups = table##_func_group,				\
 +		.group_size = ARRAY_SIZE(table##_func_group),		\
 +	}
@@ -123,6 +131,7 @@ index 000000000..26e7d3375
 +#define GPIO_PCM1_MODE_MASK			BIT(12)
 +#define GPIO_PCM_INT_MODE_MASK			BIT(9)
 +#define GPIO_PCM_RESET_MODE_MASK		BIT(8)
++#define SPI_GPIO_MODE_MASK			GENMASK(22, 19)
 +#define GPIO_SPI_QUAD_MODE_MASK			BIT(4)
 +#define GPIO_SPI_CS4_MODE_MASK			BIT(3)
 +#define GPIO_SPI_CS3_MODE_MASK			BIT(2)
@@ -145,6 +154,8 @@ index 000000000..26e7d3375
 +#define GPIO_SIPO_MODE_MASK			BIT(2)
 +#define GPIO_EMMC_MODE_MASK			BIT(1)
 +#define GPIO_PON_MODE_MASK			BIT(0)
++/* Port of pbs05 ponwrt 202-25: alternate PON mux bit on AN7583 */
++#define GPIO_PON_ALT_MODE_MASK			BIT(27)
 +
 +#define REG_NPU_UART_EN				0x0224
 +#define JTAG_UDI_EN_MASK			BIT(4)
@@ -745,11 +756,20 @@ index 000000000..26e7d3375
 +};
 +
 +static const int an7583_pon_pins[] = { 15, 16, 17, 18, 19, 20 };
++/*
++ * Port of pbs05 ponwrt 202-29: GPIO15 carries the active-low TX_DISABLE
++ * signal on the Nokia XG-040G-MF.  Excluding it gives the optical frontend
++ * exclusive ownership while the rest of the PON group keeps the SCU mux.
++ */
++static const int an7583_pon_tx_disable_gpio_pins[] = { 15, 16, 18, 19, 20 };
 +static const int an7583_pon_tod_1pps_pins[] = { 32 };
 +static const int an7583_gsw_tod_1pps_pins[] = { 32 };
 +static const int an7583_sipo_pins[] = { 34, 35 };
 +static const int an7583_sipo_rclk_pins[] = { 34, 35, 33 };
-+static const int an7583_mdio_pins[] = { 43, 44 };
++static const int an7583_mdio_pins[] = { 53, 54 };
++
++static const int an7583_mdio1_pins[] = { 43, 44 };
++
 +static const int an7583_uart2_pins[] = { 34, 35 };
 +static const int an7583_uart2_cts_rts_pins[] = { 32, 33 };
 +static const int an7583_hsuart_pins[] = { 30, 31 };
@@ -763,7 +783,7 @@ index 000000000..26e7d3375
 +static const int an7583_jtag_dfd_pins[] = { 23, 24, 22, 25, 26 };
 +static const int an7583_pcm1_pins[] = { 10, 11, 12, 13, 14 };
 +static const int an7583_pcm2_pins[] = { 28, 29, 30, 31, 24 };
-+static const int an7583_spi_pins[] = { 28, 29, 30, 31 };
++static const int an7583_spi_pins[] = { 45, 46, 47, 48 };
 +static const int an7583_spi_quad_pins[] = { 25, 26 };
 +static const int an7583_spi_cs1_pins[] = { 27 };
 +static const int an7583_pcm_spi_pins[] = { 28, 29, 30, 31, 10, 11, 12, 13 };
@@ -823,11 +843,15 @@ index 000000000..26e7d3375
 +
 +static const struct pingroup an7583_pinctrl_groups[] = {
 +	PINCTRL_PIN_GROUP("pon", an7583_pon),
++	PINCTRL_PIN_GROUP("pon_tx_disable_gpio", an7583_pon_tx_disable_gpio),
 +	PINCTRL_PIN_GROUP("pon_tod_1pps", an7583_pon_tod_1pps),
 +	PINCTRL_PIN_GROUP("gsw_tod_1pps", an7583_gsw_tod_1pps),
 +	PINCTRL_PIN_GROUP("sipo", an7583_sipo),
 +	PINCTRL_PIN_GROUP("sipo_rclk", an7583_sipo_rclk),
 +	PINCTRL_PIN_GROUP("mdio", an7583_mdio),
++
++	PINCTRL_PIN_GROUP("mdio1", an7583_mdio1),
++
 +	PINCTRL_PIN_GROUP("uart2", an7583_uart2),
 +	PINCTRL_PIN_GROUP("uart2_cts_rts", an7583_uart2_cts_rts),
 +	PINCTRL_PIN_GROUP("hsuart", an7583_hsuart),
@@ -900,7 +924,9 @@ index 000000000..26e7d3375
 +	PINCTRL_PIN_GROUP("pcie_reset1", an7583_pcie_reset1),
 +};
 +
-+static const char *const pon_groups[] = { "pon" };
++static const char *const pon_groups[] = {
++	"pon", "pon_tx_disable_gpio"
++};
 +static const char *const tod_1pps_groups[] = { "pon_tod_1pps", "gsw_tod_1pps" };
 +static const char *const sipo_groups[] = { "sipo", "sipo_rclk" };
 +static const char *const mdio_groups[] = { "mdio" };
@@ -909,9 +935,10 @@ index 000000000..26e7d3375
 +					   "hsuart_cts_rts", "uart4",
 +					   "uart5" };
 +static const char *const i2c_groups[] = { "i2c1" };
++static const char *const an7583_i2c_groups[] = { "i2c0", "i2c1" };
 +static const char *const jtag_groups[] = { "jtag_udi", "jtag_dfd" };
 +static const char *const pcm_groups[] = { "pcm1", "pcm2" };
-+static const char *const spi_groups[] = { "spi_quad", "spi_cs1" };
++static const char *const spi_groups[] = { "spi", "spi_quad", "spi_cs1" };
 +static const char *const pcm_spi_groups[] = { "pcm_spi", "pcm_spi_int",
 +					      "pcm_spi_rst", "pcm_spi_cs1",
 +					      "pcm_spi_cs2_p156",
@@ -992,6 +1019,15 @@ index 000000000..26e7d3375
 +			GPIO_PON_MODE_MASK
 +		},
 +		.regmap_size = 1,
++	}, {
++		.name = "pon_tx_disable_gpio",
++		.regmap[0] = {
++			AIROHA_FUNC_MUX,
++			REG_GPIO_PON_MODE,
++			GPIO_PON_MODE_MASK | GPIO_PON_ALT_MODE_MASK,
++			GPIO_PON_MODE_MASK
++		},
++		.regmap_size = 1,
 +	},
 +};
 +
@@ -1064,16 +1100,10 @@ index 000000000..26e7d3375
 +		.regmap[0] = {
 +			AIROHA_FUNC_MUX,
 +			REG_GPIO_PON_MODE,
-+			GPIO_SGMII_MDIO_MODE_MASK,
-+			GPIO_SGMII_MDIO_MODE_MASK
++			AN7583_MDC_0_GPIO_MODE_MASK | AN7583_MDIO_0_GPIO_MODE_MASK,
++			0
 +		},
-+		.regmap[1] = {
-+			AIROHA_FUNC_MUX,
-+			REG_GPIO_SPI_CS1_MODE,
-+			GPIO_MDC_IO_MASTER_MODE_MODE,
-+			GPIO_MDC_IO_MASTER_MODE_MODE
-+		},
-+		.regmap_size = 2,
++		.regmap_size = 1,
 +	},
 +};
 +
@@ -1149,6 +1179,27 @@ index 000000000..26e7d3375
 +	},
 +};
 +
++static const struct airoha_pinctrl_func_group an7583_i2c_func_group[] = {
++	{
++		.name = "i2c0",
++		.regmap[0] = {
++			AIROHA_FUNC_MUX,
++			REG_GPIO_PON_MODE,
++			AN7583_I2C0_SCL_GPIO_MODE_MASK | AN7583_I2C0_SDA_GPIO_MODE_MASK,
++			0
++		},
++		.regmap_size = 1,
++	}, {
++		.name = "i2c1",
++		.regmap[0] = {
++			AIROHA_FUNC_MUX,
++			REG_GPIO_PON_MODE,
++			AN7583_I2C1_SCL_GPIO_MODE_MASK | AN7583_I2C1_SDA_GPIO_MODE_MASK,
++			0
++		},
++		.regmap_size = 1,
++	},
++};
 +static const struct airoha_pinctrl_func_group jtag_func_group[] = {
 +	{
 +		.name = "jtag_udi",
@@ -1195,6 +1246,15 @@ index 000000000..26e7d3375
 +
 +static const struct airoha_pinctrl_func_group spi_func_group[] = {
 +	{
++		.name = "spi",
++		.regmap[0] = {
++			AIROHA_FUNC_MUX,
++			REG_GPIO_PON_MODE,
++			SPI_GPIO_MODE_MASK,
++			0
++		},
++		.regmap_size = 1,
++	}, {
 +		.name = "spi_quad",
 +		.regmap[0] = {
 +			AIROHA_FUNC_MUX,
@@ -1775,7 +1835,7 @@ index 000000000..26e7d3375
 +	PINCTRL_FUNC_DESC("sipo", sipo),
 +	PINCTRL_FUNC_DESC("mdio", an7583_mdio),
 +	PINCTRL_FUNC_DESC("uart", uart),
-+	PINCTRL_FUNC_DESC("i2c", i2c),
++	PINCTRL_FUNC_DESC("i2c", an7583_i2c),
 +	PINCTRL_FUNC_DESC("jtag", jtag),
 +	PINCTRL_FUNC_DESC("pcm", pcm),
 +	PINCTRL_FUNC_DESC("spi", spi),
@@ -2466,7 +2526,10 @@ index 000000000..26e7d3375
 +	gc->direction_output = airoha_gpio_direction_output;
 +	gc->set = airoha_gpio_set;
 +	gc->get = airoha_gpio_get;
-+	gc->base = -1;
++	/*
++	 * 上游 6.18 无此行：原来写 -1（动态基址）会把 gpiochip 分到 448-511，
++	 * 用户态看到的编号与官方固件（0-63）对不上。用默认 base=0。
++	 */
 +	gc->ngpio = AIROHA_NUM_PINS;
 +
 +	girq->default_type = IRQ_TYPE_NONE;

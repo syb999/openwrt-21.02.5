@@ -1,0 +1,32 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: dsa: mt7530: always report DSA_TAG_PROTO_MTK
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/dsa/mt7530.c b/drivers/net/dsa/mt7530.c
+--- a/drivers/net/dsa/mt7530.c	2026-10-10 21:15:24.425299182 +0800
++++ b/drivers/net/dsa/mt7530.c	2026-10-10 21:15:24.429299338 +0800
+@@ -1590,15 +1590,14 @@
+ static enum dsa_tag_protocol
+ mtk_get_tag_protocol(struct dsa_switch *ds, int port)
+ {
+-	struct mt7530_priv *priv = ds->priv;
+-
+-	if (port != MT7530_CPU_PORT) {
+-		dev_warn(priv->dev,
+-			 "port not matched with tagging CPU port\n");
+-		return DSA_TAG_PROTO_NONE;
+-	} else {
+-		return DSA_TAG_PROTO_MTK;
+-	}
++	/* Upstream (6.18) always reports DSA_TAG_PROTO_MTK.  Returning
++	 * DSA_TAG_PROTO_NONE for the user ports made the stack parse the
++	 * frames received on the conduit (eth0) as untagged, while the CPU
++	 * port has the switch special tag enabled
++	 * (CPORT_SW2FE_STAG_EN), so every frame arriving from lan2/3/4 was
++	 * discarded: eth0 showed RX=120 while lan4 stayed at RX=0.
++	 */
++	return DSA_TAG_PROTO_MTK;
+ }
+ 
+ static int

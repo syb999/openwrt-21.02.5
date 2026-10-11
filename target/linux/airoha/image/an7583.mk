@@ -56,7 +56,8 @@ define Device/nokia_xg-040g-mf-common
     # kmod-regulator-userspace-consumer does not exist in this 5.4 tree yet.
   DEVICE_PACKAGES := airoha-an7583-npu-firmware airoha-en8811h-firmware i2c-tools kmod-usb3 kmod-usb-ledtrig-usbport \
 	kmod-airoha-en7572 kmod-airoha-xpon kmod-airoha-pon-frontend \
-	airoha-ponctl airoha-pond uboot-envtools $(AIROHA_USB_STORAGE_PACKAGES)
+	airoha-ponctl airoha-pond uboot-envtools $(AIROHA_USB_STORAGE_PACKAGES) \
+	luci-ssl luci-mod-admin-full luci-theme-bootstrap luci-app-firewall
 endef
 
 define Device/nokia_xg-040g-mf
@@ -79,6 +80,8 @@ define Device/nokia_xg-040g-mf-ubi
   UBOOTENV_IN_UBI := 1
   KERNEL_IN_UBI := 1
   DEVICE_PACKAGES += arm-trusted-firmware-airoha
+  # uImage.FIT 子镜像块设备：UBI 变体的 rootfs 挂载/升级依赖它（配合内核 CONFIG_UIMAGE_FIT_BLK）
+  DEVICE_PACKAGES += fitblk
   KERNEL := kernel-bin | gzip
   KERNEL_INITRAMFS := kernel-bin | lzma | \
 	fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 128k
@@ -90,8 +93,11 @@ define Device/nokia_xg-040g-mf-ubi
   # Preloader + BL31/U-Boot FIP.  bl2/bl31 staging images come from
   # arm-trusted-firmware-airoha (builds pbs05/uboot-an758x's tf-a tree), the
   # u-boot image from uboot-airoha, fiptool from arm-trusted-firmware-tools.
-  ARTIFACT/preloader.bin := an7583-preloader nokia_xg-040g-mf
-  ARTIFACT/bl31-uboot.fip := an7583-bl31-uboot nokia_xg-040g-mf
-  ARTIFACTS := preloader.bin bl31-uboot.fip
+  # 🔴 禁用: OpenWrt target 自产的 preloader/fip 与 pbs05 官方不同(未签名/未验证)，
+  # 唯一用途是“别刷”，留着只会造成误刷。sysupgrade.itb 不依赖它们。
+  # 刷机引导件请用 pbs05 官方 v2026.07-4: /home/oem/airoha-port/bootloader-official-an7583-mf/
+  # ARTIFACT/preloader.bin := an7583-preloader nokia_xg-040g-mf
+  # ARTIFACT/bl31-uboot.fip := an7583-bl31-uboot nokia_xg-040g-mf
+  # ARTIFACTS := preloader.bin bl31-uboot.fip
 endef
 TARGET_DEVICES += nokia_xg-040g-mf-ubi

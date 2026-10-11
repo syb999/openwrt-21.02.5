@@ -26,10 +26,10 @@ index fddf61584..b51b119b2 100644
 +obj-$(CONFIG_AIROHA_GE_SOC_PHY)	+= airoha-ge-soc.o
 diff --git a/drivers/net/phy/airoha-ge-soc.c b/drivers/net/phy/airoha-ge-soc.c
 new file mode 100644
-index 000000000..73b07623a
+index 0000000..1111111
 --- /dev/null
 +++ b/drivers/net/phy/airoha-ge-soc.c
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,177 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Driver for the Airoha AN7581 built-in Gigabit Ethernet PHYs (backport)
@@ -56,6 +56,12 @@ index 000000000..73b07623a
 +#include <linux/slab.h>
 +
 +#define AIROHA_GPHY_ID_AN7581		0x03a294c1
++/*
++ * The AN7583 GPHY reports a completely different ID.  Unlike AN7581 it
++ * comes up with BMCR_PDOWN set (powered down), so its registers read back
++ * as zero until config_init() clears that bit.
++ */
++#define AIROHA_GPHY_ID_AN7583		0xc0ff0420
 +
 +struct airoha_socphy_priv {
 +	/* Placeholder: no calibration data required for the AN7581 */
@@ -66,6 +72,9 @@ index 000000000..73b07623a
 +{
 +	struct airoha_socphy_priv *priv;
 +	struct pinctrl *pinctrl;
++
++	dev_dbg(&phydev->mdio.dev, "[DBG3] GPHY driver probed, phy_id=0x%08x\n",
++		 phydev->phy_id);
 +
 +	/* Toggle pinctrl to enable the PHY LED pins */
 +	pinctrl = devm_pinctrl_get_select(&phydev->mdio.dev, "gbe-led");
@@ -81,6 +90,86 @@ index 000000000..73b07623a
 +	return 0;
 +}
 +
++static int an7583_phy_config_init(struct phy_device *phydev)
++{
++	int val, ret;
++
++	val = phy_read(phydev, MII_BMCR);
++	dev_info(&phydev->mdio.dev,
++		 "[DBG3] an7583 config_init: BMCR=0x%04x (id=0x%08x)\n",
++		 val, phydev->phy_id);
++
++	{
++		u16 r403, r10d, after;
++
++		/* Vendor sequence (mt7531_sw_post_init): the internal GPHYs
++		 * are powered down by default; software must bring them up.
++		 */
++		r403 = phy_read_mmd(phydev, 0x1f, 0x403);
++		phy_write_mmd(phydev, 0x1f, 0x403,
++			      (r403 | BIT(4)) & ~BIT(5));
++
++		r10d = phy_read_mmd(phydev, 0x1f, 0x10d);
++		phy_write_mmd(phydev, 0x1f, 0x10d, 0x10);
++		phy_write_mmd(phydev, 0x1f, 0x10d, 0x14);
++
++		val = phy_read(phydev, MII_BMCR);
++		val &= ~(BMCR_ISOLATE | BMCR_PDOWN);
++		phy_write(phydev, MII_BMCR, val);
++
++		after = phy_read(phydev, MII_BMCR);
++		pr_debug("[PWR] BMCR before=0x%04x after=0x%04x "
++			"mmd403=0x%04x->0x%04x mmd10d=0x%04x bmsr=0x%04x\n",
++			val, after, r403,
++			phy_read_mmd(phydev, 0x1f, 0x403), r10d,
++			phy_read(phydev, MII_BMSR));
++	}
++
++	/* BMCR_PDOWN is enabled by default */
++	ret = phy_clear_bits(phydev, MII_BMCR, BMCR_PDOWN);
++	if (ret < 0)
++		dev_warn(&phydev->mdio.dev,
++			 "[DBG3] clearing BMCR_PDOWN failed: %d\n", ret);
++
++	/* The internal GPHY does not answer standard register reads (BMCR
++	 * reads back as 0), so genphy_read_abilities() leaves phydev->
++	 * supported empty.  An empty supported mask makes
++	 * phylink_validate() fail with -EINVAL and the port never comes up.
++	 * Advertise this PHY's fixed capabilities directly.
++	 */
++	/* Rebuild the capability set from scratch: phydev->supported comes
++	 * from genphy_read_abilities(), which reads back nothing for this
++	 * GPHY.  It must contain the port modes (TP/MII) as well, because
++	 * mt753x_phylink_validate() does linkmode_and(supported, mask) and
++	 * would otherwise wipe it clean, making phylink_validate() return
++	 * -EINVAL and the port never come up.
++	 */
++	linkmode_zero(phydev->supported);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_TP_BIT, phydev->supported);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_MII_BIT, phydev->supported);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_10baseT_Half_BIT,
++			 phydev->supported);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_10baseT_Full_BIT,
++			 phydev->supported);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_100baseT_Half_BIT,
++			 phydev->supported);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_100baseT_Full_BIT,
++			 phydev->supported);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_1000baseT_Full_BIT,
++			 phydev->supported);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_Autoneg_BIT, phydev->supported);
++	linkmode_copy(phydev->advertising, phydev->supported);
++	dev_info(&phydev->mdio.dev,
++		 "[DBG3] supported set: TP/MII/10-100-1000 (n=%*pb)\n",
++		 __ETHTOOL_LINK_MODE_MASK_NBITS, phydev->supported);
++
++	/* Never fail config_init: a failure here aborts phy_attach_direct()
++	 * and, on 5.4, walks into phy_leds_unregister() with an
++	 * uninitialised leds list (kernel panic).
++	 */
++	return 0;
++}
++
 +static struct phy_driver airoha_socphy_drivers[] = {
 +	{
 +		PHY_ID_MATCH_EXACT(AIROHA_GPHY_ID_AN7581),
@@ -89,7 +178,17 @@ index 000000000..73b07623a
 +		.config_aneg		= genphy_config_aneg,
 +		.aneg_done		= genphy_aneg_done,
 +		.read_status		= genphy_read_status,
-+		.soft_reset		= genphy_soft_reset,
++		.suspend		= genphy_suspend,
++		.resume			= genphy_resume,
++	},
++	{
++		PHY_ID_MATCH_EXACT(AIROHA_GPHY_ID_AN7583),
++		.name			= "Airoha AN7583 PHY",
++		.config_init		= an7583_phy_config_init,
++		.probe			= an7581_phy_probe,
++		.config_aneg		= genphy_config_aneg,
++		.aneg_done		= genphy_aneg_done,
++		.read_status		= genphy_read_status,
 +		.suspend		= genphy_suspend,
 +		.resume			= genphy_resume,
 +	},
@@ -99,11 +198,12 @@ index 000000000..73b07623a
 +
 +static struct mdio_device_id __maybe_unused airoha_socphy_tbl[] = {
 +	{ PHY_ID_MATCH_EXACT(AIROHA_GPHY_ID_AN7581) },
++	{ PHY_ID_MATCH_EXACT(AIROHA_GPHY_ID_AN7583) },
 +	{ }
 +};
 +
 +MODULE_DEVICE_TABLE(mdio, airoha_socphy_tbl);
 +
-+MODULE_DESCRIPTION("Airoha SoC Gigabit Ethernet PHYs (AN7581)");
++MODULE_DESCRIPTION("Airoha SoC Gigabit Ethernet PHYs (AN7581/AN7583)");
 +MODULE_AUTHOR("Lorenzo Bianconi <lorenzo@kernel.org>");
 +MODULE_LICENSE("GPL");

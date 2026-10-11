@@ -82,7 +82,7 @@ new file mode 100644
 index 000000000..61b2d0284
 --- /dev/null
 +++ b/drivers/net/ethernet/airoha/airoha_eth.c
-@@ -0,0 +1,2924 @@
+@@ -0,0 +1,3063 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Copyright (c) 2024 AIROHA Inc
@@ -92,6 +92,7 @@ index 000000000..61b2d0284
 +#include <linux/of.h>
 +#include <linux/of_device.h>
 +#include <linux/of_net.h>
++#include <linux/of_address.h>
 +#include <linux/of_reserved_mem.h>
 +#include <linux/platform_device.h>
 +#include <linux/tcp.h>
@@ -414,7 +415,7 @@ index 000000000..61b2d0284
 +					 PSE_QUEUE_RSV_PAGES);
 +	/* PPE1 */
 +	for (q = 0; q < pse_port_num_queues[FE_PSE_PORT_PPE1]; q++) {
-+		if (q < pse_port_num_queues[FE_PSE_PORT_PPE1])
++		if (q < pse_port_num_queues[FE_PSE_PORT_PPE1] / 2)
 +			airoha_fe_set_pse_oq_rsv(eth, FE_PSE_PORT_PPE1, q,
 +						 PSE_QUEUE_RSV_PAGES);
 +		else
@@ -607,10 +608,10 @@ index 000000000..61b2d0284
 +		      FIELD_PREP(IP_ASSEMBLE_PORT_MASK, 0) |
 +		      FIELD_PREP(IP_ASSEMBLE_NBQ_MASK, 22));
 +
-+	airoha_fe_set(eth, REG_GDM_FWD_CFG(3),
-+		      GDM_PAD_EN_MASK | GDM_STRIP_CRC_MASK);
-+	airoha_fe_set(eth, REG_GDM_FWD_CFG(4),
-+		      GDM_PAD_EN_MASK | GDM_STRIP_CRC_MASK);
++	airoha_fe_set(eth, REG_GDM_FWD_CFG(AIROHA_GDM3_IDX),
++		      GDM_PAD_EN_MASK);
++	airoha_fe_set(eth, REG_GDM_FWD_CFG(AIROHA_GDM4_IDX),
++		      GDM_PAD_EN_MASK);
 +
 +	airoha_fe_crsn_qsel_init(eth);
 +
@@ -626,10 +627,36 @@ index 000000000..61b2d0284
 +	/* disable IFC by default */
 +	airoha_fe_clear(eth, REG_FE_CSR_IFC_CFG, FE_IFC_EN_MASK);
 +
++	/* 把 PSE 默认 CPU 口指向 CDM1/CDM2（DMA 口）。
++	 * 上游 fe_init 有这两条；本树此前误删，导致 PSE 默认端口未配置、
++	 * 后续 MC_VLAN 表写入无人应答（[DBG] mc_vlan_clear ret=-110）。 */
++	airoha_fe_wr(eth, REG_PPE_DFT_CPORT0(0),
++		     FIELD_PREP(DFT_CPORT_MASK(7), FE_PSE_PORT_CDM1) |
++		     FIELD_PREP(DFT_CPORT_MASK(6), FE_PSE_PORT_CDM1) |
++		     FIELD_PREP(DFT_CPORT_MASK(5), FE_PSE_PORT_CDM1) |
++		     FIELD_PREP(DFT_CPORT_MASK(4), FE_PSE_PORT_CDM1) |
++		     FIELD_PREP(DFT_CPORT_MASK(3), FE_PSE_PORT_CDM1) |
++		     FIELD_PREP(DFT_CPORT_MASK(2), FE_PSE_PORT_CDM1) |
++		     FIELD_PREP(DFT_CPORT_MASK(1), FE_PSE_PORT_CDM1) |
++		     FIELD_PREP(DFT_CPORT_MASK(0), FE_PSE_PORT_CDM1));
++	airoha_fe_wr(eth, REG_PPE_DFT_CPORT0(1),
++		     FIELD_PREP(DFT_CPORT_MASK(7), FE_PSE_PORT_CDM2) |
++		     FIELD_PREP(DFT_CPORT_MASK(6), FE_PSE_PORT_CDM2) |
++		     FIELD_PREP(DFT_CPORT_MASK(5), FE_PSE_PORT_CDM2) |
++		     FIELD_PREP(DFT_CPORT_MASK(4), FE_PSE_PORT_CDM2) |
++		     FIELD_PREP(DFT_CPORT_MASK(3), FE_PSE_PORT_CDM2) |
++		     FIELD_PREP(DFT_CPORT_MASK(2), FE_PSE_PORT_CDM2) |
++		     FIELD_PREP(DFT_CPORT_MASK(1), FE_PSE_PORT_CDM2) |
++		     FIELD_PREP(DFT_CPORT_MASK(0), FE_PSE_PORT_CDM2));
++
 +	/* enable 1:N vlan action, init vlan table */
 +	airoha_fe_set(eth, REG_MC_VLAN_EN, MC_VLAN_EN_MASK);
 +
-+	return airoha_fe_mc_vlan_clear(eth);
++	{
++		int r = airoha_fe_mc_vlan_clear(eth);
++		dev_dbg(eth->dev, "[DBG] fe_init: mc_vlan_clear ret=%d\n", r);
++		return r;
++	}
 +}
 +
 +
@@ -870,8 +897,9 @@ index 000000000..61b2d0284
 +	const struct page_pool_params pp_params = {
 +		.order = 0,
 +		.pool_size = 256,
-+		.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV |
-+			 PP_FLAG_PAGE_FRAG,
++		/* PP_FLAG_PAGE_FRAG 在本树 page_pool 里不属于 PP_FLAG_ALL，
++		 * page_pool_init() 会判为未知标志返回 -EINVAL。 */
++		.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
 +		.dma_dir = DMA_FROM_DEVICE,
 +		.nid = NUMA_NO_NODE,
 +		.dev = qdma->eth->dev,
@@ -924,18 +952,39 @@ index 000000000..61b2d0284
 +
 +static void airoha_qdma_cleanup_rx_queue(struct airoha_queue *q)
 +{
-+	struct airoha_eth *eth = q->qdma->eth;
++	struct airoha_qdma *qdma = q->qdma;
++	struct airoha_eth *eth = qdma->eth;
++	int qid = q - &qdma->q_rx[0];
 +
 +	while (q->queued) {
 +		struct airoha_queue_entry *e = &q->entry[q->tail];
++		struct airoha_qdma_desc *desc = &q->desc[q->tail];
 +		struct page *page = virt_to_head_page(e->buf);
 +
 +		dma_sync_single_for_cpu(eth->dev, e->dma_addr, e->dma_len,
 +					page_pool_get_dma_dir(q->page_pool));
 +		page_pool_put_full_page(q->page_pool, page, false);
++		/* Reset DMA descriptor */
++		WRITE_ONCE(desc->ctrl, 0);
++		WRITE_ONCE(desc->addr, 0);
++		WRITE_ONCE(desc->data, 0);
++		WRITE_ONCE(desc->msg0, 0);
++		WRITE_ONCE(desc->msg1, 0);
++		WRITE_ONCE(desc->msg2, 0);
++		WRITE_ONCE(desc->msg3, 0);
++
 +		q->tail = (q->tail + 1) % q->ndesc;
 +		q->queued--;
 +	}
++
++	q->head = q->tail;
++	/* Set RX_DMA_IDX to RX_CPU_IDX to notify the hw the QDMA RX ring is
++	 * empty.
++	 */
++	airoha_qdma_rmw(qdma, REG_RX_CPU_IDX(qid), RX_RING_CPU_IDX_MASK,
++			FIELD_PREP(RX_RING_CPU_IDX_MASK, q->head));
++	airoha_qdma_rmw(qdma, REG_RX_DMA_IDX(qid), RX_RING_DMA_IDX_MASK,
++			FIELD_PREP(RX_RING_DMA_IDX_MASK, q->tail));
 +}
 +
 +static int airoha_qdma_init_rx(struct airoha_qdma *qdma)
@@ -1179,6 +1228,7 @@ index 000000000..61b2d0284
 +static int airoha_qdma_init_hfwd_queues(struct airoha_qdma *qdma)
 +{
 +	int size, index, num_desc = HW_DSCP_NUM;
++	int err;
 +	struct airoha_eth *eth = qdma->eth;
 +	int id = qdma - &eth->qdma[0];
 +	u32 status, buf_size;
@@ -1193,7 +1243,7 @@ index 000000000..61b2d0284
 +	index = of_property_match_string(eth->dev->of_node,
 +					 "memory-region-names", name);
 +	if (index >= 0) {
-+		struct reserved_mem *rmem;
++		struct resource qres;
 +		struct device_node *np;
 +
 +		/* Consume reserved memory for hw forwarding buffers queue if
@@ -1204,13 +1254,18 @@ index 000000000..61b2d0284
 +		if (!np)
 +			return -ENODEV;
 +
-+		rmem = of_reserved_mem_lookup(np);
++		/* 同 NPU 那处：5.4 的 of_reserved_mem_lookup() 依赖 reserved_mem[]
++		 * 表（本板为空），改用 of_address_to_resource() 解析节点 reg。 */
++		err = of_address_to_resource(np, 0, &qres);
 +		of_node_put(np);
-+		dma_addr = rmem->base;
++		if (err)
++			return err;
++
++		dma_addr = qres.start;
 +		/* Compute the number of hw descriptors according to the
 +		 * reserved memory size and the payload buffer size
 +		 */
-+		num_desc = div_u64(rmem->size, buf_size);
++		num_desc = div_u64(resource_size(&qres), buf_size);
 +	} else {
 +		size = buf_size * num_desc;
 +		if (!dmam_alloc_coherent(eth->dev, size, &dma_addr,
@@ -1512,10 +1567,6 @@ index 000000000..61b2d0284
 +	if (err)
 +		return err;
 +
-+	err = reset_control_bulk_deassert(eth->soc->num_xsi_rsts, eth->xsi_rsts);
-+	if (err)
-+		return err;
-+
 +	msleep(20);
 +	err = reset_control_bulk_deassert(ARRAY_SIZE(eth->rsts), eth->rsts);
 +	if (err)
@@ -1523,18 +1574,27 @@ index 000000000..61b2d0284
 +
 +	msleep(20);
 +	err = airoha_fe_init(eth);
-+	if (err)
++	if (err) {
++		dev_err(eth->dev, "[DBG] hw_init: fe_init FAILED err=%d\n", err);
 +		return err;
++	}
++	dev_dbg(eth->dev, "[DBG] hw_init: fe_init ok\n");
 +
 +	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++) {
 +		err = airoha_qdma_init(pdev, eth, &eth->qdma[i]);
-+		if (err)
++		if (err) {
++			dev_err(eth->dev, "[DBG] hw_init: qdma_init[%d] FAILED err=%d\n", i, err);
 +			return err;
++		}
++		dev_dbg(eth->dev, "[DBG] hw_init: qdma_init[%d] ok\n", i);
 +	}
 +
 +	err = airoha_ppe_init(eth);
-+	if (err)
++	if (err) {
++		dev_err(eth->dev, "[DBG] hw_init: ppe_init FAILED err=%d\n", err);
 +		return err;
++	}
++	dev_dbg(eth->dev, "[DBG] hw_init: ppe_init ok\n");
 +
 +	set_bit(DEV_STATE_INITIALIZED, &eth->state);
 +
@@ -1555,8 +1615,15 @@ index 000000000..61b2d0284
 +			page_pool_destroy(qdma->q_rx[i].page_pool);
 +	}
 +
-+	for (i = 0; i < ARRAY_SIZE(qdma->q_tx_irq); i++)
++	for (i = 0; i < ARRAY_SIZE(qdma->q_tx_irq); i++) {
++		/* 只有成功注册过 napi 的队列才能 netif_napi_del()：
++		 * 本树 netif_napi_add_tx() 在 q 分配【之前】执行，用 q 判空会漏判，
++		 * 对未注册 napi 调用会导致 list_del_init(&napi->dev_list) 空指针 panic。 */
++		if (!qdma->q_tx_irq[i].napi.dev)
++			continue;
++
 +		netif_napi_del(&qdma->q_tx_irq[i].napi);
++	}
 +
 +	for (i = 0; i < ARRAY_SIZE(qdma->q_tx); i++) {
 +		if (!qdma->q_tx[i].ndesc)
@@ -2508,6 +2575,78 @@ index 000000000..61b2d0284
 +	return port->pcs;
 +}
 +
++/* 5.4 的 phylink_mac_ops 必需 validate()（6.x 已移除，所以官方 6.18 ops 里没有）。
++ * phylink_create() 会无条件调用它，缺失即空指针崩溃。
++ * 这里按 MAC 能力填 mask，phy 侧再与支持的模式求交。 */
++static void airoha_mac_validate(struct phylink_config *config,
++				unsigned long *supported,
++				struct phylink_link_state *state)
++{
++	__ETHTOOL_DECLARE_LINK_MODE_MASK(mask) = { 0, };
++
++	phylink_set(mask, Autoneg);
++	phylink_set(mask, Pause);
++	phylink_set(mask, Asym_Pause);
++
++	phylink_set(mask, 10baseT_Half);
++	phylink_set(mask, 10baseT_Full);
++	phylink_set(mask, 100baseT_Half);
++	phylink_set(mask, 100baseT_Full);
++	phylink_set(mask, 1000baseT_Full);
++	phylink_set(mask, 1000baseX_Full);
++
++	switch (state->interface) {
++	case PHY_INTERFACE_MODE_SGMII:
++	case PHY_INTERFACE_MODE_1000BASEX:
++		break;
++	case PHY_INTERFACE_MODE_2500BASEX:
++		phylink_set(mask, 2500baseT_Full);
++		phylink_set(mask, 2500baseX_Full);
++		break;
++	case PHY_INTERFACE_MODE_10GBASER:
++	case PHY_INTERFACE_MODE_USXGMII:
++	case PHY_INTERFACE_MODE_XGMII:
++		phylink_set(mask, 2500baseT_Full);
++		phylink_set(mask, 5000baseT_Full);
++		phylink_set(mask, 10000baseT_Full);
++		phylink_set(mask, 10000baseCR_Full);
++		phylink_set(mask, 10000baseSR_Full);
++		phylink_set(mask, 10000baseLR_Full);
++		phylink_set(mask, 10000baseER_Full);
++		break;
++	default:
++		break;
++	}
++
++	phylink_set_port_modes(mask);
++
++	bitmap_and(supported, supported, mask, __ETHTOOL_LINK_MODE_MASK_NBITS);
++	bitmap_and(state->advertising, state->advertising, mask,
++		   __ETHTOOL_LINK_MODE_MASK_NBITS);
++}
++
++static int airoha_mac_link_state(struct phylink_config *config,
++				 struct phylink_link_state *state)
++{
++	struct airoha_gdm_port *port = container_of(config, struct airoha_gdm_port,
++						    phylink_config);
++
++	/* 5.4 的 phylink_mac_ops 必需 mac_link_state（6.x 已移除）。
++	 * 外部口（GDM1/2，接 PHY）的链路状态由 PCS/PHY 提供，
++	 * 这里返回 -EOPNOTSUPP 让 phylink 走 PCS 路径；
++	 * 内部 CPU 口（GDM4）恒为 10G 全双工。
++	 */
++	if (port->id == AIROHA_GDM4_IDX) {
++		state->link = 1;
++		state->speed = SPEED_10000;
++		state->duplex = DUPLEX_FULL;
++		state->an_complete = 1;
++		return 0;
++	}
++
++	return -EOPNOTSUPP;
++}
++
 +static void airoha_mac_config(struct phylink_config *config, unsigned int mode,
 +			      const struct phylink_link_state *state)
 +{
@@ -2598,6 +2737,8 @@ index 000000000..61b2d0284
 +}
 +
 +static const struct phylink_mac_ops airoha_phylink_ops = {
++	.validate = airoha_mac_validate,
++	.mac_link_state = airoha_mac_link_state,
 +	.mac_select_pcs = airoha_phylink_mac_select_pcs,
 +	.mac_config = airoha_mac_config,
 +	.mac_link_up = airoha_mac_link_up,
@@ -2721,8 +2862,6 @@ index 000000000..61b2d0284
 +		return err;
 +
 +	err = airoha_get_mac_address(dev);
-+	if (err)
-+		return err;
 +	if (err) {
 +		if (err == -EPROBE_DEFER)
 +			return err;
@@ -3697,7 +3836,7 @@ new file mode 100644
 index 000000000..456b5c987
 --- /dev/null
 +++ b/drivers/net/ethernet/airoha/airoha_npu.c
-@@ -0,0 +1,821 @@
+@@ -0,0 +1,833 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Copyright (c) 2025 AIROHA Inc
@@ -3923,7 +4062,7 @@ index 000000000..456b5c987
 +}
 +
 +static int airoha_npu_run_firmware(struct device *dev, void __iomem *base,
-+				   struct reserved_mem *rmem)
++				   struct resource *res)
 +{
 +	const struct airoha_npu_soc_data *soc;
 +	void __iomem *addr;
@@ -3933,7 +4072,7 @@ index 000000000..456b5c987
 +	if (!soc)
 +		return -EINVAL;
 +
-+	addr = devm_ioremap(dev, rmem->base, rmem->size);
++	addr = devm_ioremap(dev, res->start, resource_size(res));
 +	if (IS_ERR(addr))
 +		return PTR_ERR(addr);
 +
@@ -4383,7 +4522,9 @@ index 000000000..456b5c987
 +static int airoha_npu_probe(struct platform_device *pdev)
 +{
 +	struct device *dev = &pdev->dev;
-+	struct reserved_mem *rmem;
++
++	dev_dbg(dev, "[DBG] npu: probe entered\n");
++	struct resource res;
 +	struct airoha_npu *npu;
 +	struct device_node *np;
 +	void __iomem *base;
@@ -4416,15 +4557,23 @@ index 000000000..456b5c987
 +	if (IS_ERR(npu->regmap))
 +		return PTR_ERR(npu->regmap);
 +
++	/*
++	 * 5.4 没有 of_reserved_mem_region_to_resource()（官方 6.18 用的那个），
++	 * 而 of_reserved_mem_lookup() 依赖 reserved_mem[] 表（本板为空）⇒ 恒返回 NULL。
++	 * npu-binary@84000000 节点自带 reg，直接用 of_address_to_resource() 解析，
++	 * 结果与官方拿到的 resource 等价（base=0x84000000 size=0xa00000）。
++	 */
 +	np = of_parse_phandle(dev->of_node, "memory-region", 0);
 +	if (!np)
 +		return -ENODEV;
 +
-+	rmem = of_reserved_mem_lookup(np);
++	err = of_address_to_resource(np, 0, &res);
 +	of_node_put(np);
-+
-+	if (!rmem)
-+		return -ENODEV;
++	if (err) {
++		dev_err(dev, "[DBG] npu: of_address_to_resource failed: %d\n", err);
++		return err;
++	}
++	dev_dbg(dev, "[DBG] npu: reserved mem %pR\n", &res);
 +
 +	irq = platform_get_irq(pdev, 0);
 +	if (irq < 0)
@@ -4466,12 +4615,14 @@ index 000000000..456b5c987
 +	if (err)
 +		return err;
 +
-+	err = airoha_npu_run_firmware(dev, base, rmem);
++	dev_dbg(dev, "[DBG] npu: about to run firmware\n");
++	err = airoha_npu_run_firmware(dev, base, &res);
 +	if (err)
 +		return dev_err_probe(dev, err, "failed to run npu firmware\n");
++	dev_dbg(dev, "[DBG] npu: firmware running\n");
 +
 +	regmap_write(npu->regmap, REG_CR_NPU_MIB(10),
-+		     rmem->base + NPU_EN7581_FIRMWARE_RV32_MAX_SIZE);
++		     res.start + NPU_EN7581_FIRMWARE_RV32_MAX_SIZE);
 +	regmap_write(npu->regmap, REG_CR_NPU_MIB(11), 0x40000); /* SRAM 256K */
 +	regmap_write(npu->regmap, REG_CR_NPU_MIB(12), 0);
 +	regmap_write(npu->regmap, REG_CR_NPU_MIB(21), 1);
@@ -4479,7 +4630,7 @@ index 000000000..456b5c987
 +
 +	/* setting booting address */
 +	for (i = 0; i < NPU_NUM_CORES; i++)
-+		regmap_write(npu->regmap, REG_CR_BOOT_BASE(i), rmem->base);
++		regmap_write(npu->regmap, REG_CR_BOOT_BASE(i), res.start);
 +	usleep_range(1000, 2000);
 +
 +	/* enable NPU cores */

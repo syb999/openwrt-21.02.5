@@ -1,0 +1,41 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: phy: en8811h: keep the full copper advertisement
+
+Upstream's EN8811H driver declares .get_rate_matching = RATE_MATCH_PAUSE,
+telling phylink the PHY performs rate adaptation between the 2.5G SerDes
+and the copper pair.  5.4 has neither phydev->rate_matching nor that
+callback, so phylink narrows phydev->advertising to the MAC-side mode;
+for a 2500BASE-X link the PHY then advertises only 2.5G on the copper
+pair and a 1G link partner never comes up ("Link detected: no", carrier
+0, no frames).  Advertise the copper speeds explicitly instead.
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/phy/air_en8811h.c b/drivers/net/phy/air_en8811h.c
+--- a/drivers/net/phy/air_en8811h.c	2026-10-10 18:49:57.985812810 +0800
++++ b/drivers/net/phy/air_en8811h.c	2026-10-10 18:49:57.985812810 +0800
+@@ -982,6 +982,24 @@
+ 	int ret;
+ 	u32 adv;
+ 
++	/* Restore the full copper advertisement.  phylink narrows
++	 * phydev->advertising to the MAC-side mode, which for a 2500BASE-X
++	 * link means the PHY would only advertise 2.5G on the copper pair
++	 * and a 1G link partner could never come up (the port then reports
++	 * "Link detected: no").  The EN8811H performs the rate adaptation
++	 * between the 2.5G SerDes and the copper pair itself, exactly as
++	 * upstream's .get_rate_matching = RATE_MATCH_PAUSE declares; 5.4 has
++	 * neither phydev->rate_matching nor that op, so advertise the copper
++	 * speeds directly instead.
++	 */
++	linkmode_set_bit(ETHTOOL_LINK_MODE_10baseT_Half_BIT, phydev->advertising);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_10baseT_Full_BIT, phydev->advertising);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_100baseT_Half_BIT, phydev->advertising);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_100baseT_Full_BIT, phydev->advertising);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_1000baseT_Full_BIT, phydev->advertising);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_2500baseT_Full_BIT, phydev->advertising);
++	linkmode_set_bit(ETHTOOL_LINK_MODE_Autoneg_BIT, phydev->advertising);
++
+ 	if (phydev->autoneg == AUTONEG_DISABLE) {
+ 		phydev_warn(phydev, "Disabling autoneg is not supported\n");
+ 		return -EINVAL;

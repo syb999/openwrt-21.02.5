@@ -1,0 +1,51 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: dsa: register slave mii bus through OF on 5.4
+
+On 5.4 __mdiobus_register() has no of_node branch, so calling
+mdiobus_register() for the slave MDIO bus never instantiates the PHYs
+described under the switch's "mdio" child node.  PHYs such as the
+AN7583 internal GPHYs carry an explicit "ethernet-phy-idXXXX.YYYY"
+compatible (they boot powered down and cannot be probed by reading
+registers 2/3), so they would never get a driver.
+
+Use of_mdiobus_register() when the "mdio" child exists.
+
+Signed-off-by: airoha-port <airoha@local>
+---
+--- a/net/dsa/dsa2.c	2026-10-09 15:20:26.335262740 +0800
++++ b/net/dsa/dsa2.c	2026-10-09 15:20:26.335262740 +0800
+@@ -14,6 +14,7 @@
+ #include <linux/rtnetlink.h>
+ #include <linux/of.h>
+ #include <linux/of_net.h>
++#include <linux/of_mdio.h>
+ #include <net/devlink.h>
+ 
+ #include "dsa_priv.h"
+@@ -367,6 +368,7 @@
+ 
+ static int dsa_switch_setup(struct dsa_switch *ds)
+ {
++	struct device_node *mdio_np;
+ 	int err = 0;
+ 
+ 	/* Initialize ds->phys_mii_mask before registering the slave MDIO bus
+@@ -404,7 +406,17 @@
+ 
+ 		dsa_slave_mii_bus_init(ds);
+ 
+-		err = mdiobus_register(ds->slave_mii_bus);
++		/* Register through the OF-aware path when the switch node has
++		 * an "mdio" child: on 5.4 mdiobus_register() alone never
++		 * instantiates the DT-described PHYs (__mdiobus_register has
++		 * no of_node branch here), so PHYs carrying an explicit
++		 * "ethernet-phy-idXXXX.YYYY" compatible would never appear.
++		 */
++		mdio_np = of_get_child_by_name(ds->dev->of_node, "mdio");
++		if (mdio_np)
++			err = of_mdiobus_register(ds->slave_mii_bus, mdio_np);
++		else
++			err = mdiobus_register(ds->slave_mii_bus);
+ 		if (err < 0)
+ 			goto teardown;
+ 	}

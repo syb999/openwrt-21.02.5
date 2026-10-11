@@ -20,12 +20,12 @@
  	int ret;
  
 -	ret = request_firmware(&fw, fw_info->name, dev);
-+	/* 5.4 backport (upstream v7.3 "load the firmware without the sysfs
-+	 * fallback"): request_firmware() honours /sys/.../loading and the
-+	 * user-helper fallback, so a fallback armed at runtime (or
-+	 * CONFIG_FW_LOADER_USER_HELPER_FALLBACK) makes probe fail with whatever
-+	 * the helper returns.  request_firmware_direct() skips that. */
-+	ret = request_firmware_direct(&fw, fw_name, dev);
++	/* 与上游/官方保持一致：request_firmware()。
++	 * 5.4 的 _request_firmware_prepare() 会先查 builtin 固件
++	 * （CONFIG_EXTRA_FIRMWARE 编进内核的那份），正常即可命中；
++	 * 原先用 request_firmware_direct() 在本配置下拿不到固件，
++	 * 导致 NPU probe 反复 EPROBE_DEFER（且 dev_err_probe 静默无日志）。 */
++	ret = request_firmware(&fw, fw_name, dev);
  	if (ret)
 -		return ret == -ENOENT ? -EPROBE_DEFER : ret;
 +		return dev_err_probe(dev, ret == -ENOENT ? -EPROBE_DEFER : ret,

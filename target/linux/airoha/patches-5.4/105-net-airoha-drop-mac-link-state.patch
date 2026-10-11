@@ -1,0 +1,70 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: ethernet: airoha: drop mac_link_state so phylink uses the PCS
+
+5.4's phylink_mac_pcs_get_state() consults pl->pcs only when
+pl->ops->mac_link_state is absent:
+
+    if (pl->pcs && pl->pcs->ops->pcs_get_state &&
+        !pl->ops->mac_link_state) {
+            pl->pcs->ops->pcs_get_state(...);
+            return 0;
+    }
+
+The driver registered .mac_link_state, so phylink never queried the
+Airoha PCS.  The 2500base-x link on lan1 therefore resolved to
+SPEED_UNKNOWN and the MAC was programmed with speed=-1 / duplex=255,
+which made it drop every frame: carrier was reported but RX and TX
+counters stayed at zero.
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-10 12:50:55.913331179 +0800
++++ b/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-10 12:50:55.913331179 +0800
+@@ -2793,28 +2793,6 @@
+ 		   __ETHTOOL_LINK_MODE_MASK_NBITS);
+ }
+ 
+-static int airoha_mac_link_state(struct phylink_config *config,
+-				 struct phylink_link_state *state)
+-{
+-	struct airoha_gdm_port *port = container_of(config, struct airoha_gdm_port,
+-						    phylink_config);
+-
+-	/* 5.4 的 phylink_mac_ops 必需 mac_link_state（6.x 已移除）。
+-	 * 外部口（GDM1/2，接 PHY）的链路状态由 PCS/PHY 提供，
+-	 * 这里返回 -EOPNOTSUPP 让 phylink 走 PCS 路径；
+-	 * 内部 CPU 口（GDM4）恒为 10G 全双工。
+-	 */
+-	if (port->id == AIROHA_GDM4_IDX) {
+-		state->link = 1;
+-		state->speed = SPEED_10000;
+-		state->duplex = DUPLEX_FULL;
+-		state->an_complete = 1;
+-		return 0;
+-	}
+-
+-	return -EOPNOTSUPP;
+-}
+-
+ static void airoha_mac_config(struct phylink_config *config, unsigned int mode,
+ 			      const struct phylink_link_state *state)
+ {
+@@ -2914,7 +2892,16 @@
+ 
+ static const struct phylink_mac_ops airoha_phylink_ops = {
+ 	.validate = airoha_mac_validate,
+-	.mac_link_state = airoha_mac_link_state,
++	/* NOTE: deliberately no .mac_link_state here.  5.4's phylink only
++	 * consults pl->pcs when mac_link_state is absent -- see
++	 * phylink_mac_pcs_get_state() in drivers/net/phy/phylink.c:
++	 *     if (pl->pcs && pl->pcs->ops->pcs_get_state &&
++	 *         !pl->ops->mac_link_state) { ...use PCS... }
++	 * Providing the callback made phylink ignore the Airoha PCS
++	 * entirely, so the 2500base-x link resolved to SPEED_UNKNOWN and
++	 * the MAC was programmed with speed=-1 / duplex=255, dropping
++	 * every frame (RX/TX stayed at zero).
++	 */
+ 	.mac_select_pcs = airoha_phylink_mac_select_pcs,
+ 	.mac_config = airoha_mac_config,
+ 	.mac_link_up = airoha_mac_link_up,

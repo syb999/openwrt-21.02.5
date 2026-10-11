@@ -30,7 +30,7 @@ new file mode 100644
 index 000000000..f6ef79872
 --- /dev/null
 +++ b/drivers/mtd/nand/airoha_bmt.c
-@@ -0,0 +1,575 @@
+@@ -0,0 +1,605 @@
 +
 +/*
 + * Airoha BMT algorithm
@@ -86,6 +86,7 @@ index 000000000..f6ef79872
 +int bmt_index=0xffff; 
 +int bbt_index=0xffff; 
 +unsigned int total_blks  , system_blks , bmt_blks, _to, _to2, val;
++static int dbg_left = 24;
 +
 +module_param(bmt_index,    int,  S_IRUSR  |  S_IWUSR);
 +module_param(bbt_index,    int,  S_IRUSR  |  S_IWUSR);
@@ -98,10 +99,22 @@ index 000000000..f6ef79872
 +
 +
 +static bool is_bad_raw(int block) { 
-+	u8 fdm[4];
++	u8 fdm[4] = {0xff,0xff,0xff,0xff};
++	struct mtd_oob_ops dbgops = {
++		.mode = MTD_OPS_RAW,
++		.ooboffs = bmtd.oob_offset,
++		.oobbuf = fdm,
++		.ooblen = sizeof(fdm),
++		.datbuf = bmtd.data_buf,
++		.len = bmtd.pg_size,
++	};
 +	int ret;
-+	ret = bbt_nand_read(blk_pg(block), bmtd.data_buf, bmtd.pg_size,
-+			    fdm, sizeof(fdm));
++	ret = bmtd._read_oob(bmtd.mtd, blk_pg(block) << bmtd.pg_shift, &dbgops);
++	if (dbg_left-- > 0)
++		printk("bmt is_bad_raw blk=%d ret=%d retlen=%zu oobret=%zu fdm=%02x %02x %02x %02x data=%02x %02x %02x %02x\n",
++		       block, ret, dbgops.retlen, dbgops.oobretlen,
++		       fdm[0], fdm[1], fdm[2], fdm[3],
++		       bmtd.data_buf[0], bmtd.data_buf[1], bmtd.data_buf[2], bmtd.data_buf[3]);
 +	if (ret || fdm[0] != 0xff ){
 +		return true; 
 +	}
@@ -113,7 +126,9 @@ index 000000000..f6ef79872
 +	int ret;
 +	ret = bbt_nand_read(blk_pg(block), bmtd.data_buf, bmtd.pg_size,
 +			    fdm, sizeof(fdm));
-+	//printk("%x %x %x %x\n", fdm[0],  fdm[1],  fdm[2],  fdm[3]);
++	if (dbg_left-- > 0)
++		printk("bmt is_bad_raw blk=%d ret=%d fdm=%02x %02x %02x %02x\n",
++		       block, ret, fdm[0], fdm[1], fdm[2], fdm[3]);
 +	if (ret || fdm[0] != 0xff || fdm[1] != 0xff ){
 +		return true; 
 +	}
@@ -138,7 +153,7 @@ index 000000000..f6ef79872
 +static void mark_bad(int block) { 
 +	u8 fdm[4] = {0xff, 0xff, 0xff, 0xff};
 +	struct mtd_oob_ops ops = { 
-+		.mode = MTD_OPS_PLACE_OOB,
++		.mode = MTD_OPS_RAW,
 +		.ooboffs = 0,
 +		.ooblen = 4, 
 +		.oobbuf = fdm,
@@ -162,7 +177,7 @@ index 000000000..f6ef79872
 +static void mark_good(int block) { 
 +	u8 fdm[4] = {0xff, 0xff, 0xff, 0xff};
 +	struct mtd_oob_ops ops = { 
-+		.mode = MTD_OPS_PLACE_OOB,
++		.mode = MTD_OPS_RAW,
 +		.ooboffs = 0,
 +		.ooblen = 4, 
 +		.oobbuf = fdm,
@@ -179,7 +194,7 @@ index 000000000..f6ef79872
 +static void make_mapping(u16 from , u16 to) { 
 +	u8 fdm[4] = {0xff, 0xff, 0xff , 0xff};
 +	struct mtd_oob_ops ops = { 
-+		.mode = MTD_OPS_PLACE_OOB,
++		.mode = MTD_OPS_RAW,
 +		.ooboffs = 0,
 +		.ooblen = 4, 
 +		.oobbuf = fdm,
@@ -299,12 +314,20 @@ index 000000000..f6ef79872
 +	if(bbt_index ==0xffff) bbt_index = find_available_block(false);
 +	if(bmt_index ==0xffff) bmt_index = find_available_block(true);
 +
++	/* find_available_block() 找不到可用块时返回 -1；
++	 * 若不守卫，会用 -1 去写（地址回绕到 ~4GB）并触发无限重试。*/
++	if (bmt_index < 0 || bbt_index < 0) {
++		printk("bmt: no available block (bmt=%d bbt=%d), skip persisting table\n",
++		       bmt_index, bbt_index);
++		return;
++	}
++
 +	bbt_nand_erase(bmt_index);
 +	bbt_nand_erase(bbt_index);
 +	printk("putting back in bbt_index: %d, bmt_index: %d\n" , bbt_index, bmt_index);
 +
 +	ops = (struct mtd_oob_ops) { 
-+		.mode = MTD_OPS_PLACE_OOB,
++		.mode = MTD_OPS_RAW,
 +		.ooboffs = 0,
 +		.ooblen = 0,
 +		.oobbuf = NULL,
@@ -317,14 +340,14 @@ index 000000000..f6ef79872
 +	if (retlen) { 
 +		printk("error while write");
 +		mark_bad(bmt_index);
-+		if (bmt_index > system_blks) { 
++		if (bmt_index > (int)system_blks) { 
 +			bmt_index--; 
 +			goto retry_bmt;
 +		}
 +		return;
 +	}
 +	ops1 = (struct mtd_oob_ops) { 
-+		.mode = MTD_OPS_PLACE_OOB,
++		.mode = MTD_OPS_RAW,
 +		.ooboffs = 0,
 +		.ooblen = 0,
 +		.oobbuf = NULL,
@@ -337,7 +360,7 @@ index 000000000..f6ef79872
 +	if (retlen) { 
 +		printk("error while write");
 +		mark_bad(bbt_index);
-+		if (bbt_index < total_blks) { 
++		if (bbt_index < (int)total_blks) { 
 +			bbt_index++;
 +			goto retry_bbt;
 +		}
@@ -360,7 +383,9 @@ index 000000000..f6ef79872
 +	memcpy(&bmt.header.signature, "BMT",3);
 +	bmt.header.version = 1; 
 +	bmt.header.size = 0;
-+	for ( i = total_blks -1 ; i >= system_blks ;i--) { 
++	/* system_blks 是 unsigned：i 减到 -1 时无符号比较恒真 ⇒ 死循环，
++	 * 且 is_bad(-1) 经 blk_pg(u16) 截断成 65535 ⇒ 访问 ~4GB 处触发 WARN 风暴。*/
++	for ( i = total_blks -1 ; i >= (int)system_blks ;i--) { 
 +		unsigned short mapped_block;
 +		u8 fdm[4];
 +		int ret;
@@ -397,7 +422,12 @@ index 000000000..f6ef79872
 +	bool block_already_in_bbt = false;
 +	u16 new_block = find_available_block(false);
 +	int i; 
-+	// TODO check for -1
++	/* find_available_block() 无可用块时返回 -1，赋给 u16 会变成 65535，
++	 * 随后 bbt_nand_erase(65535<<17) 访问 ~4GB ⇒ WARN/崩溃。故先守住。 */
++	if ((int)(short)new_block < 0) {
++		printk("bmt: remap_block: no free block, skip remap\n");
++		return false;
++	}
 +
 +	bbt_nand_erase(new_block);
 +	if (copy_len)
@@ -501,7 +531,7 @@ index 000000000..f6ef79872
 +		mark_bad(_to);
 +	} else if ( val == 7) { 
 +		struct mtd_oob_ops opsk = { 
-+			.mode = MTD_OPS_PLACE_OOB, 
++			.mode = MTD_OPS_RAW, 
 +			.ooboffs = 0, 
 +			.ooblen = 0, 
 +			.oobbuf = NULL,
@@ -530,7 +560,7 @@ index 000000000..f6ef79872
 +		}
 +	} else if (val == 9) { 
 +		struct mtd_oob_ops ops = { 
-+			.mode = MTD_OPS_PLACE_OOB,
++			.mode = MTD_OPS_RAW,
 +			.ooboffs = 0,
 +			.ooblen = 0,
 +			.oobbuf = NULL,
@@ -550,13 +580,13 @@ index 000000000..f6ef79872
 +	} else if (val == 11) {
 +		char *buf1, *buf2;
 +		struct mtd_oob_ops ops = { 
-+			.mode = MTD_OPS_PLACE_OOB,
++			.mode = MTD_OPS_RAW,
 +			.ooboffs = 0,
 +			.ooblen = 0,
 +			.oobbuf = NULL,
 +		};
 +		struct mtd_oob_ops ops1 = { 
-+			.mode = MTD_OPS_PLACE_OOB,
++			.mode = MTD_OPS_RAW,
 +			.ooboffs = 0,
 +			.ooblen = 0,
 +			.oobbuf = NULL,
@@ -611,7 +641,7 @@ new file mode 100644
 index 000000000..063adb50f
 --- /dev/null
 +++ b/drivers/mtd/nand/mtk_bmt.c
-@@ -0,0 +1,474 @@
+@@ -0,0 +1,481 @@
 +/*
 + * Copyright (c) 2017 MediaTek Inc.
 + * Author: Xiangsheng Hou <xiangsheng.hou@mediatek.com>
@@ -647,14 +677,14 @@ index 000000000..063adb50f
 +
 +	for (i = 0; i < pages; i++) {
 +		struct mtd_oob_ops rd_ops = {
-+			.mode = MTD_OPS_PLACE_OOB,
++			.mode = MTD_OPS_RAW,
 +			.oobbuf = oob,
 +			.ooblen = min_t(int, bmtd.mtd->oobsize / pages, sizeof(oob)),
 +			.datbuf = bmtd.data_buf,
 +			.len = bmtd.pg_size,
 +		};
 +		struct mtd_oob_ops wr_ops = {
-+			.mode = MTD_OPS_PLACE_OOB,
++			.mode = MTD_OPS_RAW,
 +			.oobbuf = oob,
 +			.datbuf = bmtd.data_buf,
 +			.len = bmtd.pg_size,
@@ -1037,6 +1067,13 @@ index 000000000..063adb50f
 +	else if (of_property_read_bool(np, "mediatek,bbt"))
 +		bmtd.ops = &mtk_bmt_bbt_ops;
 +	else
++		/*
++		 * 不挂载任何 BMT：本板 flash 无坏块（u-boot 侧 mtd bad 为空），
++		 * 而 OOB 读取路径已修复，驱动自身的 spinand_isbad（MTD_OPS_RAW
++		 * 直读坏块标记）即可正确判定 —— 与 u-boot 同路。
++		 * 挂 airoha BMT 反而会因 remap 逻辑误标记好块（实测 marking
++		 * bad :1/:1888 并导致 UBI unable to read from mtd2）。
++		 */
 +		return 0;
 +
 +	bmtd.remap_range = of_get_property(np, "mediatek,bmt-remap-range",
@@ -1091,7 +1128,7 @@ new file mode 100644
 index 000000000..517ff7414
 --- /dev/null
 +++ b/drivers/mtd/nand/mtk_bmt.h
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,138 @@
 +#ifndef __MTK_BMT_PRIV_H
 +#define __MTK_BMT_PRIV_H
 +
@@ -1171,6 +1208,7 @@ index 000000000..517ff7414
 +extern const struct mtk_bmt_ops mtk_bmt_v2_ops;
 +extern const struct mtk_bmt_ops mtk_bmt_bbt_ops;
 +extern const struct mtk_bmt_ops mtk_bmt_nmbm_ops;
++extern const struct mtk_bmt_ops airoha_bmt_ops;
 +
 +static inline u32 blk_pg(u16 block)
 +{
@@ -1182,7 +1220,7 @@ index 000000000..517ff7414
 +	      unsigned char *fdm, int fdm_len)
 +{
 +	struct mtd_oob_ops ops = {
-+		.mode = MTD_OPS_PLACE_OOB,
++		.mode = MTD_OPS_RAW,
 +		.ooboffs = bmtd.oob_offset,
 +		.oobbuf = fdm,
 +		.ooblen = fdm_len,
@@ -1213,7 +1251,7 @@ index 000000000..517ff7414
 +static inline int write_bmt(u16 block, unsigned char *dat)
 +{
 +	struct mtd_oob_ops ops = {
-+		.mode = MTD_OPS_PLACE_OOB,
++		.mode = MTD_OPS_RAW,
 +		.ooboffs = OOB_SIGNATURE_OFFSET + bmtd.oob_offset,
 +		.oobbuf = bmtd.ops->sig,
 +		.ooblen = bmtd.ops->sig_len,
@@ -1681,7 +1719,7 @@ index 000000000..a896e49ec
 +
 +	for (tries = 0; tries < NMBM_TRY_COUNT; tries++) {
 +		struct mtd_oob_ops ops = {
-+			.mode = MTD_OPS_PLACE_OOB,
++			.mode = MTD_OPS_RAW,
 +			.oobbuf = oob,
 +			.datbuf = data,
 +		};
@@ -1721,7 +1759,7 @@ index 000000000..a896e49ec
 +
 +	for (tries = 0; tries < NMBM_TRY_COUNT; tries++) {
 +		struct mtd_oob_ops ops = {
-+			.mode = MTD_OPS_PLACE_OOB,
++			.mode = MTD_OPS_RAW,
 +			.oobbuf = (void *)oob,
 +			.datbuf = (void *)data,
 +		};

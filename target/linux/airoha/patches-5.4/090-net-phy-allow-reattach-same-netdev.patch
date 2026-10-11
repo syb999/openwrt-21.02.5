@@ -1,0 +1,24 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: phy: allow re-attach of a PHY to the same netdev
+
+phy_attach_direct() rejects any PHY that already has attached_dev set,
+even when it is being attached to the very same net_device.  With DSA the
+slave netdev can be set up (and thus the PHY attached) more than once, so
+the second attempt fails with -EBUSY and the port never comes up.
+
+Only treat it as a conflict when a *different* netdev already owns the
+PHY, which is what the upstream driver does.
+
+Signed-off-by: airoha-port <airoha@local>
+---
+--- a/drivers/net/phy/phy_device.c	2026-10-09 19:43:35.135187403 +0800
++++ b/drivers/net/phy/phy_device.c	2026-10-09 19:43:35.135187403 +0800
+@@ -1522,7 +1522,7 @@
+ 			goto error_module_put;
+ 	}
+ 
+-	if (phydev->attached_dev) {
++	if (phydev->attached_dev && phydev->attached_dev != dev) {
+ 		dev_err(&dev->dev, "PHY already attached\n");
+ 		err = -EBUSY;
+ 		goto error;

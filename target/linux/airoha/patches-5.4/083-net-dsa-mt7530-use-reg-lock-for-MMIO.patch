@@ -1,0 +1,69 @@
+--- a/drivers/net/dsa/mt7530.c
++++ b/drivers/net/dsa/mt7530.c
+@@ -134,29 +134,26 @@
+ static void
+ core_write(struct mt7530_priv *priv, u32 reg, u32 val)
+ {
+-	struct mii_bus *bus = priv->bus;
+-
+-	mutex_lock_nested(&bus->mdio_lock, MDIO_MUTEX_NESTED);
++	mt7530_reg_lock(priv);
+ 
+ 	core_write_mmd_indirect(priv, reg, MDIO_MMD_VEND2, val);
+ 
+-	mutex_unlock(&bus->mdio_lock);
++	mt7530_reg_unlock(priv);
+ }
+ 
+ static void
+ core_rmw(struct mt7530_priv *priv, u32 reg, u32 mask, u32 set)
+ {
+-	struct mii_bus *bus = priv->bus;
+ 	u32 val;
+ 
+-	mutex_lock_nested(&bus->mdio_lock, MDIO_MUTEX_NESTED);
++	mt7530_reg_lock(priv);
+ 
+ 	val = core_read_mmd_indirect(priv, reg, MDIO_MMD_VEND2);
+ 	val &= ~mask;
+ 	val |= set;
+ 	core_write_mmd_indirect(priv, reg, MDIO_MMD_VEND2, val);
+ 
+-	mutex_unlock(&bus->mdio_lock);
++	mt7530_reg_unlock(priv);
+ }
+ 
+ static void
+@@ -278,13 +275,11 @@
+ static void
+ mt7530_write(struct mt7530_priv *priv, u32 reg, u32 val)
+ {
+-	struct mii_bus *bus = priv->bus;
+-
+-	mutex_lock_nested(&bus->mdio_lock, MDIO_MUTEX_NESTED);
++	mt7530_reg_lock(priv);
+ 
+ 	mt7530_mii_write(priv, reg, val);
+ 
+-	mutex_unlock(&bus->mdio_lock);
++	mt7530_reg_unlock(priv);
+ }
+ 
+ static u32
+@@ -296,14 +291,13 @@
+ static u32
+ _mt7530_read(struct mt7530_dummy_poll *p)
+ {
+-	struct mii_bus		*bus = p->priv->bus;
+ 	u32 val;
+ 
+-	mutex_lock_nested(&bus->mdio_lock, MDIO_MUTEX_NESTED);
++	mt7530_reg_lock(p->priv);
+ 
+ 	val = mt7530_mii_read(p->priv, p->reg);
+ 
+-	mutex_unlock(&bus->mdio_lock);
++	mt7530_reg_unlock(p->priv);
+ 
+ 	return val;
+ }

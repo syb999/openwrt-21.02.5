@@ -1,0 +1,39 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: ethernet: airoha: attach the external PHY based on dev->phydev
+
+phylink_of_phy_connect() returns 0 without attaching a PHY when the link mode
+is MLO_AN_FIXED, and a close/reopen cycle clears netdev->phydev.  The
+"connect once" flag therefore ended up set while netdev->phydev stayed NULL on
+the 2.5G port (ethtool showed only "Link detected: no", the PHY read_status was
+never polled, copper never linked).  Guard on dev->phydev instead.
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-11 11:22:18.385277301 +0800
++++ b/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-11 11:22:18.389277397 +0800
+@@ -1920,7 +1920,15 @@
+ 		 * with a "Led ... renamed ... due to name collision" message
+ 		 * confirming the second attach.
+ 		 */
+-		if (!port->phy_connected) {
++		/* Decide on dev->phydev, not on a "we connected once" flag:
++		 * phylink_of_phy_connect() returns 0 without attaching anything
++		 * when the link mode is MLO_AN_FIXED, and a close/reopen cycle
++		 * clears netdev->phydev again.  Keying off the flag left the
++		 * 2.5G port with phy_connected=1 but netdev->phydev==NULL for
++		 * good: ethtool printed only "Link detected: no", the PHY's
++		 * read_status was never polled and the copper never linked.
++		 */
++		if (!dev->phydev) {
+ 			err = phylink_of_phy_connect(port->phylink,
+ 						     dev->dev.of_node, 0);
+ 			if (err) {
+@@ -1928,7 +1936,6 @@
+ 					   __func__, err);
+ 				return err;
+ 			}
+-			port->phy_connected = true;
+ 		}
+ 
+ 	}

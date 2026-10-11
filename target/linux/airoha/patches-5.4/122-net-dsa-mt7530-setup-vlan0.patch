@@ -1,0 +1,70 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: dsa: mt7530: set up VLAN 0 for VLAN-unaware bridges
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/dsa/mt7530.c b/drivers/net/dsa/mt7530.c
+--- a/drivers/net/dsa/mt7530.c	2026-10-10 23:13:36.325124845 +0800
++++ b/drivers/net/dsa/mt7530.c	2026-10-10 23:13:36.325124845 +0800
+@@ -1628,6 +1628,21 @@
+ }
+ 
+ static int
++mt7530_setup_vlan0(struct mt7530_priv *priv)
++{
++	u32 val;
++
++	/* Validate the entry with independent learning, keep the original
++	 * ingress tag attribute.
++	 */
++	val = IVL_MAC | EG_CON | PORT_MEM(MT7530_ALL_MEMBERS) | FID(FID_BRIDGED) |
++	      VLAN_VALID;
++	mt7530_write(priv, MT7530_VAWD1, val);
++
++	return mt7530_vlan_cmd(priv, MT7530_VTCR_WR_VID, 0);
++}
++
++static int
+ mt7530_setup(struct dsa_switch *ds)
+ {
+ 	struct mt7530_priv *priv = ds->priv;
+@@ -1927,7 +1942,13 @@
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	return 0;
++	/* Setup VLAN ID 0 for VLAN-unaware bridges.  Without it the switch has
++	 * no VID 0 entry and the frames of a VLAN-unaware bridge (all of
++	 * br-lan) never reach the CPU port with the special tag: mtk_tag_rcv()
++	 * reads the ethertype as the tag and drops everything, so eth0 RX
++	 * grows while lan2/3/4 stay at RX=0.
++	 */
++	return mt7530_setup_vlan0(priv);
+ }
+ 
+ static bool
+diff -ruN a/drivers/net/dsa/mt7530.h b/drivers/net/dsa/mt7530.h
+--- a/drivers/net/dsa/mt7530.h	2026-10-10 23:13:36.325124845 +0800
++++ b/drivers/net/dsa/mt7530.h	2026-10-10 23:22:51.280746201 +0800
+@@ -147,6 +147,8 @@
+ #define  IVL_MAC			BIT(30)
+ /* Per VLAN Egress Tag Control */
+ #define  VTAG_EN			BIT(28)
++/* Keep the original ingress tag attribute (upstream calls it EG_CON) */
++#define  EG_CON				BIT(29)
+ /* VLAN Member Control */
+ #define  PORT_MEM(x)			(((x) & 0xff) << 16)
+ /* VLAN Entry Valid */
+@@ -167,6 +169,12 @@
+ 
+ /* Register for port STP state control */
+ #define MT7530_SSP_P(x)			(0x2000 + ((x) * 0x100))
++#define  FID(x)				(((x) & 0x7) << 1)
++
++enum {
++	FID_BRIDGED = 1,
++};
++
+ #define  FID_PST(x)			((x) & 0x3)
+ #define  FID_PST_MASK			FID_PST(0x3)
+ 

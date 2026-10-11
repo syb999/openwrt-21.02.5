@@ -1,0 +1,51 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: dsa: mt7530: accept PHY_INTERFACE_MODE_INTERNAL on switch ports
+
+The AN7583 internal GPHYs are described with phy-mode = "internal" and
+mt7988_phy_supported() accepts that mode, but mt753x_phylink_mac_config()
+only accepted PHY_INTERFACE_MODE_GMII for ports 0..4 and bailed out via
+"goto unsupported"; the following in-band negotiation guard rejected any
+non-SGMII interface as well.  Consequently the switch port MAC was never
+programmed and lan2/3/4 passed no traffic, logging:
+
+    mt753x_phylink_mac_config: unsupported internal port: 2
+
+Accept the internal interface in both places, matching upstream
+mt7988_mac_config(), which simply returns 0 - there is no MII pinout.
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/dsa/mt7530.c b/drivers/net/dsa/mt7530.c
+--- a/drivers/net/dsa/mt7530.c	2026-10-10 07:37:23.210529609 +0800
++++ b/drivers/net/dsa/mt7530.c	2026-10-10 07:37:23.210529609 +0800
+@@ -2253,7 +2253,14 @@
+ 	case 2:
+ 	case 3:
+ 	case 4:
+-		if (state->interface != PHY_INTERFACE_MODE_GMII)
++		/* The AN7583 internal GPHYs are described with
++		 * phy-mode = "internal" in the device tree and
++		 * mt7988_phy_supported() accepts that mode, so accept it here
++		 * too.  Otherwise the port MAC is never programmed and the
++		 * port passes no traffic ("unsupported internal port: N").
++		 */
++		if (state->interface != PHY_INTERFACE_MODE_GMII &&
++		    state->interface != PHY_INTERFACE_MODE_INTERNAL)
+ 			goto unsupported;
+ 		break;
+ 	case 5: /* 2nd cpu port with phy of port 0 or 4 / external phy */
+@@ -2284,8 +2291,13 @@
+ 		return;
+ 	}
+ 
++	/* In-band negotiation is meaningless for the internal GPHYs: there is
++	 * no MII pinout and mt7988_setup() brings them up directly.  Let those
++	 * ports through instead of bailing out here.
++	 */
+ 	if (phylink_autoneg_inband(mode) &&
+-	    state->interface != PHY_INTERFACE_MODE_SGMII) {
++	    state->interface != PHY_INTERFACE_MODE_SGMII &&
++	    state->interface != PHY_INTERFACE_MODE_INTERNAL) {
+ 		dev_err(ds->dev, "%s: in-band negotiation unsupported\n",
+ 			__func__);
+ 		return;

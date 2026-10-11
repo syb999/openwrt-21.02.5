@@ -1,0 +1,43 @@
+--- a/drivers/usb/host/xhci-mtk.c
++++ b/drivers/usb/host/xhci-mtk.c
+@@ -212,7 +212,14 @@ static int xhci_mtk_clks_get(struct xhci_hcd_mtk *mtk)
+ {
+ 	struct device *dev = mtk->dev;
+ 
+-	mtk->sys_clk = devm_clk_get(dev, "sys_ck");
++	/*
++	 * sys_ck is the only mandatory clock in this driver's original form,
++	 * yet every other clock here is optional and the Airoha an7583 device
++	 * tree does not describe a sys_ck at all.  Upstream made all of them
++	 * optional (devm_clk_bulk_get_optional with sys_ck first), so mirrors
++	 * boards that simply omit the clock.  Do the same here.
++	 */
++	mtk->sys_clk = devm_clk_get_optional(dev, "sys_ck");
+ 	if (IS_ERR(mtk->sys_clk)) {
+ 		dev_err(dev, "fail to get sys_ck\n");
+ 		return PTR_ERR(mtk->sys_clk);
+--- a/drivers/usb/mtu3/mtu3_plat.c
++++ b/drivers/usb/mtu3/mtu3_plat.c
+@@ -226,7 +226,8 @@ static int get_ssusb_rscs(struct platform_device *pdev)
+ 		return PTR_ERR(ssusb->vusb33);
+ 	}
+ 
+-	ssusb->sys_clk = devm_clk_get(dev, "sys_ck");
++	/* See xhci-mtk.c: an7583 provides no sys_ck; upstream treats it as optional. */
++	ssusb->sys_clk = devm_clk_get_optional(dev, "sys_ck");
+ 	if (IS_ERR(ssusb->sys_clk)) {
+ 		dev_err(dev, "failed to get sys clock\n");
+ 		return PTR_ERR(ssusb->sys_clk);
+--- a/drivers/usb/host/xhci-mtk.c
++++ b/drivers/usb/host/xhci-mtk.c
+@@ -461,6 +461,8 @@ static int xhci_mtk_probe(struct platform_device *pdev)
+ 
+ 	mtk->dev = dev;
+-	mtk->vbus = devm_regulator_get(dev, "vbus");
++	/* vbus/vusb33 由板级 regulator 提供，注册时机可能晚于本 probe；
++	 * 缺失时按可选用 dummy（避免 devm_regulator_get 直接报错/反复重试）。 */
++	mtk->vbus = devm_regulator_get_optional(dev, "vbus");
+ 	if (IS_ERR(mtk->vbus)) {
+ 		dev_err(dev, "fail to get vbus\n");
+ 		return PTR_ERR(mtk->vbus);
+

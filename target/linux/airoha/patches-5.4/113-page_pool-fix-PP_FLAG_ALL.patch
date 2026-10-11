@@ -1,0 +1,12 @@
+--- a/include/net/page_pool.h
++++ b/include/net/page_pool.h
+@@ -37,7 +37,7 @@
+ #define PP_FLAG_DMA_MAP 1 /* Should page_pool do the DMA map/unmap */
+ /* Airoha backport: flags used by newer drivers (inert on 5.4) */
+ #define PP_FLAG_DMA_SYNC_DEV	2 /* driver syncs DMA itself */
+ #define PP_FLAG_PAGE_FRAG	4 /* page is split into fragments */
+-#define PP_FLAG_ALL	PP_FLAG_DMA_MAP
++#define PP_FLAG_ALL	(PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV)
+ 
+ /*
+  * Fast allocation side cache array/stack

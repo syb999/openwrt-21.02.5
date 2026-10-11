@@ -36,7 +36,7 @@ new file mode 100644
 index 000000000..e77f00415
 --- /dev/null
 +++ b/drivers/spi/spi-airoha-snfi.c
-@@ -0,0 +1,1105 @@
+@@ -0,0 +1,1161 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Copyright (c) 2024 AIROHA Inc
@@ -706,8 +706,39 @@ index 000000000..e77f00415
 +	if (err)
 +		goto error_dma_unmap;
 +
-+	/* set cust sec size */
-+	val = as_ctrl->nfi_cfg.sec_size * as_ctrl->nfi_cfg.sec_num;
++	/*
++	 * 控制器从缓存 offset 0 起 DMA read_data_byte_number 个字节，
++	 * 因此必须覆盖 offs+len。原实现写死 sec_size*sec_num（仅 ECC 保护的
++	 * 主数据区 = 2048），OOB/spare 区从未被搬入缓存，导致任何
++	 * 只读 OOB 的请求（offs>=pagesize）返回全 0（实测坏块标记变 0x00，
++	 * BMT 把所有块误判为坏）。u-boot 同样按实际长度设置该寄存器。
++	 */
++	/*
++	 * 控制器实际搬运字节数 = sector_number × custom_sector_size
++	 *                      = read/write_data_byte_number
++	 * u-boot 的做法：sector_number = 1，custom_sector_size = 本次实际长度。
++	 * 本驱动只在初始化时把 custom_sector_size 设成 sec_size（仅 ECC 保护的
++	 * 主数据区 2048），OOB/spare 区于是永远不被搬运 —— 只读 OOB 的请求
++	 * 拿到缓存里的陈旧内容（实测坏块标记读成 0x00 ⇒ 所有块被判坏 ⇒ UBI
++	 * 无法 attach）。这里按 u-boot 的方式逐次重设。
++	 */
++	val = round_up(offs + len, 64);
++	if (val > SPI_NAND_CACHE_SIZE)
++		val = SPI_NAND_CACHE_SIZE;
++
++	err = regmap_update_bits(as_ctrl->regmap_nfi, REG_SPI_NFI_SECCUS_SIZE,
++				 SPI_NFI_CUS_SEC_SIZE | SPI_NFI_CUS_SEC_SIZE_EN,
++				 FIELD_PREP(SPI_NFI_CUS_SEC_SIZE, val) |
++				 SPI_NFI_CUS_SEC_SIZE_EN);
++	if (err)
++		goto error_dma_unmap;
++
++	err = regmap_update_bits(as_ctrl->regmap_nfi, REG_SPI_NFI_CON,
++				 SPI_NFI_SEC_NUM,
++				 FIELD_PREP(SPI_NFI_SEC_NUM, 1));
++	if (err)
++		goto error_dma_unmap;
++
 +	val = FIELD_PREP(SPI_NFI_READ_DATA_BYTE_NUM, val);
 +	err = regmap_update_bits(as_ctrl->regmap_nfi,
 +				 REG_SPI_NFI_SNF_MISC_CTL2,
@@ -843,8 +874,33 @@ index 000000000..e77f00415
 +	if (err)
 +		goto error_dma_unmap;
 +
-+	val = FIELD_PREP(SPI_NFI_PROG_LOAD_BYTE_NUM,
-+			 as_ctrl->nfi_cfg.sec_size * as_ctrl->nfi_cfg.sec_num);
++	/*
++	 * 控制器实际搬运字节数 = sector_number × custom_sector_size
++	 *                      = read/write_data_byte_number
++	 * u-boot 的做法：sector_number = 1，custom_sector_size = 本次实际长度。
++	 * 本驱动只在初始化时把 custom_sector_size 设成 sec_size（仅 ECC 保护的
++	 * 主数据区 2048），OOB/spare 区于是永远不被搬运 —— 只读 OOB 的请求
++	 * 拿到缓存里的陈旧内容（实测坏块标记读成 0x00 ⇒ 所有块被判坏 ⇒ UBI
++	 * 无法 attach）。这里按 u-boot 的方式逐次重设。
++	 */
++	val = round_up(offs + len, 64);
++	if (val > SPI_NAND_CACHE_SIZE)
++		val = SPI_NAND_CACHE_SIZE;
++
++	err = regmap_update_bits(as_ctrl->regmap_nfi, REG_SPI_NFI_SECCUS_SIZE,
++				 SPI_NFI_CUS_SEC_SIZE | SPI_NFI_CUS_SEC_SIZE_EN,
++				 FIELD_PREP(SPI_NFI_CUS_SEC_SIZE, val) |
++				 SPI_NFI_CUS_SEC_SIZE_EN);
++	if (err)
++		goto error_dma_unmap;
++
++	err = regmap_update_bits(as_ctrl->regmap_nfi, REG_SPI_NFI_CON,
++				 SPI_NFI_SEC_NUM,
++				 FIELD_PREP(SPI_NFI_SEC_NUM, 1));
++	if (err)
++		goto error_dma_unmap;
++
++	val = FIELD_PREP(SPI_NFI_PROG_LOAD_BYTE_NUM, val);
 +	err = regmap_update_bits(as_ctrl->regmap_nfi,
 +				 REG_SPI_NFI_SNF_MISC_CTL2,
 +				 SPI_NFI_PROG_LOAD_BYTE_NUM, val);

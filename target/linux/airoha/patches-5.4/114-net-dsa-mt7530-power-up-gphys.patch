@@ -1,0 +1,58 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: dsa: mt7530: power up the AN7583 internal GPHYs
+
+Patch 099 replaced the old mt7988_gphy_enable() (vendor POWER_ON_OFF clear
++ PLL bring-up) with the CONN_CFG write alone.  Vendor mt7531_sw_post_init()
+warns explicitly that "Internal PHYs are disabled by default. SW should
+enable them.", and without that step the GPHY registers still read back
+correctly (BMCR=0x1840, BMSR=0x7949) but the analog front end stays off:
+BMSR bit2 (LINK_STATUS) is 0, carrier stays 0 and the copper pair never
+links even with a cable attached.
+
+Clear POWER_ON_OFF / set PHY_EN_BYPASS_MODE in PHY_DEV1F 0x403 and bring up
+the PHY PLL via 0x10d for each internal GPHY, in addition to CONN_CFG.
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/dsa/mt7530.c b/drivers/net/dsa/mt7530.c
+--- a/drivers/net/dsa/mt7530.c	2026-10-10 20:03:49.939924750 +0800
++++ b/drivers/net/dsa/mt7530.c	2026-10-10 20:12:13.386229431 +0800
+@@ -2738,6 +2738,38 @@
+ 	after = mt7530_read(priv, AN7583_GEPHY_CONN_CFG);
+ 	dev_dbg(priv->dev, "[GPHY] CONN_CFG(0x7c14) before=0x%08x after=0x%08x\n",
+ 		 before, after);
++
++	/* Vendor mt7531_sw_post_init(): "Internal PHYs are disabled by
++	 * default. SW should enable them."  Clear POWER_ON_OFF (BIT5) and set
++	 * PHY_EN_BYPASS_MODE (BIT4) in PHY_DEV1F 0x403 for every internal
++	 * GPHY, then power up the PHY PLL (0x10d: 0x10 then 0x14).  Without
++	 * this the GPHY registers still read back fine, but the analog front
++	 * end stays off and the copper pair never links
++	 * ("Link detected: no", carrier 0, BMSR bit2 = 0).
++	 */
++	{
++		u32 r403, r10d, a407 = 0;
++		int i;
++
++		/* Cover both the low "control" addresses (0..4) and the real
++		 * internal GPHY addresses (9..12) declared in the DT.
++		 */
++		for (i = 0; i < 13; i++) {
++			r403 = mt7531_ind_mmd_read(priv, i, 0x1f, 0x403);
++			mt7531_ind_mmd_write(priv, i, 0x1f, 0x403,
++					     (r403 | BIT(4)) & ~BIT(5));
++
++			r10d = mt7531_ind_mmd_read(priv, i, 0x1f, 0x10d);
++			mt7531_ind_mmd_write(priv, i, 0x1f, 0x10d, 0x10);
++			mt7531_ind_mmd_write(priv, i, 0x1f, 0x10d, 0x14);
++
++			a407 |= mt7531_ind_mmd_read(priv, i, 0x1f, 0x403);
++		}
++
++		dev_info(priv->dev,
++			 "[GPHY] power-on: 403 before=0x%04x after=0x%04x 10d=0x%04x\n",
++			 r403, a407, r10d);
++	};
+ }
+ 
+ static int mt7988_pad_setup(struct dsa_switch *ds, phy_interface_t interface)

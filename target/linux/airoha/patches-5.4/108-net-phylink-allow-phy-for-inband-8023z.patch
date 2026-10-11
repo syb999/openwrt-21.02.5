@@ -1,0 +1,54 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: phylink: allow attaching a PHY for in-band 802.3z modes
+
+5.4's phylink refuses to attach a PHY whenever the link is in-band and the
+interface is 802.3z (1000BASE-X / 2500BASE-X).  That is wrong for boards
+where the PHY sits behind the SerDes and only the *copper* side is driven
+by the PHY: on the Nokia XG-040G-MF gdm3 is 2500base-x with an EN8811H on
+phy-handle, and because phylink_of_phy_connect() returned 0 early the PHY
+was never attached (pl->phydev == NULL, mac_link_up() receives phy=NULL),
+so the EN8811H was never brought up and the port received no frames at
+all while reporting carrier.
+
+Newer kernels no longer carry this clause.  Drop it from both
+phylink_attach_phy() and phylink_of_phy_connect().
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/phy/phylink.c b/drivers/net/phy/phylink.c
+--- a/drivers/net/phy/phylink.c	2026-10-10 18:34:59.105159871 +0800
++++ b/drivers/net/phy/phylink.c	2026-10-10 18:34:59.105159871 +0800
+@@ -974,9 +974,14 @@
+ static int phylink_attach_phy(struct phylink *pl, struct phy_device *phy,
+ 			      phy_interface_t interface)
+ {
+-	if (WARN_ON(pl->cfg_link_an_mode == MLO_AN_FIXED ||
+-		    (pl->cfg_link_an_mode == MLO_AN_INBAND &&
+-		     phy_interface_mode_is_8023z(interface))))
++	/* Only a fixed link genuinely has no PHY.  Refusing to attach a PHY
++	 * for an in-band 802.3z mode (1000BASE-X / 2500BASE-X) is wrong for
++	 * hardware such as the Nokia XG-040G-MF, where gdm3 is 2500base-x and
++	 * the EN8811H sits behind the SerDes: the PCS negotiates the SerDes
++	 * link while the PHY drives the copper side.  Newer kernels dropped
++	 * this clause.
++	 */
++	if (WARN_ON(pl->cfg_link_an_mode == MLO_AN_FIXED))
+ 		return -EINVAL;
+ 
+ 	if (pl->phydev)
+@@ -1041,10 +1046,11 @@
+ 	struct phy_device *phy_dev;
+ 	int ret;
+ 
+-	/* Fixed links and 802.3z are handled without needing a PHY */
+-	if (pl->cfg_link_an_mode == MLO_AN_FIXED ||
+-	    (pl->cfg_link_an_mode == MLO_AN_INBAND &&
+-	     phy_interface_mode_is_8023z(pl->link_interface)))
++	/* Fixed links are handled without needing a PHY.  In-band 802.3z
++	 * modes may still have a PHY behind the SerDes (see
++	 * phylink_attach_phy()), so do not bail out for them here.
++	 */
++	if (pl->cfg_link_an_mode == MLO_AN_FIXED)
+ 		return 0;
+ 
+ 	phy_node = of_parse_phandle(dn, "phy-handle", 0);

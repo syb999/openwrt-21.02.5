@@ -1,0 +1,68 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: ethernet: airoha: attach the PHY only once
+
+phylink_of_phy_connect() was called from airoha_dev_open(), so the PHY was
+re-attached on every "ip link set up" - netifd opens the port once during
+boot and again when the interface is added to the bridge.  Each attach
+runs phy_attach_direct() -> phy_init_hw() -> config_init(), re-initialising
+the EN8811H; the copper link that was up (pcs_get_state link=1 at 12.8 s)
+dropped right after the second attach (link=0 at 25.6 s), together with a
+"Led ... renamed ... due to name collision" message that confirms the
+double registration.
+
+Track it with a per-port flag and connect only once.
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-10 19:03:16.199963822 +0800
++++ b/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-10 19:03:16.199963822 +0800
+@@ -1912,11 +1912,27 @@
+ 		dev->dev.of_node);
+ 
+ 	if (airhoa_is_phy_external(port)) {
+-		err = phylink_of_phy_connect(port->phylink, dev->dev.of_node, 0);
+-		if (err) {
+-			netdev_err(dev, "%s: could not attach PHY: %d\n", __func__,
+-				   err);
+-			return err;
++		/* Attach the PHY only once.  phylink_of_phy_connect() ->
++		 * phy_attach_direct() -> phy_init_hw() -> config_init()
++		 * re-initialises the EN8811H; doing that on every dev_open()
++		 * (netifd opens the port once at boot and again when the
++		 * interface is added to the bridge) drops the copper link:
++		 *
++		 *   [12.8] lan1: PHY [..] driver [Airoha EN8811H] ; link=1
++		 *   [25.6] lan1: PHY [..] driver [Airoha EN8811H] ; link=0
++		 *
++		 * with a "Led ... renamed ... due to name collision" message
++		 * confirming the second attach.
++		 */
++		if (!port->phy_connected) {
++			err = phylink_of_phy_connect(port->phylink,
++						     dev->dev.of_node, 0);
++			if (err) {
++				netdev_err(dev, "%s: could not attach PHY: %d\n",
++					   __func__, err);
++				return err;
++			}
++			port->phy_connected = true;
+ 		}
+ 
+ 		phylink_start(port->phylink);
+diff -ruN a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+--- a/drivers/net/ethernet/airoha/airoha_eth.h	2026-10-10 19:03:16.199963822 +0800
++++ b/drivers/net/ethernet/airoha/airoha_eth.h	2026-10-10 19:03:16.199963822 +0800
+@@ -621,6 +621,12 @@
+ 	u64 fwd_tx_packets;
+ 
+ 	struct metadata_dst *dsa_meta[AIROHA_MAX_DSA_PORTS];
++
++	/* phylink_of_phy_connect() must run exactly once per port: doing it
++	 * in airoha_dev_open() re-initialises the PHY on every "ip link set
++	 * up" and drops the copper link of the EN8811H (link goes 1 -> 0).
++	 */
++	bool phy_connected;
+ };
+ 
+ #define AIROHA_RXD4_PPE_CPU_REASON	GENMASK(20, 16)

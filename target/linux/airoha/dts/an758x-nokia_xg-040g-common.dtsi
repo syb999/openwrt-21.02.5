@@ -13,7 +13,19 @@
 	};
 
 	chosen {
-		bootargs = "console=ttyS0,115200 earlycon";
+		/*
+		 * root= 必须给出：fitblk/ubi block 会把 fit 卷映射成 /dev/fit0。
+		 * 与上游同系列板（an7581-q1000k.dts / an7581-w1700k-ubi.dts）逐字一致。
+		 * 缺这条会停在 VFS: Cannot open root device "(null)"。
+		 */
+		bootargs = "console=ttyS0,115200 earlycon ubi.block=0,fit root=/dev/fit0 rootwait";
+		/*
+		 * fitblk 驱动在 init 里检查 /chosen 是否有 u-boot,version；
+		 * 没有就直接 return 0、不注册 /dev/fit0（实测卡在
+		 * "Waiting for root device /dev/fit0..."）。u-boot 正常会用
+		 * fdt_setprop 写入该属性，这里给出同值兜底。
+		 */
+		u-boot,version = "2026.07";
 		stdout-path = "serial0:115200n8";
 	};
 
@@ -36,7 +48,10 @@
 };
 
 &npu {
-	status = "okay";
+	/* 测试：PPE（硬件转发引擎）可能把用户口的帧直接投给 CPU 网口、
+	 * 绕过交换机的特殊标签，导致 eth0 收到无标签帧而 DSA 全丢。
+	 * 先关掉它，验证标签路径。 */
+	status = "disabled";
 };
 
 &pon_pcs {

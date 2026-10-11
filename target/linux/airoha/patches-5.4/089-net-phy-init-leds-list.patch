@@ -1,0 +1,25 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: phy: fix NULL deref in phy_leds_unregister on attach failure
+
+struct phy_device has a "leds" list under CONFIG_LED_TRIGGER_PHY, but
+phy_device_create() never initialises it.  When phy_attach_direct()
+later fails (e.g. phy_init_hw() returns an error) the error path calls
+phy_detach() -> phy_leds_unregister(), which walks that list and
+dereferences a NULL pointer, panicking the kernel.
+
+Initialise the list when the device is created.
+
+Signed-off-by: airoha-port <airoha@local>
+---
+--- a/drivers/net/phy/phy_device.c	2026-10-09 19:16:15.849948998 +0800
++++ b/drivers/net/phy/phy_device.c	2026-10-09 19:16:15.853949471 +0800
+@@ -630,6 +630,9 @@
+ 
+ 	dev->state = PHY_DOWN;
+ 
++#ifdef CONFIG_LED_TRIGGER_PHY
++	INIT_LIST_HEAD(&dev->leds);
++#endif
+ 	mutex_init(&dev->lock);
+ 	INIT_DELAYED_WORK(&dev->state_queue, phy_state_machine);
+ 

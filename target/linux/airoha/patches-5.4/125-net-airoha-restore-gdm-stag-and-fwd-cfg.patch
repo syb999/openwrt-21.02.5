@@ -1,0 +1,43 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: ethernet: airoha: restore ponwrt GDM STAG clause and forward cfg
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN b/drivers/net/ethernet/airoha/airoha_eth.c c/drivers/net/ethernet/airoha/airoha_eth.c
+--- b/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-11 07:40:03.434986063 +0800
++++ c/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-11 07:40:03.434986063 +0800
+@@ -1942,18 +1942,28 @@
+ 	if (port->phylink)
+ 		phylink_start(port->phylink);
+ 
++	/* GDM forward-port configuration (ponwrt 127). */
++	{
++		u32 pse_port = FE_PSE_PORT_PPE1;
++
++		if (port->id == AIROHA_GDM2_IDX &&
++		    airoha_ppe_is_enabled(qdma->eth, 1))
++			pse_port = FE_PSE_PORT_PPE2;
++
++		airoha_set_gdm_port_fwd_cfg(qdma->eth,
++					    REG_GDM_FWD_CFG(port->id),
++					    pse_port);
++	}
++
+ 	netif_tx_start_all_queues(dev);
+ 	err = airoha_set_vip_for_gdm_port(port, true);
+ 	if (err)
+ 		return err;
+ 
+-	/* Only the DSA conduit needs the special tag.  lan1 is gdm3, which
+-	 * is wired straight to the EN8811H and does not pass through the
+-	 * switch, so enabling STAG there makes the driver expect switch
+-	 * tagging and every frame is dropped (RX/TX stay at zero).
+-	 * Upstream (6.18) keys this purely off netdev_uses_dsa().
++	/* It seems GDM3 and GDM4 need SPORT enabled to correctly work
++	 * (ponwrt 310-06) - this clause is deliberate.
+ 	 */
+-	if (netdev_uses_dsa(dev))
++	if (netdev_uses_dsa(dev) || port->id > 2)
+ 		airoha_fe_set(qdma->eth, REG_GDM_INGRESS_CFG(port->id),
+ 			      GDM_STAG_EN_MASK);
+ 	else

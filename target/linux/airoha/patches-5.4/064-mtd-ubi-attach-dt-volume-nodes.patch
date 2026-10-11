@@ -1,0 +1,480 @@
+--- a/drivers/mtd/mtdcore.c
++++ b/drivers/mtd/mtdcore.c
+@@ -642,9 +642,16 @@
+ 	if (!found)
+ 		goto exit_partitions;
+ 
+-	/* Set of_node only for nvmem */
+-	if (of_device_is_compatible(mtd_dn, "nvmem-cells"))
+-		mtd_set_of_node(mtd, mtd_dn);
++	/*
++	 * Port of upstream ("Set of_node" is unconditional there): attach the
++	 * DT node of every matched partition, not only nvmem ones.  The UBI
++	 * volume devices derive their fwnode from here and drivers such as
++	 * drivers/block/fitblk.c match the root disk through that phandle.
++	 * Without it fitblk_probe() defers forever and /dev/fit0 never appears
++	 * (observed: "Waiting for root device /dev/fit0...").
++	 */
++	mtd_set_of_node(mtd, mtd_dn);
++	pr_debug("[DBG] mtd_check_of_node: mtd\"%s\" <- %pOF\n", mtd->name, mtd_dn);
+ 
+ exit_partitions:
+ 	of_node_put(partitions);
+--- a/drivers/mtd/ubi/vmt.c
++++ b/drivers/mtd/ubi/vmt.c
+@@ -14,6 +14,7 @@
+ #include <linux/math64.h>
+ #include <linux/slab.h>
+ #include <linux/export.h>
++#include <linux/property.h>
+ #include "ubi.h"
+ 
+ static int self_check_volumes(struct ubi_device *ubi);
+@@ -135,6 +136,41 @@
+  * error code in case of failure. Note, the caller has to have the
+  * @ubi->device_mutex locked.
+  */
++static struct fwnode_handle *find_volume_fwnode(struct ubi_volume *vol)
++{
++	struct fwnode_handle *fw_vols, *fw_vol;
++	const char *volname;
++	u32 volid;
++
++	pr_debug("[DBG] find_volume_fwnode: vol=\"%s\" parent=%pOF parent_of_node=%pOF\n",
++		vol->name, dev_of_node(vol->dev.parent),
++		vol->dev.parent->parent ? dev_of_node(vol->dev.parent->parent) : NULL);
++	fw_vols = device_get_named_child_node(vol->dev.parent->parent, "volumes");
++	if (!fw_vols) {
++		pr_debug("[DBG] find_volume_fwnode: NO \"volumes\" child -> NULL\n");
++		return NULL;
++	}
++	pr_debug("[DBG] find_volume_fwnode: got volumes node %pOF, matching volname=%s\n",
++		to_of_node(fw_vols), vol->name);
++
++	fwnode_for_each_child_node(fw_vols, fw_vol) {
++		if (!fwnode_property_read_string(fw_vol, "volname", &volname) &&
++		    strncmp(volname, vol->name, vol->name_len))
++			continue;
++
++		if (!fwnode_property_read_u32(fw_vol, "volid", &volid) &&
++		    vol->vol_id != volid)
++			continue;
++
++		pr_debug("[DBG] find_volume_fwnode: MATCHED %pOF for vol \"%s\"\n",
++			to_of_node(fw_vol), vol->name);
++		return fw_vol;
++	}
++
++	pr_debug("[DBG] find_volume_fwnode: no match for vol \"%s\"\n", vol->name);
++	return NULL;
++}
++
+ int ubi_create_volume(struct ubi_device *ubi, struct ubi_mkvol_req *req)
+ {
+ 	int i, err, vol_id = req->vol_id;
+@@ -223,6 +259,7 @@
+ 	vol->name_len  = req->name_len;
+ 	memcpy(vol->name, req->name, vol->name_len);
+ 	vol->ubi = ubi;
++	device_set_node(&vol->dev, find_volume_fwnode(vol));
+ 
+ 	/*
+ 	 * Finish all pending erases because there may be some LEBs belonging
+@@ -589,6 +626,13 @@
+ 	vol->dev.class = &ubi_class;
+ 	vol->dev.groups = volume_dev_groups;
+ 	dev_set_name(&vol->dev, "%s_%d", ubi->ubi_name, vol->vol_id);
++	/*
++	 * Same as upstream linux-6.1: attach the DT node of the matching volume
++	 * on the *attach* path too.  Volumes present on flash (our boot case)
++	 * are registered here, not via ubi_create_volume(), so without this the
++	 * volume devices get no of_node and fitblk_probe() defers forever.
++	 */
++	device_set_node(&vol->dev, find_volume_fwnode(vol));
+ 	err = device_register(&vol->dev);
+ 	if (err)
+ 		goto out_cdev;
+--- a/drivers/mtd/ubi/build.c
++++ b/drivers/mtd/ubi/build.c
+@@ -878,6 +878,14 @@
+ 	ubi->dev.release = dev_release;
+ 	ubi->dev.class = &ubi_class;
+ 	ubi->dev.groups = ubi_dev_groups;
++	/*
++	 * Port of upstream linux-6.1: parent the UBI device to the MTD device.
++	 * ubi_create_volume() walks vol->dev.parent->parent to find the DT
++	 * "volumes" node and attach it to each volume device; without this
++	 * parent that lookup yields NULL, volume devices get no of_node,
++	 * fitblk_probe() defers forever and /dev/fit0 never appears.
++	 */
++	ubi->dev.parent = &mtd->dev;
+ 
+ 	ubi->mtd = mtd;
+ 	ubi->ubi_num = ubi_num;
+@@ -1228,6 +1236,50 @@
+ 	put_mtd_device(mtd);
+ }
+ 
++/*
++ * Port of upstream linux-6.18 ("UBI: attach UBI volumes from DT" flow):
++ * auto-attach an MTD marked compatible = "linux,ubi" as soon as it is added.
++ * This makes the "fit" ubiblock appear early enough for the uImage.FIT block
++ * driver (drivers/block/fitblk.c) to find it on its first probe.  With only
++ * the legacy ubi_auto_attach() (late_initcall, matching by name) the ubiblock
++ * shows up too late: fitblk_probe() returns -EPROBE_DEFER and the deferred
++ * probe is never retried for a newly created block device, so /dev/fit0 never
++ * appears and the kernel hangs on "Waiting for root device /dev/fit0...".
++ */
++static void ubi_notify_add(struct mtd_info *mtd)
++{
++	struct device_node *np = mtd_get_of_node(mtd);
++	int err;
++
++	if (!of_device_is_compatible(np, "linux,ubi"))
++		return;
++
++	/*
++	 * we are already holding &mtd_table_mutex, but still need
++	 * to bump refcount
++	 */
++	err = __get_mtd_device(mtd);
++	if (err)
++		return;
++
++	/* called while holding mtd_table_mutex */
++	mutex_lock_nested(&ubi_devices_mutex, SINGLE_DEPTH_NESTING);
++	err = ubi_attach_mtd_dev(mtd, UBI_DEV_NUM_AUTO, 0, 0);
++	mutex_unlock(&ubi_devices_mutex);
++	if (err < 0)
++		__put_mtd_device(mtd);
++}
++
++static void ubi_notify_remove(struct mtd_info *mtd)
++{
++	/* do nothing for now */
++}
++
++static struct mtd_notifier ubi_mtd_notifier = {
++	.add = ubi_notify_add,
++	.remove = ubi_notify_remove,
++};
++
+ static int __init ubi_init(void)
+ {
+ 	int err, i, k;
+@@ -1266,6 +1318,17 @@
+ 		goto out_slab;
+ 
+ 
++	/*
++	 * Register the MTD notifier *before* anything else: the callback fires
++	 * for every MTD device already present and for each one added later,
++	 * attaching those marked compatible = "linux,ubi" immediately (see
++	 * ubi_notify_add()).  Upstream linux-6.18 does the same and relies on
++	 * this to get the "fit" ubiblock up early enough for the uImage.FIT
++	 * block driver to find it.
++	 */
++	if (!ubi_is_module())
++		register_mtd_user(&ubi_mtd_notifier);
++
+ 	/* Attach MTD devices */
+ 	for (i = 0; i < mtd_devs; i++) {
+ 		struct mtd_dev_param *p = &mtd_dev_param[i];
+@@ -1317,6 +1380,14 @@
+ 	    !ubi_is_module() && !mtd_devs)
+ 		ubi_auto_attach();
+ 
++	/*
++	 * Upstream linux-6.18: register the volume notifier here, in the early
++	 * ubi_init.  It must be in place *before* the devices are attached
++	 * (which happens from the MTD notifier registered above), so that every
++	 * UBI_VOLUME_ADDED event - including this board's "fit" volume -
++	 * creates its ubiblock immediately.  The block device is then present
++	 * well before the uImage.FIT driver probes.
++	 */
+ 	err = ubiblock_init();
+ 	if (err) {
+ 		pr_err("UBI error: block: cannot initialize, error %d\n", err);
+@@ -1345,7 +1416,14 @@
+ 	pr_err("UBI error: cannot initialize UBI, error %d\n", err);
+ 	return err;
+ }
+-late_initcall(ubi_init);
++/*
++ * Upstream linux-6.18 registers the UBI infrastructure (and the MTD notifier)
++ * from a device_initcall and only the command-line driven attach from a
++ * late_initcall.  With everything in late_initcall the notifier replay for an
++ * already present "linux,ubi" partition happened ~2.6s too late and the
++ * uImage.FIT block driver (fitblk) had given up on /dev/fit0 by then.
++ */
++device_initcall(ubi_init);
+ 
+ static void __exit ubi_exit(void)
+ {
+--- a/drivers/mtd/ubi/block.c
++++ b/drivers/mtd/ubi/block.c
+@@ -68,10 +68,10 @@
+ };
+ 
+ /* Numbers of elements set in the @ubiblock_param array */
+-static int ubiblock_devs __initdata;
++static int ubiblock_devs;
+ 
+ /* MTD devices specification parameters */
+-static struct ubiblock_param ubiblock_param[UBIBLOCK_MAX_DEVICES] __initdata;
++static struct ubiblock_param ubiblock_param[UBIBLOCK_MAX_DEVICES];
+ 
+ struct ubiblock {
+ 	struct ubi_volume_desc *desc;
+@@ -454,8 +454,17 @@
+ 
+ 	list_add_tail(&dev->list, &ubiblock_devices);
+ 
+-	/* Must be the last step: anyone can call file ops from now on */
+-	add_disk(dev->gd);
++	/*
++	 * Port of upstream linux-6.1/6.18: pass the volume device as the parent
++	 * of the disk.  drivers/block/fitblk.c matches the root disk through
++	 * dev->parent->of_node, so without this parent the uImage.FIT driver can
++	 * never find the ubiblock and /dev/fit0 is never created (observed:
++	 * "[DBG] fitblk_probe: no block dev for rootdisk ... -> DEFER" even
++	 * though the ubiblock already existed).
++	 *
++	 * Must be the last step: anyone can call file ops from now on.
++	 */
++	device_add_disk(vi->dev, dev->gd, NULL);
+ 	dev_info(disk_to_dev(dev->gd), "created from ubi%d:%d(%s)",
+ 		 dev->ubi_num, dev->vol_id, vi->name);
+ 	mutex_unlock(&devices_mutex);
+@@ -576,6 +585,8 @@
+ 	return 0;
+ }
+ 
++static void ubiblock_create_from_param(struct ubi_volume_info *vi);
++
+ static int ubiblock_notify(struct notifier_block *nb,
+ 			 unsigned long notification_type, void *ns_ptr)
+ {
+@@ -584,9 +595,12 @@
+ 	switch (notification_type) {
+ 	case UBI_VOLUME_ADDED:
+ 		/*
+-		 * We want to enforce explicit block device creation for
+-		 * volumes, so when a volume is added we do nothing.
++		 * Upstream linux-6.18 creates the block device here, as soon as the
++		 * matching volume is attached.  The old "do nothing" behaviour made
++		 * /dev/ubiblock0_5 and hence /dev/fit0 appear only when the one-shot
++		 * init-time call happened to run after UBI was attached.
+ 		 */
++		ubiblock_create_from_param(&nt->vi);
+ 		break;
+ 	case UBI_VOLUME_REMOVED:
+ 		ubiblock_remove(&nt->vi);
+@@ -612,56 +626,86 @@
+ 	.notifier_call = ubiblock_notify,
+ };
+ 
+-static struct ubi_volume_desc * __init
+-open_volume_desc(const char *name, int ubi_num, int vol_id)
++/*
++ * Port of upstream linux-6.18: decide whether the freshly added volume @vi is
++ * the one named on the command line.  Only the "ubi.block=<ubi_num>,<name>"
++ * and "ubi.block=<ubi_num>,<vol_id>" forms are handled here (that is what
++ * OpenWrt passes for the "fit" volume); the path form would need
++ * ubi_get_num_by_path(), which 5.4 does not provide.
++ */
++static bool
++match_volume_desc(struct ubi_volume_info *vi, const char *name,
++		  int ubi_num, int vol_id)
+ {
++	int len;
++
+ 	if (ubi_num == -1)
+-		/* No ubi num, name must be a vol device path */
+-		return ubi_open_volume_path(name, UBI_READONLY);
+-	else if (vol_id == -1)
+-		/* No vol_id, must be vol_name */
+-		return ubi_open_volume_nm(ubi_num, name, UBI_READONLY);
+-	else
+-		return ubi_open_volume(ubi_num, vol_id, UBI_READONLY);
++		/* path form not supported on 5.4 */
++		return false;
++
++	if (vol_id == -1) {
++		/* Got ubi_num, but no vol_id, name must be volume name */
++		if (vi->ubi_num != ubi_num)
++			return false;
++
++		len = strnlen(name, UBI_VOL_NAME_MAX + 1);
++		if (len < 1 || vi->name_len != len)
++			return false;
++
++		if (strcmp(name, vi->name))
++			return false;
++
++		return true;
++	}
++
++	if (vi->ubi_num != ubi_num)
++		return false;
++
++	if (vi->vol_id != vol_id)
++		return false;
++
++	return true;
+ }
+ 
+-static void __init ubiblock_create_from_param(void)
++/*
++ * Port of upstream linux-6.18: create the ubiblock for @vi if it matches one
++ * of the "ubi.block=" parameters.  Called from the UBI_VOLUME_ADDED
++ * notification, so the block device shows up the moment the volume is
++ * attached instead of depending on a one-shot call at init time.
++ */
++static void
++ubiblock_create_from_param(struct ubi_volume_info *vi)
+ {
+ 	int i, ret = 0;
+ 	struct ubiblock_param *p;
+-	struct ubi_volume_desc *desc;
+-	struct ubi_volume_info vi;
+ 
+-	/*
+-	 * If there is an error creating one of the ubiblocks, continue on to
+-	 * create the following ubiblocks. This helps in a circumstance where
+-	 * the kernel command-line specifies multiple block devices and some
+-	 * may be broken, but we still want the working ones to come up.
+-	 */
+ 	for (i = 0; i < ubiblock_devs; i++) {
+ 		p = &ubiblock_param[i];
+ 
+-		desc = open_volume_desc(p->name, p->ubi_num, p->vol_id);
+-		if (IS_ERR(desc)) {
+-			pr_err(
+-			       "UBI: block: can't open volume on ubi%d_%d, err=%ld\n",
+-			       p->ubi_num, p->vol_id, PTR_ERR(desc));
++		if (!match_volume_desc(vi, p->name, p->ubi_num, p->vol_id))
+ 			continue;
+-		}
+-
+-		ubi_get_volume_info(desc, &vi);
+-		ubi_close_volume(desc);
+ 
+-		ret = ubiblock_create(&vi);
+-		if (ret) {
+-			pr_err(
+-			       "UBI: block: can't add '%s' volume on ubi%d_%d, err=%d\n",
+-			       vi.name, p->ubi_num, p->vol_id, ret);
+-			continue;
+-		}
++		ret = ubiblock_create(vi);
++		if (ret)
++			pr_err("UBI: block: can't add '%s' volume on ubi%d_%d, err=%d\n",
++			       vi->name, p->ubi_num, p->vol_id, ret);
++		break;
+ 	}
+ }
+ 
++static struct ubi_volume_desc * __init
++open_volume_desc(const char *name, int ubi_num, int vol_id)
++{
++	if (ubi_num == -1)
++		/* No ubi num, name must be a vol device path */
++		return ubi_open_volume_path(name, UBI_READONLY);
++	else if (vol_id == -1)
++		/* No vol_id, must be vol_name */
++		return ubi_open_volume_nm(ubi_num, name, UBI_READONLY);
++	else
++		return ubi_open_volume(ubi_num, vol_id, UBI_READONLY);
++}
++
+ #define UBIFS_NODE_MAGIC  0x06101831
+ static inline int ubi_vol_is_ubifs(struct ubi_volume_desc *desc)
+ {
+@@ -674,32 +718,6 @@
+ 	return magic == UBIFS_NODE_MAGIC;
+ }
+ 
+-static void __init ubiblock_create_auto_rootfs(void)
+-{
+-	int ubi_num, ret, is_ubifs;
+-	struct ubi_volume_desc *desc;
+-	struct ubi_volume_info vi;
+-
+-	for (ubi_num = 0; ubi_num < UBI_MAX_DEVICES; ubi_num++) {
+-		desc = ubi_open_volume_nm(ubi_num, "rootfs", UBI_READONLY);
+-		if (IS_ERR(desc))
+-			continue;
+-
+-		ubi_get_volume_info(desc, &vi);
+-		is_ubifs = ubi_vol_is_ubifs(desc);
+-		ubi_close_volume(desc);
+-		if (is_ubifs)
+-			break;
+-
+-		ret = ubiblock_create(&vi);
+-		if (ret)
+-			pr_err("UBI error: block: can't add '%s' volume, err=%d\n",
+-				vi.name, ret);
+-		/* always break if we get here */
+-		break;
+-	}
+-}
+-
+ static void ubiblock_remove_all(void)
+ {
+ 	struct ubiblock *next;
+@@ -726,21 +744,12 @@
+ 		return ubiblock_major;
+ 
+ 	/*
+-	 * Attach block devices from 'block=' module param.
+-	 * Even if one block device in the param list fails to come up,
+-	 * still allow the module to load and leave any others up.
+-	 */
+-	ubiblock_create_from_param();
+-
+-	/* auto-attach "rootfs" volume if existing and non-ubifs */
+-	if (IS_ENABLED(CONFIG_MTD_ROOTFS_ROOT_DEV))
+-		ubiblock_create_auto_rootfs();
+-
+-	/*
+-	 * Block devices are only created upon user requests, so we ignore
+-	 * existing volumes.
++	 * Upstream linux-6.18 registers the volume notifier and nothing else:
++	 * block devices are created from the UBI_VOLUME_ADDED notification as
++	 * volumes appear (including the ones present at attach time).  The
++	 * notifier must not be atomic because creating a block device may sleep.
+ 	 */
+-	ret = ubi_register_volume_notifier(&ubiblock_notifier, 1);
++	ret = ubi_register_volume_notifier(&ubiblock_notifier, 0);
+ 	if (ret)
+ 		goto err_unreg;
+ 	return 0;
+--- a/drivers/mtd/ubi/kapi.c
++++ b/drivers/mtd/ubi/kapi.c
+@@ -67,6 +67,9 @@
+ void ubi_do_get_volume_info(struct ubi_device *ubi, struct ubi_volume *vol,
+ 			    struct ubi_volume_info *vi)
+ {
++	/* Port of upstream linux-6.1: expose the volume device, used by the
++	 * ubiblock layer to parent the block device. */
++	vi->dev = &vol->dev;
+ 	vi->vol_id = vol->vol_id;
+ 	vi->ubi_num = ubi->ubi_num;
+ 	vi->size = vol->reserved_pebs;
+--- a/include/linux/mtd/ubi.h
++++ b/include/linux/mtd/ubi.h
+@@ -110,6 +110,12 @@
+ 	int name_len;
+ 	const char *name;
+ 	dev_t cdev;
++	/*
++	 * Port of upstream linux-6.1: the volume's &struct device.  Needed by
++	 * the ubiblock layer so the block device can be parented to the volume,
++	 * which is how drivers/block/fitblk.c finds the root disk.
++	 */
++	struct device *dev;
+ };
+ 
+ /**

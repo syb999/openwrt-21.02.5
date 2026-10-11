@@ -1,0 +1,60 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: dsa: mt7530: complete the CPU port setup for AN7583
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/dsa/mt7530.c b/drivers/net/dsa/mt7530.c
+--- a/drivers/net/dsa/mt7530.c	2026-10-10 21:59:12.489872990 +0800
++++ b/drivers/net/dsa/mt7530.c	2026-10-10 21:59:12.489872990 +0800
+@@ -1023,19 +1023,38 @@
+ 	mt7530_write(priv, MT7530_PVC_P(port),
+ 		     PORT_SPEC_TAG);
+ 
+-	/* Unknown multicast frame forwarding to the cpu port */
+-	mt7530_rmw(priv, MT7530_MFC, UNM_FFP_MASK, UNM_FFP(BIT(port)));
++	/* Enable flooding on the CPU port */
++	mt7530_set(priv, MT7530_MFC, BC_FFP(BIT(port)) | UNM_FFP(BIT(port)) |
++		   UNU_FFP(BIT(port)));
+ 
+ 	/* Set CPU port number */
+ 	if (priv->id == ID_MT7621)
+ 		mt7530_rmw(priv, MT7530_MFC, CPU_MASK, CPU_EN | CPU_PORT(port));
+ 
++	/* Add the CPU port to the CPU port bitmap for MT7531 and the switch on
++	 * the MT7988/EN7581/AN7583 SoCs.  Trapped frames (i.e. every frame the
++	 * switch sends up towards the host) are forwarded to the CPU port that
++	 * is affine to the inbound user port, and are emitted **with the
++	 * switch special tag**.  Without this the switch never treats the port
++	 * as a CPU port, frames reach the conduit untagged and
++	 * mtk_tag_rcv() then reads the ethertype as the tag (hdr=0x0800/x86dd),
++	 * fails to find a source port and drops everything: eth0 RX grows
++	 * while the user ports stay at RX=0.
++	 */
++	if (priv->id == ID_MT7531 || priv->id == ID_MT7988 ||
++	    priv->id == ID_EN7581)
++		mt7530_set(priv, MT7531_CFC, MT7531_CPU_PMAP(BIT(port)));
++
+ 	/* CPU port gets connected to all user ports of
+ 	 * the switch.
+ 	 */
+ 	mt7530_write(priv, MT7530_PCR_P(port),
+ 		     PCR_MATRIX(dsa_user_ports(priv->ds)));
+ 
++	/* Set to fallback mode for independent VLAN learning */
++	mt7530_rmw(priv, MT7530_PCR_P(port), PCR_PORT_VLAN_MASK,
++		   MT7530_PORT_FALLBACK_MODE);
++
+ 	return 0;
+ }
+ 
+diff -ruN a/drivers/net/dsa/mt7530.h b/drivers/net/dsa/mt7530.h
+--- a/drivers/net/dsa/mt7530.h	2026-10-10 21:59:12.489872990 +0800
++++ b/drivers/net/dsa/mt7530.h	2026-10-10 22:07:27.934892795 +0800
+@@ -52,6 +52,7 @@
+ #define  MT7531_MIRROR_PORT_GET(x)	(((x) >> 16) & MIRROR_MASK)
+ #define  MT7531_MIRROR_PORT_SET(x)	(((x) & MIRROR_MASK) << 16)
+ #define  MT7531_CPU_PMAP_MASK		GENMASK(7, 0)
++#define  MT7531_CPU_PMAP(x)		((x) & MT7531_CPU_PMAP_MASK)
+ 
+ #define MT753X_MIRROR_REG(id)		(((id) == ID_MT7531 || \
+ 					  (id) == ID_EN7581) ? \

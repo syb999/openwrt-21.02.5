@@ -210,3 +210,14 @@
  obj-$(CONFIG_SPARC_US3_CPUFREQ)		+= sparc-us3-cpufreq.o
  obj-$(CONFIG_UNICORE32)			+= unicore2-cpufreq.o
 +obj-$(CONFIG_ARM_AIROHA_SOC_CPUFREQ) += airoha-cpufreq.o
+--- a/drivers/cpufreq/cpufreq-dt-platdev.c
++++ b/drivers/cpufreq/cpufreq-dt-platdev.c
+@@ -103,4 +103,8 @@ static const struct of_device_id whitelist[] __initconst = {
+ static const struct of_device_id blacklist[] __initconst = {
++	{ .compatible = "airoha,an7583", },
++	{ .compatible = "airoha,en7581", },
++	{ .compatible = "airoha,en7583", },
++
+ 	{ .compatible = "allwinner,sun50i-h6", },
+ 
+ 	{ .compatible = "arm,vexpress", },

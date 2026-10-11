@@ -1,0 +1,187 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: phy: en8811h: port the Co-Clock Output provider
+
+Upstream registers a clock provider for the EN8811H "Co-Clock Output"
+(CKO) and uses its save/restore_context hooks for power management.  The
+whole block was missing from this port.
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/phy/air_en8811h.c b/drivers/net/phy/air_en8811h.c
+--- a/drivers/net/phy/air_en8811h.c	2026-10-10 19:32:36.928762778 +0800
++++ b/drivers/net/phy/air_en8811h.c	2026-10-10 19:49:25.668682732 +0800
+@@ -12,6 +12,7 @@
+  */
+ 
+ #include <linux/clk.h>
++#include <linux/clk-provider.h>
+ #include <linux/phy.h>
+ #include <linux/delay.h>
+ #include <linux/firmware.h>
+@@ -141,6 +142,10 @@
+ 
+ /* Led definitions */
+ #define EN8811H_LED_COUNT	3
++#define EN8811H_HWTRAP1			0xcf914
++#define   EN8811H_HWTRAP1_CKO			BIT(12)
++#define EN8811H_CLK_CGM			0xcf958
++#define   EN8811H_CLK_CGM_CKO			BIT(26)
+ 
+ /* Default LED setup:
+  * GPIO5 <-> LED0  On: Link detected, blink Rx/Tx
+@@ -162,10 +167,17 @@
+ 	unsigned long state;
+ };
+ 
++#define clk_hw_to_en8811h_priv(_hw)			\
++	container_of(_hw, struct en8811h_priv, hw)
++
+ struct en8811h_priv {
+ 	u32		firmware_version;
+ 	bool		mcu_needs_restart;
+ 	struct led	led[EN8811H_LED_COUNT];
++	/* Co-Clock Output provider (upstream 6.18). */
++	struct clk_hw	hw;
++	struct phy_device	*phydev;
++	unsigned int	cko_is_enabled;
+ };
+ 
+ enum {
+@@ -852,6 +864,107 @@
+ };
+ 
+ #endif /* AIR_EN8811H_PHY_LED */
++static unsigned long en8811h_clk_recalc_rate(struct clk_hw *hw,
++					     unsigned long parent)
++{
++	struct en8811h_priv *priv = clk_hw_to_en8811h_priv(hw);
++	struct phy_device *phydev = priv->phydev;
++	u32 pbus_value;
++	int ret;
++
++	ret = air_buckpbus_reg_read(phydev, EN8811H_HWTRAP1, &pbus_value);
++	if (ret < 0)
++		return ret;
++
++	return (pbus_value & EN8811H_HWTRAP1_CKO) ? 50000000 : 25000000;
++}
++
++static int en8811h_clk_enable(struct clk_hw *hw)
++{
++	struct en8811h_priv *priv = clk_hw_to_en8811h_priv(hw);
++	struct phy_device *phydev = priv->phydev;
++
++	return air_buckpbus_reg_modify(phydev, EN8811H_CLK_CGM,
++				       EN8811H_CLK_CGM_CKO,
++				       EN8811H_CLK_CGM_CKO);
++}
++
++static void en8811h_clk_disable(struct clk_hw *hw)
++{
++	struct en8811h_priv *priv = clk_hw_to_en8811h_priv(hw);
++	struct phy_device *phydev = priv->phydev;
++
++	air_buckpbus_reg_modify(phydev, EN8811H_CLK_CGM,
++				EN8811H_CLK_CGM_CKO, 0);
++}
++
++static int en8811h_clk_is_enabled(struct clk_hw *hw)
++{
++	struct en8811h_priv *priv = clk_hw_to_en8811h_priv(hw);
++	struct phy_device *phydev = priv->phydev;
++	u32 pbus_value;
++	int ret;
++
++	ret = air_buckpbus_reg_read(phydev, EN8811H_CLK_CGM, &pbus_value);
++	if (ret < 0)
++		return ret;
++
++	return (pbus_value & EN8811H_CLK_CGM_CKO);
++}
++
++static int en8811h_clk_save_context(struct clk_hw *hw)
++{
++	struct en8811h_priv *priv = clk_hw_to_en8811h_priv(hw);
++
++	priv->cko_is_enabled = en8811h_clk_is_enabled(hw);
++
++	return 0;
++}
++
++static void en8811h_clk_restore_context(struct clk_hw *hw)
++{
++	struct en8811h_priv *priv = clk_hw_to_en8811h_priv(hw);
++
++	if (!priv->cko_is_enabled)
++		en8811h_clk_disable(hw);
++}
++
++static const struct clk_ops en8811h_clk_ops = {
++	.recalc_rate		= en8811h_clk_recalc_rate,
++	.enable			= en8811h_clk_enable,
++	.disable		= en8811h_clk_disable,
++	.is_enabled		= en8811h_clk_is_enabled,
++	.save_context		= en8811h_clk_save_context,
++	.restore_context	= en8811h_clk_restore_context,
++};
++
++static int en8811h_clk_provider_setup(struct device *dev, struct clk_hw *hw)
++{
++	struct clk_init_data init;
++	int ret;
++
++	if (!IS_ENABLED(CONFIG_COMMON_CLK))
++		return 0;
++
++	/* 5.4 has no fwnode_get_name(); dev_name() is portable and the CKO
++	 * clock's name is only cosmetic.
++	 */
++	init.name = devm_kasprintf(dev, GFP_KERNEL, "%s-cko", dev_name(dev));
++	if (!init.name)
++		return -ENOMEM;
++
++	init.ops = &en8811h_clk_ops;
++	init.flags = 0;
++	init.num_parents = 0;
++	hw->init = &init;
++
++	ret = devm_clk_hw_register(dev, hw);
++	if (ret)
++		return ret;
++
++	return devm_of_clk_add_hw_provider(dev, of_clk_hw_simple_get, hw);
++}
++
+ static int en8811h_probe(struct phy_device *phydev)
+ {
+ 	struct en8811h_priv *priv;
+@@ -870,6 +983,12 @@
+ 	/* mcu has just restarted after firmware load */
+ 	priv->mcu_needs_restart = false;
+ 
++	priv->phydev = phydev;
++	/* Co-Clock Output */
++	ret = en8811h_clk_provider_setup(&phydev->mdio.dev, &priv->hw);
++	if (ret)
++		return ret;
++
+ #if AIR_EN8811H_PHY_LED
+ 	priv->led[0].rules = AIR_DEFAULT_TRIGGER_LED0;
+ 	priv->led[1].rules = AIR_DEFAULT_TRIGGER_LED1;
+@@ -1131,14 +1250,14 @@
+  */
+ static int en8811h_resume(struct phy_device *phydev)
+ {
+-	clk_restore_context();
++	en8811h_clk_restore_context(&((struct en8811h_priv *)phydev->priv)->hw);
+ 
+ 	return genphy_resume(phydev);
+ }
+ 
+ static int en8811h_suspend(struct phy_device *phydev)
+ {
+-	clk_save_context();
++	en8811h_clk_save_context(&((struct en8811h_priv *)phydev->priv)->hw);
+ 
+ 	return genphy_suspend(phydev);
+ }

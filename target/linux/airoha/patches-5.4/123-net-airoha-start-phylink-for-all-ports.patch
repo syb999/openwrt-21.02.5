@@ -1,0 +1,27 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: ethernet: airoha: start phylink for every port
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-11 07:40:03.434986063 +0800
++++ b/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-11 07:40:03.434986063 +0800
+@@ -1931,9 +1931,17 @@
+ 			port->phy_connected = true;
+ 		}
+ 
+-		phylink_start(port->phylink);
+ 	}
+ 
++	/* phylink_start() for **every** port, not only for the ones with an
++	 * external PHY.  gdm1 (the CPU port / DSA conduit, port->id == 1) is
++	 * not "external", so it never got started here; its MAC was never
++	 * configured by phylink and the reference firmware's
++	 * "airoha_eth eth0: Link is Up - 10Gbps/Full" line never appeared.
++	 */
++	if (port->phylink)
++		phylink_start(port->phylink);
++
+ 	netif_tx_start_all_queues(dev);
+ 	err = airoha_set_vip_for_gdm_port(port, true);
+ 	if (err)

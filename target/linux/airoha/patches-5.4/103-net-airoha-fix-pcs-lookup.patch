@@ -1,0 +1,47 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: ethernet: airoha: fix PCS lookup (pass consumer fwnode)
+
+fwnode_pcs_get() parses the "pcs-handle" property of the fwnode handed to
+it, so airoha_pcs_get() must pass the consumer (MAC) node.  The driver
+instead resolved the reference first with fwnode_find_reference() and
+then passed the PCS node itself, making the framework search for
+"pcs-handle" inside the PCS node, which always fails.  port->pcs ended up
+NULL, phylink then ran the 2500base-x link with SPEED_UNKNOWN (-1) and the
+interface reported carrier while passing no frames at all (RX/TX = 0).
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-10 10:49:14.418247915 +0800
++++ b/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-10 10:49:14.418247915 +0800
+@@ -2943,17 +2943,23 @@
+  */
+ static struct phylink_pcs *airoha_pcs_get(struct device_node *np)
+ {
+-	struct fwnode_handle *pcs_fwnode;
+ 	struct phylink_pcs *pcs;
+ 
+-	pcs_fwnode = fwnode_find_reference(of_fwnode_handle(np), "pcs-handle", 0);
+-	if (IS_ERR(pcs_fwnode))
++	/* fwnode_pcs_get() parses the "pcs-handle" property of the fwnode it
++	 * is given, so it must be handed the *consumer* node (the MAC node),
++	 * not the already-resolved PCS node.  Passing the resolved node makes
++	 * the framework look for "pcs-handle" inside the PCS node itself,
++	 * which fails and leaves port->pcs NULL -> phylink then runs the
++	 * 2500base-x link with speed SPEED_UNKNOWN and no frame ever moves.
++	 */
++	pcs = fwnode_pcs_get(of_fwnode_handle(np), 0);
++	if (IS_ERR(pcs)) {
++		pr_debug("[DBG14] %pOF: fwnode_pcs_get failed: %ld\n",
++			np, PTR_ERR(pcs));
+ 		return NULL;
++	}
+ 
+-	pcs = fwnode_pcs_get(pcs_fwnode, 0);
+-	fwnode_handle_put(pcs_fwnode);
+-	if (IS_ERR(pcs))
+-		return NULL;
++	pr_debug("[DBG14] %pOF: pcs resolved OK\n", np);
+ 
+ 	return pcs;
+ }

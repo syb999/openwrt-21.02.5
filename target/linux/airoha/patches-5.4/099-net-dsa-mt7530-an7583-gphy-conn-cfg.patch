@@ -1,0 +1,114 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: dsa: mt7530: fix AN7583 GPHY addressing and power-up
+
+dsa2.c seeds ds->phys_mii_mask from the user-port bitmap and
+dsa_slave_phy_read()/write() drop any access whose address is not in
+that mask, answering 0xffff.  The AN7583 internal GPHYs live at MDIO
+addresses 9..12 as declared in the device tree, so the PHY probe reads
+never reached the switch and every PHY was reported "missing".  Widen
+the mask so the DT-declared addresses reach mt7531_ind_c22_phy_read().
+
+Also enable AN7583_GEPHY_CONN_CFG (GPHY core register clock + ethernet
+AFE power-up) as upstream mt7530.c does.
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/dsa/mt7530.c b/drivers/net/dsa/mt7530.c
+--- a/drivers/net/dsa/mt7530.c	2026-10-09 23:01:47.935321558 +0800
++++ b/drivers/net/dsa/mt7530.c	2026-10-10 06:39:34.194667020 +0800
+@@ -2705,25 +2705,27 @@
+ 
+ static void mt7988_gphy_enable(struct mt7530_priv *priv)
+ {
+-	u32 val;
+-	int i;
++	u32 before, after;
+ 
+-	/* Enable the internal PHYs (clear POWER_ON_OFF, set bypass mode) */
+-	for (i = 0; i < MT7530_NUM_PORTS; i++) {
+-		val = mt7531_ind_mmd_read(priv, i, 0x1f, 0x403);
+-		val |= BIT(4);		/* PHY_EN_BYPASS_MODE */
+-		val &= ~BIT(5);		/* POWER_ON_OFF */
+-		mt7531_ind_mmd_write(priv, i, 0x1f, 0x403, val);
+-
+-		/* Power up the PHY PLL (vendor: 0x10 then 0x14) */
+-		mt7531_ind_mmd_write(priv, i, 0x1f, 0x10d, 0x10);
+-		mt7531_ind_mmd_write(priv, i, 0x1f, 0x10d, 0x14);
+-
+-		/* De-isolate and clear power down */
+-		val = mt7531_ind_c22_phy_read(priv, i, MII_BMCR);
+-		val &= ~(BMCR_ISOLATE | BMCR_PDOWN);
+-		mt7531_ind_c22_phy_write(priv, i, MII_BMCR, val);
+-	}
++	/* AN7583 requires an additional tweak to CONN_CFG:
++	 *  - enable the GPHY core register clock (BIT30), without which the
++	 *    internal PHY registers read back as zero and the PHY driver
++	 *    cannot even read the PHY ID;
++	 *  - power up the ethernet AFE (clear ETHER_AFE_PWD).
++	 * This mirrors upstream mt7530.c (AN7583 setup).  The MT7531 PLLGP
++	 * registers used previously do not exist on AN7583 (reads return
++	 * 0xdeadbeef), so they never brought the GPHYs up.
++	 */
++	before = mt7530_read(priv, AN7583_GEPHY_CONN_CFG);
++	mt7530_rmw(priv, AN7583_GEPHY_CONN_CFG,
++		   AN7583_CSR_DPHY_CKIN_SEL |
++		   AN7583_CSR_PHY_CORE_REG_CLK_SEL |
++		   AN7583_CSR_ETHER_AFE_PWD,
++		   AN7583_CSR_DPHY_CKIN_SEL |
++		   AN7583_CSR_PHY_CORE_REG_CLK_SEL);
++	after = mt7530_read(priv, AN7583_GEPHY_CONN_CFG);
++	dev_dbg(priv->dev, "[GPHY] CONN_CFG(0x7c14) before=0x%08x after=0x%08x\n",
++		 before, after);
+ }
+ 
+ static int mt7988_pad_setup(struct dsa_switch *ds, phy_interface_t interface)
+@@ -2807,6 +2809,21 @@
+ 		return ret;
+ 	}
+ 
++	/* AN7583: bring up the GPHY core clock / ethernet AFE *before*
++	 * resetting the PHYs, as upstream does.
++	 */
++	mt7988_gphy_enable(priv);
++
++	/* DSA only forwards slave-MDIO accesses to addresses present in
++	 * ds->phys_mii_mask, and dsa2.c seeds that mask from the user-port
++	 * bitmap (0..num_ports-1).  The AN7583 internal GPHYs answer at
++	 * MDIO addresses 9..12, exactly as declared in the device tree.
++	 * Unless the mask is widened, dsa_slave_phy_read() answers 0xffff
++	 * for those addresses and every PHY is reported as
++	 * "MDIO device at address 10 is missing".
++	 */
++	ds->phys_mii_mask |= GENMASK(12, 9);
++
+ 	/* Reset the switch PHYs */
+ 	mt7530_write(priv, MT7530_SYS_CTRL, SYS_CTRL_PHY_RST);
+ 
+@@ -2814,13 +2831,6 @@
+ 	priv->p5_interface = PHY_INTERFACE_MODE_NA;
+ 	priv->p6_interface = PHY_INTERFACE_MODE_NA;
+ 
+-	/* Bring up the internal GPHY PLL.  This has to happen at probe
+-	 * time: the GPHY registers (including their ID) read back as zero
+-	 * until the PLLGP block is programmed, and the PHY devices are
+-	 * probed by DSA before phylink ever calls .pad_setup().
+-	 */
+-	mt7988_gphy_enable(priv);
+-
+ 	return mt7531_setup_common(ds);
+ }
+ 
+diff -ruN a/drivers/net/dsa/mt7530.h b/drivers/net/dsa/mt7530.h
+--- a/drivers/net/dsa/mt7530.h	2026-10-09 23:01:47.935321558 +0800
++++ b/drivers/net/dsa/mt7530.h	2026-10-09 23:01:47.939321774 +0800
+@@ -511,6 +511,10 @@
+ /* Registers for RGMII and SGMII PLL clock */
+ #define MT7531_ANA_PLLGP_CR2		0x78b0
+ #define MT7531_ANA_PLLGP_CR5		0x78bc
++#define AN7583_GEPHY_CONN_CFG		0x7c14
++#define  AN7583_CSR_DPHY_CKIN_SEL	BIT(31)
++#define  AN7583_CSR_PHY_CORE_REG_CLK_SEL BIT(30)
++#define  AN7583_CSR_ETHER_AFE_PWD	GENMASK(28, 24)
+ 
+ /* Registers for TRGMII on the both side */
+ #define MT7530_TRGMII_RCK_CTRL		0x7a00
