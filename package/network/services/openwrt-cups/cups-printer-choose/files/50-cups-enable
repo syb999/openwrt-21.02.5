@@ -1,0 +1,24 @@
+#!/bin/sh
+# 首启引导: 让 CUPS 处于"能直接驱动 USB 打印机"的状态
+#
+# 1) cups 包的 init 默认不 enable ⇒ 这里 enable + start
+# 2) cupsd 必须以 root 跑: USB backend 要直接打开 /dev/usb/lp0 (设备节点是 root:root 0600,
+#    cups 2.3 的 User/Group 在 cups-files.conf, 而树里那份没写 ⇒ 默认可能切到 lp)
+#    原包的 CUPS 1.x cupsd.conf 里就写着 "User root ... required to make cups work with the usb backend"
+# 3) /dev/usb/lp* 权限兜底 (没有 udev, devtmpfs 给的是 0600)
+
+CF=/etc/cups/cups-files.conf
+if [ -f "$CF" ]; then
+	grep -q '^User root' "$CF" 2>/dev/null || sed -i '1i User root' "$CF"
+	grep -q '^Group root' "$CF" 2>/dev/null || sed -i '1i Group root' "$CF"
+fi
+
+for dev in /dev/usb/lp*; do
+	[ -c "$dev" ] && chmod 0666 "$dev" 2>/dev/null
+done
+
+mkdir -p /var/cache/cups /var/cups /var/spool/cups/tmp 2>/dev/null
+
+[ -x /etc/init.d/cupsd ] && /etc/init.d/cupsd enable >/dev/null 2>&1
+[ -x /etc/init.d/cupsd ] && /etc/init.d/cupsd start >/dev/null 2>&1
+exit 0

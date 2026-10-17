@@ -1,0 +1,294 @@
+#!/bin/sh
+#
+# cups-printer-choose - 在路由器上选择打印机型号并创建 CUPS 队列
+#
+# 两种模式:
+#   raw  : 路由器只转发字节流, 由客户端自带驱动 (Windows/手机/Linux 客户端装 HP/Epson 驱动)
+#          不需要 ghostscript / cups-filters, 任何打印机都能这样用 (经典打印服务器模式)
+#   ppd  : 路由器侧出驱动 (PPD + filter), 客户端发 PDF 即可打印
+#          需要驱动包 + cups-filters(foomatic-rip/pdftoraster) + ghostscript
+#
+# 用法:
+#   cups-printer-choose                  交互选择
+#   cups-printer-choose -l               列出检测到的打印机 / 可用 PPD / 驱动层状态
+#   cups-printer-choose -c               只检查驱动层是否齐全
+#   cups-printer-choose -a URI -n NAME [-p PPD] [-r]
+#                                        非交互建队列 (-p 给 PPD, -r 强制 raw)
+#   cups-printer-choose -D               删除队列: cups-printer-choose -D -n NAME
+#   cups-printer-choose -f               给 HP host-based 机灌固件 (P1006/1020 等上电后必须先灌)
+#   cups-printer-choose -d               列出已有队列
+#
+# 例:
+#   cups-printer-choose -a "usb://HP/LaserJet%20P1006?serial=000000000000" -n hp1006 -p /usr/share/cups/model/HP-LaserJet_P1006.ppd
+#   cups-printer-choose -a "usb://HP/LaserJet%20P1006" -n hp1006 -r
+#
+PROG=${0##*/}
+MODEL_DIRS="/usr/share/cups/model /usr/share/ppd"
+FILTER_DIR="/usr/lib/cups/filter"
+
+die() { echo "$PROG: $*" >&2; exit 1; }
+
+usage() {
+	sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'
+	exit 0
+}
+
+need_cups() {
+	command -v lpinfo >/dev/null 2>&1 || die "缺少 lpinfo (opkg install cups-client)"
+	command -v lpadmin >/dev/null 2>&1 || die "缺少 lpadmin (opkg install cups-client)"
+	if ! lpstat -r >/dev/null 2>&1; then
+		/etc/init.d/cupsd start >/dev/null 2>&1
+		sleep 1
+		lpstat -r >/dev/null 2>&1 || die "cupsd 没起来 (检查 /etc/init.d/cupsd start 与 /etc/cups/cupsd.conf)"
+	fi
+}
+
+list_devices() {
+	lpinfo -v 2>/dev/null | awk '$1=="direct" || $1=="network" {print $2}' | sort -u
+}
+
+list_ppds() {
+	for d in $MODEL_DIRS; do
+		[ -d "$d" ] || continue
+		find "$d" -type f -name '*.ppd' 2>/dev/null
+	done | sort -u
+}
+
+list_queues() {
+	lpstat -p 2>/dev/null | awk '{print $2}' | sort -u
+}
+
+ppd_needs() {
+	# 打印该 PPD 依赖的 filter (cupsFilter 行)
+	grep -h '^\*cupsFilter' "$1" 2>/dev/null | awk '{print $3}' | sort -u
+}
+
+uri_to_name() {
+	# usb://HP/LaserJet%20P1006?serial=xxx -> LaserJet_P1006
+	echo "$1" | sed -e 's/[?#].*$//' -e 's|.*/||' -e 's/%20/_/g' \
+		-e 's/[^A-Za-z0-9._-]/_/g' -e 's/^_*//' -e 's/_*$//' | cut -c1-32
+}
+
+check_layer() {
+	missing=0
+	echo "== CUPS 驱动层 =="
+	for f in foomatic-rip pdftoraster pdftops gstoraster; do
+		if [ -x "$FILTER_DIR/$f" ]; then
+			echo "   OK   $FILTER_DIR/$f"
+		else
+			echo "   缺失 $FILTER_DIR/$f"
+			missing=$((missing + 1))
+		fi
+	done
+	if command -v gs >/dev/null 2>&1; then
+		echo "   OK   ghostscript $(gs --version 2>/dev/null)"
+	else
+		echo "   缺失 ghostscript"
+		missing=$((missing + 1))
+	fi
+	n=$(list_ppds | wc -l)
+	echo "   可用 PPD: $n 个"
+	if [ "$missing" -gt 0 ]; then
+		echo ""
+		echo "   ⚠ 驱动层不全 ⇒ 只能用 raw 模式(客户端自带驱动)。"
+		echo "     ppd 模式需要 cups-filters + ghostscript。"
+		return 1
+	fi
+	return 0
+}
+
+# HP host-based 激光机 (LJ 1000/1005/1018/1020/P100x/P1505) 每次上电要先灌固件,
+# 否则不认打印数据。这里手工灌一次 (上电后跑一遍即可)。
+load_firmware() {
+	FW_DIR=/usr/share/foo2zjs/firmware
+	[ -d "$FW_DIR" ] || die "没有 foo2zjs 固件目录 (opkg install foo2zjs)"
+	found=0
+	for d in /sys/bus/usb/devices/*/; do
+		[ -r "$d/idVendor" ] || continue
+		[ "$(cat "$d/idVendor" 2>/dev/null)" = "03f0" ] || continue
+		prod=$(cat "$d/product" 2>/dev/null)
+		[ -n "$prod" ] || continue
+		model=$(echo "$prod" | sed -n 's/.*[Ll]aser[Jj]et[[:space:]]*\([A-Za-z]*[0-9]\+[A-Za-z]*\).*/\1/p')
+		[ -n "$model" ] || continue
+		fw=""
+		for cand in "$FW_DIR/sihp${model}.dl" "$FW_DIR/sihp$(echo $model | tr 'A-Z' 'a-z').dl"; do
+			[ -s "$cand" ] && { fw=$cand; break; }
+		done
+		if [ -z "$fw" ]; then
+			echo "   $prod -> 没有对应固件 ($model)"
+			continue
+		fi
+		for dev in /dev/usb/lp*; do
+			[ -c "$dev" ] || continue
+			if cat "$fw" > "$dev" 2>/dev/null; then
+				echo "   $prod: 已灌入 $fw -> $dev"
+				found=$((found + 1))
+			else
+				echo "   $prod: 写入 $dev 失败 (打印机/驱动占用?)"
+			fi
+		done
+	done
+	[ -n "$(ls /dev/usb/lp* 2>/dev/null)" ] || die "没有 /dev/usb/lp* (检查 kmod-usb-printer 是否加载: lsmod | grep usblp)"
+	[ "$found" -gt 0 ] || echo "没有需要灌固件的 HP 打印机 (或型号未匹配)"
+}
+
+create_queue() {
+	uri=$1; name=$2; ppd=$3
+	for q in $(list_queues); do
+		[ "$q" = "$name" ] && die "队列 $name 已存在 (先 -D -n $name 删除)"
+	done
+	if [ -n "$ppd" ]; then
+		[ -f "$ppd" ] || die "PPD 不存在: $ppd"
+		for f in $(ppd_needs "$ppd"); do
+			[ -x "$FILTER_DIR/$f" ] || echo "$PROG: 注意: PPD 需要 $f, 当前缺失" >&2
+		done
+		lpadmin -p "$name" -E -v "$uri" -P "$ppd" -o printer-is-shared=true >/dev/null \
+			|| die "lpadmin 建队失败"
+	else
+		lpadmin -p "$name" -E -v "$uri" -m raw -o printer-is-shared=true >/dev/null \
+			|| die "lpadmin 建队失败"
+	fi
+	lpadmin -d "$name" >/dev/null 2>&1
+	cupsctl --share-printers >/dev/null 2>&1
+	echo "已创建队列: $name"
+	echo "   设备: $uri"
+	if [ -n "$ppd" ]; then
+		echo "   驱动: $ppd (路由器侧转换)"
+	else
+		echo "   模式: raw (客户端自带驱动, 路由器只转发)"
+	fi
+	[ "$(list_queues | grep -c .)" = "1" ] && echo "   已设为默认打印机"
+}
+
+interactive() {
+	devs=$(list_devices)
+	if [ -z "$devs" ]; then
+		echo "没有检测到打印机。可手工输入设备 URI (例: usb://HP/LaserJet%20P1006), 回车跳过:" >&2
+		read -r uri
+		[ -z "$uri" ] && die "没有可用设备"
+	else
+		echo "检测到的打印机:"
+		i=0
+		for d in $devs; do
+			i=$((i + 1))
+			echo "  $i) $d"
+		done
+		printf "选择编号 [1-%s]: " "$i"
+		read -r sel
+		case "$sel" in
+			''|*[!0-9]*) die "无效输入" ;;
+		esac
+		[ "$sel" -ge 1 ] && [ "$sel" -le "$i" ] || die "编号越界"
+		uri=$(echo "$devs" | sed -n "${sel}p")
+	fi
+
+	defname=$(uri_to_name "$uri")
+	[ -z "$defname" ] && defname=printer
+
+	ppds=$(list_ppds)
+	if [ -n "$ppds" ]; then
+		echo ""
+		echo "可用驱动 (PPD):"
+		echo "  0) raw 模式 —— 客户端自带驱动, 不需要路由器驱动 (推荐先用这个)"
+		i=0
+		for p in $ppds; do
+			i=$((i + 1))
+			echo "  $i) ${p##*/}"
+			[ "$i" -ge 40 ] && { echo "  ... (只列前 40 个, 共 $(echo "$ppds" | wc -l) 个)"; break; }
+		done
+		# 按设备名猜一个匹配的 PPD
+		hint=$(echo "$ppds" | grep -i -m1 "$defname" 2>/dev/null)
+		[ -n "$hint" ] && echo "  (建议: ${hint##*/})"
+		printf "选择驱动编号 [0-%s, 默认 0]: " "$i"
+		read -r psel
+		case "$psel" in
+			''|0) ppd="" ;;
+			*[!0-9]*) die "无效输入" ;;
+			*) [ "$psel" -le "$i" ] || die "编号越界"; ppd=$(echo "$ppds" | sed -n "${psel}p") ;;
+		esac
+	else
+		echo ""
+		echo "当前没有安装任何 PPD/驱动包 ⇒ 只能建 raw 队列 (客户端自带驱动)。"
+		ppd=""
+	fi
+
+	printf "队列名 [%s]: " "$defname"
+	read -r name
+	[ -z "$name" ] && name=$defname
+	create_queue "$uri" "$name" "$ppd"
+}
+
+[ $# -eq 0 ] && { need_cups; interactive; exit $?; }
+
+ACTION=list
+NAME=""
+URI=""
+PPD=""
+RAW=0
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-l|--list) ACTION=list ;;
+		-c|--check) ACTION=check ;;
+		-f|--firmware) ACTION=firmware ;;
+		-a|--add) shift; URI=$1 ;;
+		-n|--name) shift; NAME=$1 ;;
+		-p|--ppd) shift; PPD=$1 ;;
+		-r|--raw) RAW=1 ;;
+		-D|--delete) ACTION=delete ;;
+		-d|--queues) ACTION=queues ;;
+		-h|--help) usage ;;
+		*) die "未知参数: $1 (用 -h 看用法)" ;;
+	esac
+	shift
+done
+
+case "$ACTION" in
+	check)
+		check_layer
+		;;
+	firmware)
+		load_firmware
+		;;
+	queues)
+		need_cups
+		q=$(list_queues)
+		if [ -z "$q" ]; then echo "没有队列"; else
+			for x in $q; do
+				d=$(lpstat -p "$x" 2>/dev/null | head -1)
+				echo "$d"
+			done
+			echo ""
+			printf "默认: "; lpstat -d 2>/dev/null | sed 's/.*: //'
+		fi
+		;;
+	delete)
+		need_cups
+		[ -z "$NAME" ] && die "-D 需要 -n 队列名"
+		lpadmin -x "$NAME" >/dev/null || die "删除失败: $NAME"
+		echo "已删除队列: $NAME"
+		;;
+	list)
+		need_cups
+		echo "== 检测到的打印机 (lpinfo -v) =="
+		devs=$(list_devices)
+		if [ -z "$devs" ]; then echo "   (无)"; else echo "$devs" | sed 's/^/   /'; fi
+		echo ""
+		echo "== 已装 PPD =="
+		ppds=$(list_ppds)
+		if [ -z "$ppds" ]; then echo "   (无: 没有装驱动包, 只能用 raw)"; else echo "$ppds" | sed 's/^/   /'; fi
+		echo ""
+		echo "== 已有队列 =="
+		q=$(list_queues)
+		if [ -z "$q" ]; then echo "   (无)"; else echo "$q" | sed 's/^/   /'; fi
+		echo ""
+		check_layer
+		;;
+	add)
+		need_cups
+		[ -z "$URI" ] && die "-a 需要设备 URI (见 -l)"
+		[ -z "$NAME" ] && NAME=$(uri_to_name "$URI")
+		[ -z "$NAME" ] && die "无法从 URI 推导队列名, 请给 -n"
+		[ "$RAW" = "1" ] && PPD=""
+		create_queue "$URI" "$NAME" "$PPD"
+		;;
+esac

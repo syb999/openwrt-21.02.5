@@ -1,0 +1,51 @@
+#!/bin/sh
+# /etc/hotplug.d/usb/30-cups-printer-firmware
+#
+# HP 的 host-based 激光机 (LaserJet 1000/1005/1018/1020/P100x/P1505 等) 每次上电
+# 都是"空"的, 必须先由主机把 foo2zjs 的固件写进打印机 (/dev/usb/lp0) 才能打印。
+# Linux 发行版靠 udev 规则 + /etc/hotplug/usb/hplj* 脚本做这件事; OpenWrt 没有 udev,
+# 所以用 procd 的 hotplug.d 实现同样的事。
+#
+# 依赖: kmod-usb-printer (usblp) + foo2zjs (固件在 /usr/share/foo2zjs/firmware/)
+#
+[ "$ACTION" = "add" ] || exit 0
+[ -n "$PRODUCT" ] || exit 0
+
+VID=$(echo "$PRODUCT" | cut -d/ -f1)
+# 只处理 HP (03f0); 其它厂商的固件上传机制不同, 不在这里猜
+[ "$VID" = "3f0" ] || exit 0
+
+FW_DIR=/usr/share/foo2zjs/firmware
+[ -d "$FW_DIR" ] || exit 0
+
+# 等 usblp 把 /dev/usb/lp* 建出来 (热插拔事件早于 usblp probe 是常态)
+n=0
+while [ $n -lt 20 ]; do
+	[ -n "$(ls /dev/usb/lp* 2>/dev/null)" ] && break
+	n=$((n + 1))
+	sleep 1
+done
+[ -n "$(ls /dev/usb/lp* 2>/dev/null)" ] || { logger -t cups-fw "no /dev/usb/lp* after 20s"; exit 0; }
+
+# 读 USB 产品名, 从中取型号 (例: "HP LaserJet P1006" -> P1006, "hp LaserJet 1005 series" -> 1005)
+prod=""
+for f in /sys$DEVPATH/../product /sys$DEVPATH/product /sys$DEVPATH/../../product; do
+	[ -r "$f" ] && { prod=$(cat "$f" 2>/dev/null); [ -n "$prod" ] && break; }
+done
+[ -n "$prod" ] || { logger -t cups-fw "cannot read product string"; exit 0; }
+
+model=$(echo "$prod" | sed -n 's/.*[Ll]aser[Jj]et[[:space:]]*\([A-Za-z]*[0-9]\+[A-Za-z]*\).*/\1/p')
+[ -n "$model" ] || { logger -t cups-fw "no model in '$prod'"; exit 0; }
+
+fw=""
+for cand in "$FW_DIR/sihp${model}.dl" "$FW_DIR/sihp$(echo $model | tr 'A-Z' 'a-z').dl"; do
+	[ -s "$cand" ] && { fw=$cand; break; }
+done
+[ -n "$fw" ] || { logger -t cups-fw "no firmware for model $model (prod='$prod')"; exit 0; }
+
+for dev in /dev/usb/lp*; do
+	[ -c "$dev" ] || continue
+	chmod 0666 "$dev" 2>/dev/null
+	cat "$fw" > "$dev" 2>/dev/null && logger -t cups-fw "uploaded $fw to $dev"
+done
+exit 0
