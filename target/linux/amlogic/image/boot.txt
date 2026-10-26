@@ -1,0 +1,9 @@
+setenv condev "console=ttyAML0,115200n8 no_console_suspend consoleblank=0"
+setenv kernel_loadaddr "0x00208000"
+setenv dtb_loadaddr "0x21800000"
+setenv dtb_name "dtb"
+setenv boot_start 'bootm ${kernel_loadaddr} - ${dtb_loadaddr}'
+setenv load_and_boot 'if fatload mmc ${devnum} ${kernel_loadaddr} uImage; then if fatload mmc ${devnum} ${dtb_loadaddr} ${dtb_name}; then setenv bootargs "root=/dev/mmcblk${rootdev}p2 rootwait ro ${condev} fsck.repair=yes net.ifnames=0 mac=${mac}"; run boot_start; fi; fi'
+# u-boot 的 mmc 编号和 Linux 的 mmcblk 编号是反的（eMMC 在 u-boot 是 mmc 1，在 5.4 里是 mmcblk0），所以 devnum 1 -> rootdev 0
+if mmc dev 0; then setenv devnum 0; setenv rootdev 1; else setenv devnum 1; setenv rootdev 0; fi
+if run load_and_boot; then echo "booted from mmc ${devnum}"; else setenv devnum 1; setenv rootdev 0; run load_and_boot; fi

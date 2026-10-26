@@ -1,0 +1,54 @@
+From: onecloud-bsp <bsp@localhost>
+Subject: [PATCH] phy: amlogic: meson8b-usb2: allow boards without an USB ID pin
+
+The OneCloud (Amlogic S805) wires its OTG port as a plain host port and
+leaves the USB ID pin floating.  In host mode phy_meson8b_usb2_power_on()
+enables ACA detection and then insists that the ID pin is *not* floating:
+
+    phy phy-c1108800.phy.0: USB ID detect failed!
+    phy phy-c1108800.phy.0: phy poweron failed --> -22
+    dwc2: probe of c9040000.usb failed with error -22
+
+so the whole controller (and with it one of the two USB-A ports) fails to
+probe.  Add an opt-in DT property, "amlogic,no-id-detect", for boards that
+do not have the ID pin wired: ACA detection is still programmed (harmless)
+but a floating ID no longer aborts power_on.  Other boards are unaffected.
+
+Signed-off-by: onecloud-bsp <bsp@localhost>
+---
+ drivers/phy/amlogic/phy-meson8b-usb2.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+--- a/drivers/phy/amlogic/phy-meson8b-usb2.c
++++ b/drivers/phy/amlogic/phy-meson8b-usb2.c
+@@ -107,6 +107,7 @@
+ struct phy_meson8b_usb2_priv {
+ 	void __iomem		*regs;
+ 	enum usb_dr_mode	dr_mode;
++	bool			no_id_detect;
+ 	struct clk		*clk_usb_general;
+ 	struct clk		*clk_usb;
+ 	struct reset_control	*reset;
+@@ -182,8 +183,9 @@
+ 
+ 		udelay(ACA_ENABLE_COMPLETE_TIME);
+ 
+-		if (phy_meson8b_usb2_read(priv, REG_ADP_BC) &
+-			REG_ADP_BC_ACA_PIN_FLOAT) {
++		if (!priv->no_id_detect &&
++		    (phy_meson8b_usb2_read(priv, REG_ADP_BC) &
++		     REG_ADP_BC_ACA_PIN_FLOAT)) {
+ 			dev_warn(&phy->dev, "USB ID detect failed!\n");
+ 			clk_disable_unprepare(priv->clk_usb);
+ 			clk_disable_unprepare(priv->clk_usb_general);
+@@ -245,6 +247,10 @@
+ 		return -EINVAL;
+ 	}
+ 
++	/* boards that do not wire up the USB ID pin (e.g. OneCloud) */
++	priv->no_id_detect = of_property_read_bool(pdev->dev.of_node,
++						   "amlogic,no-id-detect");
++
+ 	phy = devm_phy_create(&pdev->dev, NULL, &phy_meson8b_usb2_ops);
+ 	if (IS_ERR(phy)) {
+ 		dev_err(&pdev->dev, "failed to create PHY\n");

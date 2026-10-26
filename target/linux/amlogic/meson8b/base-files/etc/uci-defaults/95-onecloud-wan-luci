@@ -1,0 +1,72 @@
+#!/bin/sh
+
+onecloud_mac_addr() {
+	local h
+	h=$(cat /sys/class/mmc_host/*/mmc*:*/cid 2>/dev/null | head -1 | tr -d ' \n')
+	if [ ${#h} -lt 10 ]; then
+		h=$(hexdump -n 5 -e '5/1 "%02x"' /dev/urandom 2>/dev/null)
+	fi
+	[ ${#h} -ge 10 ] || return 1
+	h=$(printf '%s' "$h" | tail -c 10)
+	printf '02:%s:%s:%s:%s:%s' \
+		"$(printf '%s' "$h" | cut -c1-2)" "$(printf '%s' "$h" | cut -c3-4)" \
+		"$(printf '%s' "$h" | cut -c5-6)" "$(printf '%s' "$h" | cut -c7-8)" \
+		"$(printf '%s' "$h" | cut -c9-10)"
+}
+
+if [ -f /etc/config/firewall ]; then
+	zone=$(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\(@zone\[[0-9]*\]\)\.name='wan'$/\1/p" | head -1)
+	if [ -n "$zone" ]; then
+		uci set firewall.$zone.input='ACCEPT'
+		uci -q del_list firewall.$zone.network='fallback'
+		uci add_list firewall.$zone.network='fallback'
+		uci commit firewall
+	fi
+fi
+
+cur=$(uci -q get network.wan.macaddr)
+where="network.wan.macaddr"
+if [ -z "$cur" ]; then
+	idx=$(uci show network 2>/dev/null | sed -n "s/^network\.\(@device\[[0-9]*\]\)\.name='eth0'$/\1/p" | head -1)
+	if [ -n "$idx" ]; then
+		cur=$(uci -q get "network.$idx.macaddr")
+		where="network.$idx.macaddr"
+	fi
+fi
+
+bad=0
+case "$cur" in
+	""|06:11:81:A1:D5:89|02:00:7f:ff:ff:ff) bad=1 ;;
+	*)
+
+		hexonly=$(printf '%s' "$cur" | tr -d ':')
+		[ ${#hexonly} -eq 12 ] || bad=1
+		;;
+esac
+
+if [ "$bad" = "1" ]; then
+	new=$(onecloud_mac_addr)
+	if [ -n "$new" ]; then
+		uci set "$where=$new"
+		uci commit network
+		logger -t onecloud "wan macaddr fixed: was '${cur:-<empty>}' now '$new' ($where)"
+		cur="$new"
+	fi
+fi
+
+if [ -n "$cur" ]; then
+	tag=$(printf '%s' "$cur" | tr -d ':' | tail -c 4)
+	uci set system.@system[0].hostname="OneCloud-$tag"
+	uci commit system
+fi
+
+
+if [ -f /etc/config/uhttpd ]; then
+	uci set uhttpd.main.script_timeout='120'
+	uci set uhttpd.main.network_timeout='120'
+	uci commit uhttpd
+	/etc/init.d/uhttpd restart >/dev/null 2>&1
+	logger -t onecloud "uhttpd timeouts raised (script/network = 900s) for large sysupgrade uploads"
+fi
+
+exit 0

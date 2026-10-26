@@ -1,0 +1,34 @@
+Amlogic SD/USB burning components for the Thunder OneCloud (S805 / meson8b)
+
+Source: hzyitc/u-boot-onecloud, release build-20221028-0940, file
+"eMMC.burn.img" (https://github.com/hzyitc/u-boot-onecloud/releases),
+extracted with AmlImg v0.3.1 (`AmlImg unpack eMMC.burn.img .`).
+
+These files are the DDR init blob, the u-boot payload and the
+bootloader/resource partitions that the Amlogic USB Burning Tool writes
+before the OpenWrt partitions. They are only used by the "emmc.burn.img"
+image target and are independent of the OpenWrt kernel/rootfs.
+
+Only the following files are kept (boot.simg / rootfs.simg from that release
+are replaced by the freshly built OpenWrt partitions):
+
+    0.DDR.USB              DDR init          USB:  DDR
+    1.UBOOT_COMP.USB       u-boot payload    USB:  UBOOT_COMP
+    2.aml_sdc_burn.ini     burn settings     ini:  aml_sdc_burn
+    3.platform.conf        load addresses    conf: platform
+    4.bootloader.PARTITION u-boot partition  PARTITION: bootloader
+    5.bootloader.VERIFY    its checksum      VERIFY:    bootloader
+    6.resource.PARTITION   resource part.    PARTITION: resource
+    7.resource.VERIFY      its checksum      VERIFY:    resource
+    8.meson.dtb            board device tree dtb:  meson
+
+8.meson.dtb is NOT from that release: it is the meson8b-onecloud device tree
+that hzyitc shipped in the boot (FAT) partition of the same OpenWrt release
+(dtb, 19345 B). The Linux aml-flash tool (--soc=m8) needs a sub_type="meson"
+entry: it checks check_file "$dtb_file" right after unpacking the image and
+aborts with "<tmpdir>/ not found" when the entry is missing, then issues
+`mwrite <dtb> mem dtb normal` before writing the OpenWrt partitions.
+The vendor-tree dtb is used (not the in-tree mainline one) because it is the
+one that shipped together with these 2015 u-boot components.
+
+Checksums: see sha256sums.

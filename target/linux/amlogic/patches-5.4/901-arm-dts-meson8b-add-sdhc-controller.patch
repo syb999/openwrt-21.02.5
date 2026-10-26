@@ -1,0 +1,52 @@
+--- a/arch/arm/boot/dts/meson.dtsi
++++ b/arch/arm/boot/dts/meson.dtsi
+@@ -132,6 +132,13 @@
+ 				status = "disabled";
+ 			};
+ 
++			sdhc: mmc@8e00 {
++				compatible = "amlogic,meson-mx-sdhc";
++				reg = <0x8e00 0x42>;
++				interrupts = <GIC_SPI 78 IRQ_TYPE_EDGE_RISING>;
++				status = "disabled";
++			};
++
+ 			spifc: spi@8c80 {
+ 				compatible = "amlogic,meson6-spifc";
+ 				reg = <0x8c80 0x80>;
+--- a/arch/arm/boot/dts/meson8b.dtsi
++++ b/arch/arm/boot/dts/meson8b.dtsi
+@@ -353,6 +353,16 @@
+ 			};
+ 		};
+ 
++		sdxc_c_pins: sdxc-c {
++			mux {
++				groups = "sdxc_d0_c", "sdxc_d13_c",
++					 "sdxc_d47_c", "sdxc_clk_c",
++					 "sdxc_cmd_c";
++				function = "sdxc_c";
++				bias-pull-up;
++			};
++		};
++
+ 		pwm_c1_pins: pwm-c1 {
+ 			mux {
+ 				groups = "pwm_c1";
+@@ -516,6 +526,16 @@
+ 	nvmem-cell-names = "temperature_calib";
+ };
+ 
++&sdhc {
++	compatible = "amlogic,meson8-sdhc", "amlogic,meson-mx-sdhc";
++	clocks = <&clkc CLKID_XTAL>,
++		 <&clkc CLKID_FCLK_DIV4>,
++		 <&clkc CLKID_FCLK_DIV3>,
++		 <&clkc CLKID_FCLK_DIV5>,
++		 <&clkc CLKID_SDHC>;
++	clock-names = "clkin0", "clkin1", "clkin2", "clkin3", "pclk";
++};
++
+ &sdio {
+ 	compatible = "amlogic,meson8b-sdio", "amlogic,meson-mx-sdio";
+ 	clocks = <&clkc CLKID_SDIO>, <&clkc CLKID_CLK81>;

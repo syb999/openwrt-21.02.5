@@ -1,0 +1,46 @@
+#!/bin/sh /etc/rc.common
+
+START=18
+
+mac_from_cid() {
+	ser=$(cat /sys/class/mmc_host/*/mmc*:*/cid 2>/dev/null | head -1 | tr -d ' \n')
+	if [ ${#ser} -lt 10 ]; then
+		ser=$(hexdump -n 5 -e '5/1 "%02x"' /dev/urandom 2>/dev/null)
+	fi
+	[ ${#ser} -ge 10 ] || return 1
+	h=$(printf '%s' "$ser" | tail -c 10)
+	printf '02:%s:%s:%s:%s:%s' \
+		"$(printf '%s' "$h" | cut -c1-2)" "$(printf '%s' "$h" | cut -c3-4)" \
+		"$(printf '%s' "$h" | cut -c5-6)" "$(printf '%s' "$h" | cut -c7-8)" \
+		"$(printf '%s' "$h" | cut -c9-10)"
+}
+
+boot() {
+	local mac idx cur hexonly wasup
+
+	mac=$(uci -q get network.wan.macaddr)
+	if [ -z "$mac" ]; then
+		idx=$(uci show network 2>/dev/null | sed -n "s/^network\.\(@device\[[0-9]*\]\)\.name='eth0'$/\1/p" | head -1)
+		[ -n "$idx" ] && mac=$(uci -q get "network.$idx.macaddr")
+	fi
+
+	hexonly=$(printf '%s' "$mac" | tr -d ':')
+	[ ${#hexonly} -eq 12 ] || mac=$(mac_from_cid)
+	[ -n "$mac" ] || return 0
+
+	cur=$(cat /sys/class/net/eth0/address 2>/dev/null)
+	[ "$cur" = "$mac" ] && return 0
+
+	wasup=0
+	[ "$(cat /sys/class/net/eth0/operstate 2>/dev/null)" = "up" ] && wasup=1
+	[ -e /sys/class/net/eth0/flags ] && wasup=1
+
+	ip link set dev eth0 down 2>/dev/null
+	if ip link set dev eth0 address "$mac"; then
+		logger -t onecloud "eth0 mac set: $cur -> $mac"
+	else
+		logger -t onecloud "eth0 mac FAILED: $cur -> $mac"
+	fi
+	ip link set dev eth0 up 2>/dev/null
+	return 0
+}

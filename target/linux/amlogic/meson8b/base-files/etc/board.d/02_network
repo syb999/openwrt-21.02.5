@@ -1,0 +1,35 @@
+#!/bin/sh
+#
+# Copyright (C) 2021 OpenWrt.org
+
+. /lib/functions/uci-defaults.sh
+
+board_config_update
+
+onecloud_mac_addr() {
+	local h
+	h=$(cat /sys/class/mmc_host/*/mmc*:*/cid 2>/dev/null | head -1 | tr -d ' \n')
+	if [ ${#h} -lt 10 ]; then
+		h=$(hexdump -n 5 -e '5/1 "%02x"' /dev/urandom 2>/dev/null)
+	fi
+	[ ${#h} -ge 10 ] || return 1
+	h=$(printf '%s' "$h" | tail -c 10)
+	printf '02:%s:%s:%s:%s:%s' \
+		"$(printf '%s' "$h" | cut -c1-2)" "$(printf '%s' "$h" | cut -c3-4)" \
+		"$(printf '%s' "$h" | cut -c5-6)" "$(printf '%s' "$h" | cut -c7-8)" \
+		"$(printf '%s' "$h" | cut -c9-10)"
+}
+
+ucidef_set_interface_wan "eth0"
+macaddr=$(onecloud_mac_addr)
+ucidef_set_interface_macaddr "wan" "$macaddr"
+
+ucidef_set_interface "fallback" \
+	device "eth0" \
+	protocol "static" \
+	ipaddr "192.168.1.1" \
+	netmask "255.255.255.0"
+
+board_config_flush
+
+exit 0
