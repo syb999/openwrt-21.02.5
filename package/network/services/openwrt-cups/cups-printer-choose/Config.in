@@ -1,17 +1,15 @@
 config CUPS_PRINTER_CHOOSE_HP_ZJS
-	bool "  HP / Samsung / Konica / Oki ZjStream 激光机 (foo2zjs)"
+	bool "  HP / Samsung / Konica / Oki ZjStream (foo2zjs)"
 	help
-	  foo2zjs 驱动, 自带 PPD:
-	    HP LaserJet 1000 / 1005 / P1005 / P1006 / 1018 / 1020 / 1022 /
-	      1022n / 1022nw / P1505 / M1005 MFP / M1120 MFP / M1319 MFP
-	    HP Color LaserJet 1500 / 1600 / 2600n / CP1215
-	    Samsung CLP-2xx / CLP-3xx / CLP-6xx, Konica Minolta magicolor,
-	    Oki C110 / C130 / C3100 / C5100, Dell 1355 / C1765 ...
-	  注: PPD 走 foomatic-rip, 路由器侧转 PDF 还需要 cups-filters + ghostscript。
-	      HP P1006 用的是 foo2zjs 自带固件 (sihpP1006.img), 不需要 HP 闭源插件。
+		foo2zjs PPD:
+		HP LaserJet 1000 / 1005 / P1005 / P1006 / 1018 / 1020 / 1022 /
+		1022n / 1022nw / P1505 / M1005 MFP / M1120 MFP / M1319 MFP
+		HP Color LaserJet 1500 / 1600 / 2600n / CP1215
+		Samsung CLP-2xx / CLP-3xx / CLP-6xx, Konica Minolta magicolor,
+		Oki C110 / C130 / C3100 / C5100, Dell 1355 / C1765
 
 config CUPS_PRINTER_CHOOSE_BROTHER
-	bool "  Brother DCP/HL/MFC 激光机 (brlaser)"
+	bool "  Brother DCP/HL/MFC(brlaser)"
 
 config CUPS_PRINTER_CHOOSE_CANON_BJNP
-	bool "  Canon 老式网络打印机 BJNP 协议 (cups-bjnp)"
+	bool "  Canon BJNP(cups-bjnp)"
