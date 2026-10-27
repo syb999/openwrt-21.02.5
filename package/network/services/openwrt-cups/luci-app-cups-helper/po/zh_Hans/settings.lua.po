@@ -1,0 +1,70 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "CUPS Helper - optimization"
+msgstr "CUPS 助手 - 优化"
+
+msgid "These values are written into a managed block inside /etc/cups/cupsd.conf and applied by restarting cupsd. Queues are published over mDNS so clients find the printer without typing an address."
+msgstr "这些值会写入 /etc/cups/cupsd.conf 的受管块并重启 cupsd 生效。队列通过 mDNS 发布，客户端不用手填地址就能发现打印机。"
+
+msgid "Settings"
+msgstr "设置"
+
+msgid "Publish queues over mDNS (avahi)"
+msgstr "通过 mDNS 发布队列（avahi）"
+
+msgid "Requires avahi-daemon. Then phones and desktops list the queue automatically."
+msgstr "需要 avahi-daemon。装好后手机和电脑会自动列出这个队列。"
+
+msgid "Listen on all interfaces"
+msgstr "在所有接口上监听"
+
+msgid "Off = localhost only (printers unreachable from the LAN)."
+msgstr "关闭 = 只监听本机（局域网访问不到打印机）。"
+
+msgid "CUPS log level"
+msgstr "CUPS 日志级别"
+
+msgid "error keeps the flash writes down on a small device."
+msgstr "小设备上用 error 可以减少写 flash。"
+
+msgid "error"
+msgstr "error"
+
+msgid "warn"
+msgstr "warn"
+
+msgid "info"
+msgstr "info"
+
+msgid "debug"
+msgstr "debug"
+
+msgid "Max queued jobs"
+msgstr "队列中最大任务数"
+
+msgid "Default 50."
+msgstr "默认 50。"
+
+msgid "Max jobs per printer"
+msgstr "每台打印机最大任务数"
+
+msgid "Default 10."
+msgstr "默认 10。"
+
+msgid "Keep job history (days, 0 = never)"
+msgstr "保留任务历史（天，0 = 不保留）"
+
+msgid "On tmpfs every reboot clears it anyway; 1 is enough for troubleshooting."
+msgstr "/var 是 tmpfs，重启本来就会清空；1 天足够排查问题。"
+
+msgid "Allowed subnets"
+msgstr "允许访问的网段"
+
+msgid "Comma separated CIDRs, e.g. 192.168.1.0/24, 10.80.1.0/24. Every Allow list in cupsd.conf is rewritten to 127.0.0.1 plus these subnets. Leave empty to keep the CUPS defaults (10/8, 172.16/12, 192.168/16)."
+msgstr "多个 CIDR 用逗号分隔，例如 192.168.1.0/24, 10.80.1.0/24。cupsd.conf 里所有 Allow 列表会被改成 127.0.0.1 + 这些网段；留空则保持 CUPS 默认（10/8、172.16/12、192.168/16）。"
+
+msgid "Invalid CIDR: "
+msgstr "网段格式不正确："
+

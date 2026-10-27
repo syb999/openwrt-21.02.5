@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=cups-printer-choose
 PKG_VERSION:=1.0
-PKG_RELEASE:=1
+PKG_RELEASE:=5
 
 PKG_LICENSE:=GPL-2.0-only
 
@@ -36,7 +36,9 @@ define Package/cups-printer-choose/install
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/usb
 	$(INSTALL_BIN) ./files/30-cups-printer-firmware $(1)/etc/hotplug.d/usb/
 	$(INSTALL_DIR) $(1)/usr/share/ppd/epson
-	$(INSTALL_DATA) ./files/ppd/Epson-LQ-850-24pin.ppd $(1)/usr/share/ppd/epson/
+	$(INSTALL_DATA) ./files/ppd/epson/*.ppd $(1)/usr/share/ppd/epson/
+	$(INSTALL_DIR) $(1)/usr/share/ppd/cups-generic
+	$(INSTALL_DATA) ./files/ppd/generic/*.ppd $(1)/usr/share/ppd/cups-generic/
 endef
 
 define Build/Compile

@@ -1,0 +1,169 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "CUPS Helper"
+msgstr "CUPS 助手"
+
+msgid "Service status"
+msgstr "服务状态"
+
+msgid "cupsd process"
+msgstr "cupsd 进程"
+
+msgid "running"
+msgstr "运行中"
+
+msgid "not running"
+msgstr "未运行"
+
+msgid "Port 631 listening"
+msgstr "631 端口监听"
+
+msgid "yes"
+msgstr "是"
+
+msgid "no"
+msgstr "否"
+
+msgid "Default printer"
+msgstr "默认打印机"
+
+msgid "(none)"
+msgstr "（未设置）"
+
+msgid "Client address"
+msgstr "客户端地址"
+
+msgid "raw queues"
+msgstr "raw 队列"
+
+msgid "Start"
+msgstr "启动"
+
+msgid "Restart"
+msgstr "重启"
+
+msgid "Stop"
+msgstr "停止"
+
+msgid "Enable on boot"
+msgstr "设为开机自启"
+
+msgid "Print queues"
+msgstr "打印队列"
+
+msgid "No printers configured yet. Use "Add printer" below, or check the diagnostics."
+msgstr "还没有配置任何打印机。用下面的「添加打印机」，或先看诊断。"
+
+msgid "Name"
+msgstr "名称"
+
+msgid "State"
+msgstr "状态"
+
+msgid "Device"
+msgstr "设备"
+
+msgid "Actions"
+msgstr "操作"
+
+msgid "default"
+msgstr "默认"
+
+msgid "Test page"
+msgstr "测试页"
+
+msgid "Set default"
+msgstr "设为默认"
+
+msgid "Delete"
+msgstr "删除"
+
+msgid "Add printer"
+msgstr "添加打印机"
+
+msgid "Diagnostics"
+msgstr "诊断"
+
+msgid "USB printer device"
+msgstr "USB 打印机设备"
+
+msgid "/dev/usb/lp0 present"
+msgstr "/dev/usb/lp0 存在"
+
+msgid "/dev/usb/lp0 missing (printer unplugged or not detected)"
+msgstr "/dev/usb/lp0 不存在（打印机没插好或没识别）"
+
+msgid "usblp kernel module"
+msgstr "usblp 内核模块"
+
+msgid "loaded"
+msgstr "已加载"
+
+msgid "not loaded (needs kmod-usb-printer)"
+msgstr "未加载（需要 kmod-usb-printer）"
+
+msgid "cups-files.conf"
+msgstr "cups-files.conf"
+
+msgid "no User/Group line (CUPS built-in default)"
+msgstr "没有 User/Group 行（用 CUPS 内置默认值）"
+
+msgid "lp account"
+msgstr "lp 账号"
+
+msgid "present"
+msgstr "存在"
+
+msgid "missing - cupsd refuses to start"
+msgstr "不存在 —— cupsd 会拒绝启动"
+
+msgid "Run as root?"
+msgstr "以 root 运行？"
+
+msgid "yes - CUPS 2.x refuses to start, set User lp"
+msgstr "是 —— CUPS 2.x 会拒绝启动，改成 User lp"
+
+msgid "One-click fix"
+msgstr "一键修复"
+
+msgid "Create lp user + set User lp + restart"
+msgstr "创建 lp 账号 + 改 User lp + 重启"
+
+msgid "not needed"
+msgstr "不需要"
+
+msgid "avahi / dbus (auto-discovery)"
+msgstr "avahi / dbus（自动发现）"
+
+msgid "installed"
+msgstr "已安装"
+
+msgid "not installed - clients cannot discover the printer, enter the ipp:// address manually"
+msgstr "未安装 —— 客户端不会自动发现，需要手填 ipp:// 地址"
+
+msgid "Apply optimization settings + republish mDNS"
+msgstr "应用优化设置 + 重新发布 mDNS"
+
+msgid "Optimization settings"
+msgstr "优化设置"
+
+msgid "mDNS discovery (avahi)"
+msgstr "mDNS 发现（avahi）"
+
+msgid "avahi installed"
+msgstr "avahi 已安装"
+
+msgid "avahi not installed - clients must type the ipp:// address"
+msgstr "avahi 未安装 —— 客户端只能手填 ipp:// 地址"
+
+msgid "daemon running"
+msgstr "守护进程运行中"
+
+msgid "daemon not running"
+msgstr "守护进程未运行"
+
+msgid "%d queue(s) published"
+msgstr "已发布 %d 个队列"
+

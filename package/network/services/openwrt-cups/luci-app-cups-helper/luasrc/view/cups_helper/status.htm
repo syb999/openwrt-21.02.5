@@ -1,0 +1,176 @@
+<%+header%>
+<%
+	local sys  = require "luci.sys"
+	local fs   = require "nixio.fs"
+	local http = require "luci.http"
+
+	local function sh(cmd)
+		local out = sys.exec(cmd .. " 2>/dev/null") or ""
+		return out:gsub("%s+$", "")
+	end
+
+	local ip        = http.getenv("SERVER_ADDR") or "device-ip"
+	local running   = (sh("pidof cupsd") ~= "")
+	local listening = (sh("netstat -tln 2>/dev/null | grep -c ':631 '") ~= "0")
+	local op_url    = luci.dispatcher.build_url('admin/services/cups-helper/op')
+
+	-- queue list: lpstat -p gives the state, printers.conf gives DeviceURI
+	local printers = {}
+	local cur
+	for line in (sys.exec("lpstat -p 2>/dev/null") or ""):gmatch("[^\n]+") do
+		local n, st = line:match("^printer%s+(%S+)%s+is%s+(%S+)%.?")
+		if n then
+			cur = { name = n, state = st }
+			printers[#printers + 1] = cur
+		end
+	end
+	local uris = {}
+	for line in (fs.readfile("/etc/cups/printers.conf") or ""):gmatch("[^\n]+") do
+		local n = line:match("^<Printer%s+([^>]+)>")
+		if n then cur = n end
+		local u = line:match("^DeviceURI%s+(.+)$")
+		if u and cur then uris[cur] = u:gsub("%s+$", "") end
+	end
+	for _, p in ipairs(printers) do p.uri = uris[p.name] or "?" end
+	local dflt = (sh("lpstat -d 2>/dev/null"):match("destination:%s*(%S+)"))
+
+	local user_line, group_line = "", ""
+	for line in (fs.readfile("/etc/cups/cups-files.conf") or ""):gmatch("[^\n]+") do
+		if line:match("^User%s")  then user_line  = line end
+		if line:match("^Group%s") then group_line = line end
+	end
+	local lp_ok   = (sh("id lp 2>/dev/null") ~= "")
+	local as_root = user_line:match("User%s+root") ~= nil
+%>
+
+<h2 name="content"><%:CUPS Helper%></h2>
+
+<% if http.formvalue("msg") then %>
+	<div class="alert-message" style="margin-bottom:10px"><%=http.formvalue("msg")%></div>
+<% end %>
+
+<div class="cbi-section">
+	<h3><%:Service status%></h3>
+	<table class="table" style="width:auto">
+		<tr><td style="padding-right:14px"><%:cupsd process%></td>
+		    <td><%= running and translate("running") or
+		           "<span style=\"color:#b00\">" .. translate("not running") .. "</span>" %></td></tr>
+		<tr><td><%:Port 631 listening%></td>
+		    <td><%= listening and translate("yes") or
+		           "<span style=\"color:#b00\">" .. translate("no") .. "</span>" %></td></tr>
+		<tr><td><%:Default printer%></td>
+		    <td><%= dflt or translate("(none)") %></td></tr>
+		<tr><td><%:Client address%></td>
+		    <td><code>ipp://<%=ip%>:631/printers/&lt;name&gt;</code>　
+		        <code>socket://<%=ip%>:9100</code> <small>(<%:raw queues%>)</small></td></tr>
+	</table>
+	<div style="margin-top:10px">
+		<% local acts = { {"start", "Start"}, {"restart", "Restart"},
+		                  {"stop", "Stop"}, {"enable", "Enable on boot"} } %>
+		<% for _, x in ipairs(acts) do %>
+		<form method="post" action="<%=op_url%>" style="display:inline">
+			<input type="hidden" name="token" value="<%=token%>">
+			<input type="hidden" name="action" value="<%=x[1]%>">
+			<button class="cbi-button cbi-button-apply"><%=translate(x[2])%></button>
+		</form>
+		<% end %>
+		<form method="post" action="<%=op_url%>" style="display:inline">
+			<input type="hidden" name="token" value="<%=token%>">
+			<input type="hidden" name="action" value="apply">
+			<button class="cbi-button cbi-button-action"><%:Apply optimization settings + republish mDNS%></button>
+		</form>
+		<a class="cbi-button" href="<%=luci.dispatcher.build_url('admin/services/cups-helper/settings')%>"><%:Optimization settings%></a>
+	</div>
+</div>
+
+<div class="cbi-section">
+	<h3><%:Print queues%> (<%=#printers%>)</h3>
+	<% if #printers == 0 then %>
+		<p style="color:#a05a00"><%:No printers configured yet. Use "Add printer" below, or check the diagnostics.%></p>
+	<% else %>
+	<table class="table">
+		<tr><th><%:Name%></th><th><%:State%></th><th><%:Device%></th><th><%:Actions%></th></tr>
+		<% for _, p in ipairs(printers) do %>
+		<tr>
+			<td><%=p.name%><% if dflt == p.name then %>
+				<small style="color:#146c2e">(<%:default%>)</small><% end %></td>
+			<td><%=p.state%></td>
+			<td><code><%=p.uri%></code></td>
+			<td style="white-space:nowrap">
+				<% local btns = { {"test", "Test page", "cbi-button-action"},
+				                  {"setdefault", "Set default", ""},
+				                  {"del", "Delete", "cbi-button-negative"} } %>
+				<% for _, b in ipairs(btns) do %>
+				<form method="post" action="<%=op_url%>" style="display:inline">
+					<input type="hidden" name="token" value="<%=token%>">
+					<input type="hidden" name="action" value="<%=b[1]%>">
+					<input type="hidden" name="name" value="<%=p.name%>">
+					<button class="cbi-button <%=b[3]%>"><%=translate(b[2])%></button>
+				</form>
+				<% end %>
+			</td>
+		</tr>
+		<% end %>
+	</table>
+	<% end %>
+	<div style="margin-top:10px">
+		<a class="cbi-button cbi-button-add"
+		   href="<%=luci.dispatcher.build_url('admin/services/cups-helper/add')%>"><%:Add printer%></a>
+	</div>
+</div>
+
+<div class="cbi-section">
+	<h3><%:Diagnostics%></h3>
+	<table class="table" style="width:auto">
+		<tr><td style="padding-right:14px"><%:USB printer device%></td>
+		    <td><%= fs.access("/dev/usb/lp0") and translate("/dev/usb/lp0 present") or
+		           "<span style=\"color:#b00\">" ..
+		           translate("/dev/usb/lp0 missing (printer unplugged or not detected)") ..
+		           "</span>" %></td></tr>
+		<tr><td><%:usblp kernel module%></td>
+		    <td><%= (sh("lsmod | grep -c '^usblp'") ~= "0") and translate("loaded") or
+		           translate("not loaded (needs kmod-usb-printer)") %></td></tr>
+		<tr><td><%:cups-files.conf%></td>
+		    <td><%= (user_line ~= "" and group_line ~= "") and (user_line .. " / " .. group_line) or
+		           "<span style=\"color:#a05a00\">" ..
+		           translate("no User/Group line (CUPS built-in default)") .. "</span>" %></td></tr>
+		<tr><td><%:lp account%></td>
+		    <td><%= lp_ok and translate("present") or
+		           "<span style=\"color:#b00\">" ..
+		           translate("missing - cupsd refuses to start") .. "</span>" %></td></tr>
+		<tr><td><%:Run as root?%></td>
+		    <td><%= as_root and
+		           ("<span style=\"color:#b00\">" ..
+		            translate("yes - CUPS 2.x refuses to start, set User lp") ..
+		            "</span>") or translate("no") %></td></tr>
+		<tr><td><%:One-click fix%></td>
+		    <td>
+			<% if as_root or not lp_ok then %>
+			<form method="post" action="<%=op_url%>" style="display:inline">
+				<input type="hidden" name="token" value="<%=token%>">
+				<input type="hidden" name="action" value="fixuser">
+				<button class="cbi-button cbi-button-apply"><%:Create lp user + set User lp + restart%></button>
+			</form>
+			<% else %>
+				<small style="color:#146c2e"><%:not needed%></small>
+			<% end %>
+		    </td></tr>
+		<tr><td><%:mDNS discovery (avahi)%></td>
+		    <td>
+			<% local av_inst = (sh("opkg list-installed 2>/dev/null | grep -cE '^avahi-daemon|^dbus'") ~= "0")
+			   local av_run  = (sh("pidof avahi-daemon") ~= "")
+			   local pubs    = tonumber(sh("ls -1 /etc/avahi/services 2>/dev/null | grep -c cups-helper-") or "0") or 0 %>
+			<%= av_inst and translate("avahi installed") or
+			    ("<span style=\"color:#a05a00\">" ..
+			     translate("avahi not installed - clients must type the ipp:// address") .. "</span>") %>
+			<% if av_inst then %>
+				, <%= av_run and translate("daemon running") or
+				      ("<span style=\"color:#b00\">" .. translate("daemon not running") .. "</span>") %>,
+				<%= string.format(translate("%d queue(s) published"), pubs) %>
+			<% end %>
+		    </td></tr>
+	</table>
+	<pre style="max-height:220px;overflow:auto;background:#f7f7f9;padding:8px;border-radius:6px;font-size:12px"><%=sh("logread 2>/dev/null | grep -i cups | tail -15")%></pre>
+</div>
+
+<%+footer%>

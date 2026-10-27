@@ -1,5 +1,5 @@
 config CUPS_PRINTER_CHOOSE_HP_ZJS
-	bool "  HP / Samsung / Konica / Oki ZjStream (foo2zjs)"
+	bool "HP / Samsung / Konica / Oki ZjStream (foo2zjs)"
 	help
 		foo2zjs PPD:
 		HP LaserJet 1000 / 1005 / P1005 / P1006 / 1018 / 1020 / 1022 /
@@ -9,7 +9,7 @@ config CUPS_PRINTER_CHOOSE_HP_ZJS
 		Oki C110 / C130 / C3100 / C5100, Dell 1355 / C1765
 
 config CUPS_PRINTER_CHOOSE_BROTHER
-	bool "  Brother DCP/HL/MFC(brlaser)"
+	bool "Brother DCP/HL/MFC(brlaser)"
 
 config CUPS_PRINTER_CHOOSE_CANON_BJNP
-	bool "  Canon BJNP(cups-bjnp)"
+	bool "Canon BJNP(cups-bjnp)"

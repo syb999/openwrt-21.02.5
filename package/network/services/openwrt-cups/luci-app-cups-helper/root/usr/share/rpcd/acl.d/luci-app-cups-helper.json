@@ -1,0 +1,13 @@
+{
+ "luci-app-cups-helper": {
+  "description": "CUPS helper (status, diagnostics, queue management)",
+  "read": {
+   "ubus": {
+    "session": [
+     "access"
+    ]
+   }
+  },
+  "write": {}
+ }
+}

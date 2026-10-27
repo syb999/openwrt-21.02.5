@@ -120,6 +120,9 @@ CONFIGURE_ARGS+= \
 define Package/cups/install
 	$(INSTALL_DIR) $(1)/etc/cups
 	$(CP) $(PKG_INSTALL_DIR)/etc/cups/* $(1)/etc/cups/
+	sed -i -e 's/^User root/User lp/' -e 's/^Group root/Group lp/' \
+		-e 's/^# User lp/User lp/' -e 's/^# Group lp/Group lp/' \
+		$(1)/etc/cups/cups-files.conf
 	$(LN) /tmp $(1)/etc/cups/certs
 
 	$(INSTALL_DIR) $(1)/usr/lib/cups
@@ -159,6 +162,10 @@ define Package/cups/install
 	# install initscript with priority 60
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/cupsd.init $(1)/etc/init.d/cupsd
+
+	# CUPS 2.x 需要非特权账号 lp（OpenWrt 默认没有），首次安装在 uci-defaults 里补
+	$(INSTALL_DIR) $(1)/etc/uci-defaults
+	$(INSTALL_BIN) ./files/etc/uci-defaults/92-cups-lp-user $(1)/etc/uci-defaults/
 	$(INSTALL_BIN) \
 		$(PKG_INSTALL_DIR)/usr/sbin/{cupsctl,cupsd} \
 		$(1)/usr/sbin/

@@ -1,0 +1,58 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "CUPS Helper"
+msgstr "CUPS 助手"
+
+msgid "Done: "
+msgstr "完成："
+
+msgid "Failed: "
+msgstr "失败："
+
+msgid "Fixed and started, cupsd pid "
+msgstr "已修复并启动，cupsd pid "
+
+msgid "Still not running after the fix"
+msgstr "修复后仍未启动"
+
+msgid "Queue name may only contain letters, digits, _ . -"
+msgstr "队列名只能用字母、数字、_ . -"
+
+msgid "Device URI is empty or invalid"
+msgstr "设备地址为空或不合法"
+
+msgid "Choose a driver (raw or a PPD)"
+msgstr "请选择驱动（raw 或 PPD）"
+
+msgid "Queue added: "
+msgstr "已添加队列："
+
+msgid "Failed to add queue: "
+msgstr "添加队列失败："
+
+msgid "Queue deleted: "
+msgstr "已删除队列："
+
+msgid "Failed to delete: "
+msgstr "删除失败："
+
+msgid "Default printer: "
+msgstr "默认打印机："
+
+msgid "Test page sent to "
+msgstr "已发送测试页到 "
+
+msgid "Failed to send test page: "
+msgstr "发送测试页失败："
+
+msgid "Unknown action"
+msgstr "未知操作"
+
+msgid "Settings applied and queues republished"
+msgstr "设置已应用，队列已重新发布"
+
+msgid "Apply failed: "
+msgstr "应用失败："
+

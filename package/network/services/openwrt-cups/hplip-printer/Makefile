@@ -1,11 +1,16 @@
 #
-# 🔴 硬阻塞（2026-10 实测，别重走）：hpcups 链接需要 libImageProcessor，
-#    而 hplip 源码里**只有预编译的 x86 版本**（prnt/hpcups/libImageProcessor-x86_64.so /
-#    -x86_32.so，无 arm 版本、也没有源码），交叉编译 aarch64 时 ld 报
-#    "skipping incompatible .../libImageProcessor.so" + "cannot find -lImageProcessor"。
-#    ⇒ 在 aarch64 OpenWrt 上 hpcups 编不出来。HP LaserJet Pro P1106/P1102 请优先试
-#    foo2zjs 自带的 HP-LaserJet_Pro_P1102.ppd（同引擎家族），或换 IPP/其它路径。
-#    当前包默认不选（.config 里 is not set），保留代码供以后找到 arm 版 ImageProcessor 时用。
+# 🔴 ARM/MIPS 上编不出来（2026-10 实测 + 符号表核实）：hpcups 的 hpcups_LDADD 里
+#    硬编码 -lImageProcessor，而 hplip 只带预编译的 x86 版本
+#    （prnt/hpcups/libImageProcessor-x86_64.so / -x86_32.so，libImageProcessor.so 是
+#    指向 x86_64 的符号链接），既无 ARM 版也无源码 ⇒ 交叉链接报
+#      ./prnt/hpcups//libImageProcessor.so: file format not recognized
+#      collect2: error: ld returned 1 exit status
+#    （ip/*.c 编出来的是 libhpip，导出符号名不同，替不了。）
+#    它提供的 5 个符号 imageProcessorCreate/StartPage/ProcessLine/EndPage/Destroy
+#    只有 HPCupsFilter.cpp 调用，且都在
+#      if (strncmp(m_JA.printer_platform, "ljzjstream", 10) == 0) 里 ⇒ 只影响 ZjStream
+#    机型（P1005/P1006/P1102/P1106 这一系），这些机型请用本树的 foo2zjs 包。
+#    ⇒ 本包已用 DEPENDS 限制为 @(TARGET_x86||TARGET_x86_64)，非 x86 平台不可选。
 #
 # hplip-printer 3.21.2 — 只取 hplip 的**打印**部分 (hpcups filter + PPD)
 #
@@ -60,7 +65,19 @@ define Package/hplip-printer
   CATEGORY:=Utilities
   TITLE:=HPLIP printing part (hpcups filter + PPDs)
   URL:=https://developers.hp.com/hp-linux-imaging-and-printing
-  DEPENDS:=+libcups +libjpeg-turbo +libstdcpp
+  # 只允许在 x86 上选：hpcups 链接时需要 -lImageProcessor，而 hplip 源码里只有
+  # 预编译的 x86 版本（prnt/hpcups/libImageProcessor-x86_64.so / -x86_32.so），
+  # 既没有 ARM 版也没有源码。ARM 上交叉链接会拿到 x86 ELF ⇒
+  #   ./prnt/hpcups//libImageProcessor.so: file format not recognized
+  #   collect2: error: ld returned 1 exit status
+  # （HPLIP 里 ip/*.c 编出来的是另一个库 libhpip，导出的符号名不同，顶不上。）
+  # 而且这 5 个符号 imageProcessorCreate/StartPage/ProcessLine/EndPage/Destroy
+  # 在全部源码里只有 prnt/hpcups/HPCupsFilter.cpp 调用，并且都被
+  #   if (strncmp(m_JA.printer_platform, "ljzjstream", 10) == 0)
+  # 包着 —— 只有 ZjStream 机型（P1005/P1006/P1102/P1106 这一系）才走。
+  # 这些机型在 OpenWrt 上要用 foo2zjs（本树 package/network/services/openwrt-cups/foo2zjs），
+  # 不需要 hplip。所以这里直接把包限制在 x86/x86_64，ARM 上不可选 ⇒ 不会被误开。
+  DEPENDS:=@(TARGET_x86||TARGET_x86_64) +libcups +libjpeg-turbo +libstdcpp
 endef
 
 define Package/hplip-printer/description

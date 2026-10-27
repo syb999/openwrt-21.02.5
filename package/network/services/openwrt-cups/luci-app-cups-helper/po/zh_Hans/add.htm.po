@@ -1,0 +1,67 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "Add printer"
+msgstr "添加打印机"
+
+msgid "Queue name"
+msgstr "队列名称"
+
+msgid "Only letters, digits, underscore, dot and dash."
+msgstr "只能用字母、数字、下划线、点、横线。"
+
+msgid "Device URI"
+msgstr "设备地址"
+
+msgid "(detected on this device)"
+msgstr "（本机已检测到）"
+
+msgid "(currently not detected)"
+msgstr "（当前未检测到）"
+
+msgid "network printer, raw port"
+msgstr "网络打印机，raw/9100 端口"
+
+msgid "IPP network printer"
+msgstr "支持 IPP 的网络打印机"
+
+msgid "queue"
+msgstr "队列名"
+
+msgid "Custom device URI (overrides the selection above)"
+msgstr "自定义设备 URI（覆盖上面的选择）"
+
+msgid "Driver / PPD"
+msgstr "驱动 / PPD"
+
+msgid "raw - the client renders, the router only forwards (lowest CPU, recommended)"
+msgstr "raw —— 客户端自己渲染，盒子只转发（最省 CPU，推荐）"
+
+msgid "(ignored when raw is used)"
+msgstr "（用 raw 时忽略）"
+
+msgid "raw: a Linux client with the P1006/P1106 driver sends ZjStream directly - fastest."
+msgstr "raw：Linux 客户端用 P1006/P1106 驱动直接发 ZjStream —— 最快。"
+
+msgid "PPD: the router renders the job, any client works, but the CPU is slow."
+msgstr "PPD：由盒子渲染，任何客户端都能用，但单核 CPU 慢。"
+
+msgid "No PPD found. Install foo2zjs or gutenprint first."
+msgstr "没找到任何 PPD，先装 foo2zjs 或 gutenprint。"
+
+msgid "%d PPDs available (foo2zjs and others)."
+msgstr "可用 PPD %d 个（foo2zjs 及其它）。"
+
+msgid "Set as default"
+msgstr "设为默认"
+
+msgid "Make this the system default queue."
+msgstr "设为系统默认打印队列。"
+
+msgid "Create queue"
+msgstr "创建队列"
+
+msgid "Back"
+msgstr "返回"
+

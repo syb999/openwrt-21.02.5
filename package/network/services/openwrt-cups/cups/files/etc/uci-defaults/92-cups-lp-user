@@ -1,0 +1,19 @@
+#!/bin/sh
+# CUPS 2.x 不能以 root 运行（cups-files.conf: User lp），但 OpenWrt 默认没有 lp 账号，
+# 缺了它 cupsd 直接退出： "Will not use User root (UID=0) ... You must use a
+# non-privileged account instead." / "Unable to read /etc/cups/cups-files.conf due to errors."
+grep -q '^lp:' /etc/group 2>/dev/null || echo 'lp:x:7:' >> /etc/group
+grep -q '^lp:' /etc/passwd 2>/dev/null || \
+	echo 'lp:x:7:7:lp:/var/spool/lpd:/bin/false' >> /etc/passwd
+# 旧版本装出来的配置里写的是 User root / Group root（CUPS 2.x 直接拒绝启动），就地改掉
+if [ -f /etc/cups/cups-files.conf ]; then
+	sed -i -e 's/^User root$/User lp/' -e 's/^Group root$/Group lp/' /etc/cups/cups-files.conf
+	grep -q '^User lp' /etc/cups/cups-files.conf || sed -i '1i User lp' /etc/cups/cups-files.conf
+	grep -q '^Group lp' /etc/cups/cups-files.conf || sed -i '1i Group lp' /etc/cups/cups-files.conf
+fi
+
+for d in /var/cache/cups /var/cups /var/spool/cups /var/run/cups; do
+	[ -d "$d" ] && chown -R lp:lp "$d" 2>/dev/null
+done
+/etc/init.d/cupsd restart >/dev/null 2>&1
+exit 0

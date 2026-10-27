@@ -1,0 +1,13 @@
+#!/bin/sh
+[ -f /etc/config/cups_helper ] || cat > /etc/config/cups_helper <<'EOF'
+config cups_helper 'main'
+	option avahi '1'
+	option access_subnet '192.168.1.0/24'
+	option log_level 'warn'
+	option max_jobs '50'
+	option max_jobs_per_printer '10'
+	option keep_jobs_days '1'
+	option listen_any '1'
+EOF
+[ -x /usr/lib/cups-helper/apply.sh ] && /usr/lib/cups-helper/apply.sh >/dev/null 2>&1
+exit 0

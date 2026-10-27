@@ -1,0 +1,90 @@
+<%+header%>
+<%
+	local sys  = require "luci.sys"
+	local fs   = require "nixio.fs"
+
+	local ppds = {}
+	for line in (sys.exec("ls -1 /usr/share/ppd/*/*.ppd /usr/share/ppd/*.ppd /usr/share/cups/model/*.ppd 2>/dev/null") or ""):gmatch("[^\n]+") do
+		ppds[#ppds + 1] = line
+	end
+	local usb = fs.access("/dev/usb/lp0")
+%>
+
+<h2 name="content"><%:Add printer%></h2>
+
+<form method="post" action="<%=luci.dispatcher.build_url('admin/services/cups-helper/op')%>">
+<input type="hidden" name="token" value="<%=token%>">
+<input type="hidden" name="action" value="add">
+
+<div class="cbi-section">
+	<div class="cbi-value">
+		<label class="cbi-value-title"><%:Queue name%></label>
+		<div class="cbi-value-field">
+			<input type="text" name="name" class="cbi-input-text" value="LP" placeholder="LP">
+			<div class="cbi-value-description"><%:Only letters, digits, underscore, dot and dash.%></div>
+		</div>
+	</div>
+
+	<div class="cbi-value">
+		<label class="cbi-value-title"><%:Device URI%></label>
+		<div class="cbi-value-field">
+			<select name="uri" class="cbi-input-select">
+				<option value="usb:/dev/usb/lp0"<%= usb and " selected" or "" %>>
+					usb:/dev/usb/lp0 <%= usb and translate("(detected on this device)") or translate("(currently not detected)") %>
+				</option>
+				<option value="socket://192.168.1.100:9100">socket://IP:9100 (<%:network printer, raw port%>)</option>
+				<option value="ipp://192.168.1.100:631/ipp/print">ipp://IP:631/ipp/print (<%:IPP network printer%>)</option>
+				<option value="lpd://192.168.1.100/queue">lpd://IP/<%:queue%></option>
+			</select>
+			<input type="text" name="uri_custom" class="cbi-input-text" style="margin-top:6px"
+			       placeholder="<%:Custom device URI (overrides the selection above)%>">
+		</div>
+	</div>
+
+	<div class="cbi-value">
+		<label class="cbi-value-title"><%:Driver / PPD%></label>
+		<div class="cbi-value-field">
+			<select name="model" class="cbi-input-select">
+				<option value="raw"><%:raw - the client renders, the router only forwards (lowest CPU, recommended)%></option>
+			</select>
+			<select name="ppd" class="cbi-input-select" style="margin-top:6px">
+				<option value=""><%:(ignored when raw is used)%></option>
+				<% for _, p in ipairs(ppds) do %>
+				<option value="<%=p%>"><%=p:gsub("^/usr/share/ppd/", "")%></option>
+				<% end %>
+			</select>
+			<div class="cbi-value-description">
+				<%:raw: a Linux client with the P1006/P1106 driver sends ZjStream directly - fastest.%><br>
+				<%:PPD: the router renders the job, any client works, but the CPU is slow.%><br>
+				<% if #ppds == 0 then %>
+					<span style="color:#b00"><%:No PPD found. Install foo2zjs or gutenprint first.%></span>
+				<% else %>
+					<%=string.format(translate("%d PPDs available (foo2zjs and others)."), #ppds)%>
+				<% end %>
+			</div>
+		</div>
+	</div>
+
+	<div class="cbi-value">
+		<label class="cbi-value-title"><%:Set as default%></label>
+		<div class="cbi-value-field">
+			<input type="checkbox" name="default" value="1" checked>
+			<div class="cbi-value-description"><%:Make this the system default queue.%></div>
+		</div>
+	</div>
+</div>
+
+<div class="cbi-page-actions">
+	<button class="cbi-button cbi-button-apply"><%:Create queue%></button>
+	<a class="cbi-button" href="<%=luci.dispatcher.build_url('admin/services/cups-helper')%>"><%:Back%></a>
+</div>
+</form>
+
+<script type="text/javascript">
+// a filled "uri_custom" wins over the select; disable the select so it is obvious
+document.querySelector('input[name="uri_custom"]').addEventListener('input', function () {
+	document.querySelector('select[name="uri"]').disabled = !!this.value;
+});
+</script>
+
+<%+footer%>

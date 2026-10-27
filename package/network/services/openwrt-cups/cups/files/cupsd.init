@@ -7,6 +7,9 @@ start() {
 	mkdir -m 0755 -p /var/cache/cups
 	mkdir -m 0755 -p /var/cups
 	mkdir -m 0755 -p /var/spool/cups/tmp
+	mkdir -m 0755 -p /var/run/cups
+	# CUPS 2.x 以非特权账号运行（cups-files.conf 里 User lp）
+	chown -R lp:lp /var/cache/cups /var/cups /var/spool/cups /var/run/cups 2>/dev/null
 	service_start /usr/sbin/cupsd
 }
 
