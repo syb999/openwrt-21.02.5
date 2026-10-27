@@ -18,7 +18,7 @@ define Package/$(PKG_NAME)
   SECTION:=net
   CATEGORY:=Network
   SUBMENU:=Web Servers/Proxies
-  DEPENDS:=@(TARGET_sunxi_cortexa7||TARGET_brcm2708_bcm2710||TARGET_bcm27xx||TARGET_armvirt||TARGET_ar71xx||TARGET_ramips||TARGET_x86_64)
+  DEPENDS:=@(TARGET_sunxi_cortexa7||TARGET_rockchip||TARGET_brcm2708_bcm2710||TARGET_bcm27xx||TARGET_armvirt||TARGET_amlogic||TARGET_ar71xx||TARGET_ramips||TARGET_x86_64)
 endef
 
 define Package/$(PKG_NAME)/description
@@ -65,6 +65,8 @@ define Package/$(PKG_NAME)/install
 	$(INSTALL_CONF) ./files/Caddyfile $(1)/etc/caddy/Caddyfile
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/caddy.init $(1)/etc/init.d/caddy
+	$(INSTALL_DIR) $(1)/etc/security
+	$(INSTALL_CONF) ./files/limits.conf $(1)/etc/security/limits.conf
 	$(INSTALL_DIR) $(1)/usr/bin/caddy
 	$(INSTALL_DIR) $(1)/bin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/caddy $(1)/usr/bin/caddy
