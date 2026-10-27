@@ -1,0 +1,14 @@
+#!/bin/sh
+# 上传两份 Excel 再等匹配结果，默认的 script_timeout=60 / network_timeout=30 容易掐断。
+# 只放宽、不缩小；已经是更大值的保持不动。
+[ -f /etc/config/uhttpd ] || exit 0
+cur=$(uci -q get uhttpd.main.script_timeout || echo 60)
+case "$cur" in ''|*[!0-9]*) cur=60 ;; esac
+if [ "$cur" -lt 300 ]; then
+	uci set uhttpd.main.script_timeout='300'
+	uci set uhttpd.main.network_timeout='300'
+	uci commit uhttpd
+	/etc/init.d/uhttpd restart >/dev/null 2>&1
+	logger -t excel-match "uhttpd timeouts raised to 300s for Excel uploads"
+fi
+exit 0

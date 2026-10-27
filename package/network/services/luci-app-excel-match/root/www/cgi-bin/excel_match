@@ -1,0 +1,327 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""
+/www/cgi-bin/excel_match — LuCI「Excel 匹配」页面的后端（普通 CGI，免登录，内网使用）
+
+POST multipart/form-data：
+    f1, f2        两个 Excel 文件（.xlsx / .xlsm；.xls 会提示先转格式）
+    match1        主表匹配列（列名 / 1 起始序号 / Excel 字母 A..ZZ）
+    match2        数据表匹配列
+    extract       提取列，逗号或空格分隔
+    sheet1/sheet2 工作表名或 1 起始序号（留空=第一张）
+    header1/header2  表头所在行（1 起始，默认 1）
+    ignore_case   "1" = 忽略大小写
+    numeric       "1" = 数字归一（00123 / 123.0 / １２３ 都算 123）
+    keep_all      "1" = 结果保留主表全部列
+    dup_mode      pair（重复值按顺序一一对应）| lookup（重复值都用第一条）
+
+正常返回：xlsx（附件下载），并把统计放进 X-Match-Report 头（base64 JSON）
+出错返回：application/json  {"error": "..."}
+GET /cgi-bin/excel_match?selftest=1 → 纯文本，用于确认部署是否正常
+"""
+
+import base64
+import cgi
+from urllib.parse import unquote
+import hmac
+import json
+import os
+import shutil
+import sys
+import tempfile
+import traceback
+import zipfile
+
+sys.path.insert(0, "/usr/lib/excel-match")
+
+UCI = "/etc/config/excel_match"          # 口令与大小限制都在这里（LuCI 设置页修改）
+MAX_FILE_BYTES = 10 * 1024 * 1024
+MAX_TOTAL_BYTES = 20 * 1024 * 1024
+MAX_UNPACKED_BYTES = 200 * 1024 * 1024
+
+
+def uci_get(opt, default=""):
+    """直接读 /etc/config/excel_match（不调 uci，省进程）。"""
+    try:
+        with open(UCI, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("option " + opt + " "):
+                    v = line[len("option ") + len(opt) + 1:].strip()
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                        v = v[1:-1]
+                    return v
+    except OSError:
+        pass
+    return default
+
+
+def load_conf():
+    global MAX_FILE_BYTES, MAX_TOTAL_BYTES, MAX_UNPACKED_BYTES
+    def mb(opt, dflt):
+        try:
+            v = int(uci_get(opt, str(dflt)))
+        except (TypeError, ValueError):
+            v = dflt
+        return (v if 1 <= v <= 4096 else dflt) * 1024 * 1024
+    MAX_FILE_BYTES = mb("max_file_mb", 10)
+    MAX_TOTAL_BYTES = mb("max_total_mb", 20)
+    MAX_UNPACKED_BYTES = mb("max_unpacked_mb", 200)
+KEYFILE = "/etc/excel-match.key"        # 访问口令；文件不存在或为空 = 不启用
+
+
+def get_key():
+    """口令：UCI 的 token 优先，其次老的 /etc/excel-match.key。空 = 不启用。"""
+    v = uci_get("token", None)
+    if v is not None:
+        return v
+    try:
+        with open(KEYFILE, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read().rstrip("\r\n")
+    except OSError:
+        return ""
+
+
+def field_raw(form, name):
+    """
+    取表单字段原文。cgi.FieldStorage 会**吃掉首尾空白**（实测 "xyz " → "xyz"），
+    所以首尾有空格、或口令本身是空格时，改走 <name>_b64（base64 of UTF-8）以保证逐字节一致。
+    """
+    if form is not None and (name + "_b64") in form:
+        try:
+            return base64.b64decode(form[name + "_b64"].value or "").decode("utf-8")
+        except Exception:
+            return ""
+    return (form[name].value if (form is not None and name in form) else "") or ""
+
+
+def check_key(form=None):
+    """口令没设就放行；设了就必须一致。返回 None=通过，否则返回错误文本。"""
+    want = get_key()
+    if not want:
+        return None
+    got = (form.get("tok") or "") if isinstance(form, dict) else field_raw(form, "_token")
+    if not got:
+        got = os.environ.get("HTTP_X_TOKEN", "") or ""
+        # 头部同样会被 server 去掉首尾空白；要精确就用 X-Token-B64
+        b64h = os.environ.get("HTTP_X_TOKEN_B64", "") or ""
+        if b64h:
+            try:
+                got = base64.b64decode(b64h).decode("utf-8")
+            except Exception:
+                got = ""
+    if hmac.compare_digest(str(got), want):
+        return None
+    return "需要访问口令（在页面提示处输入，或联系管理员）"
+
+
+def _hdr(status, ctype, extra=None):
+    sys.stdout.write("Status: %s\r\n" % status)
+    sys.stdout.write("Content-Type: %s\r\n" % ctype)
+    sys.stdout.write("Cache-Control: no-store\r\n")
+    for k, v in (extra or []):
+        sys.stdout.write("%s: %s\r\n" % (k, v))
+    sys.stdout.write("\r\n")
+    sys.stdout.flush()
+
+
+def fail(msg, status="400 Bad Request", extra=None):
+    _hdr(status, "application/json; charset=utf-8", extra)
+    sys.stdout.write(json.dumps({"error": msg}, ensure_ascii=False))
+    sys.stdout.flush()
+    sys.exit(0)
+
+
+def ok_file(path, report):
+    blob = json.dumps(report, ensure_ascii=False).encode("utf-8")
+    name = "match_result.xlsx"
+    cd = "attachment; filename=\"%s\"; filename*=UTF-8''%s" % (
+        name, "%E5%8C%B9%E9%85%8D%E7%BB%93%E6%9E%9C.xlsx")   # 匹配结果.xlsx
+    _hdr("200 OK",
+         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+         [("Content-Disposition", cd),
+          ("X-Match-Report", base64.b64encode(blob).decode("ascii")),
+          ("Content-Length", str(os.path.getsize(path)))])
+    with open(path, "rb") as fh:
+        shutil.copyfileobj(fh, sys.stdout.buffer)
+    sys.stdout.flush()
+
+
+def main():
+    load_conf()
+    # 部署自检
+    if os.environ.get("QUERY_STRING", "").find("selftest") >= 0:
+        try:
+            import pandas, openpyxl, match_core          # noqa: F401
+            _hdr("200 OK", "text/plain; charset=utf-8")
+            sys.stdout.write("ok python=%s pandas=%s openpyxl=%s\n"
+                             % (sys.version.split()[0], pandas.__version__, openpyxl.__version__))
+        except Exception as exc:
+            _hdr("500 Internal Server Error", "text/plain; charset=utf-8")
+            sys.stdout.write("selftest failed: %r\n" % (exc,))
+        return
+
+    if os.environ.get("REQUEST_METHOD", "").upper() != "POST":
+        qs = os.environ.get("QUERY_STRING", "")
+        if "check=1" in qs:
+            # 口令优先从 query 里取（%xx 解码后），其次 X-Token / X-Token-B64 头。
+            # 之所以要 query 这条路：部分 CGI 宿主（如 python http.server）不转发自定义头。
+            tk = ""
+            for kv in qs.split("&"):
+                if kv.startswith("tk_b64="):
+                    try:
+                        tk = base64.b64decode(unquote(kv[7:])).decode("utf-8")
+                    except Exception:
+                        tk = ""
+                elif kv.startswith("tk=") and not tk:
+                    tk = unquote(kv[3:])
+            bad = check_key({"tok": tk}) if tk else check_key(None)
+            _hdr("200 OK", "application/json; charset=utf-8")
+            sys.stdout.write(json.dumps(
+                {"ok": 1, "authorized": bad is None,
+                 "token_required": bool(get_key()),
+                 "error": bad or None}, ensure_ascii=False))
+            sys.stdout.flush()
+            return
+        host = os.environ.get("HTTP_HOST") or os.environ.get("SERVER_ADDR") or "<设备IP>"
+        _hdr("200 OK", "application/json; charset=utf-8")
+        sys.stdout.write(json.dumps({
+            "ok": 1,
+            "usage": "POST multipart/form-data 上传 f1/f2/match1/match2/extract 等字段",
+            "page": "http://%s/excel.htm" % host,
+            "curl": ("curl -F f1=@主表.xlsx -F f2=@数据表.xlsx -F match1=编号 "
+                     "-F match2=编号 -F 'extract=姓名 电话' "
+                     "http://%s/cgi-bin/excel_match -o 结果.xlsx") % host,
+            "selftest": "?selftest=1",
+            "token_required": bool(get_key()),
+            "limits": {"file_mb": MAX_FILE_BYTES // 1048576,
+                       "total_mb": MAX_TOTAL_BYTES // 1048576,
+                       "unpacked_mb": MAX_UNPACKED_BYTES // 1048576},
+        }, ensure_ascii=False, indent=1))
+        sys.stdout.flush()
+        return
+
+    try:
+        total = int(os.environ.get("CONTENT_LENGTH") or 0)
+    except ValueError:
+        total = 0
+    if total <= 0:
+        fail("没收到上传内容")
+    if total > MAX_TOTAL_BYTES:
+        fail("上传太大（%.1f MB），两份合计上限 %d MB"
+             % (total / 1048576.0, MAX_TOTAL_BYTES // 1048576))
+
+    try:
+        form = cgi.FieldStorage(fp=sys.stdin.buffer, environ=os.environ,
+                                keep_blank_values=True)
+    except Exception as exc:
+        fail("上传解析失败：%r" % (exc,))
+
+    # 改口令：POST ?action=setkey  (字段 cur=旧口令, new=新口令；新口令留空=关闭口令)
+    if os.environ.get("QUERY_STRING", "").find("action=setkey") >= 0:
+        cur = field_raw(form, "cur")
+        new = field_raw(form, "new")
+        want = get_key()
+        if want and not hmac.compare_digest(str(cur), want):
+            fail("旧口令不对")
+        new = str(new)
+        try:
+            lines, done = [], False
+            try:
+                with open(UCI, "r", encoding="utf-8", errors="replace") as fh:
+                    lines = fh.read().splitlines()
+            except OSError:
+                lines = ["config excel_match 'main'"]
+            for ln in lines:
+                if ln.strip().startswith("option token "):
+                    lines[lines.index(ln)] = "\toption token %r" % new
+                    done = True
+                    break
+            if not done:
+                lines.append("\toption token %r" % new)
+            with open(UCI, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+            if os.path.exists(KEYFILE):
+                os.remove(KEYFILE)
+        except OSError as exc:
+            fail("写口令失败：%r" % (exc,))
+        _hdr("200 OK", "application/json; charset=utf-8")
+        sys.stdout.write(json.dumps({"ok": 1, "token_required": bool(new)},
+                                    ensure_ascii=False))
+        sys.stdout.flush()
+        return
+
+    bad = check_key(form)
+    if bad:
+        fail(bad, status="403 Forbidden")
+
+    tmp = tempfile.mkdtemp(prefix="excel-match-")
+    try:
+        saved = {}
+        for key in ("f1", "f2"):
+            item = form[key] if key in form else None
+            if item is None or not getattr(item, "filename", ""):
+                fail("请选择%s" % ("主表文件" if key == "f1" else "数据表文件"))
+            fn = os.path.basename(item.filename) or (key + ".xlsx")
+            ext = os.path.splitext(fn)[1].lower() or ".xlsx"
+            path = os.path.join(tmp, key + ext)
+            got = 0
+            with open(path, "wb") as fh:
+                while True:
+                    chunk = item.file.read(262144)
+                    if not chunk:
+                        break
+                    got += len(chunk)
+                    if got > MAX_FILE_BYTES:
+                        fail("%s 超过单个文件上限 %d MB（这台设备内存有限）"
+                             % (fn, MAX_FILE_BYTES // 1048576))
+                    fh.write(chunk)
+            if got == 0:
+                fail("%s 是空文件" % fn)
+            if ext in (".xlsx", ".xlsm"):
+                try:
+                    with zipfile.ZipFile(path) as zf:
+                        unpacked = sum(i.file_size for i in zf.infolist())
+                except Exception:
+                    fail("%s 不是有效的 xlsx（压缩包结构损坏）" % fn)
+                if unpacked > MAX_UNPACKED_BYTES:
+                    fail("%s 解压后 %.0f MB，超过上限 %d MB（疑似压缩炸弹）"
+                         % (fn, unpacked / 1048576.0, MAX_UNPACKED_BYTES // 1048576))
+            saved[key] = path
+
+        def g(name, default=""):
+            v = form[name].value if name in form else default
+            return default if v in (None, "") else v
+
+        def flag(name):
+            return str(g(name, "")).lower() in ("1", "on", "true", "yes")
+
+        dup_mode = str(g("dup_mode", "pair"))
+        if dup_mode not in ("pair", "lookup"):
+            dup_mode = "pair"
+
+        import match_core
+        res, report = match_core.run_match(
+            saved["f1"], saved["f2"],
+            g("match1"), g("match2"), g("extract", ""),
+            sheet1=g("sheet1", None), sheet2=g("sheet2", None),
+            header1=int(g("header1", 1) or 1), header2=int(g("header2", 1) or 1),
+            ignore_case=flag("ignore_case"), numeric=flag("numeric"),
+            relax=True, keep_all_file1=flag("keep_all"), dup_mode=dup_mode,
+        )
+        out = os.path.join(tmp, "out.xlsx")
+        res.to_excel(out, index=False)
+        ok_file(out, report)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        if exc.__class__.__name__ == "MatchError":
+            fail(str(exc))
+        fail("处理失败：%s\n%s" % (exc, traceback.format_exc()[-800:]),
+             status="500 Internal Server Error")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

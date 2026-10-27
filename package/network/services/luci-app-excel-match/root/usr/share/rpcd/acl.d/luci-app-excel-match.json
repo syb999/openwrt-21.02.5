@@ -1,0 +1,12 @@
+{
+	"luci-app-excel-match": {
+		"description": "Excel 表格匹配（设置口令与上传大小限制）",
+		"read": {
+			"ubus": { "session": [ "access" ] },
+			"uci": [ "excel_match", "uhttpd" ]
+		},
+		"write": {
+			"uci": [ "excel_match" ]
+		}
+	}
+}

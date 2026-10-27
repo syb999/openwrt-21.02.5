@@ -1,0 +1,16 @@
+#!/bin/sh
+[ -f /etc/config/excel_match ] || {
+	cat > /etc/config/excel_match <<'EOF'
+config excel_match 'main'
+	option token ''
+	option max_file_mb '10'
+	option max_total_mb '20'
+	option max_unpacked_mb '200'
+EOF
+}
+# 从 JS 版升级上来时，opkg 不会删旧包才有的文件，这里清掉，避免旧菜单/旧视图残留
+rm -f /usr/share/luci/menu.d/luci-app-excel-match.json 2>/dev/null
+rm -rf /www/luci-static/resources/view/excel_match 2>/dev/null
+rm -f /tmp/luci-indexcache 2>/dev/null
+rm -rf /tmp/luci-modulecache 2>/dev/null
+exit 0

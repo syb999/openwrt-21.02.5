@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store">
+<title>Excel 表格匹配</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:14px;font:15px/1.5 -apple-system,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;background:#f5f6f8;color:#222}
+.wrap{max-width:640px;margin:0 auto}
+h1{font-size:19px;margin:0 0 2px}
+.sub{color:#777;font-size:12px;margin-bottom:12px}
+.card{background:#fff;border-radius:10px;padding:14px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:12px}
+label{display:block;font-size:13px;color:#555;margin:10px 0 4px}
+label:first-child{margin-top:0}
+input[type=text],select{width:100%;padding:9px 10px;border:1px solid #ccd0d5;border-radius:7px;font-size:15px;background:#fff}
+input[type=file]{width:100%;font-size:13px;padding:7px;border:1px dashed #c3c8ce;border-radius:7px;background:#fafbfc}
+.hint{font-size:11px;color:#8a9099;margin-top:3px}
+.row{display:flex;gap:10px}
+.row>div{flex:1;min-width:0}
+button{font-size:15px;padding:11px 16px;border-radius:8px;border:0;font-weight:600}
+.primary{background:#2b7de9;color:#fff;width:100%;margin-top:14px}
+.primary:disabled{background:#9dbde6}
+.ghost{background:#eceff3;color:#333;margin-top:8px;width:100%}
+details{margin-top:10px}
+summary{cursor:pointer;color:#2b7de9;font-size:13px;padding:4px 0}
+.chk{display:flex;align-items:center;gap:7px;margin:8px 0;font-size:14px;color:#333}
+.chk input{width:18px;height:18px}
+#status{font-size:13px;color:#666;margin:10px 0 0;min-height:18px}
+#out{display:none}
+table{width:100%;border-collapse:collapse;font-size:14px}
+td{padding:5px 0;border-bottom:1px solid #eef0f3}
+td:last-child{text-align:right;font-weight:700}
+.tag{font-size:12px;color:#a05a00;margin-top:8px}
+.err{background:#fff4f4;border:1px solid #f3c9c9;color:#a01414;padding:10px;border-radius:8px;white-space:pre-wrap;font-size:13px}
+.ok{background:#f2fbf4;border:1px solid #c8e9d2;color:#146c2e;padding:10px;border-radius:8px;font-weight:600}
+.v{float:right;color:#aab;font-size:11px;font-weight:400}
+#gate{position:fixed;inset:0;background:#f5f6f8;display:none;align-items:center;justify-content:center;padding:20px;z-index:99}
+#gate .box{background:#fff;border-radius:12px;padding:20px;max-width:380px;width:100%;box-shadow:0 2px 12px rgba(0,0,0,.12)}
+#gate h2{font-size:17px;margin:0 0 6px}
+#gate p{font-size:13px;color:#777;margin:0 0 12px}
+#gate input{width:100%;padding:10px;border:1px solid #ccd0d5;border-radius:8px;font-size:16px}
+#gate button{margin-top:10px;width:100%;background:#2b7de9;color:#fff}
+#gate .e{color:#a01414;font-size:13px;margin-top:8px;min-height:16px}
+</style>
+</head>
+<body>
+<div id="gate">
+  <div class="box">
+    <h2>需要访问口令</h2>
+    <p>这台设备启用了口令保护，输入后才能使用。</p>
+    <input type="password" id="gate-k" autocomplete="current-password" placeholder="访问口令">
+    <button id="gate-go">进入</button>
+    <div class="e" id="gate-e"></div>
+  </div>
+</div>
+
+<div class="wrap" id="main">
+  <h1>Excel 表格匹配 <span class="v">v1.1</span></h1>
+  <div class="sub">免登录 · 主表按匹配列去数据表取列，结果直接下载
+    <a href="javascript:void 0" id="setkey" style="float:right;color:#2b7de9;text-decoration:none">设口令</a>
+  </div>
+
+  <div class="card">
+    <label>主表文件（要补数据的表）</label>
+    <input type="file" id="f1" accept=".xlsx,.xlsm,.xls">
+    <label>数据表文件（数据来源）</label>
+    <input type="file" id="f2" accept=".xlsx,.xlsm,.xls">
+
+    <div class="row">
+      <div>
+        <label>主表匹配列</label>
+        <input type="text" id="match1" placeholder="列名 / 1 / A">
+      </div>
+      <div>
+        <label>数据表匹配列</label>
+        <input type="text" id="match2" placeholder="列名 / 1 / A">
+      </div>
+    </div>
+
+    <label>要提取的列（逗号或空格分隔，可留空）</label>
+    <input type="text" id="extract" placeholder="例如：姓名 电话 部门">
+    <div class="hint">列可以写列名、序号（1 起）或 Excel 字母（A、B…Z、AA）　|　单文件 ≤ 10MB，两份合计 ≤ 20MB</div>
+
+    <details>
+      <summary>工作表 / 表头行 / 归一化选项</summary>
+      <div class="row">
+        <div><label>主表工作表</label><input type="text" id="sheet1" placeholder="留空=第一张"></div>
+        <div><label>数据表工作表</label><input type="text" id="sheet2" placeholder="留空=第一张"></div>
+      </div>
+      <div class="row">
+        <div><label>主表表头行</label><input type="text" id="header1" value="1"></div>
+        <div><label>数据表表头行</label><input type="text" id="header2" value="1"></div>
+      </div>
+      <div class="chk"><input type="checkbox" id="numeric"><label for="numeric" style="margin:0">数字归一（00123 / 123.0 / １２３ 都当 123）</label></div>
+      <div class="chk"><input type="checkbox" id="ignore_case"><label for="ignore_case" style="margin:0">忽略大小写</label></div>
+      <div class="chk"><input type="checkbox" id="keep_all"><label for="keep_all" style="margin:0">保留主表全部列</label></div>
+      <label>重复值处理</label>
+      <select id="dup_mode">
+        <option value="pair">按顺序一一对应（默认）</option>
+        <option value="lookup">重复值都用第一条（vlookup）</option>
+      </select>
+    </details>
+
+    <button class="primary" id="go">开始匹配</button>
+    <button class="ghost" id="clr">清空</button>
+    <div id="status"></div>
+  </div>
+
+  <div class="card" id="out"></div>
+</div>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var go = $('go'), out = $('out'), status = $('status');
+
+  function say(t) { status.textContent = t || ''; }
+
+  function showErr(msg) {
+    out.style.display = '';
+    out.innerHTML = '';
+    var d = document.createElement('div');
+    d.className = 'err';
+    d.textContent = msg;
+    out.appendChild(d);
+    say('');
+  }
+
+  function row(k, v) {
+    var tr = document.createElement('tr');
+    var a = document.createElement('td'); a.textContent = k;
+    var b = document.createElement('td'); b.textContent = String(v);
+    tr.appendChild(a); tr.appendChild(b);
+    return tr;
+  }
+
+  function showReport(rep) {
+    say('');
+    out.style.display = '';
+    out.innerHTML = '';
+    var ok = document.createElement('div');
+    ok.className = 'ok';
+    ok.textContent = '完成，结果文件已开始下载';
+    out.appendChild(ok);
+
+    var t = document.createElement('table');
+    t.appendChild(row('主表行数', rep.rows_file1));
+    t.appendChild(row('匹配成功', rep.matched));
+    t.appendChild(row('未匹配', rep.unmatched));
+    if (rep.empty_key_file1) t.appendChild(row('主表空键（不参与匹配）', rep.empty_key_file1));
+    if (rep.duplicate_key_count) t.appendChild(row('数据表重复键数', rep.duplicate_key_count));
+    if (rep.unused_rows_file2) t.appendChild(row('数据表未用到的行', rep.unused_rows_file2));
+    out.appendChild(t);
+
+    if (rep.unmatched_key_count) {
+      var d = document.createElement('div');
+      d.className = 'tag';
+      d.textContent = '有 ' + rep.unmatched_key_count + ' 个键在数据表里找不到，例如：' +
+        (rep.unmatched_keys || []).slice(0, 5).join('、');
+      out.appendChild(d);
+    }
+    var hints = rep.hints || {};
+    Object.keys(hints).forEach(function (k) {
+      var d = document.createElement('div');
+      d.className = 'tag';
+      d.textContent = '勾上「' + k + '」还能多配 ' + hints[k].count + ' 个（如 ' +
+        (hints[k].samples || []).join('、') + '）';
+      out.appendChild(d);
+    });
+  }
+
+  function b64json(s) {
+    var bin = atob(s), n = bin.length, u = new Uint8Array(n);
+    for (var i = 0; i < n; i++) u[i] = bin.charCodeAt(i);
+    return JSON.parse(new TextDecoder('utf-8').decode(u));
+  }
+
+  var TK = 'excel_match_token';
+  function token() { try { return localStorage.getItem(TK) || ''; } catch (e) { return ''; } }
+  // 表单字段的首尾空白会被 python 的 cgi 模块吃掉，口令一律带一份 base64 传输，
+  // 这样「空口令」和「一个空格的口令」才能真正区分。
+  function b64(s) {
+    var u = new TextEncoder().encode(s), o = '';
+    for (var i = 0; i < u.length; i++) o += String.fromCharCode(u[i]);
+    return btoa(o);
+  }
+  function setToken(v) { try { v ? localStorage.setItem(TK, v) : localStorage.removeItem(TK); } catch (e) { } }
+
+  function buildForm() {
+    var fd = new FormData();
+    fd.append('f1', $('f1').files[0]);
+    fd.append('f2', $('f2').files[0]);
+    fd.append('match1', $('match1').value.trim());
+    fd.append('match2', $('match2').value.trim());
+    fd.append('extract', $('extract').value.trim());
+    fd.append('sheet1', $('sheet1').value.trim());
+    fd.append('sheet2', $('sheet2').value.trim());
+    fd.append('header1', $('header1').value.trim() || '1');
+    fd.append('header2', $('header2').value.trim() || '1');
+    if ($('numeric').checked) fd.append('numeric', '1');
+    if ($('ignore_case').checked) fd.append('ignore_case', '1');
+    if ($('keep_all').checked) fd.append('keep_all', '1');
+    fd.append('dup_mode', $('dup_mode').value);
+    if (token() !== '') { fd.append('_token', token()); fd.append('_token_b64', b64(token())); }
+    return fd;
+  }
+
+  $('setkey').addEventListener('click', function () {
+    var cur = token();
+    if (!cur) {
+      var c = prompt('如果原来已设过口令，先输入旧口令（没设过就留空）：');
+      if (c === null) return;
+      cur = c;
+    }
+    var nv = prompt('输入新口令（可用空格/符号，留空 = 关闭口令保护）：');
+    if (nv === null) return;
+    var fd = new FormData();
+    fd.append('cur', cur); fd.append('cur_b64', b64(cur));
+    fd.append('new', nv); fd.append('new_b64', b64(nv));
+    fetch('/cgi-bin/excel_match?action=setkey&_=' + Date.now(), { method: 'POST', body: fd })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (j.ok) { setToken(nv); alert(nv ? '口令已设置' : '口令已关闭'); }
+        else alert(j.error || '设置失败');
+      })
+      .catch(function (e) { alert('设置失败：' + e); });
+  });
+
+  function saveBlob(r) {
+    var rep = {};
+    try { rep = b64json(r.headers.get('X-Match-Report') || ''); } catch (e) { rep = {}; }
+    return r.blob().then(function (b) {
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(b);
+      a.download = '匹配结果.xlsx';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 4000);
+      showReport(rep);
+    });
+  }
+
+  function attempt(isRetry) {
+    return fetch('/cgi-bin/excel_match?_=' + Date.now(), { method: 'POST', body: buildForm() })
+      .then(function (r) {
+        var ct = r.headers.get('Content-Type') || '';
+        if (ct.indexOf('spreadsheet') >= 0) return saveBlob(r);
+        return r.text().then(function (t) {
+          var m = t;
+          try { m = JSON.parse(t).error || t; } catch (e) { }
+          if (!isRetry && (r.status === 403 || String(m).indexOf('口令') >= 0)) {
+            var k = prompt('这台设备启用了访问口令，请输入：');
+            if (k === null) throw new Error('已取消（需要口令才能用）');
+            setToken(k);
+            say('正在上传并匹配…');
+            return attempt(true);
+          }
+          throw new Error(m);
+        });
+      });
+  }
+
+  go.addEventListener('click', function () {
+    if (!$('f1').files.length || !$('f2').files.length) return showErr('请选择主表和数据表两个 Excel 文件');
+    if (!$('match1').value.trim() || !$('match2').value.trim()) return showErr('请填写两个匹配列');
+    var MAXF = 10 * 1024 * 1024, MAXT = 20 * 1024 * 1024;
+    var s1 = $('f1').files[0].size, s2 = $('f2').files[0].size;
+    if (s1 > MAXF || s2 > MAXF)
+      return showErr('单个文件超过 10MB（主表 ' + (s1 / 1048576).toFixed(1) + 'MB，数据表 ' +
+                     (s2 / 1048576).toFixed(1) + 'MB）');
+    if (s1 + s2 > MAXT)
+      return showErr('两个文件合计 ' + ((s1 + s2) / 1048576).toFixed(1) + 'MB，超过 20MB 上限');
+
+    go.disabled = true;
+    out.style.display = 'none';
+    say('正在上传并匹配…（文件大时要等十几秒）');
+
+    attempt(false)
+      .catch(function (e) { showErr('失败：' + (e && e.message ? e.message : e)); })
+      .then(function () { go.disabled = false; });
+  });
+
+  // 页面加载先探一次：没设口令 或 口令正确 → 显示表单；否则只显示口令框
+  function gateShow(msg) {
+    $('main').style.display = 'none';
+    $('gate').style.display = 'flex';
+    $('gate-e').textContent = msg || '';
+    $('gate-k').focus();
+  }
+  function gateHide() {
+    $('gate').style.display = 'none';
+    $('main').style.display = '';
+  }
+  function probe() {
+    var h = {}, q = '';
+    if (token() !== '') {
+      h['X-Token-B64'] = b64(token());
+      q = '&tk_b64=' + encodeURIComponent(b64(token()));
+    }
+    return fetch('/cgi-bin/excel_match?check=1' + q + '&_=' + Date.now(), { headers: h })
+      .then(function (r) { return r.json(); })
+      .catch(function () { return { ok: 0, authorized: false, error: '无法连接设备' }; });
+  }
+  function gateTry() {
+    var v = $('gate-k').value;
+    setToken(v);
+    $('gate-e').textContent = '验证中…';
+    probe().then(function (j) {
+      if (j.authorized) { gateHide(); }
+      else {
+        setToken('');
+        $('gate-e').textContent = j.token_required === false ? '设备已关闭口令，刷新即可' : '口令不对';
+      }
+    });
+  }
+  $('gate-go').addEventListener('click', gateTry);
+  $('gate-k').addEventListener('keydown', function (e) { if (e.key === 'Enter') gateTry(); });
+
+  $('main').style.display = 'none';
+  probe().then(function (j) {
+    if (j.authorized) gateHide();
+    else gateShow(j.error === '无法连接设备' ? j.error : '');
+  });
+
+  $('clr').addEventListener('click', function () {
+    ['f1', 'f2', 'match1', 'match2', 'extract', 'sheet1', 'sheet2'].forEach(function (i) { $(i).value = ''; });
+    $('header1').value = '1'; $('header2').value = '1';
+    $('numeric').checked = false; $('ignore_case').checked = false; $('keep_all').checked = false;
+    $('dup_mode').value = 'pair';
+    out.style.display = 'none'; say('');
+  });
+})();
+</script>
+</body>
+</html>
