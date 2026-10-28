@@ -9,7 +9,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=samba
 PKG_VERSION:=3.6.25
-PKG_RELEASE:=7
+PKG_RELEASE:=13
 
 PKG_SOURCE_URL:=http://ftp.samba.org/pub/samba \
 	http://ftp.samba.org/pub/samba/stable
@@ -123,6 +123,10 @@ CONFIGURE_ARGS += \
 	--without-libtevent \
 	--without-libaddns \
 	--with-shared-modules=pdb_tdbsam,pdb_wbc_sam,idmap_nss,nss_info_template,auth_winbind,auth_wbc,auth_domain
+
+# 让 200-remove_printer_support.patch 里的 #ifdef PRINTER_SUPPORT 分支生效,
+# 否则 smbd 在 open_file_ntcreate() 里对打印共享直接 return ACCESS_DENIED
+TARGET_CFLAGS += -DPRINTER_SUPPORT -DREGISTRY_BACKEND
 
 MAKE_FLAGS += DYNEXP= PICFLAG= MODULES=
 

@@ -1,0 +1,42 @@
+--- a/source3/rpc_server/spoolss/srv_spoolss_nt.c
++++ b/source3/rpc_server/spoolss/srv_spoolss_nt.c
+@@ -4762,7 +4762,38 @@
+ 				    lp_const_servicename(snum),
+ 				    &info2);
+ 	if (!W_ERROR_IS_OK(result)) {
+-		goto out;
++		/*
++		 * Stripped-down builds (OpenWrt samba36) may have no usable
++		 * registry, so the stored PrinterInfo2 cannot be read.  Falling
++		 * through here made every client fail to enumerate the printer
++		 * (Windows shows error 0x2e).  Build the info from local config
++		 * instead: empty drivername lets the client use its own driver.
++		 */
++		const char *sname = lp_const_servicename(snum);
++		const char *cmt   = lp_comment(snum);
++
++		DEBUG(0, ("_spoolss_GetPrinter: no printer info (%s), using "
++			  "local defaults for [%s]\n",
++			  win_errstr(result), sname));
++
++		info2 = talloc_zero(p->mem_ctx, struct spoolss_PrinterInfo2);
++		if (info2 == NULL) {
++			result = WERR_NOMEM;
++			goto out;
++		}
++		info2->printername    = talloc_strdup(info2, sname);
++		info2->sharename      = talloc_strdup(info2, sname);
++		info2->portname       = talloc_strdup(info2, "Samba Printer Port");
++		info2->drivername     = talloc_strdup(info2, "");
++		info2->comment        = talloc_strdup(info2, cmt ? cmt : "");
++		info2->location       = talloc_strdup(info2, "");
++		info2->sepfile        = talloc_strdup(info2, "");
++		info2->printprocessor = talloc_strdup(info2, "winprint");
++		info2->datatype       = talloc_strdup(info2, "RAW");
++		info2->parameters     = talloc_strdup(info2, "");
++		info2->attributes     = PRINTER_ATTRIBUTE_SHARED;
++		info2->priority       = 1;
++		result = WERR_OK;
+ 	}
+ 
+ 	switch (r->in.level) {

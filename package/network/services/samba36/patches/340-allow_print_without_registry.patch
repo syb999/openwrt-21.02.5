@@ -1,0 +1,35 @@
+--- a/source3/printing/nt_printing.c
++++ b/source3/printing/nt_printing.c
+@@ -1757,9 +1757,18 @@
+ 					    pname,
+ 					    &secdesc);
+ 	if (!W_ERROR_IS_OK(result)) {
++		/*
++		 * On stripped-down builds (e.g. OpenWrt's samba36) the winreg /
++		 * registry subsystem may be unusable, so no printer security
++		 * descriptor can be fetched.  Denying here makes the whole
++		 * print share permanently ACCESS_DENIED; fall back to allowing
++		 * the access the share itself already grants.
++		 */
++		DEBUG(0, ("print_access_check: no security descriptor for "
++			  "printer [%s] (%s), allowing\n",
++			  pname, win_errstr(result)));
+ 		talloc_destroy(mem_ctx);
+-		errno = ENOMEM;
+-		return False;
++		return True;
+ 	}
+ 
+ 	if (access_type == JOB_ACCESS_ADMINISTER) {
+@@ -1830,7 +1839,10 @@
+ 	result = winreg_get_printer_internal(NULL, session_info, msg_ctx,
+ 				    servicename, &pinfo2);
+ 	if (!W_ERROR_IS_OK(result)) {
+-		return False;
++		/* No registry => no print-time restriction known: do not deny. */
++		DEBUG(0, ("print_time_access_check: no printer info for [%s] "
++			  "(%s), allowing\n", servicename, win_errstr(result)));
++		return True;
+ 	}
+ 
+ 	if (pinfo2->starttime == 0 && pinfo2->untiltime == 0) {
