@@ -25,11 +25,11 @@
 		end
 	end
 	local uris = {}
-	for line in (fs.readfile("/etc/cups/printers.conf") or ""):gmatch("[^\n]+") do
-		local n = line:match("^<Printer%s+([^>]+)>")
-		if n then cur = n end
-		local u = line:match("^DeviceURI%s+(.+)$")
-		if u and cur then uris[cur] = u:gsub("%s+$", "") end
+	-- 用 lpstat -v 取设备地址: printers.conf 是 cupsd 异步落盘的, 刚建好的队列还没写进去,
+	-- 而且默认队列的标签是 <DefaultPrinter X> 不是 <Printer X>, 按文件解析会显示 "?"
+	for line in (sh("lpstat -v"):gmatch("[^\n]+")) do
+		local n, u = line:match("^device for (.-):%s*(.+)$")
+		if n then uris[n] = u:gsub("%s+$", "") end
 	end
 	for _, p in ipairs(printers) do p.uri = uris[p.name] or "?" end
 	local dflt = (sh("lpstat -d 2>/dev/null"):match("destination:%s*(%S+)"))
@@ -41,12 +41,30 @@
 	end
 	local lp_ok   = (sh("id lp 2>/dev/null") ~= "")
 	local as_root = user_line:match("User%s+root") ~= nil
+
+	-- CUPS usb 后端(libusb 实现)自己枚举打印机并给出 usb://制造商/型号?serial=... 地址，
+	-- 这才是"有没有 USB 打印机"的判据；/dev/usb/lp0 属于 usblp 模块，本构建用不到。
+	local usbdevs = {}
+	for line in (sh("/usr/lib/cups/backend/usb") or ""):gmatch("[^\n]+") do
+		local uri = line:match("^direct%s+(%S+)")
+		if uri then usbdevs[#usbdevs + 1] = uri end
+	end
+
+	-- 网络打印机: lpinfo -v 里 backend 真正发现出来的 URI (dnssd/socket/ipp/lpd)
+	local netdevs, nseen = {}, {}
+	for line in (sh("lpinfo -v") or ""):gmatch("[^\n]+") do
+		local kind, u = line:match("^(%S+)%s+(%S+)$")
+		if kind == "network" and u and u:match("://") and not nseen[u] then
+			nseen[u] = true
+			netdevs[#netdevs + 1] = u
+		end
+	end
 %>
 
 <h2 name="content"><%:CUPS Helper%></h2>
 
 <% if http.formvalue("msg") then %>
-	<div class="alert-message" style="margin-bottom:10px"><%=http.formvalue("msg")%></div>
+	<div class="alert-message" style="margin-bottom:10px"><%=pcdata(http.formvalue("msg"))%></div>
 <% end %>
 
 <div class="cbi-section">
@@ -92,11 +110,12 @@
 		<tr><th><%:Name%></th><th><%:State%></th><th><%:Device%></th><th><%:Actions%></th></tr>
 		<% for _, p in ipairs(printers) do %>
 		<tr>
-			<td><%=p.name%><% if dflt == p.name then %>
+			<td><%=pcdata(p.name)%><% if dflt == p.name then %>
 				<small style="color:#146c2e">(<%:default%>)</small><% end %></td>
 			<td><%=p.state%></td>
-			<td><code><%=p.uri%></code></td>
+			<td><code><%=pcdata(p.uri)%></code></td>
 			<td style="white-space:nowrap">
+				<a class="cbi-button" href="<%=luci.dispatcher.build_url('admin/services/cups-helper/add')%>?edit=<%=pcdata(p.name)%>"><%:Edit%></a>
 				<% local btns = { {"test", "Test page", "cbi-button-action"},
 				                  {"setdefault", "Set default", ""},
 				                  {"del", "Delete", "cbi-button-negative"} } %>
@@ -104,8 +123,9 @@
 				<form method="post" action="<%=op_url%>" style="display:inline">
 					<input type="hidden" name="token" value="<%=token%>">
 					<input type="hidden" name="action" value="<%=b[1]%>">
-					<input type="hidden" name="name" value="<%=p.name%>">
-					<button class="cbi-button <%=b[3]%>"><%=translate(b[2])%></button>
+					<input type="hidden" name="name" value="<%=pcdata(p.name)%>">
+					<button class="cbi-button <%=b[3]%>"<%= (b[1] == "del") and
+						(" onclick=\"return confirm('" .. pcdata(translate("Really delete queue") .. " " .. p.name) .. "?')\"") or "" %>><%=translate(b[2])%></button>
 				</form>
 				<% end %>
 			</td>
@@ -122,16 +142,21 @@
 <div class="cbi-section">
 	<h3><%:Diagnostics%></h3>
 	<table class="table" style="width:auto">
-		<tr><td style="padding-right:14px"><%:USB printer device%></td>
-		    <td><%= fs.access("/dev/usb/lp0") and translate("/dev/usb/lp0 present") or
-		           "<span style=\"color:#b00\">" ..
-		           translate("/dev/usb/lp0 missing (printer unplugged or not detected)") ..
-		           "</span>" %></td></tr>
+		<tr><td style="padding-right:14px"><%:USB printer (CUPS usb backend)%></td>
+		    <td><%= #usbdevs > 0 and
+		           pcdata(string.format(translate("%d found"), #usbdevs) .. ": " .. table.concat(usbdevs, ", ")) or
+		           ("<span style=\"color:#b00\">" ..
+		            translate("none - lsusb sees the device but CUPS does not") .. "</span>") %></td></tr>
+		<tr><td style="padding-right:14px"><%:Network printers (lpinfo -v)%></td>
+		    <td><%= (#netdevs > 0) and
+		           pcdata(string.format(translate("%d found"), #netdevs) .. ": " .. table.concat(netdevs, ", ")) or
+		           ("<span style=\"color:#a05a00\">" ..
+		            translate("none - CUPS can still reach a printer at a known IP") .. "</span>") %></td></tr>
 		<tr><td><%:usblp kernel module%></td>
 		    <td><%= (sh("lsmod | grep -c '^usblp'") ~= "0") and translate("loaded") or
-		           translate("not loaded (needs kmod-usb-printer)") %></td></tr>
+		           translate("not loaded - not needed by CUPS (only p910nd uses /dev/usb/lp0)") %></td></tr>
 		<tr><td><%:cups-files.conf%></td>
-		    <td><%= (user_line ~= "" and group_line ~= "") and (user_line .. " / " .. group_line) or
+		    <td><%= (user_line ~= "" and group_line ~= "") and pcdata(user_line .. " / " .. group_line) or
 		           "<span style=\"color:#a05a00\">" ..
 		           translate("no User/Group line (CUPS built-in default)") .. "</span>" %></td></tr>
 		<tr><td><%:lp account%></td>
@@ -170,7 +195,7 @@
 			<% end %>
 		    </td></tr>
 	</table>
-	<pre style="max-height:220px;overflow:auto;background:#f7f7f9;padding:8px;border-radius:6px;font-size:12px"><%=sh("logread 2>/dev/null | grep -i cups | tail -15")%></pre>
+	<pre style="max-height:220px;overflow:auto;background:#f7f7f9;padding:8px;border-radius:6px;font-size:12px"><%=pcdata(sh("logread 2>/dev/null | grep -i cups | tail -15"))%></pre>
 </div>
 
 <%+footer%>

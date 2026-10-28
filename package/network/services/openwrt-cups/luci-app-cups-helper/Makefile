@@ -5,7 +5,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-cups-helper
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=8
+PKG_RELEASE:=20
 PKG_PO_VERSION:=1.0.0
 
 PKG_LICENSE:=MIT

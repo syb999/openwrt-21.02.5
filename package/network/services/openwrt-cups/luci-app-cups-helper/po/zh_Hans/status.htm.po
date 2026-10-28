@@ -166,4 +166,26 @@ msgstr "守护进程未运行"
 
 msgid "%d queue(s) published"
 msgstr "已发布 %d 个队列"
+msgid "Edit"
+msgstr "编辑"
 
+msgid "USB printer (CUPS usb backend)"
+msgstr "USB 打印机（CUPS usb 后端）"
+
+msgid "Really delete queue"
+msgstr "确定要删除队列"
+
+msgid "%d found"
+msgstr "发现 %d 个"
+
+msgid "none - lsusb sees the device but CUPS does not"
+msgstr "无 —— lsusb 能看到设备但 CUPS 看不到"
+
+msgid "not loaded - not needed by CUPS (only p910nd uses /dev/usb/lp0)"
+msgstr "未加载 —— CUPS 不需要它（只有 p910nd 用 /dev/usb/lp0）"
+
+msgid "Network printers (lpinfo -v)"
+msgstr "网络打印机（lpinfo -v）"
+
+msgid "none - CUPS can still reach a printer at a known IP"
+msgstr "无 —— 仍可直接用已知 IP 添加"

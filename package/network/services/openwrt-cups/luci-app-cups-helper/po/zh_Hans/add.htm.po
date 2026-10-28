@@ -64,4 +64,44 @@ msgstr "创建队列"
 
 msgid "Back"
 msgstr "返回"
+msgid "No USB printer found by the CUPS usb backend."
+msgstr "CUPS 的 USB 后端没有发现打印机。"
 
+msgid "Check the printer is powered on and connected. If lsusb shows it, the device is not exposing itself as a USB printer class interface."
+msgstr "检查打印机是否已开机并连接。如果 lsusb 能看到它，说明设备没有把自身暴露成 USB 打印机类接口。"
+
+msgid "keep the current driver (only change the device URI)"
+msgstr "保持当前驱动（只改设备地址）"
+
+msgid "PPD - the router renders with the PPD chosen below"
+msgstr "PPD —— 由盒子用下面选中的 PPD 渲染"
+
+msgid "Current driver"
+msgstr "当前驱动"
+
+msgid "Edit printer"
+msgstr "编辑打印机"
+
+msgid "/dev/usb/lp0 exists (usblp loaded) - CUPS does not use it"
+msgstr "/dev/usb/lp0 存在（usblp 已加载）—— CUPS 不使用它"
+
+msgid "Save"
+msgstr "保存"
+
+msgid "This queue was not found by lpstat. cupsd may be stopped - the page stays in edit mode, saving will report the error instead of creating a new queue."
+msgstr "lpstat 找不到这个队列（cupsd 可能没运行）。页面保持编辑模式，保存时会报错，而不是新建一条队列。"
+
+msgid "USB printer"
+msgstr "USB 打印机"
+
+msgid "Network printers found on the LAN"
+msgstr "局域网里发现的网络打印机"
+
+msgid "network printer IP or hostname"
+msgstr "网络打印机 IP 或主机名"
+
+msgid "No network printer discovered by lpinfo - the boxes below build the URI by hand."
+msgstr "lpinfo 没有发现网络打印机 —— 用下面三个输入框手工拼设备地址。"
+
+msgid "driverless (IPP everywhere) - no PPD, for ipp/ipps network printers"
+msgstr "driverless（IPP everywhere）—— 不用 PPD，适用于 ipp/ipps 网络打印机"

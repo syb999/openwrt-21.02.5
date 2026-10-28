@@ -55,4 +55,11 @@ msgstr "设置已应用，队列已重新发布"
 
 msgid "Apply failed: "
 msgstr "应用失败："
+msgid "Queue updated: "
+msgstr "队列已更新："
 
+msgid "Failed to update queue: "
+msgstr "更新队列失败："
+
+msgid "Invalid queue name"
+msgstr "队列名无效"

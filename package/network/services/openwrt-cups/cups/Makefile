@@ -136,6 +136,8 @@ define Package/cups/install
 	$(CP) $(PKG_INSTALL_DIR)/usr/lib/cups/filter/{commandtops,pstops} \
 		$(PKG_INSTALL_DIR)/usr/lib/cups/filter/gziptoany \
 		$(1)/usr/lib/cups/filter
+	# CUPS 要求过滤器可执行: 装出来是 754, cupsd 以 lp 用户跑过滤链会 Permission denied (113)
+	chmod 0755 $(1)/usr/lib/cups/filter/*
 
 	$(INSTALL_DIR) $(1)/usr/share/cups/templates
 	$(CP) $(PKG_INSTALL_DIR)/usr/share/cups/templates/*.tmpl \
@@ -208,6 +210,8 @@ define Package/cups-raster-filters/install
 	$(CP) $(PKG_INSTALL_DIR)/usr/lib/cups/filter/{rastertoepson,rastertohp,rastertolabel,rastertopwg} \
 		$(1)/usr/lib/cups/filter
 	$(LN) rastertolabel $(1)/usr/lib/cups/filter/rastertodymo
+	# 同 Package/cups/install: 装出来是 754, cupsd 以 lp 用户跑会被拒 (113)
+	chmod 0755 $(1)/usr/lib/cups/filter/*
 endef
 
 define Package/cups-ppdc/install

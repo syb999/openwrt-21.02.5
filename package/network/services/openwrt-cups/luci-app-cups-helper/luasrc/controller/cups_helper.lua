@@ -36,9 +36,11 @@ local function safe_name(v)
 	return (v and v:match("^[%w_%.%-]+$")) or nil
 end
 
+-- 注意: 字符类里必须有 %% —— CUPS 的 usb URI 是百分号编码的
+-- (usb://HP/LaserJet%20Professional%20P1106?serial=...)，漏了 %% 会被判成非法 URI
 local function safe_uri(v)
 	if not v or #v > 200 then return nil end
-	if v:match("^[%w_%.%-:/%?#%[%]@=+,]+$") then return v end
+	if v:match("^[%w_%.%-:/%%?#%[%]@=+,]+$") then return v end
 	return nil
 end
 
@@ -83,19 +85,30 @@ function op()
 		msg = out ~= "" and (translate("Fixed and started, cupsd pid ") .. out)
 			or translate("Still not running after the fix")
 
-	elseif a == "add" then
+	elseif a == "add" or a == "edit" then
+		local is_edit = (a == "edit")
 		if not name then
 			msg = translate("Queue name may only contain letters, digits, _ . -")
-		elseif not uri then
+		elseif not is_edit and not uri then
 			msg = translate("Device URI is empty or invalid")
 		else
-			local args = "lpadmin -p " .. name .. " -E -v " .. uri
-			if model == "raw" then
-				args = args .. " -m raw"
-			elseif ppd then
-				args = args .. " -P " .. ppd
-			else
-				args = nil
+			-- 设备地址里可能有 % ? = (usb://...?serial=...)，一律单引号包起来
+			local args = "lpadmin -p " .. name .. " -E"
+			if uri then args = args .. " -v '" .. uri .. "'" end
+			-- model=keep 是编辑模式下的"只改地址，不动驱动"
+			if model ~= "keep" then
+				-- driverless (IPP everywhere): 网络打印机不用 PPD, CUPS 自己问设备要能力
+				if model == "everywhere" then
+					args = args .. " -m everywhere"
+				-- 选了 PPD 就以 PPD 为准: 否则"model 停在 raw、下面又挑了 PPD"会静默建出
+				-- raw 队列, 客户端发 PDF 时打出一堆乱码/空白, 表现就是"添加了但没用"
+				elseif ppd then
+					args = args .. " -P '" .. ppd .. "'"
+				elseif model == "raw" then
+					args = args .. " -m raw"
+				else
+					args = nil
+				end
 			end
 			if not args then
 				msg = translate("Choose a driver (raw or a PPD)")
@@ -104,9 +117,16 @@ function op()
 				if ok == 0 then
 					sh("cupsenable " .. name .. "; cupsaccept " .. name)
 					if make_default then sh("lpadmin -d " .. name) end
-					msg = translate("Queue added: ") .. name
+					-- 队列变了就重建 mDNS 发布, 否则客户端要等下次"应用优化设置"才能搜到
+					sh("/usr/lib/cups-helper/apply.sh mdns")
+					-- 同时让 samba 重建打印共享: 共享名 = 队列名, 不重建的话
+					-- \\盒子\<旧队列名> 会一直指向一个已经不存在的队列, Windows 就"无法添加打印机"
+					sh("[ -x /etc/init.d/samba ] && /etc/init.d/samba reload")
+					msg = is_edit and (translate("Queue updated: ") .. name)
+						or (translate("Queue added: ") .. name)
 				else
-					msg = translate("Failed to add queue: ") .. out
+					msg = is_edit and (translate("Failed to update queue: ") .. out)
+						or (translate("Failed to add queue: ") .. out)
 				end
 			end
 		end
@@ -116,6 +136,10 @@ function op()
 			msg = translate("Invalid queue name")
 		else
 			local ok, out = sh("lpadmin -x " .. name)
+			if ok == 0 then
+				sh("/usr/lib/cups-helper/apply.sh mdns")
+				sh("[ -x /etc/init.d/samba ] && /etc/init.d/samba reload")
+			end
 			msg = ok == 0 and (translate("Queue deleted: ") .. name)
 				or (translate("Failed to delete: ") .. out)
 		end
@@ -132,9 +156,14 @@ function op()
 		if not name then
 			msg = translate("Invalid queue name")
 		else
-			local ok, out = sh("printf 'CUPS helper test page\\n" ..
-				"from OpenWrt cups-helper\\n\\n' | lp -d " .. name ..
-				" -t cups-helper-test")
+			-- 用 CUPS 自带的 PDF 测试页: 文本(text/plain)要过 texttopdf, 盒子上没装字体
+			-- 就会报 "No usable font available"; PDF 走 pdftopdf/pdftops, 不需要字体
+			local ok, out = sh(
+				"p=/usr/share/cups/data/default-testpage.pdf; " ..
+				"if [ -f $p ]; then lp -d " .. name .. " -t cups-helper-test $p; " ..
+				"else printf '%%!PS-Adobe-3.0\n/Helvetica findfont 14 scalefont setfont\n" ..
+				"72 720 moveto (cups-helper test page) show\nshowpage\n' >/tmp/ch-test.ps; " ..
+				"lp -d " .. name .. " -t cups-helper-test /tmp/ch-test.ps; rm /tmp/ch-test.ps; fi")
 			msg = ok == 0 and (translate("Test page sent to ") .. name .. ": " .. out)
 				or (translate("Failed to send test page: ") .. out)
 		end
@@ -143,6 +172,6 @@ function op()
 		msg = translate("Unknown action")
 	end
 
-	http.redirect(disp.build_url("admin/services/cups-helper",
-		"msg=" .. http.urlencode(msg or "")))
+	http.redirect(disp.build_url("admin/services/cups-helper") ..
+		"?msg=" .. http.urlencode(msg or ""))
 end

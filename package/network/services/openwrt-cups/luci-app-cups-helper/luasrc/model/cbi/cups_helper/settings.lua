@@ -42,7 +42,10 @@ o.validate = function(self, value)
 	end
 	return value
 end
-o.default = "192.168.1.0/24"
+-- 不要给默认值: 一旦填了, apply.sh 会把 cupsd.conf 里所有 Allow 改写成
+-- 127.0.0.1 + 这个网段, 盒子不在这个网段上时整个局域网都连不上 CUPS。
+-- 空 = 保留 CUPS 自带默认(10/8, 172.16/12, 192.168/16)。
+o.default = nil
 o.rmempty = true
 
 o = s:option(ListValue, "log_level", translate("CUPS log level"),

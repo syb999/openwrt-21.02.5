@@ -2,25 +2,144 @@
 <%
 	local sys  = require "luci.sys"
 	local fs   = require "nixio.fs"
+	local http = require "luci.http"
 
 	local ppds = {}
 	for line in (sys.exec("ls -1 /usr/share/ppd/*/*.ppd /usr/share/ppd/*.ppd /usr/share/cups/model/*.ppd 2>/dev/null") or ""):gmatch("[^\n]+") do
 		ppds[#ppds + 1] = line
 	end
-	local usb = fs.access("/dev/usb/lp0")
+
+	-- 本构建的 CUPS usb 后端是 libusb 实现 (--enable-libusb)，它自己枚举打印机
+	-- 并把设备地址拼成 usb://制造商/型号?serial=... ；这也是后端在打印时唯一能
+	-- 匹配上的写法。直接调后端枚举，判据和 lpinfo -v 一致。
+	-- /dev/usb/lp0 是内核 usblp 模块(kmod-usb-printer)建的字符设备，本构建的
+	-- CUPS 用不到它，拿它判断"有没有打印机"会误报。
+	local usbdevs, seen = {}, {}
+	for line in (sys.exec("/usr/lib/cups/backend/usb 2>/dev/null") or ""):gmatch("[^\n]+") do
+		local uri, mm, desc = line:match('^direct%s+(%S+)%s+"([^"]*)"%s+"([^"]*)"')
+		if uri and not seen[uri] then
+			seen[uri] = true
+			usbdevs[#usbdevs + 1] = { uri = uri, desc = (desc ~= "" and desc or mm) }
+		end
+	end
+	-- 兜底: usb 后端偶尔枚举不出来(权限问题/被 usblp 占用/后端路径不同), 但 lpinfo -v
+	-- 里只要出现 direct usb:// 也算有打印机 —— 两个来源取并集, 不再是"lsusb 有就算有"
+	if #usbdevs == 0 then
+		for line in (sys.exec("lpinfo -v 2>/dev/null") or ""):gmatch("[^\n]+") do
+			local kind, u = line:match("^(%S+)%s+(%S+)$")
+			if kind == "direct" and u and u:match("^usb://") and not seen[u] then
+				seen[u] = true
+				usbdevs[#usbdevs + 1] = { uri = u, desc = (u:match("^usb://([^?]+)") or u):gsub("%%20", " ") }
+			end
+		end
+	end
+	local usblp = fs.access("/dev/usb/lp0")
+
+	-- 编辑模式: ?edit=<队列名>，取该队列现在的设备地址
+	local edit = http.formvalue("edit")
+	local edit_missing = false
+	local cur_uri
+	if edit then
+		if not edit:match("^[%w_%.%-]+$") then
+			edit = nil
+		else
+			for line in (sys.exec("lpstat -v 2>/dev/null") or ""):gmatch("[^\n]+") do
+				local n, u = line:match("^device for (.-):%s*(.+)$")
+				if n == edit then cur_uri = u:gsub("%s+$", "") end
+			end
+			-- 队列不存在(或 cupsd 没运行)时不要退回"新建"模式: 那样名字会被重置成默认值,
+			-- 用户以为在改, 实际又建了一条新队列
+			if not cur_uri then edit_missing = true end
+		end
+	end
+	-- 网络打印机: lpinfo -v 会列出后端实际发现了的设备 (dnssd:// / socket:// / ipp:// / lpd://)。
+	-- 只取带 "://" 的完整 URI —— 光秃秃的 "network socket" 只是说支持这个 scheme, 不是设备。
+	local netdevs, nseen = {}, {}
+	for line in (sys.exec("lpinfo -v 2>/dev/null") or ""):gmatch("[^\n]+") do
+		local kind, u = line:match("^(%S+)%s+(%S+)$")
+		if kind == "network" and u and u:match("://") and not nseen[u] then
+			nseen[u] = true
+			netdevs[#netdevs + 1] = u
+		end
+	end
+
+	local cur_matched = false
+	for _, d in ipairs(usbdevs) do
+		if d.uri == cur_uri then cur_matched = true end
+	end
+	for _, u in ipairs(netdevs) do
+		if u == cur_uri then cur_matched = true end
+	end
+
+	-- 新建时的默认队列名: 从唯一一台 USB 打印机推导
+	-- (usb://HP/LaserJet%20Professional%20P1106?serial=... -> HP-P1106)。
+	-- 推不出来就留空让用户填 —— 以前固定写 "LP", 很容易手滑建出一条叫 LP 的野队列。
+	local def_name = ""
+	if not edit and #usbdevs == 1 then
+		local path = usbdevs[1].uri:match("^usb://([^?]+)") or ""
+		local mk, md = path:match("^([^/]+)/(.+)$")
+		if mk and md then
+			md = md:gsub("%%20", " ")
+			local tok = md:match("([%w]+)%s*$") or md
+			def_name = (mk .. "-" .. tok):gsub("[^%w]", "-"):gsub("%-+", "-")
+			def_name = def_name:gsub("^%-+", ""):gsub("%-+$", "")
+		end
+	end
+	local dflt = (sys.exec("lpstat -d 2>/dev/null") or ""):match("destination:%s*(%S+)")
+
+	-- 编辑模式: 找出这个队列现在用的驱动。
+	-- 没有 /etc/cups/ppd/<队列>.ppd 就是 raw 队列；否则拿它的 md5 去和 PPD 清单比对，
+	-- 找出对应的清单项并在下拉框里预选 —— 不然"改成 PPD 方式"实际会用第一项(P1006 foo2xqx)，
+	-- 看起来就是"改了没生效 / 打出来是乱码"。
+	local cur_ppd, cur_raw, cur_nick
+	if edit then
+		local cppd = "/etc/cups/ppd/" .. edit .. ".ppd"
+		if fs.access(cppd) then
+			cur_nick = (sys.exec("sed -n 's/^\\*NickName:[ \	]*\"\\(.*\\)\"$/\\1/p' " .. cppd .. " 2>/dev/null") or ""):gsub("\n.*", "")
+			local cursum, sums = nil, {}
+			local cmd = "md5sum " .. cppd
+			if #ppds > 0 then cmd = cmd .. " " .. table.concat(ppds, " ") end
+			for line in (sys.exec(cmd .. " 2>/dev/null") or ""):gmatch("[^\n]+") do
+				local sum, path = line:match("^(%x+)%s+(.+)$")
+				if sum and path then
+					if path == cppd then
+						cursum = sum
+					else
+						sums[path] = sum
+					end
+				end
+			end
+			if cursum then
+				for _, p in ipairs(ppds) do
+					if sums[p] == cursum then
+						cur_ppd = p
+						break
+					end
+				end
+			end
+		else
+			cur_raw = true
+		end
+	end
 %>
 
-<h2 name="content"><%:Add printer%></h2>
+<h2 name="content"><%= edit and translate("Edit printer") or translate("Add printer") %></h2>
+
+<% if edit_missing then %>
+<div class="alert-message warning" style="margin-bottom:10px">
+	<%:This queue was not found by lpstat. cupsd may be stopped - the page stays in edit mode, saving will report the error instead of creating a new queue.%>
+</div>
+<% end %>
 
 <form method="post" action="<%=luci.dispatcher.build_url('admin/services/cups-helper/op')%>">
 <input type="hidden" name="token" value="<%=token%>">
-<input type="hidden" name="action" value="add">
+<input type="hidden" name="action" value="<%= edit and "edit" or "add" %>">
 
 <div class="cbi-section">
 	<div class="cbi-value">
 		<label class="cbi-value-title"><%:Queue name%></label>
 		<div class="cbi-value-field">
-			<input type="text" name="name" class="cbi-input-text" value="LP" placeholder="LP">
+			<input type="text" name="name" class="cbi-input-text" value="<%=pcdata(edit or def_name)%>"<%= edit and " readonly" or "" %> placeholder="HP-P1106">
 			<div class="cbi-value-description"><%:Only letters, digits, underscore, dot and dash.%></div>
 		</div>
 	</div>
@@ -29,15 +148,56 @@
 		<label class="cbi-value-title"><%:Device URI%></label>
 		<div class="cbi-value-field">
 			<select name="uri" class="cbi-input-select">
-				<option value="usb:/dev/usb/lp0"<%= usb and " selected" or "" %>>
-					usb:/dev/usb/lp0 <%= usb and translate("(detected on this device)") or translate("(currently not detected)") %>
-				</option>
-				<option value="socket://192.168.1.100:9100">socket://IP:9100 (<%:network printer, raw port%>)</option>
-				<option value="ipp://192.168.1.100:631/ipp/print">ipp://IP:631/ipp/print (<%:IPP network printer%>)</option>
-				<option value="lpd://192.168.1.100/queue">lpd://IP/<%:queue%></option>
+				<% if #usbdevs > 0 then %>
+				<optgroup label="<%:USB printer%>">
+					<% for i, d in ipairs(usbdevs) do %>
+					<option value="<%=pcdata(d.uri)%>"<%= (cur_uri and d.uri == cur_uri) and " selected" or ((not cur_uri and i == 1) and " selected" or "") %>><%=pcdata(d.desc)%> — <%=pcdata(d.uri)%></option>
+					<% end %>
+				</optgroup>
+				<% else %>
+				<option value=""><%:No USB printer found by the CUPS usb backend.%></option>
+				<% end %>
+				<% if #netdevs > 0 then %>
+				<optgroup label="<%:Network printers found on the LAN%>">
+					<% for _, u in ipairs(netdevs) do %>
+					<option value="<%=pcdata(u)%>"<%= (cur_uri == u) and " selected" or "" %>><%=pcdata(u)%></option>
+					<% end %>
+				</optgroup>
+				<% end %>
 			</select>
+			<div style="margin-top:6px">
+				<select name="net_scheme" class="cbi-input-select" style="width:8em">
+					<option value="socket">socket</option>
+					<option value="ipp">ipp</option>
+					<option value="ipps">ipps</option>
+					<option value="lpd">lpd</option>
+				</select>
+				<input type="text" name="net_host" class="cbi-input-text" style="width:14em"
+				       placeholder="<%:network printer IP or hostname%>">
+				<input type="text" name="net_port" class="cbi-input-text" style="width:9em"
+				       placeholder="9100 / 631 / <%:queue%>">
+			</div>
 			<input type="text" name="uri_custom" class="cbi-input-text" style="margin-top:6px"
+			       value="<%=pcdata((cur_uri and not cur_matched) and cur_uri or "")%>"
 			       placeholder="<%:Custom device URI (overrides the selection above)%>">
+			<div class="cbi-value-description">
+				<% if #netdevs == 0 then %>
+				<small><%:No network printer discovered by lpinfo - the boxes below build the URI by hand.%></small><br>
+				<% end %>
+				<% if cur_uri then %>
+				<code><%=pcdata(cur_uri)%></code><br>
+				<% end %>
+				<% if #usbdevs > 0 then %>
+					<% for _, d in ipairs(usbdevs) do %>
+				<code><%=pcdata(d.uri)%></code><br>
+					<% end %>
+				<% else %>
+				<span style="color:#b00"><%:Check the printer is powered on and connected. If lsusb shows it, the device is not exposing itself as a USB printer class interface.%></span><br>
+				<% end %>
+				<% if usblp then %>
+				<small><%=translate("/dev/usb/lp0 exists (usblp loaded) - CUPS does not use it")%></small>
+				<% end %>
+			</div>
 		</div>
 	</div>
 
@@ -45,15 +205,27 @@
 		<label class="cbi-value-title"><%:Driver / PPD%></label>
 		<div class="cbi-value-field">
 			<select name="model" class="cbi-input-select">
-				<option value="raw"><%:raw - the client renders, the router only forwards (lowest CPU, recommended)%></option>
+				<% if edit then %>
+				<option value="keep"><%:keep the current driver (only change the device URI)%></option>
+				<% end %>
+				<option value="raw"<%= edit and "" or " selected" %>><%:raw - the client renders, the router only forwards (lowest CPU, recommended)%></option>
+				<option value="ppd"><%:PPD - the router renders with the PPD chosen below%></option>
+				<option value="everywhere"><%:driverless (IPP everywhere) - no PPD, for ipp/ipps network printers%></option>
 			</select>
 			<select name="ppd" class="cbi-input-select" style="margin-top:6px">
-				<option value=""><%:(ignored when raw is used)%></option>
+				<option value=""></option>
 				<% for _, p in ipairs(ppds) do %>
-				<option value="<%=p%>"><%=p:gsub("^/usr/share/ppd/", "")%></option>
+				<option value="<%=pcdata(p)%>"<%= (cur_ppd and p == cur_ppd) and " selected" or "" %>><%=pcdata((p:gsub("^/usr/share/ppd/", "")))%></option>
 				<% end %>
 			</select>
 			<div class="cbi-value-description">
+				<% if edit then %>
+					<% if cur_raw then %>
+						<span><%:Current driver%>: <b>raw</b></span><br>
+					<% elseif cur_nick and cur_nick ~= "" then %>
+						<span><%:Current driver%>: <b><%=pcdata(cur_nick)%></b><%= cur_ppd and (" (" .. pcdata(cur_ppd:gsub("^/usr/share/ppd/", "")) .. ")") or "" %></span><br>
+					<% end %>
+				<% end %>
 				<%:raw: a Linux client with the P1006/P1106 driver sends ZjStream directly - fastest.%><br>
 				<%:PPD: the router renders the job, any client works, but the CPU is slow.%><br>
 				<% if #ppds == 0 then %>
@@ -68,23 +240,63 @@
 	<div class="cbi-value">
 		<label class="cbi-value-title"><%:Set as default%></label>
 		<div class="cbi-value-field">
-			<input type="checkbox" name="default" value="1" checked>
+			<input type="checkbox" name="default" value="1"<%= (not edit or dflt == edit) and " checked" or "" %>>
 			<div class="cbi-value-description"><%:Make this the system default queue.%></div>
 		</div>
 	</div>
 </div>
 
 <div class="cbi-page-actions">
-	<button class="cbi-button cbi-button-apply"><%:Create queue%></button>
+	<button class="cbi-button cbi-button-apply"><%= edit and translate("Save") or translate("Create queue") %></button>
 	<a class="cbi-button" href="<%=luci.dispatcher.build_url('admin/services/cups-helper')%>"><%:Back%></a>
 </div>
 </form>
 
 <script type="text/javascript">
 // a filled "uri_custom" wins over the select; disable the select so it is obvious
-document.querySelector('input[name="uri_custom"]').addEventListener('input', function () {
-	document.querySelector('select[name="uri"]').disabled = !!this.value;
+var chSelect = document.querySelector('select[name="uri"]');
+var chCustom = document.querySelector('input[name="uri_custom"]');
+var netAuto = false;                      // uri_custom 是不是下面自动拼出来的
+chSelect.disabled = !!chCustom.value;
+chCustom.addEventListener('input', function () {
+	netAuto = false;                       // 用户自己改了, 别再被下面自动拼的覆盖
+	chSelect.disabled = !!this.value;
 });
+
+// 网络打印机: 协议 + 主机 + 端口/队列 -> 拼成设备地址, 写进 uri_custom
+var nSch  = document.querySelector('select[name="net_scheme"]');
+var nHost = document.querySelector('input[name="net_host"]');
+var nPort = document.querySelector('input[name="net_port"]');
+function buildNetUri() {
+	var h = (nHost.value || '').replace(/^\s+|\s+$/g, '');
+	if (!h) { return ''; }
+	var p = (nPort.value || '').replace(/^\s+|\s+$/g, '');
+	var sc = nSch.value;
+	if (sc === 'socket') { return 'socket://' + h + ':' + (p || '9100'); }
+	if (sc === 'lpd')    { return 'lpd://' + h + '/' + (p || 'queue'); }
+	return sc + '://' + h + ':' + (p || '631') + '/ipp/print';
+}
+function syncNetUri() {
+	var u = buildNetUri();
+	if (u) { chCustom.value = u; netAuto = true; }
+	else if (netAuto) { chCustom.value = ''; netAuto = false; }
+	chSelect.disabled = !!chCustom.value;
+}
+if (nSch && nHost && nPort) {
+	nSch.addEventListener('change', syncNetUri);
+	nHost.addEventListener('input', syncNetUri);
+	nPort.addEventListener('input', syncNetUri);
+}
+
+// CUPS 的队列名只允许 [A-Za-z0-9._-]；中文/空格直接打进去会被服务端拒掉，
+// 看起来就像"点了创建没反应"。这里边输入边过滤，省得白点一次。
+var chName = document.querySelector('input[name="name"]');
+if (!chName.readOnly) {
+	chName.addEventListener('input', function () {
+		var v = this.value.replace(/[^A-Za-z0-9._-]/g, '');
+		if (v !== this.value) { this.value = v; }
+	});
+}
 </script>
 
 <%+footer%>
