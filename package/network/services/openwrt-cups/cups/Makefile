@@ -10,7 +10,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=cups
 PKG_VERSION:=2.3.3
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION)-source.tar.gz
 PKG_SOURCE_URL:=https://github.com/apple/cups/releases/download/v$(PKG_VERSION)/
@@ -132,12 +132,12 @@ define Package/cups/install
 	$(CP) $(PKG_INSTALL_DIR)/usr/lib/cups/driver $(1)/usr/lib/cups
 	$(CP) $(PKG_INSTALL_DIR)/usr/lib/cups/monitor $(1)/usr/lib/cups
 
+	# 过滤器必须 0755: cupsd 以 lp 用户跑过滤链, 源码树里装出来是 754 → execv Permission denied(113)
+	# 用 INSTALL_BIN(install -m0755) 在安装时把权限写进去, 不依赖源码模式、也不用事后 chmod
 	$(INSTALL_DIR) $(1)/usr/lib/cups/filter
-	$(CP) $(PKG_INSTALL_DIR)/usr/lib/cups/filter/{commandtops,pstops} \
-		$(PKG_INSTALL_DIR)/usr/lib/cups/filter/gziptoany \
-		$(1)/usr/lib/cups/filter
-	# CUPS 要求过滤器可执行: 装出来是 754, cupsd 以 lp 用户跑过滤链会 Permission denied (113)
-	chmod 0755 $(1)/usr/lib/cups/filter/*
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/cups/filter/commandtops $(1)/usr/lib/cups/filter/
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/cups/filter/pstops      $(1)/usr/lib/cups/filter/
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/cups/filter/gziptoany  $(1)/usr/lib/cups/filter/
 
 	$(INSTALL_DIR) $(1)/usr/share/cups/templates
 	$(CP) $(PKG_INSTALL_DIR)/usr/share/cups/templates/*.tmpl \
@@ -207,11 +207,11 @@ endef
 # libcups 一样会撞名。此处改名 cups-raster-filters。
 define Package/cups-raster-filters/install
 	$(INSTALL_DIR) $(1)/usr/lib/cups/filter
-	$(CP) $(PKG_INSTALL_DIR)/usr/lib/cups/filter/{rastertoepson,rastertohp,rastertolabel,rastertopwg} \
-		$(1)/usr/lib/cups/filter
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/cups/filter/rastertoepson $(1)/usr/lib/cups/filter/
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/cups/filter/rastertohp    $(1)/usr/lib/cups/filter/
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/cups/filter/rastertolabel $(1)/usr/lib/cups/filter/
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/cups/filter/rastertopwg   $(1)/usr/lib/cups/filter/
 	$(LN) rastertolabel $(1)/usr/lib/cups/filter/rastertodymo
-	# 同 Package/cups/install: 装出来是 754, cupsd 以 lp 用户跑会被拒 (113)
-	chmod 0755 $(1)/usr/lib/cups/filter/*
 endef
 
 define Package/cups-ppdc/install

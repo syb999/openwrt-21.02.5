@@ -144,6 +144,17 @@ function op()
 				or (translate("Failed to delete: ") .. out)
 		end
 
+	elseif a == "enableq" then
+		-- 队列被 CUPS 停掉(ErrorPolicy stop-printer: 后端失败一次就 disable)后要能一键拉回来,
+		-- 否则用户只能看到"打印机不见了"
+		if not name then
+			msg = translate("Invalid queue name")
+		else
+			local ok, out = sh("cupsenable " .. name .. "; cupsaccept " .. name)
+			msg = ok == 0 and (translate("Queue enabled: ") .. name)
+				or (translate("Failed: ") .. out)
+		end
+
 	elseif a == "setdefault" then
 		if not name then
 			msg = translate("Invalid queue name")
@@ -158,6 +169,15 @@ function op()
 		else
 			-- 用 CUPS 自带的 PDF 测试页: 文本(text/plain)要过 texttopdf, 盒子上没装字体
 			-- 就会报 "No usable font available"; PDF 走 pdftopdf/pdftops, 不需要字体
+			-- raw 队列没有 PPD: CUPS 会把这个 PDF 原样丢给打印机, P1106 这类 ZjStream 机器
+			-- 不认 PDF ⇒ 不出纸, 还会被 ErrorPolicy 停掉队列(看起来"打印机消失了")
+			-- 注意: sh() 返回两个值 (ok, out), 不能 (sh(...) or ""):match(...) —— 那样拿到的是 ok(数字)
+			local _, ppdout = sh("[ -f /etc/cups/ppd/" .. name .. ".ppd ] && echo yes")
+			if not (ppdout or ""):match("yes") then
+				msg = translate("This queue is raw (no PPD): the router cannot render a test page. Edit it and pick a PPD - HP P1106 uses foo2zjs/HP-LaserJet_Pro_P1102.ppd")
+				http.redirect(disp.build_url("admin/services/cups-helper") .. "?msg=" .. http.urlencode(msg or ""))
+				return
+			end
 			local ok, out = sh(
 				"p=/usr/share/cups/data/default-testpage.pdf; " ..
 				"if [ -f $p ]; then lp -d " .. name .. " -t cups-helper-test $p; " ..

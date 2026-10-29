@@ -105,3 +105,6 @@ msgstr "lpinfo 没有发现网络打印机 —— 用下面三个输入框手工
 
 msgid "driverless (IPP everywhere) - no PPD, for ipp/ipps network printers"
 msgstr "driverless（IPP everywhere）—— 不用 PPD，适用于 ipp/ipps 网络打印机"
+
+msgid "A raw queue cannot print the router-side test page - pick a PPD to test from here."
+msgstr "raw 队列无法用路由器打测试页 —— 想在界面上测试请选 PPD。"

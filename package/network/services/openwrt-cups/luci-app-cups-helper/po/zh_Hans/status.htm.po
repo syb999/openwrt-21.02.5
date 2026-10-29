@@ -189,3 +189,6 @@ msgstr "网络打印机（lpinfo -v）"
 
 msgid "none - CUPS can still reach a printer at a known IP"
 msgstr "无 —— 仍可直接用已知 IP 添加"
+
+msgid "Enable queue"
+msgstr "启用队列"

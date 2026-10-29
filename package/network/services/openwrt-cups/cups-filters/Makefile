@@ -12,7 +12,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=cups-filters
 PKG_VERSION:=1.28.15
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://github.com/OpenPrinting/cups-filters/releases/download/$(PKG_VERSION)/
@@ -67,8 +67,12 @@ define Package/cups-filters/description
 endef
 
 define Package/cups-filters/install
+	# 过滤器必须 0755 (cupsd 以 lp 用户跑过滤链)。用 find -exec install -m0755:
+	# ① 权限由本 Makefile 显式写入, 不依赖源码里文件的原始 754, 也不用事后 chmod
+	# ② 必须是 shell 在运行时求值, 不能用 $(wildcard)(它在 make 解析阶段求值, 那时
+	#    PKG_INSTALL_DIR 还是空的 ⇒ 过滤器会一个都不打包, 已踩过)
 	$(INSTALL_DIR) $(1)/usr/lib/cups/filter
-	$(CP) $(PKG_INSTALL_DIR)/usr/lib/cups/filter/* $(1)/usr/lib/cups/filter/
+	find $(PKG_INSTALL_DIR)/usr/lib/cups/filter -type f -exec $(INSTALL_BIN) {} $(1)/usr/lib/cups/filter/ \;
 
 	# cups-filters 自己的两个运行库, 过滤器都靠它们 (漏了会报 missing dependencies)
 	$(INSTALL_DIR) $(1)/usr/lib
@@ -87,8 +91,6 @@ define Package/cups-filters/install
 		$(INSTALL_DIR) $(1)/usr/share/ppd; \
 		$(CP) $(PKG_INSTALL_DIR)/usr/share/ppd/* $(1)/usr/share/ppd/; } || true
 
-	# CUPS 要求过滤器可执行且 root 拥有 (cupsd 以 root 起过滤链)
-	chmod 0755 $(1)/usr/lib/cups/filter/*
 endef
 
 $(eval $(call BuildPackage,cups-filters))

@@ -63,3 +63,9 @@ msgstr "更新队列失败："
 
 msgid "Invalid queue name"
 msgstr "队列名无效"
+
+msgid "Queue enabled: "
+msgstr "队列已启用："
+
+msgid "This queue is raw (no PPD): the router cannot render a test page. Edit it and pick a PPD - HP P1106 uses foo2zjs/HP-LaserJet_Pro_P1102.ppd"
+msgstr "该队列是 raw（没有 PPD），路由器无法渲染测试页。请编辑该队列并选择 PPD —— HP P1106 用 foo2zjs/HP-LaserJet_Pro_P1102.ppd"

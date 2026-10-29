@@ -63,6 +63,29 @@
 		end
 	end
 
+	-- 新建时的默认驱动: 有把握就预选 PPD, 否则才用 raw。
+	-- 原因: raw 队列从路由器打测试页是打不出来的(CUPS 会把 PDF 原样丢给打印机),
+	-- 用户第一件事就是点测试页 ⇒ 不出纸, 还会被 ErrorPolicy 停掉队列(看起来"打印机消失了")
+	local sugg_ppd
+	if not edit and #usbdevs == 1 then
+		local model = ((usbdevs[1].desc or "") .. " " .. (usbdevs[1].uri or ""))
+		-- HP P11xx (P1102/P1106/P1107/P1109…) 都是 ZjStream v2, 共用 HP-LaserJet_Pro_P1102.ppd
+		if model:match("P11%d%d") then
+			for _, q in ipairs(ppds) do
+				if q:match("foo2zjs/HP%-LaserJet_Pro_P1102%.ppd$") then sugg_ppd = q end
+			end
+		end
+		-- 通用: 型号里的 4 位数字命中 PPD 文件名就用它
+		if not sugg_ppd then
+			local tok = model:match("(P%d%d%d%d)")
+			if tok then
+				for _, q in ipairs(ppds) do
+					if q:lower():find(tok:lower(), 1, true) then sugg_ppd = q; break end
+				end
+			end
+		end
+	end
+
 	local cur_matched = false
 	for _, d in ipairs(usbdevs) do
 		if d.uri == cur_uri then cur_matched = true end
@@ -208,14 +231,14 @@
 				<% if edit then %>
 				<option value="keep"><%:keep the current driver (only change the device URI)%></option>
 				<% end %>
-				<option value="raw"<%= edit and "" or " selected" %>><%:raw - the client renders, the router only forwards (lowest CPU, recommended)%></option>
-				<option value="ppd"><%:PPD - the router renders with the PPD chosen below%></option>
+				<option value="raw"<%= (not edit and not sugg_ppd) and " selected" or "" %>><%:raw - the client renders, the router only forwards (lowest CPU, recommended)%></option>
+				<option value="ppd"<%= (not edit and sugg_ppd) and " selected" or "" %>><%:PPD - the router renders with the PPD chosen below%></option>
 				<option value="everywhere"><%:driverless (IPP everywhere) - no PPD, for ipp/ipps network printers%></option>
 			</select>
 			<select name="ppd" class="cbi-input-select" style="margin-top:6px">
 				<option value=""></option>
 				<% for _, p in ipairs(ppds) do %>
-				<option value="<%=pcdata(p)%>"<%= (cur_ppd and p == cur_ppd) and " selected" or "" %>><%=pcdata((p:gsub("^/usr/share/ppd/", "")))%></option>
+				<option value="<%=pcdata(p)%>"<%= (p == (cur_ppd or sugg_ppd)) and " selected" or "" %>><%=pcdata((p:gsub("^/usr/share/ppd/", "")))%></option>
 				<% end %>
 			</select>
 			<div class="cbi-value-description">
@@ -227,6 +250,7 @@
 					<% end %>
 				<% end %>
 				<%:raw: a Linux client with the P1006/P1106 driver sends ZjStream directly - fastest.%><br>
+				<span style="color:#a05a00"><%:A raw queue cannot print the router-side test page - pick a PPD to test from here.%></span><br>
 				<%:PPD: the router renders the job, any client works, but the CPU is slow.%><br>
 				<% if #ppds == 0 then %>
 					<span style="color:#b00"><%:No PPD found. Install foo2zjs or gutenprint first.%></span>
