@@ -3429,6 +3429,58 @@ def cmd_csv(argv):
     return 0
 
 
+def _looks_m3u8(path):
+    """文件头是不是 HLS 清单（不看扩展名：CDN 常给 application/octet-stream）"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096).lstrip(b"\xef\xbb\xbf \r\n\t")
+        return head.startswith(b"#EXTM3U")
+    except OSError:
+        return False
+
+
+def _absolutize_m3u8(path, base):
+    """按 HLS 规范把清单里的相对 URI 用清单自身地址补成绝对地址。
+
+    腾讯这类站的清单里分段是 `00_gzc_....ts?index=0&start=...` 的相对形式，
+    存成文件交给播放器/下载器就会"缺 http 前缀、没法下/没法播"。返回改写条数。
+    """
+    if not base:
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return 0
+    n = 0
+    out = []
+    for ln in lines:
+        s = ln.strip()
+        if s and not s.startswith("#"):
+            u = urllib.parse.urljoin(base, s)
+            if u != s:
+                ln = u
+                n += 1
+        elif s.startswith(("#EXT-X-KEY", "#EXT-X-MAP", "#EXT-X-MEDIA",
+                           "#EXT-X-PART", "#EXT-X-I-FRAME-STREAM-INF")):
+            def _rep(m, base=base):
+                nonlocal n
+                u = urllib.parse.urljoin(base, m.group(2))
+                if u != m.group(2):
+                    n += 1
+                return m.group(1) + u + m.group(3)
+            ln = re.sub(r'(URI=")([^"]+)(")', _rep, ln)
+        out.append(ln)
+    if not n:
+        return 0
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+    except OSError:
+        return 0
+    return n
+
+
 def cmd_fetch(argv):
     if not argv:
         die("No URL given")
@@ -3565,6 +3617,14 @@ def cmd_fetch(argv):
     except Exception:
         final = url
     preview, looks_login = "", False
+    # 🔴 HLS 清单里的分段地址通常是相对的：原样存盘后播放器/下载器没有 base，
+    # 就是"缺 http 前缀、没法下载/没法播放"。按 HLS 规范用清单自己的最终 URL 补全。
+    absn = 0
+    if n and _looks_m3u8(out):
+        absn = _absolutize_m3u8(out, final)
+        if absn:
+            warn("fetch: rewrote %d relative playlist URI(s) to absolute (base %s)"
+                 % (absn, final[:90]))
     if (ctype.startswith("text/") or "json" in ctype or "xml" in ctype) and 0 < n < 400000:
         try:
             with open(out, "rb") as f:
@@ -3581,6 +3641,7 @@ def cmd_fetch(argv):
         "method": method, "chain": chain, "cookies_set": sorted({c.name for c in jar}),
         "headers_sent": sorted(hdrs), "header_count": len(hdrs),
         "preview": preview, "looks_login": looks_login,
+        "m3u8_absolutized": absn,
         "stopped_early": bool(maxb and n >= maxb)})
 
 

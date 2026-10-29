@@ -159,6 +159,45 @@ def free_port(prefer=PORT):
     return prefer
 
 
+def check_playlist(u):
+    """校验一个清单地址：真取一次，按 #EXTINF 与 start= 算时长"""
+    st, b = http_get(u)
+    n = b.count(b"#EXTINF")
+    if st != 200 or not n:
+        return None
+    starts = [int(x) for x in re.findall(rb"start=(\d+)", b)]
+    return {"ok": True, "kind": "hls", "playlist": u, "segments": n,
+            "duration_s": round((max(starts) / 1000.0) if starts else 0.0, 1)}
+
+
+def vinfo_playlists(body):
+    """从 v.qq.com 的 proxyhttp 响应里取播放器自己签好的清单地址。
+
+    vinfo.vl.vi[].ul.ui[].url 本身就是 ...ts.m3u8?ver=4（实测 HTTP 200、
+    282 段、2715.8s = 整集）。页面加载 ~2s 就有，不用等广告放完、
+    也不用等播放器真去拉分片。
+    """
+    out = []
+    try:
+        o = json.loads(body)
+    except Exception:
+        return out
+    v = o.get("vinfo")
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except Exception:
+            return out
+    if not isinstance(v, dict):
+        return out
+    for vi in ((v.get("vl") or {}).get("vi") or []):
+        for x in ((vi.get("ul") or {}).get("ui") or []):
+            u = (x.get("url") or "")
+            if ".m3u8" in u and u not in out:
+                out.append(u)
+    return out
+
+
 def listen(url, seconds=LISTEN_SECONDS):
     """开页面，只听网络（绝不 execute_script，避免渲染器被占死）"""
     import websocket
@@ -194,11 +233,14 @@ def listen(url, seconds=LISTEN_SECONDS):
         def nowait(m, p=None):
             i[0] += 1
             ws.send(json.dumps({"id": i[0], "method": m, "params": p or {}}))
+            return i[0]
 
         nowait("Network.enable")
         nowait("Page.enable")
         nowait("Page.navigate", {"url": url})
         segs, m3us, total, dirs = set(), set(), 0, {}
+        proxy_reqs, poll, cands = set(), {}, []
+        hit = None
         t0 = time.time()
         while time.time() - t0 < seconds:
             ws.settimeout(0.8)
@@ -206,21 +248,41 @@ def listen(url, seconds=LISTEN_SECONDS):
                 m = json.loads(ws.recv())
             except Exception:
                 continue
-            if m.get("method") == "Network.requestWillBeSent":
-                u = ((m.get("params") or {}).get("request") or {}).get("url") or ""
+            meth = m.get("method")
+            if meth == "Network.requestWillBeSent":
+                p = m.get("params") or {}
+                u = ((p.get("request") or {}).get("url")) or ""
                 total += 1
+                if "proxyhttp" in u:                  # 播放器的签名请求，响应里有清单
+                    proxy_reqs.add(p.get("requestId"))
                 if re.search(r"\.ts\?", u):
                     if u not in segs:
                         segs.add(u)
-                        try:                       # 只做计数，不发任何请求（照抄 3/3 成功的探测）
+                        try:                       # 只做计数，不发任何请求
                             dirs[u.split("/")[-2]] = dirs.get(u.split("/")[-2], 0) + 1
                         except Exception:
                             pass
                 elif ".m3u8" in u:
                     m3us.add(u)
+            elif meth == "Network.loadingFinished":
+                rid = (m.get("params") or {}).get("requestId")
+                if rid in proxy_reqs:
+                    proxy_reqs.discard(rid)
+                    poll[nowait("Network.getResponseBody", {"requestId": rid})] = rid
+            elif m.get("id") in poll:
+                for u in vinfo_playlists((m.get("result") or {}).get("body") or ""):
+                    if u not in cands:
+                        cands.append(u)
+                for u in cands:                       # 判据仍然是清单时长
+                    r = check_playlist(u)
+                    if r and r["duration_s"] >= EPISODE_MIN_S:
+                        hit = r
+                        break
+                if hit:
+                    break
         return {"ok": True, "segments_seen": len(segs), "m3u8_seen": len(m3us),
                 "requests": total, "segs": sorted(segs), "m3u8": sorted(m3us),
-                "by_dir": dirs}
+                "by_dir": dirs, "cands": cands, "episode": hit}
     finally:
         try:
             if ws:
@@ -235,13 +297,15 @@ def listen(url, seconds=LISTEN_SECONDS):
         shutil.rmtree(PROFILE, ignore_errors=True)
 
 
-def derive(segs, m3us, episode=None, by_dir=None):
+def derive(segs, m3us, episode=None, by_dir=None, cands0=None):
     if episode:                      # listen 阶段已按"时长"确认是正片
         return {"ok": True, "kind": "hls", "playlist": episode["playlist"],
-                "segments": episode["segments"], "duration_s": episode["duration_s"]}
+                "segments": episode["segments"], "duration_s": episode["duration_s"],
+                "dirs_seen": len(set(u.rsplit("/", 1)[0][-24:] for u in m3us)),
+                "by_dir": len(by_dir or {})}
     """由分片名/清单请求反推整集清单地址并校验"""
-    cands = []
-    for u in m3us:                     # 播放器自己取过的清单最可信
+    cands = list(cands0 or [])         # proxyhttp 响应里播放器自己给的清单，最可信
+    for u in m3us:                     # 播放器自己取过的清单
         cands.append(u)
     cnt = {}
     for u in segs:
@@ -306,7 +370,8 @@ def one_shot(url, force=False):
         if not r.get("ok"):
             last = r
             continue
-        best = derive(r.get("segs") or [], r.get("m3u8") or [], r.get("episode"), r.get("by_dir"))
+        best = derive(r.get("segs") or [], r.get("m3u8") or [], r.get("episode"),
+                      r.get("by_dir"), r.get("cands"))
         if best and best.get("duration_s", 0) >= EPISODE_MIN_S:
             best.update({"vid": vid, "took": round(time.time() - t0, 1), "cached": False,
                          "attempts": attempt})
@@ -366,7 +431,7 @@ def cmd_worker(url):
             _note("attempt %d: %d media request(s), checking playlists"
                   % (attempt, r.get("requests", 0)))
             best = derive(r.get("segs") or [], r.get("m3u8") or [], r.get("episode"),
-                          r.get("by_dir"))
+                          r.get("by_dir"), r.get("cands"))
             if best and best.get("duration_s", 0) >= EPISODE_MIN_S:
                 best.update({"state": "done", "vid": vid, "cached": False, "attempts": attempt})
                 if vid:

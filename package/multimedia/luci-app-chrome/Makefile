@@ -11,7 +11,7 @@ PKG_NAME:=luci-app-chrome
 # 所以**每次发新版都必须把这个值往上抬**，否则 opkg 会判定 "installed in root is
 # up to date" 而拒绝安装（就地升级就"看不到新功能"）。
 # 约定：日期 + 当天第几版。
-PKG_VERSION:=2026-10-01-90
+PKG_VERSION:=2026-10-29-2
 PKG_RELEASE:=1
 PKG_LICENSE:=Apache-2.0
 PKG_MAINTAINER:=Panther X2 Project
@@ -30,7 +30,7 @@ LUCI_TITLE:=LuCI App for headless Chrome (page grabber + media resource extracto
 # chrome-headless-shell / chromedriver already carry @TARGET_rockchip, so the
 # app inherits the target restriction through them.  python3-selenium pulls in
 # python3-urllib + python3-openssl + certifi (https) and urllib3.
-LUCI_DEPENDS:=+luci-base +chrome-headless-shell +chromedriver +python3-selenium
+LUCI_DEPENDS:=+luci-base +chrome-headless-shell +chromedriver +python3-selenium +python3-websocket-client
 LUCI_PKGARCH:=all
 
 # luci.mk only defines a default postinst `ifndef`, so this one replaces it:
