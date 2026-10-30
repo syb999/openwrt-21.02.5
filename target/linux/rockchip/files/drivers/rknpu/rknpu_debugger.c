@@ -467,6 +467,16 @@ static int rknpu_procfs_open(struct inode *inode, struct file *file)
 	return single_open(file, node->info_ent->show, node);
 }
 
+#if KERNEL_VERSION(5, 6, 0) > LINUX_VERSION_CODE
+/* struct proc_ops only exists since 5.6; 5.4 takes file_operations here. */
+static const struct file_operations rknpu_procfs_fops = {
+	.open = rknpu_procfs_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+	.write = rknpu_debugger_write,
+};
+#else
 static const struct proc_ops rknpu_procfs_fops = {
 	.proc_open = rknpu_procfs_open,
 	.proc_read = seq_read,
@@ -474,6 +484,7 @@ static const struct proc_ops rknpu_procfs_fops = {
 	.proc_release = single_release,
 	.proc_write = rknpu_debugger_write,
 };
+#endif
 
 static int rknpu_procfs_remove_files(struct rknpu_debugger *debugger)
 {
