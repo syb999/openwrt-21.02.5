@@ -100,6 +100,61 @@ bilibili 这种站用的是 DASH：**画面和声音是两个文件**。实测�
   本 app 刻意不做（只解析 URL）。
 - `.m4s` 是 fMP4 分片（`moof`+`sidx`），播放器认它，但**不能**改成 `.mp4` 当完整文件用。
 
+## bilibili：为什么"解析出来的 URL 一个都下不下来"
+
+实测（2026-10-31，同一页面的 4 个不同 CDN 主机逐个试）：
+
+    裸请求（不带任何请求头）        → 403 Forbidden
+    只带 User-Agent                 → 403 Forbidden
+    带 User-Agent + Referer         → 200 / 206  ✓
+
+即 **bilibili 的所有 m4s/mp4 地址都必须带 Referer（+UA）**，粘到浏览器/下载器里裸下必然失败。
+这跟 v.qq.com 那条路无关：`QQ_URL_RE` 只匹配 `v.qq.com`，bilibili 根本不进那段代码；
+`cmd_fetch` 最近只加过"m3u8 相对路径补全"，它只看 m3u8，不碰 m4s。
+
+另外两个必须知道的事实：
+
+- **画面和声音是两条轨**：`…-30016.m4s`(视频) + `…-30280.m4s`(音频，AAC)，单下一条只有画面或只有声音。
+- **音轨会被误判成视频**：CDN 对 30280 也回 `video/mp4` ⇒ 原来 27 条"视频"里混着 9 条纯音频。
+  现在按流 id 纠正（`30216/30232/30280` → audio，`-(30[23]\d{2})\.m4s`）。
+
+所以界面里给了 **[生成下载脚本]**（后端 `chromeui dl`）：自动挑一条视频（H.264 优先）+ 一条音频
+（码率最高），生成一个可直接跑的 .sh —— 带 Referer/UA/Origin 取流（**curl 优先，没有 curl 才退 wget**），
+再用 `ffmpeg -c copy` 合成一个 mp4。
+
+    chromeui dl [--out out.mp4]      # 输出 JSON：cmd / script / path / video / audio / headers
+    sh /tmp/chromeui/scripts/dl-*.sh [out.mp4]
+
+实测（63 秒的竖屏视频）：2.2 秒下完并合成，`4,270,574 B`、`h264 480x852 + aac`、`duration 62.718` ✓。
+用的就是 `curl -fL --retry 3 --progress-bar -H "Referer: …" -H "User-Agent: …" -H "Origin: …"`；
+**不需要 aria2**（之前那版用过 aria2，它没有 `-H`、`-o` 还是相对 `-d` 的，坑多，已去掉）。
+
+## 「带这些请求头下载」到电脑：两条老路都下不动大文件（2026-10-31 实测修好）
+
+用户视角：**电脑开 LuCI → 资源行 → [带这些请求头下载] → 存到电脑**。这条路上原来有两个坑：
+
+1. 🔴 **重放了浏览器自己的 `Range` 头**。bilibili 播放器是按片取的，抓到的请求头里就带着
+   `Range: bytes=0-14838`；原样重放 ⇒ CDN 只回那一片 ⇒ 文件"只有几百 KB"。
+   修：`clean_headers()` 的 `DROP_ALWAYS` 里加 `range`（`if-range` 本来就在）。
+2. 🔴 **字节在 RPC 里搬**。`fetch` 在**一个 RPC** 里下完（rpcd 有超时/输出上限），回来再用
+   `filedata` 一帧 48 KB 往浏览器挪（`readChunks` 400 帧 ≈ 19 MB 到顶）⇒ 465 MB 的片子永远过不去。
+
+现在的链路（`chromeui fetchbg` + `/cgi-bin/chromeui-dl`）：
+
+    [带这些请求头下载] → chromeui fetchbg <url> --headers …   # 设备后台 curl 落 /tmp/chromeui/dl/
+                       → chromeui dlstat --name X             # 网页每 1.2 s 问进度
+                       → /cgi-bin/chromeui-dl?name=X          # 浏览器普通 GET，路由器直传
+
+实测（96 分钟那期的音轨，45.2 MB）：
+
+    fetchbg 带浏览器那套头（含 range）→ total = 47,362,442（完整大小，不再是 14839）
+    dlstat 下完 → 47,362,442 / 47,362,442  done
+    CGI 直取  → http=200 size=47362442 speed=45 MB/s，cmp 逐字节一致，头 ftypiso5 ✓
+    网页实测  → 正在设备上下载… 4.5 MB / 45.2 MB 10% … → 正在把文件交给浏览器… 45.2 MB ✓
+
+⚠️ CGI 只服务 `/tmp/chromeui/dl/<纯文件名>`（`^[A-Za-z0-9][A-Za-z0-9._-]*$`），
+不做目录遍历；`/tmp` 是内存盘，机器重启就没了。
+
 ## 时间上限与"必定结束"（v.qq.com 这类页面）
 
 **默认总时限 110 秒**（`--max-total N` 可调），到点由看门狗线程**杀掉浏览器进程树**并返回：
@@ -479,6 +534,31 @@ CDN 地址有 700+ 字符，放进 `<table>` 会把表格连同整个 LuCI 页�
 中文界面要装 `luci-i18n-chrome-zh-cn`（`.config` 里
 `CONFIG_PACKAGE_luci-i18n-chrome-zh-cn=y`），否则显示英文源串。
 
+## 导出调用脚本（网页「导出调用脚本」/ `chromeui script`）
+
+不做模板库：**表单里当下是什么，就导出什么**。点「导出调用脚本」后后端把同一套参数
+（`GRAB_SPEC`，和「开始抓取」完全一致）原样拼成：
+
+    命令行（可复制）   /usr/bin/chromeui grab 'https://…' --timeout '30' --width '1280' …
+    脚本               /tmp/chromeui/scripts/grab-<host>-<时间戳>.sh   (0755，可直接跑)
+
+```sh
+sh /tmp/chromeui/scripts/grab-example.com-20261031-085052.sh            # 用它自己写死的地址
+sh /tmp/chromeui/scripts/grab-example.com-20261031-085052.sh <另一个url> # 换页面不用改文件
+sh ... > out.json                                                       # 结果是单个 JSON
+```
+
+后一句话很重要：脚本里地址被提成 `DEF_URL` + `URL="${1:-$DEF_URL}"`，所以同一个脚本
+可以反复用于任何页面。粘贴的请求头会作为 `HDRS='…'`（单引号安全转义，含引号/换行都行）
+写进脚本，命令行里显示成 `--headers "$HDRS"`。
+
+后端 JSON：`{"ok":true,"url":…,"cmd":"<命令行>","script":"<脚本全文>","path":…,"file":…,"bytes":N}`
+—— 网页直接显示 `cmd`、把 `script` 放进文本框，「复制命令行 / 复制脚本 / 下载脚本」都不再
+多发一次 RPC。`/tmp` 是 tmpfs，重启后脚本就没了（要留就下载走）。
+
+🔴 这里用的是 `grab`（一次性、打完 JSON 返回），不是网页轮询用的 `start`/`job` ——
+脚本是给 shell/别人/AI 复现用的。
+
 ## 命令行用法（不通过网页也能用）
 
     chromeui version
@@ -495,6 +575,7 @@ CDN 地址有 700+ 字符，放进 `<table>` 会把表格连同整个 LuCI 页�
     chromeui stop                    # 中止
     chromeui mediaprobe <url>        # 头部信息 / m3u8 解析
     chromeui fetch <url> [--out P] [--max-bytes N]
+    chromeui script <url> [同上]     # 不启动浏览器：把等价命令行 + 可直接跑的 .sh 导出来
     chromeui export [--out P] [--all]
 
 `chromeui grab`（命令行）仍然一次性打印完整 JSON（含 base64 截图与 HTML），方便脚本用；

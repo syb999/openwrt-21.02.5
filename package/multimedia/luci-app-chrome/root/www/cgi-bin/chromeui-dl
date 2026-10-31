@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""把 /tmp/chromeui/dl 下的文件原样流给浏览器（"下载到电脑"的最后一公里）。
+
+为什么需要它：网页原来的"下载到电脑"是 fetch(RPC) 落盘 + filedata 分块回读。
+一条 RPC 有超时和输出上限，filedata 400 帧 ≈ 19 MB ⇒ 一块 96 分钟的片子
+（465 MB）只能下到几百 KB 就没了。这里改成浏览器直接 GET 路由器，
+多大都行，速度就是内网速度。
+"""
+import os
+import re
+import sys
+import urllib.parse
+
+DL = "/tmp/chromeui/dl"
+
+
+def die(code, msg):
+    sys.stdout.write("Status: %d\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n%s\n" % (code, msg))
+    sys.stdout.flush()
+    sys.exit(0)
+
+
+q = urllib.parse.parse_qs(os.environ.get("QUERY_STRING") or "")
+name = os.path.basename((q.get("name") or [""])[0])
+if not name or not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name):
+    die(400, "bad name")
+
+path = os.path.join(DL, name)
+try:
+    total = os.path.getsize(path)
+except OSError:
+    die(404, "not found: %s" % name)
+
+ctype = "application/octet-stream"
+low = name.lower()
+for ext, t in ((".mp4", "video/mp4"), (".m4s", "video/mp4"), (".m4a", "audio/mp4"),
+               (".mp3", "audio/mpeg"), (".aac", "audio/aac"), (".flac", "audio/flac"),
+               (".m3u8", "application/vnd.apple.mpegurl"), (".ts", "video/mp2t"),
+               (".flv", "video/x-flv"), (".mkv", "video/x-matroska"),
+               (".webm", "video/webm"), (".zip", "application/zip"),
+               (".json", "application/json"), (".txt", "text/plain; charset=utf-8"),
+               (".html", "text/html; charset=utf-8")):
+    if low.endswith(ext):
+        ctype = t
+        break
+
+sys.stdout.write("Status: 200 OK\r\n")
+sys.stdout.write("Content-Type: %s\r\n" % ctype)
+sys.stdout.write("Content-Length: %d\r\n" % total)
+sys.stdout.write('Content-Disposition: attachment; filename="%s"\r\n' % name)
+sys.stdout.write("Cache-Control: no-store\r\n\r\n")
+sys.stdout.flush()
+
+try:
+    with open(path, "rb") as f:
+        while True:
+            buf = f.read(262144)
+            if not buf:
+                break
+            sys.stdout.buffer.write(buf)
+            sys.stdout.buffer.flush()
+except (BrokenPipeError, OSError):
+    pass

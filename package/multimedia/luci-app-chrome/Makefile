@@ -11,7 +11,7 @@ PKG_NAME:=luci-app-chrome
 # 所以**每次发新版都必须把这个值往上抬**，否则 opkg 会判定 "installed in root is
 # up to date" 而拒绝安装（就地升级就"看不到新功能"）。
 # 约定：日期 + 当天第几版。
-PKG_VERSION:=2026-10-29-2
+PKG_VERSION:=2026-10-31-5
 PKG_RELEASE:=1
 PKG_LICENSE:=Apache-2.0
 PKG_MAINTAINER:=Panther X2 Project

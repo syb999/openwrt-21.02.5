@@ -363,6 +363,16 @@ return view.extend({
 
 		var btnGrab = E('button', { 'class': 'btn cbi-button cbi-button-apply cg-btn', 'id': 'cg-grab' }, [ _('Fetch page') ]);
 		var btnStop = E('button', { 'class': 'btn cbi-button cg-btn', 'id': 'cg-stop', 'disabled': 'disabled' }, [ _('Abort') ]);
+		/* "export the call script": no template library - take whatever is in the
+		 * form right now, hand it to the backend (chromeui script) and show the
+		 * equivalent command line plus a ready-to-run .sh.  The point is that the
+		 * exact invocation can be copied out (to a shell, to a note, to an AI). */
+		var btnScript = E('button', { 'class': 'btn cbi-button cg-btn', 'id': 'cg-script' }, [ _('Export call script') ]);
+		/* "make download script": bilibili 这类 DASH 站画面/声音是两条 m4s，且不带
+		 * Referer/UA 一律 403 ⇒ 直接复制 URL 下不下来。这个按钮让后端挑一对轨
+		 * (chromeui dl) 并把"带请求头取流 + ffmpeg 合并"写成 .sh。 */
+		var btnDlPlan = E('button', { 'class': 'btn cbi-button cg-btn', 'id': 'cg-dlplan' }, [ _('Make download script') ]);
+		var scriptBox = E('div', { 'id': 'cg-scriptbox', 'style': 'display:none;margin-top:8px;border-top:1px solid rgba(255,255,255,.12);padding-top:8px' }, []);
 		var progLine = E('div', { 'class': 'cg-dim', 'id': 'cg-prog' }, [ '' ]);
 		var banner = E('div', { 'class': 'cg-banner', 'id': 'cg-banner' }, [ _('No task yet.') ]);
 		var notice = E('div', { 'class': 'cg-dim', 'id': 'cg-notice' }, [ '' ]);
@@ -901,20 +911,20 @@ return view.extend({
 						bCurl.addEventListener('click', function () { cp(curlCmd(m.url, hs), _('curl command copied.')); });
 						bFf.addEventListener('click', function () { cp(ffmpegCmd(m.url, hs), _('ffmpeg command copied.')); });
 						bDl.addEventListener('click', function () {
-							/* download exactly this address with exactly these headers */
+							/* 带这两个请求头把这一个地址下到**电脑**上。
+							 * 🔴 大文件不能走 RPC（fetch 落盘 + filedata 分块回读，
+							 * 一条 RPC 有超时、分块 400 帧≈19MB）⇒ 让设备后台下、
+							 * 浏览器再从路由器 HTTP 直取（/cgi-bin/chromeui-dl）。 */
 							bDl.disabled = true;
-							setNotice(_('Fetching with these headers…'), false);
-							xexec([ 'fetch', m.url, '--out', '/tmp/chromeui/fetched.bin',
-								'--headers', lines.join('\n') ]).then(function (rr) {
-								bDl.disabled = false;
+							setNotice(_('Downloading on the device…'), false);
+							xexec([ 'fetchbg', m.url, '--headers', lines.join('\n') ]).then(function (rr) {
 								var f = parseJSON(rr.out, null);
-								if (!f || f.error) {
+								if (!f || !f.ok) {
+									bDl.disabled = false;
 									setNotice(f ? msg(f, 'error') : (rr.err || _('Unknown error, please check the log')), true);
 									return;
 								}
-								if (f.file) downloadFromDevice(f.file, baseName(m.url) || 'fetched.bin');
-								setNotice('HTTP ' + (f.status || '?') + ' · ' + (f.content_type || '-') +
-									' · ' + fmtSize(f.bytes), false);
+								dlWatch(f.name, f.total, bDl);
 							});
 						});
 						box.appendChild(E('div', { 'style': 'margin-top:4px' }, [ bH, bCurl, bFf, bDl ]));
@@ -1171,6 +1181,36 @@ return view.extend({
 			});
 		}
 
+		/* 后台下载的进度轮询 + 下完把文件交给浏览器（浏览器从路由器直取，
+		 * 不经过 RPC，所以多大都能拿全）。 */
+		function dlWatch(name, total, btn) {
+			var iv = setInterval(function () {
+				xexec([ 'dlstat', '--name', name ]).then(function (r) {
+					var j = parseJSON(r.out, null);
+					if (!j || !j.ok) {
+						clearInterval(iv);
+						if (btn) btn.disabled = false;
+						setNotice(msg(j, 'error') || r.err || _('Unknown error, please check the log'), true);
+						return;
+					}
+					var pct = j.total ? ('  ' + Math.round(j.bytes * 100 / j.total) + '%') : '';
+					if (j.state === 'done') {
+						clearInterval(iv);
+						setNotice(_('Handing the file to the browser…') + ' ' + fmtSize(j.bytes), false);
+						try { window.location.href = j.url; } catch (e) {}
+						if (btn) btn.disabled = false;
+					} else if (j.state === 'error') {
+						clearInterval(iv);
+						if (btn) btn.disabled = false;
+						setNotice(_('Download failed') + ': ' + (j.message || ''), true);
+					} else {
+						setNotice(_('Downloading on the device…') + ' ' + fmtSize(j.bytes) +
+							(j.total ? ' / ' + fmtSize(j.total) + pct : ''), false);
+					}
+				});
+			}, 1200);
+		}
+
 		btnDl.addEventListener('click', function () {
 			/* export first, so the download always matches what is on screen */
 			btnDl.disabled = true;
@@ -1218,18 +1258,10 @@ return view.extend({
 		}
 		function touchVersion() { /* keeps a hook for future use */ }
 
-		btnGrab.addEventListener('click', function () {
-			var u = urlIn.value.trim();
-			setNotice('', false);
-			if (!u && hdrCk.checked && /(^|\s)curl\s/i.test(mineText())) {
-				u = '-';       /* a pasted cURL carries the URL */
-			}
-			if (!u) {
-				setNotice(_('Enter a URL first.'), true);
-				return;
-			}
-			if (u !== '-' && !URL_RE.test(u)) u = 'http://' + u;
-			var args = [ 'start', u, '--width', (wIn.value.trim() || '1280'),
+		/* one place builds the grab argv, so "Fetch page" and "Export call script"
+		 * can never drift apart */
+		function buildGrabArgs(cmd, u) {
+			var args = [ cmd, u, '--width', (wIn.value.trim() || '1280'),
 				'--height', (hIn.value.trim() || '900'),
 				'--timeout', (toIn.value.trim() || '30') ];
 			if (waitIn.value.trim()) args.push('--wait', waitIn.value.trim());
@@ -1237,17 +1269,40 @@ return view.extend({
 			if (scrollCk.checked) args.push('--scroll');
 			if (waitCk.checked) args.push('--waitload');
 			if (clickIn.value) args.push('--click', clickIn.value);
-			if (hdrCk.checked) {
-				var ht = mineText();
-				var hn = updateHdrState();
-				if (!ht.trim() || !hn) {
-					setNotice(_('Tick the box, paste your request headers (cookie/token) and try again.'), true);
-					return;
-				}
-				args.push('--headers', ht);
-				setNotice(_('Grab will send your pasted headers') + ' (' + hn + ')', false);
-			}
+			if (hdrCk.checked) args.push('--headers', mineText());
 			if (htmlCk.checked) args.push('--html');
+			return args;
+		}
+
+		/* the URL to use, or '' after putting the reason into the notice line */
+		function grabUrl() {
+			var u = urlIn.value.trim();
+			setNotice('', false);
+			if (!u && hdrCk.checked && /(^|\s)curl\s/i.test(mineText())) {
+				u = '-';       /* a pasted cURL carries the URL */
+			}
+			if (!u) {
+				setNotice(_('Enter a URL first.'), true);
+				return '';
+			}
+			if (u !== '-' && !URL_RE.test(u)) u = 'http://' + u;
+			if (hdrCk.checked) {
+				var hn = updateHdrState();
+				if (!mineText().trim() || !hn) {
+					setNotice(_('Tick the box, paste your request headers (cookie/token) and try again.'), true);
+					return '';
+				}
+			}
+			return u;
+		}
+
+		btnGrab.addEventListener('click', function () {
+			var u = grabUrl();
+			if (!u) return;
+			var args = buildGrabArgs('start', u);
+			if (hdrCk.checked) {
+				setNotice(_('Grab will send your pasted headers') + ' (' + updateHdrState() + ')', false);
+			}
 			btnGrab.disabled = true;
 			/* switch the banner to "running" BEFORE the RPC goes out: otherwise
 			 * the previous job's result (or "aborted") sits there for the whole
@@ -1271,6 +1326,91 @@ return view.extend({
 				renderText('');
 				renderHtml('', false);
 				startPoll();
+			});
+		});
+
+		/* ---- export the call script (no template library: whatever is in the
+		 * form right now is turned into the equivalent command line plus a
+		 * standalone .sh, both copyable/downloadable) ---- */
+		function renderScript(j, title) {
+			scriptBox.innerHTML = '';
+			scriptBox.style.display = '';
+			var cmdPre = E('pre', { 'class': 'cg-pre', 'style': 'margin:4px 0 0;max-height:150px;overflow:auto;white-space:pre-wrap;word-break:break-all' }, [ String(j.cmd || '') ]);
+			var ta = E('textarea', { 'readonly': 'readonly', 'class': 'cbi-input-textarea',
+				'spellcheck': 'false',
+				'style': 'width:100%;box-sizing:border-box;font-family:monospace;font-size:11px;height:190px;margin-top:4px' }, [ String(j.script || '') ]);
+			var btnCmd = E('button', { 'class': 'btn cbi-button cg-btn' }, [ _('Copy command') ]);
+			var btnScr = E('button', { 'class': 'btn cbi-button cg-btn' }, [ _('Copy script') ]);
+			var btnDlSh = E('button', { 'class': 'btn cbi-button cg-btn' }, [ _('Download script') ]);
+			btnCmd.addEventListener('click', function () {
+				copyText(String(j.cmd || ''), function (o) {
+					setNotice(o ? _('Command copied.') : _('Copy failed - select the text manually.'), !o);
+				});
+			});
+			btnScr.addEventListener('click', function () {
+				copyText(String(j.script || ''), function (o) {
+					setNotice(o ? _('Script copied.') : _('Copy failed - select the text manually.'), !o);
+				});
+			});
+			btnDlSh.addEventListener('click', function () {
+				var nm = String(j.file || 'grab.sh');
+				try {
+					var blob = new Blob([ String(j.script || '') ], { type: 'text/x-shellscript;charset=utf-8' });
+					var u = URL.createObjectURL(blob);
+					var a = document.createElement('a');
+					a.href = u;
+					a.download = nm;
+					document.body.appendChild(a);
+					a.click();
+					setTimeout(function () { document.body.removeChild(a); URL.revokeObjectURL(u); }, 4000);
+					setNotice(_('Download started') + ': ' + nm, false);
+				} catch (e) { setNotice(_('Download failed') + ': ' + e, true); }
+			});
+			scriptBox.appendChild(E('h3', {}, [ title || _('Call script') ]));
+			scriptBox.appendChild(E('div', { 'class': 'cg-dim' }, [ fmtTpl(_('Saved to %s'), [ String(j.path || '') ]) ]));
+			if (j.video) {
+				scriptBox.appendChild(E('div', { 'class': 'cg-dim' }, [
+					'video ' + j.video.id + (j.video.codec ? ' (' + j.video.codec + ')' : '') +
+					(j.audio ? '  +  audio ' + j.audio.id + (j.audio.codec ? ' (' + j.audio.codec + ')' : '') : '') ]));
+			}
+			scriptBox.appendChild(E('div', { 'class': 'cg-dim', 'style': 'margin-top:6px' }, [ _('Command line') ]));
+			scriptBox.appendChild(cmdPre);
+			scriptBox.appendChild(E('div', { 'style': 'margin-top:6px' }, [ btnCmd, btnScr, btnDlSh ]));
+			scriptBox.appendChild(E('div', { 'class': 'cg-dim', 'style': 'margin-top:6px' }, [ _('Script') ]));
+			scriptBox.appendChild(ta);
+			setNotice(fmtTpl(_('Saved to %s'), [ String(j.path || '') ]), false);
+		}
+
+		btnScript.addEventListener('click', function () {
+			var u = grabUrl();
+			if (!u) return;
+			if (u === '-') {      /* cURL mode: the URL lives inside the paste */
+				setNotice(_('Export needs a real URL in the box (the cURL mode carries its own).'), true);
+				return;
+			}
+			btnScript.disabled = true;
+			xexec(buildGrabArgs('script', u)).then(function (r) {
+				btnScript.disabled = false;
+				var j = parseJSON(r.out, null);
+				if (!j || !j.ok) {
+					setNotice(msg(j, 'error') || r.err || _('Unknown error, please check the log'), true);
+					return;
+				}
+				renderScript(j);
+			});
+		});
+
+		btnDlPlan.addEventListener('click', function () {
+			if (!media.length) { setNotice(_('No resources yet.'), true); return; }
+			btnDlPlan.disabled = true;
+			xexec([ 'dl' ]).then(function (r) {
+				btnDlPlan.disabled = false;
+				var j = parseJSON(r.out, null);
+				if (!j || !j.ok) {
+					setNotice(msg(j, 'error') || r.err || _('Unknown error, please check the log'), true);
+					return;
+				}
+				renderScript(j, _('Download script'));
 			});
 		});
 
@@ -1415,9 +1555,10 @@ return view.extend({
 				mineWrap,
 				E('div', { 'class': 'cg-dim', 'style': 'margin-top:4px' }, [
 					_('Players that only load the media after a play click (ximalaya and other web-component players) are started automatically; give an exact selector here if that is not enough') ]),
-				E('div', { 'style': 'margin-top:8px' }, [ btnGrab, btnStop ]),
+				E('div', { 'style': 'margin-top:8px' }, [ btnGrab, btnStop, btnScript ]),
 				progLine,
-				banner
+				banner,
+				scriptBox
 			]),
 			E('div', { 'class': 'cg-card' }, [
 				E('h3', {}, [ _('Screenshot') ]),
@@ -1437,7 +1578,7 @@ return view.extend({
 					E('div', {}, [ E('label', {}, [ _('Resource filter') ]), filterSel ]),
 					E('div', { 'style': 'flex:2 1 240px' }, [ E('label', {}, [ _('Playlist output path') ]), m3uOutIn ])
 				]),
-				E('div', { 'style': 'margin-top:6px' }, [ btnCopyAll, btnExport, btnDl ]),
+				E('div', { 'style': 'margin-top:6px' }, [ btnCopyAll, btnExport, btnDl, btnDlPlan ]),
 				E('div', { 'style': 'margin-top:6px' }, [ btnHdrAll, btnHdrDl ]),
 				E('div', { 'style': 'margin-top:6px' }, [ btnQQ, btnQQCopy, btnQQDl ]),
 				qqOut,

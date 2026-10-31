@@ -74,6 +74,7 @@ import random
 import re
 import socket
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -91,6 +92,7 @@ RUNCHROME = "/opt/chrome-root/run-chrome.sh"
 CHROME_BIN = "/opt/chrome/chrome-headless-shell"
 DRIVER_BIN = "/opt/chrome-tools/chromedriver"
 WORKDIR = "/tmp/chromeui"
+DLDIR = WORKDIR + "/dl"
 LOCK = WORKDIR + "/chromeui.lock"
 JOB = WORKDIR + "/job.json"
 PIDFILE = WORKDIR + "/job.pid"
@@ -903,6 +905,13 @@ def merge_media(items, max_items):
     rank = {"hls": 0, "dash": 1, "smooth": 1, "ts": 2, "video": 3, "audio": 4,
             "flash": 5, "subtitle": 6, "image": 7}
     items = [byurl[u] for u in order]
+    # bilibili 的音轨 <avid>-1-30280.m4s 也是 video/mp4，按 mime/扩展名分类永远是"视频"
+    # ⇒ 按 id 纠正，否则界面里分不出哪条是声音、下载下来也没声。
+    for it in items:
+        if it.get("kind") in (None, "video") and _bili_audio(it.get("url") or ""):
+            it["kind"] = "audio"
+            if not it.get("codec_name"):
+                it["codec_name"] = "AAC"
     items.sort(key=lambda x: (rank.get(x.get("kind"), 9), x.get("url", "")))
     return items[:max_items]
 
@@ -3195,7 +3204,11 @@ def cmd_mediaprobe(argv):
 # URL: replaying ONLY the Cookie gives a logged-in page with 12 XHRs; replaying
 # the whole copied header set gives a blank page.
 DROP_ALWAYS = ("host", "content-length", "connection", "transfer-encoding",
-               "accept-encoding", "te", "upgrade", "upgrade-insecure-requests", "expect")
+               "accept-encoding", "te", "upgrade", "upgrade-insecure-requests", "expect",
+               # 🔴 the browser's own Range must never be replayed: bilibili's player
+               # asks for one slice (e.g. "bytes=0-14838") and the CDN then answers
+               # 206 with just that slice ⇒ a "download" that stops at a few hundred KB.
+               "range")
 BROWSER_OWNED = ("accept-language", "cache-control", "pragma", "dnt",
                  "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "sec-fetch-user",
                  "if-none-match", "if-modified-since", "if-range")
@@ -3975,11 +3988,393 @@ def cmd_export(argv):
     ok({"path": out, "count": len(items), "bytes": os.path.getsize(out)})
 
 
+def cmd_fetchbg(argv):
+    """把"带请求头下载"丢到后台跑，交给 /cgi-bin/chromeui-dl 直传给电脑。
+
+    为什么不能走原来那条路：一次下载要塞进**单个 RPC**（rpcd 有超时和输出上限），
+    回来还要用 filedata 一帧 48 KB 往浏览器搬（400 帧就顶到 ~19 MB）。一块 96 分钟
+    的片子是 465 MB，两条路都不可能成 —— 现象就是"下到几百 KB 就没了"。
+    后台用 curl 落盘，浏览器再从路由器上 HTTP 直取，多大都行、速度是内网速度。
+    """
+    if not argv:
+        die("No URL given")
+    url = argv[0]
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        url = "http://" + url
+    opt = parse_args(argv[1:], {"out": (True, None), "headers": (True, None),
+                               "referer": (True, None)})
+    hdrs = parse_header_text(opt.get("headers") or "")
+    hdrs = clean_headers(hdrs)          # 顺手丢掉浏览器自己的 Range 等
+    ref = opt.get("referer") or _last_page_url()
+    if ref and not any(k.lower() == "referer" for k in hdrs):
+        hdrs["Referer"] = ref
+    if not any(k.lower() == "user-agent" for k in hdrs):
+        hdrs["User-Agent"] = UA
+
+    name = os.path.basename(opt.get("out") or "") or \
+        os.path.basename(urllib.parse.urlparse(url).path) or "download.bin"
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:80] or "download.bin"
+    try:
+        os.makedirs(DLDIR, exist_ok=True)
+    except OSError as e:
+        die("Cannot create the output directory: %s", e)
+    path = os.path.join(DLDIR, name)
+
+    total = 0
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        for k, val in hdrs.items():
+            req.add_header(k, val)
+        with urllib.request.urlopen(req, timeout=20) as x:
+            total = int(x.headers.get("Content-Length") or 0)
+    except Exception:
+        total = 0
+
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if shutil.which("curl"):
+        cmd = ["curl", "-fL", "--retry", "3", "--retry-all-errors", "-sS", "-o", path]
+        for k, val in hdrs.items():
+            cmd += ["-H", "%s: %s" % (k, val)]
+        cmd.append(url)
+    elif shutil.which("wget"):
+        cmd = ["wget", "-q", "-O", path]
+        for k, val in hdrs.items():
+            cmd += ["--header", "%s: %s" % (k, val)]
+        cmd.append(url)
+    else:
+        die("Download failed: %s", "neither curl nor wget is installed")
+
+    meta = {"name": name, "url": url, "total": total, "path": path,
+            "started": int(time.time()), "headers": sorted(hdrs)}
+    try:
+        with open(os.path.join(DLDIR, name + ".json"), "w") as f:
+            json.dump(meta, f)
+    except OSError as e:
+        die("Cannot write %s (%s)", name + ".json", e)
+    try:
+        log = open(os.path.join(DLDIR, name + ".log"), "wb")
+    except OSError:
+        log = subprocess.DEVNULL
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log,
+                             stderr=subprocess.STDOUT, close_fds=True,
+                             start_new_session=True)
+    except OSError as e:
+        die("Cannot start the download: %s", e)
+    ok({"name": name, "path": path, "total": total, "pid": p.pid,
+        "url": "/cgi-bin/chromeui-dl?name=" + urllib.parse.quote(name),
+        "headers": sorted(hdrs)})
+
+
+def cmd_dlstat(argv):
+    """后台下载的进度（网页每秒问一次，必须很小）"""
+    opt = parse_args(argv, {"name": (True, None)})
+    name = os.path.basename(opt.get("name") or "")
+    if not name:
+        die("No file given")
+    path = os.path.join(DLDIR, name)
+    log = path + ".log"
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            got = f.tell()
+    except OSError:
+        got = 0
+    try:
+        with open(path + ".json", "r") as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        meta = {}
+    tail = ""
+    try:
+        with open(log, "r", errors="replace") as f:
+            lines = [l.strip() for l in f.readlines() if l.strip()]
+        tail = (lines[-1] if lines else "")[:160]
+    except OSError:
+        pass
+    total = int(meta.get("total") or 0)
+    # curl 还在跑？按 /proc 里有没有这个文件被打开判断太贵，用"大小不再长"判断更省
+    state = "done" if (total and got >= total) else "running"
+    if state == "running" and tail and ("curl:" in tail or "error" in tail.lower()):
+        state = "error"
+    ok({"name": name, "bytes": got, "total": total, "state": state,
+        "message": tail, "url": "/cgi-bin/chromeui-dl?name=" + urllib.parse.quote(name)})
+
+
+SCRIPT_DIR = os.path.join(WORKDIR, "scripts")
+
+# bilibili 的 DASH 音轨文件名是 <avid>-1-30216/30232/30280.m4s，而 CDN 对它们
+# 回的是 video/mp4 ⇒ 按 mime/扩展名分类永远认成"视频"。只能按 id 认。
+BILI_AUDIO_RE = re.compile(r"-(30[23]\d{2})\.m4s", re.I)
+
+
+def _stream_id(u):
+    m = re.search(r"-(\d{5})\.m4s$", urllib.parse.urlparse(u).path, re.I)
+    return int(m.group(1)) if m else 0
+
+
+def _bili_audio(u):
+    """bilibili 的 DASH 音轨：<avid>-1-30216/30232/30280.m4s（只看 path，别被 ?query 挡掉）"""
+    return bool(BILI_AUDIO_RE.search(urllib.parse.urlparse(u or "").path))
+
+
+def sh_quote(s):
+    """shell 单引号字面量（含 ' 时也能安全转义）"""
+    return "'" + str(s).replace("'", "'\"'\"'") + "'"
+
+
+def cmd_script(argv):
+    """把当前页面参数导出成一条命令行 + 一个可直接跑的 .sh
+
+    参数和 grab 完全一致（同一个 GRAB_SPEC），所以导出的命令和网页上点
+    "抓取"走的是同一条路；脚本里 URL 提成 $1，换页面不用改文件、命令行里
+    的地址也方便贴给别人/AI 复现。
+    """
+    if not argv:
+        die("No URL given")
+    url = argv[0]
+    if url == "-":
+        # cURL 模式的地址藏在粘贴内容里，没法写死进脚本
+        die("No URL given")
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        url = "http://" + url
+    opt = parse_args(argv[1:], GRAB_SPEC)
+
+    val_opts = ("wait", "timeout", "width", "height", "max", "max-total", "click", "shot")
+    flag_opts = ("full", "scroll", "waitload", "html", "screenshot", "no-shot",
+                 "all-codecs", "each")
+    tail = ""
+    for k in val_opts:
+        v = opt.get(k)
+        if v not in (None, ""):
+            tail += " --" + k + " " + sh_quote(v)
+    for k in flag_opts:
+        if opt.get(k):
+            tail += " --" + k
+    hdrs = (opt.get("headers") or "").strip()
+    if hdrs:
+        tail += ' --headers "$HDRS"'
+
+    host = re.sub(r"[^A-Za-z0-9._-]+", "_", urllib.parse.urlparse(url).netloc or "page")[:40]
+    fn = "grab-%s-%s.sh" % (host, time.strftime("%Y%m%d-%H%M%S"))
+    path = os.path.join(SCRIPT_DIR, fn)
+
+    cmd = []
+    if hdrs:
+        cmd.append("HDRS=" + sh_quote(hdrs))
+    cmd.append("/usr/bin/chromeui grab %s%s" % (sh_quote(url), tail))
+    cmd = "\n".join(cmd)
+
+    script = [
+        "#!/bin/sh",
+        "# generated by luci-app-chrome (%s)" % time.strftime("%Y-%m-%d %H:%M:%S"),
+        "# page: %s" % url,
+        "# grabs that page once and prints the JSON result on stdout",
+        "# other page : sh %s <url>" % fn,
+        "# save result: sh %s > out.json" % fn,
+        "",
+        "DEF_URL=" + sh_quote(url),
+        'URL="${1:-$DEF_URL}"',
+    ]
+    if hdrs:
+        script.append("HDRS=" + sh_quote(hdrs))
+    script += ["", 'exec /usr/bin/chromeui grab "$URL"%s' % tail]
+    script = "\n".join(script) + "\n"
+
+    try:
+        os.makedirs(SCRIPT_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(script)
+        os.chmod(path, 0o755)
+    except OSError as e:
+        die("Cannot create the output directory: %s", e)
+
+    ok({"url": url, "cmd": cmd, "script": script, "path": path, "file": fn,
+        "dir": SCRIPT_DIR, "bytes": len(script)})
+
+
+def cmd_dl(argv):
+    """把上一次抓取里挑出的一对音视频，做成"真的能下下来"的命令 + .sh
+
+    为什么需要它：bilibili 这类 DASH 站
+      · 画面和声音是两条 m4s（<avid>-1-30032.m4s 视频 / -30280.m4s 音频），
+        单下视频只有画面；
+      · CDN 不带 Referer/UA 一律 403（实测：裸请求 403，UA+Referer 206）。
+    所以这里给出：带请求头的取流命令（aria2c→curl→wget 自动挑）+ ffmpeg -c copy 合并。
+    """
+    opt = parse_args(argv, {"out": (True, None), "referer": (True, None)})
+    try:
+        with open(JOB, "r", errors="replace") as f:
+            j = json.load(f)
+    except (OSError, ValueError):
+        die("No grabbed page yet - fetch one first")
+    res = j.get("result") or {}
+    media = [m for m in (res.get("media") or []) if m.get("url")]
+    if not media:
+        die("The last grab found no media resources")
+
+    def is_audio(m):
+        return m.get("kind") == "audio" or bool(_bili_audio(m.get("url") or ""))
+
+    auds = [m for m in media if is_audio(m)]
+    vids = [m for m in media if not is_audio(m) and m.get("kind") in
+            ("video", "dash", "smooth", "hls", "ts")]
+    if not vids:
+        vids = [m for m in media if not is_audio(m)]
+    if not vids:
+        die("The last grab found no audio/video streams (use --all to include images too)")
+
+    # 视频：先挑最兼容的编码（H.264 > HEVC > AV1），同编码取 id 大的（分辨率/帧率高）
+    crank = {"H.264": 0, "HEVC": 1, "AV1": 2}
+    v = sorted(vids, key=lambda m: (crank.get(m.get("codec_name") or "", 3), -_stream_id(m["url"])))[0]
+    # 音频：id 大的码率高（30280=192k > 30232=132k > 30216=64k）
+    a = sorted(auds, key=lambda m: -_stream_id(m["url"]))[0] if auds else None
+
+    def hdr_of(m):
+        hs = {}
+        hi = m.get("hdr")
+        sets = res.get("hdrs") or []
+        if hi is not None and 0 <= hi < len(sets):
+            hs = {k.lower(): v for k, v in sets[hi].items()}
+        ref = hs.get("referer") or opt.get("referer") or ""
+        if not ref:
+            p = urllib.parse.urlparse(res.get("url") or "")
+            ref = ("%s://%s/" % (p.scheme, p.netloc)) if p.netloc else ""
+        out = [("User-Agent", hs.get("user-agent") or UA)]
+        if ref:
+            out.insert(0, ("Referer", ref))
+        if hs.get("origin"):
+            out.append(("Origin", hs["origin"]))
+        return out
+
+    vh, ah = hdr_of(v), (hdr_of(a) if a else [])
+    allh = []
+    _seen = set()
+    for k, val in (vh + ah):
+        lk = k.lower()
+        if lk in _seen:          # 同名头只留第一个（track 自带的优先，别重复发 Referer）
+            continue
+        _seen.add(lk)
+        allh.append((k, val))
+
+    def slug(s):
+        s = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "_", s or "")[:48].strip("_")
+        return s or "media"
+
+    out = opt.get("out") or (slug(res.get("title")) + ".mp4")
+    name = re.sub(r"[^0-9A-Za-z._-]+", "_", sys.argv[0].rsplit("/", 1)[-1])[:8]
+    fn = "dl-%s-%s.sh" % (name, time.strftime("%Y%m%d-%H%M%S"))
+    path = os.path.join(SCRIPT_DIR, fn)
+
+    # 生成时顺手量一下两条轨的真实大小（HEAD）——脚本据此①拒绝空间不足的目录
+    # ②校验下载是否被截断。不量也能跑，只是少两道保险。
+    def probe_size(u, hdrs):
+        try:
+            req = urllib.request.Request(u, method="HEAD")
+            for k, val in hdrs:
+                req.add_header(k, val)
+            with urllib.request.urlopen(req, timeout=15) as x:
+                return int(x.headers.get("Content-Length") or 0)
+        except Exception:
+            return 0
+
+    vsz = probe_size(v["url"], allh)
+    asz = probe_size(a["url"], allh) if a else 0
+    need = int(((vsz + asz) * 2 + 64 * 1048576) / 1048576) if (vsz + asz) else 0
+
+    hdr_curl = " ".join('-H "%s: %s"' % (k, val.replace('"', '\\"')) for k, val in allh)
+    hdr_wget = " ".join('--header="%s: %s"' % (k, val.replace('"', '\\"')) for k, val in allh)
+
+    lines = [
+        "#!/bin/sh",
+        "# generated by luci-app-chrome (%s)" % time.strftime("%Y-%m-%d %H:%M:%S"),
+        "# page: %s" % (res.get("url") or ""),
+        "# usage: sh %s [output.mp4]" % fn,
+        "# the CDN answers 403 unless Referer/UA are sent - a bare curl/wget is not enough",
+        "",
+        'OUT="${1:-%s}"' % out.replace('"', ""),
+        "V=%s" % sh_quote(v["url"]),
+        "VS=%d" % vsz,
+    ]
+    if a:
+        lines += ["A=%s" % sh_quote(a["url"]), "AS=%d" % asz]
+    lines += ["", 'd=$(dirname "$OUT")', 'mkdir -p "$d" 2>/dev/null']
+    if need:
+        lines += [
+            "need=%d" % need,
+            """free=$(df -m "$d" 2>/dev/null | awk 'NR==2{print $4}')""",
+            'if [ -n "$free" ] && [ "$free" -lt "$need" ]; then',
+            '\techo "not enough space: $d has ${free} MB free, this needs ~${need} MB" >&2',
+            '\techo "hint: run it in a directory on a real disk (on this box /tmp is RAM)" >&2',
+            "\texit 1",
+            "fi",
+        ]
+    lines += [
+        "",
+        "fetch() {",
+        "\tif command -v curl >/dev/null 2>&1; then",
+        '\t\tcurl -fL --retry 3 --retry-all-errors --progress-bar %s -o "$2" "$1" || return 1' % hdr_curl,
+        "\telse",
+        '\t\twget -q %s -O "$2" "$1" || return 1' % hdr_wget,
+        "\tfi",
+        '\tgot=$(wc -c < "$2")',
+        '\tif [ "${3:-0}" -gt 0 ] && [ "$got" -lt "$3" ]; then',
+        '\t\techo "short read: $got of $3 bytes - the URL expired or the node truncated it" >&2',
+        "\t\treturn 1",
+        "\tfi",
+        "\treturn 0",
+        "}",
+        "",
+    ]
+    if a:
+        lines += [
+            """trap 'rm -f "$OUT.v.m4s" "$OUT.a.m4s"' EXIT INT TERM""",
+            'fetch "$V" "$OUT.v.m4s" "$VS" || exit 1',
+            'fetch "$A" "$OUT.a.m4s" "$AS" || exit 1',
+            'if ! command -v ffmpeg >/dev/null 2>&1; then',
+            "\ttrap - EXIT",
+            '\techo "no ffmpeg here: kept $OUT.v.m4s + $OUT.a.m4s (merge it elsewhere)" >&2',
+            "\texit 0",
+            "fi",
+            'ffmpeg -y -loglevel warning -i "$OUT.v.m4s" -i "$OUT.a.m4s" -c copy "$OUT" \\',
+            '\t|| { echo "ffmpeg failed (see above); the two .m4s files are kept" >&2; trap - EXIT; exit 1; }',
+            "\ttrap - EXIT",
+            'rm -f "$OUT.v.m4s" "$OUT.a.m4s"',
+            'echo "ok: $OUT ($(wc -c < "$OUT") bytes)"',
+        ]
+    else:
+        lines += ['fetch "$V" "$OUT" "$VS" && echo "ok: $OUT ($(wc -c < "$OUT") bytes)"']
+    script = "\n".join(lines) + "\n"
+
+    try:
+        os.makedirs(SCRIPT_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(script)
+        os.chmod(path, 0o755)
+    except OSError as e:
+        die("Cannot create the output directory: %s", e)
+
+    cmd = "\n".join(
+        ['V="%s"' % v["url"]] + (['A="%s"' % a["url"]] if a else []) +
+        ["", "sh %s" % path])
+    ok({"url": res.get("url") or "", "cmd": cmd, "script": script, "path": path,
+        "file": fn, "dir": SCRIPT_DIR, "bytes": len(script),
+        "video": {"id": _stream_id(v["url"]), "codec": v.get("codec_name") or "",
+                  "url": v["url"]},
+        "audio": ({"id": _stream_id(a["url"]), "codec": a.get("codec_name") or "",
+                   "url": a["url"]} if a else None),
+        "headers": [{"name": k, "value": val} for k, val in allh]})
+
+
 # --------------------------------------------------------------------------
 USAGE = ("usage: chromeui {version|status|selftest|grab <url> [opt]|start <url> [opt]|"
          "job|result|filedata --file N|stop|mediaprobe <url>|fetch <url> [--out P]|"
          "csv <url> [--out P.csv] [--headers T|--headers-file F]|"
-         "export [--out P]}")
+         "export [--out P]|script <url> [opt]|dl [--out P]|fetchbg <url>|dlstat --name N}")
 
 
 def main():
@@ -4008,6 +4403,14 @@ def main():
         cmd_stop()
     elif c == "export":
         cmd_export(sys.argv[2:])
+    elif c == "script":
+        cmd_script(sys.argv[2:])
+    elif c == "dl":
+        cmd_dl(sys.argv[2:])
+    elif c == "fetchbg":
+        cmd_fetchbg(sys.argv[2:])
+    elif c == "dlstat":
+        cmd_dlstat(sys.argv[2:])
     elif c == "mediaprobe":
         cmd_mediaprobe(sys.argv[2:])
     elif c == "csv":

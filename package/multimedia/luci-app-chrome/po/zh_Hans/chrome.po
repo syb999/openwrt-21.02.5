@@ -692,3 +692,45 @@ msgstr "v.qq.com：它自己的公开接口只给一段（%s）——整集请�
 
 msgid "with headers"
 msgstr "带请求头"
+
+msgid "Call script"
+msgstr "调用脚本"
+
+msgid "Command copied."
+msgstr "已复制命令行"
+
+msgid "Command line"
+msgstr "命令行"
+
+msgid "Copy command"
+msgstr "复制命令行"
+
+msgid "Copy script"
+msgstr "复制脚本"
+
+msgid "Download script"
+msgstr "下载脚本"
+
+msgid "Export call script"
+msgstr "导出调用脚本"
+
+msgid "Export needs a real URL in the box (the cURL mode carries its own)."
+msgstr "导出需要框里有一个真实 URL（cURL 模式的地址在粘贴内容里）。"
+
+msgid "Saved to %s"
+msgstr "已写入 %s"
+
+msgid "Script"
+msgstr "脚本"
+
+msgid "Script copied."
+msgstr "已复制脚本"
+
+msgid "Make download script"
+msgstr "生成下载脚本"
+
+msgid "Downloading on the device…"
+msgstr "正在设备上下载…"
+
+msgid "Handing the file to the browser…"
+msgstr "正在把文件交给浏览器…"
