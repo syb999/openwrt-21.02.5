@@ -1,0 +1,27 @@
+#!/bin/sh
+# panther,x2: 只有一个网口(wan)。wifi AP 需要一个空的 br-lan 当二层落点，
+# 而 netifd 只有在 bridge_empty=1 时才会在端口不存在的情况下也把桥建出来。
+
+. /lib/functions.sh
+
+[ "$(board_name)" = "panther,x2" ] || exit 0
+
+sect=""
+for s in $(uci -q show network 2>/dev/null | sed -n "s/^network\.\([^.=]*\)\.name='br-lan'$/\1/p"); do
+	sect="$s"
+done
+
+if [ -z "$sect" ]; then
+	uci set network.brlan=device
+	uci set network.brlan.name='br-lan'
+	uci set network.brlan.type='bridge'
+	sect=brlan
+fi
+
+uci set network.$sect.type='bridge'
+uci set network.$sect.bridge_empty='1'
+uci -q delete network.$sect.ports 2>/dev/null
+uci set network.lan.device='br-lan'
+uci commit network
+
+exit 0

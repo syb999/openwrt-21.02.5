@@ -50,7 +50,7 @@ define Device/panther_x2
     ntfs-3g kmod-fuse \
     kmod-usb-storage kmod-usb-storage-uas kmod-usb-storage-extras \
     kmod-usb-net-rtl8152 \
-    kmod-brcmfmac wpad-basic-wolfssl iw kmod-bluetooth \
+    kmod-brcmfmac cypress-firmware-43430-sdio wpad-basic-wolfssl iw kmod-bluetooth \
     kmod-rk-vcodec \
     luci-app-vputrans luci-app-rk356x-ocr luci-app-rk356x-yolov5n panel-ap-setup sht2x -urngd
 endef
