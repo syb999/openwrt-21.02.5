@@ -45,6 +45,7 @@ define Device/panther_x2
   UBOOT_DEVICE_NAME := generic-rk3568
   IMAGE/sysupgrade.img.gz := boot-common | boot-script | pine64-img | gzip | append-metadata
   DEVICE_PACKAGES := e2fsprogs mkf2fs fdisk cfdisk partx-utils block-mount \
+    parted resize2fs losetup f2fsck \
     dosfstools kmod-fs-vfat kmod-fs-msdos kmod-fs-ext4 \
     kmod-nls-cp437 kmod-nls-utf8 \
     ntfs-3g kmod-fuse \
@@ -66,7 +67,7 @@ define Device/hinlink_opc-h28k
   UBOOT_DEVICE_NAME := generic-rk3528
   IMAGE/sysupgrade.img.gz := boot-common | boot-script | pine64-img | gzip | append-metadata
   DEVICE_PACKAGES := kmod-r8168 e2fsprogs mkf2fs \
-    fdisk cfdisk partx-utils block-mount dosfstools \
+    fdisk cfdisk partx-utils block-mount parted resize2fs losetup f2fsck dosfstools \
     kmod-fs-vfat kmod-fs-msdos kmod-nls-cp437 kmod-nls-utf8 \
     ntfs-3g kmod-fuse luci-app-rk356x-ocr \
     kmod-usb-storage kmod-usb-storage-uas kmod-usb-storage-extras -urngd

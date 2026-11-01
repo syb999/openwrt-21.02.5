@@ -1,0 +1,140 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Grow the rootfs partition to the end of the boot medium, and the ext4
+# overlay that fstools keeps inside that same partition right after the
+# squashfs, so a freshly flashed image uses the whole eMMC/SD card instead of
+# the fixed 960 MiB built into the image.
+#
+# This runs in preinit, before mount_root: at that point "/" is still the
+# squashfs mounted by the kernel, so the partition table can be committed to
+# the running kernel (BLKPG_RESIZE works on a busy partition) and the overlay
+# can be resized while it is not mounted yet.  The Amlogic images instead grow
+# the root filesystem in rc.local and reboot; that is not needed here and it
+# cannot work for a squashfs+overlay layout anyway, because the overlay would
+# be created at the old size and then has to be grown online.
+#
+# Growing the partition without the reboot relies on
+#   - parted resizepart using BLKPG_RESIZE_PARTITION (block/ioctl.c updates
+#     part_nr_sects and i_size even when the partition is open), and
+#   - a *fresh* loop device placed at the overlay offset, so its size is taken
+#     from the (now larger) partition: LOOP_SET_CAPACITY on the loop fstools
+#     already has open would keep the stale size on 5.4.
+
+GROW_TAG=grow-rootfs
+
+grow_log() {
+	logger -t "$GROW_TAG" "$*" 2>/dev/null
+	# preinit runs before syslogd, so logger's message is lost: /dev/kmsg is
+	# the only channel that survives into dmesg for a board without a UART.
+	echo "$GROW_TAG: $*" > /dev/kmsg 2>/dev/null
+	echo "$GROW_TAG: $*"
+}
+
+# low 32 bits of the little endian value at <offset> of <device>
+le32() {
+	local b
+	b="$(dd if="$1" bs=1 skip="$2" count=4 2>/dev/null | hexdump -v -e '4/1 "%02x "')"
+	[ -n "$b" ] || return 1
+	set -- $b
+	echo "$((0x$4$3$2$1))"
+}
+
+grow_rootfs() {
+	local majmin partsys part disk disksys f end last pstart psize dsize free
+	local dev used off f2fs_magic ext4_magic resize_tool
+	local shift blocksize blocks fs_bytes avail loop
+
+	# "/" is the boot partition itself here, so this never picks up a copy of
+	# the same partition table sitting on a second disk (SD card + eMMC).
+	majmin="$(awk -v mp="/" '$5 == mp { print $3; exit }' /proc/self/mountinfo)"
+	[ -n "$majmin" ] || return 0
+	partsys="/sys/dev/block/$majmin"
+	[ -e "$partsys" ] || return 0
+	part="$(basename "$(readlink -f "$partsys")")"
+	[ -r "$partsys/partition" ] || return 0
+	disk="$(basename "$(dirname "$(readlink -f "$partsys")")")"
+	disksys="/sys/class/block/$disk"
+	dev="/dev/$part"
+	[ -b "$dev" ] || return 0
+
+	# never grow anything but the last partition of the medium
+	last=0
+	for f in "$disksys/"*; do
+		[ -r "$f/partition" ] || continue
+		end=$(( $(cat "$f/start") + $(cat "$f/size") ))
+		[ "$end" -gt "$last" ] && last="$end"
+	done
+	pstart="$(cat "$partsys/start")"
+	psize="$(cat "$partsys/size")"
+	if [ $(( pstart + psize )) -lt "$last" ]; then
+		grow_log "/dev/$part is not the last partition of /dev/$disk, leaving it alone"
+		return 0
+	fi
+	dsize="$(cat "$disksys/size")"
+	free=$(( dsize - pstart - psize ))
+	[ "$free" -gt 0 ] || return 0
+
+	if [ "$free" -gt 65536 ]; then
+		grow_log "growing /dev/$part by $((free / 2048)) MiB"
+		parted -s -a optimal "/dev/$disk" resizepart "$(cat "$partsys/partition")" 100% ||
+			{ grow_log "parted resizepart failed on /dev/$disk"; return 1; }
+		psize="$(cat "$partsys/size")"
+		free=$(( dsize - pstart - psize ))
+		if [ "$free" -gt 65536 ]; then
+			grow_log "/dev/$part still has $((free / 2048)) MiB unused after parted"
+			return 1
+		fi
+	fi
+
+	# Overlay offset: end of the squashfs rounded up to 64 KiB, exactly what
+	# libfstools/rootdisk.c computes.
+	[ "$(dd if="$dev" bs=1 count=4 2>/dev/null | hexdump -v -e '4/1 "%02x"')" = "68737173" ] ||
+		return 0
+	used="$(le32 "$dev" 40)" || return 0
+	[ "$(le32 "$dev" 44)" = "0" ] || return 0
+	[ "${used:-0}" -gt 0 ] || return 0
+	off=$(( (used + 65535) / 65536 * 65536 ))
+
+	# What filesystem does the overlay hold?  fstools formats f2fs when the
+	# area behind the squashfs is bigger than 100 MiB and ext4 otherwise.
+	f2fs_magic="$(dd if="$dev" bs=1 skip=$((off + 1024)) count=4 2>/dev/null | hexdump -v -e '4/1 "%02x"')"
+	ext4_magic="$(dd if="$dev" bs=1 skip=$((off + 1080)) count=2 2>/dev/null | hexdump -v -e '2/1 "%02x"')"
+	case "$f2fs_magic:$ext4_magic" in
+	1020f5f2:*)
+		# f2fs_super_block: log_blocksize @0x10, block_count @0x24
+		shift="$(le32 "$dev" $((off + 1040)))" || return 0
+		[ "$shift" -le 20 ] || return 0
+		blocksize=$((1 << shift))
+		blocks="$(le32 "$dev" $((off + 1060)))" || return 0
+		[ "$(le32 "$dev" $((off + 1064)))" = "0" ] || return 0
+		resize_tool=resize.f2fs
+		;;
+	*:53ef)
+		# ext4_super_block: s_log_block_size @0x18, s_blocks_count_lo @0x04
+		shift="$(le32 "$dev" $((off + 1048)))" || return 0
+		[ "$shift" -le 6 ] || return 0
+		blocksize=$((1024 << shift))
+		blocks="$(le32 "$dev" $((off + 1028)))" || return 0
+		resize_tool=resize2fs
+		;;
+	*)
+		# Nothing there yet: mount_root formats the overlay at the new
+		# partition size, which is what a freshly flashed image gets.
+		return 0
+		;;
+	esac
+
+	fs_bytes=$((blocks * blocksize))
+	avail=$((psize * 512 - off))
+	# 32 MiB of slack: f2fs stops growing at a section boundary, so a fully
+	# grown overlay can legitimately sit a few MiB short of the partition end.
+	[ $((avail - fs_bytes)) -gt 33554432 ] || return 0
+
+	grow_log "growing overlay on /dev/$part by $(( (avail - fs_bytes) / 1048576 )) MiB"
+	loop="$(losetup -o "$off" -f --show "$dev")" || { grow_log "no free loop device"; return 1; }
+	"$resize_tool" "$loop" >/dev/null 2>&1 || grow_log "$resize_tool failed on $loop"
+	losetup -d "$loop"
+}
+
+boot_hook_add preinit_main grow_rootfs
