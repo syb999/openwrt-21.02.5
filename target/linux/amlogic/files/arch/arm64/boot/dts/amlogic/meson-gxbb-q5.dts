@@ -60,11 +60,11 @@
 		status = "okay";
 
 		dai-link-0 {
-			sound-dai = <&aiu AIU_CPU CPU_I2S_FIFO>;
+			sound-dai = <&aiu AIU_CPU CPU_SPDIF_FIFO>;
 		};
 
 		dai-link-1 {
-			sound-dai = <&aiu AIU_CPU CPU_SPDIF_FIFO>;
+			sound-dai = <&aiu AIU_CPU CPU_I2S_FIFO>;
 		};
 
 		dai-link-2 {

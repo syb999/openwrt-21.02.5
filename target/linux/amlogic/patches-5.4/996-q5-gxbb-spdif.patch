@@ -1,12 +1,12 @@
 --- a/sound/soc/meson/gx-card.c	2026-11-04 20:28:14.797989926 +0800
-+++ b/sound/soc/meson/gx-card.c	2026-11-05 19:05:41.996578783 +0800
++++ b/sound/soc/meson/gx-card.c	2026-11-06 19:22:49.343784633 +0800
 @@ -113,8 +113,12 @@
  	if (ret)
  		return ret;
  
 -	if (gx_card_cpu_identify(dai_link->cpus, "FIFO"))
 +	if (gx_card_cpu_identify(dai_link->cpus, "FIFO")) {
-+		/* AIU: 编码器先于 FIFO 使能，否则 FIFO 一启动就欠载 */
++		/* Start the encoder before the FIFO, or the FIFO underruns at once */
 +		dai_link->trigger[SNDRV_PCM_STREAM_PLAYBACK] =
 +			SND_SOC_DPCM_TRIGGER_POST;
  		return  meson_card_set_fe_link(card, dai_link, np, true);
@@ -15,7 +15,7 @@
  	ret = meson_card_set_be_link(card, dai_link, np);
  	if (ret)
 --- a/sound/soc/meson/aiu.c	2026-11-05 18:16:29.557926001 +0800
-+++ b/sound/soc/meson/aiu.c	2026-11-05 19:05:41.996578783 +0800
++++ b/sound/soc/meson/aiu.c	2026-11-06 19:22:49.343784633 +0800
 @@ -221,7 +221,7 @@
  static int aiu_clk_get(struct device *dev)
  {
@@ -25,14 +25,15 @@
  	int ret;
  
  	pclk = devm_clk_get(dev, "pclk");
-@@ -232,6 +232,18 @@
+@@ -232,6 +232,19 @@
  	if (ret)
  		return ret;
  
 +	/*
-+	 * AIU 模块时钟（CLKID_AIU，"aiu"）：它是 aiu_glue 下面的子门控。
-+	 * 只开 aiu_glue 时整个 AIU 寄存器窗口读回 0、写也无效，FIFO 和编码器
-+	 * 都不工作（SPDIF 无输出、光口不亮）。必须显式打开。
++	 * AIU module clock (CLKID_AIU, "aiu"): it is the gate below aiu_glue.
++	 * With only aiu_glue enabled the whole AIU register window reads back
++	 * zero and writes are dropped, so the FIFOs and the encoders never do
++	 * anything (no SPDIF output, the optical transmitter stays dark).
 +	 */
 +	aiuclk = devm_clk_get_optional(dev, "aiu");
 +	if (!IS_ERR_OR_NULL(aiuclk)) {
@@ -44,8 +45,32 @@
  	aiu->spdif_mclk = devm_clk_get(dev, "spdif_mclk");
  	if (IS_ERR(aiu->spdif_mclk)) {
  		dev_err(dev, "Can't get the aiu spdif master clock\n");
+--- a/sound/soc/meson/aiu.h	2026-11-06 19:10:05.844573922 +0800
++++ b/sound/soc/meson/aiu.h	2026-11-06 19:22:49.343784633 +0800
+@@ -39,9 +39,19 @@
+ 	const struct aiu_platform_data *platform;
+ };
+ 
++/*
++ * Only S16_LE and S32_LE.
++ *
++ * In 32-bit mode the 958 (SPDIF) encoder transmits the MSB 24 bits of each
++ * 32-bit word and there is no control bit for right-aligned 24-bit samples.
++ * ALSA defines S24_LE as 24 valid bits in the low three bytes of a 4-byte
++ * word, so advertising it makes the encoder shift every sample by 8 bits and
++ * the output is pure noise (measured: S16 fine, S24 noise).  Dropping it lets
++ * ALSA's plug plugin shift S24_LE into S32_LE losslessly before it reaches
++ * the driver.
++ */
+ #define AIU_FORMATS (SNDRV_PCM_FMTBIT_S16_LE |	\
+-		     SNDRV_PCM_FMTBIT_S20_LE |	\
+-		     SNDRV_PCM_FMTBIT_S24_LE)
++		     SNDRV_PCM_FMTBIT_S32_LE)
+ 
+ int aiu_of_xlate_dai_name(struct snd_soc_component *component,
+ 			  struct of_phandle_args *args,
 --- a/sound/soc/meson/aiu-fifo.c	2026-11-04 21:52:25.580342577 +0800
-+++ b/sound/soc/meson/aiu-fifo.c	2026-11-05 19:05:41.996578783 +0800
++++ b/sound/soc/meson/aiu-fifo.c	2026-11-06 19:22:49.343784633 +0800
 @@ -55,6 +55,12 @@
  				      en_mask, enable ? en_mask : 0);
  }
@@ -59,16 +84,17 @@
  int aiu_fifo_trigger(struct snd_pcm_substream *substream, int cmd,
  		     struct snd_soc_dai *dai)
  {
-@@ -100,6 +106,16 @@
+@@ -100,6 +106,17 @@
  	struct snd_soc_component *component = dai->component;
  	struct aiu_fifo *fifo = dai->playback_dma_data;
  	dma_addr_t end;
 +	int ret;
 +
 +	/*
-+	 * 5.4 的 ASoC 核心不分配 PCM 缓冲，这一步由驱动的 hw_params 负责
-+	 * （同树的 axg-fifo.c 就是这么做的）。缺了它 runtime->dma_area 一直是
-+	 * NULL，write 在 pcm_sanity_check() 里直接 -EINVAL。
++	 * The 5.4 ASoC core does not allocate the PCM buffer, the driver's
++	 * hw_params has to do it (axg-fifo.c in this tree does the same).
++	 * Without it runtime->dma_area stays NULL and every write is rejected
++	 * by pcm_sanity_check() with -EINVAL.
 +	 */
 +	ret = snd_pcm_lib_malloc_pages(substream, params_buffer_bytes(params));
 +	if (ret < 0)
@@ -77,7 +103,7 @@
  	/* Setup the fifo boundaries */
  	end = runtime->dma_addr + runtime->dma_bytes - fifo->fifo_block;
 --- a/sound/soc/meson/aiu-fifo-i2s.c	2026-11-04 21:52:25.580342577 +0800
-+++ b/sound/soc/meson/aiu-fifo-i2s.c	2026-11-05 19:05:48.228863019 +0800
++++ b/sound/soc/meson/aiu-fifo-i2s.c	2026-11-05 21:42:40.826145125 +0800
 @@ -143,6 +143,7 @@
  	.trigger	= aiu_fifo_i2s_trigger,
  	.prepare	= aiu_fifo_i2s_prepare,
@@ -87,7 +113,7 @@
  	.shutdown	= aiu_fifo_shutdown,
  };
 --- a/sound/soc/meson/aiu-fifo-spdif.c	2026-11-04 21:52:25.580342577 +0800
-+++ b/sound/soc/meson/aiu-fifo-spdif.c	2026-11-05 19:05:48.228863019 +0800
++++ b/sound/soc/meson/aiu-fifo-spdif.c	2026-11-06 19:22:49.343784633 +0800
 @@ -24,6 +24,7 @@
  #define AIU_MEM_IEC958_CONTROL_MODE_16BIT	BIT(7)
  #define AIU_MEM_IEC958_CONTROL_MODE_LINEAR	BIT(8)
@@ -96,11 +122,12 @@
  
  #define AIU_FIFO_SPDIF_BLOCK			8
  
-@@ -68,11 +69,16 @@
+@@ -68,11 +69,17 @@
  	case SNDRV_PCM_TRIGGER_START:
  	case SNDRV_PCM_TRIGGER_RESUME:
  	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-+		/* 958/SPDIF 块软复位脉冲：不写这一下 DCU 停在复位态，光口不亮 */
++		/* Soft reset pulse for the 958 block; without it the DCU stays in
++		 * reset and the optical output stays dark */
 +		snd_soc_component_write(component, AIU_RST_SOFT,
 +					AIU_RST_SOFT_958_FAST);
  		fifo_spdif_dcu_enable(component, true);
@@ -113,7 +140,7 @@
  		fifo_spdif_dcu_enable(component, false);
  		break;
  	default:
-@@ -157,6 +163,7 @@
+@@ -157,6 +164,7 @@
  const struct snd_soc_dai_ops aiu_fifo_spdif_dai_ops = {
  	.trigger	= fifo_spdif_trigger,
  	.prepare	= fifo_spdif_prepare,
