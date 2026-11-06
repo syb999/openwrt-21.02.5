@@ -1,0 +1,174 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * SumaVision Q5 - Amlogic S905 (GXBB) IPTV box
+ *
+ *   SoC    : Amlogic S905 (GXBB), 4x Cortex-A53
+ *   RAM    : 1 GiB
+ *   eMMC   : 8 GB (sd_emmc_c, 8 bit, HS200)
+ *   SD     : microSD slot (sd_emmc_b, card detect on CARD_6)
+ *   ETH    : 10/100 on the SoC internal PHY, RMII, reset on GPIOZ_14
+ *   USB    : 2x USB2 (dwc2)
+ *   Audio  : AIU based sound card
+ *              3.5mm jack  <- AIU ACODEC (internal DAC) <- I2S encoder
+ *              optical     <- AIU SPDIF encoder -> linux,spdif-dit
+ *              HDMI        <- AIU HDMI CTRL -> dw-hdmi
+ *   IR     : AO remote input
+ *   Video  : HDMI + CVBS
+ *
+ * The board is a p201/p20x derivative: the vendor 3.14 device tree of this very
+ * box reports phy-mode "rmii", the same GPIOZ_14 PHY reset, eMMC reset on
+ * BOOT_9 and SD card detect on gpio 44 (= CARD_6), so meson-gxbb-p20x.dtsi is
+ * used as the base and only the board identity, the missing SDIO module and the
+ * audio routing are added here.
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/clock/gxbb-clkc.h>
+#include <dt-bindings/sound/meson-aiu.h>
+#include "meson-gxbb-p20x.dtsi"
+
+/ {
+	compatible = "sumavision,q5", "amlogic,p201", "amlogic,meson-gxbb";
+	model = "SumaVision Q5";
+
+	aliases {
+		mmc0 = &sd_emmc_b;
+		mmc1 = &sd_emmc_c;
+	};
+
+	/*
+	 * The internal DAC of the SoC drives the 3.5mm jack directly (no
+	 * external amplifier on this board), the SPDIF encoder goes to the
+	 * optical transmitter and HDMI audio is handled by dw-hdmi.
+	 */
+	es7134: audio-codec {
+		#sound-dai-cells = <0>;
+		compatible = "everest,es7134";
+	};
+
+	sound {
+		compatible = "amlogic,gx-sound-card";
+		model = "SumaVision Q5";
+		assigned-clocks = <&clkc CLKID_MPLL0>,
+				  <&clkc CLKID_MPLL1>,
+				  <&clkc CLKID_MPLL2>;
+		assigned-clock-parents = <0>, <0>, <0>;
+		assigned-clock-rates = <294912000>,
+				       <270950400>,
+				       <393216000>;
+		status = "okay";
+
+		dai-link-0 {
+			sound-dai = <&aiu AIU_CPU CPU_I2S_FIFO>;
+		};
+
+		dai-link-1 {
+			sound-dai = <&aiu AIU_CPU CPU_SPDIF_FIFO>;
+		};
+
+		dai-link-2 {
+			sound-dai = <&aiu AIU_CPU CPU_I2S_ENCODER>;
+			dai-format = "i2s";
+			mclk-fs = <256>;
+
+			codec-0 {
+				sound-dai = <&es7134>;
+			};
+
+		};
+
+		dai-link-3 {
+			sound-dai = <&aiu AIU_CPU CPU_SPDIF_ENCODER>;
+
+			codec-0 {
+				sound-dai = <&spdif_dit>;
+			};
+		};
+
+	};
+
+	spdif_dit: audio-codec-0 {
+		#sound-dai-cells = <0>;
+		compatible = "linux,spdif-dit";
+		status = "okay";
+		sound-name-prefix = "DIT";
+	};
+};
+
+&aiu {
+	status = "okay";
+
+	pinctrl-0 = <&spdif_out_y_pins>,
+		    <&i2s_am_clk_pins>,
+		    <&i2s_out_ao_clk_pins>,
+		    <&i2s_out_lr_clk_pins>,
+		    <&i2s_out_ch01_ao_pins>;
+	pinctrl-names = "default";
+
+	clocks = <&clkc CLKID_AIU_GLUE>,
+		 <&clkc CLKID_I2S_OUT>,
+		 <&clkc CLKID_AOCLK_GATE>,
+		 <&clkc CLKID_CTS_AMCLK>,
+		 <&clkc CLKID_MIXER_IFACE>,
+		 <&clkc CLKID_IEC958>,
+		 <&clkc CLKID_IEC958_GATE>,
+		 <&clkc CLKID_CTS_MCLK_I958>,
+		 <&clkc CLKID_CTS_I958>,
+		 <&clkc CLKID_AIU>;
+	clock-names = "pclk",
+		      "i2s_pclk",
+		      "i2s_aoclk",
+		      "i2s_mclk",
+		      "i2s_mixer",
+		      "spdif_pclk",
+		      "spdif_aoclk",
+		      "spdif_mclk",
+		      "spdif_mclk_sel",
+		      "aiu";
+};
+
+&ethmac {
+	status = "okay";
+	pinctrl-0 = <&eth_rmii_pins>;
+	pinctrl-names = "default";
+	phy-mode = "rmii";
+
+	snps,reset-gpio = <&gpio GPIOZ_14 0>;
+	snps,reset-delays-us = <0>, <10000>, <1000000>;
+	snps,reset-active-low;
+};
+
+/* no SDIO wireless module on this board */
+&sd_emmc_a {
+	status = "disabled";
+};
+
+&sdio_pwrseq {
+	status = "disabled";
+};
+
+&sd_emmc_b {
+	/delete-property/ vqmmc-supply;
+	/delete-property/ sd-uhs-sdr12;
+	/delete-property/ sd-uhs-sdr25;
+	/delete-property/ sd-uhs-sdr50;
+};
+
+&hdmi_tx {
+	status = "disabled";
+};
+
+&saradc {
+	status = "okay";
+	vref-supply = <&vddao_3v3>;
+};
+
+
+&pwm_ef {
+	status = "disabled";
+};
+
+&wifi32k {
+	status = "disabled";
+};

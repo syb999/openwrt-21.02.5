@@ -1,0 +1,18 @@
+diff -Nur a/sound/soc/soc-core.c b/sound/soc/soc-core.c
+--- a/sound/soc/soc-core.c	2026-11-03 20:45:03.619528077 +0800
++++ b/sound/soc/soc-core.c	2026-11-03 20:45:06.767671656 +0800
+@@ -3399,6 +3399,14 @@
+ 			*dai_name = dai->driver->name;
+ 			if (!*dai_name)
+ 				*dai_name = pos->name;
++		} else if (ret) {
++			/*
++			 * if another error than ENOTSUPP is returned go on and
++			 * check if another component is provided with the same
++			 * node. This may happen if a device provides several
++			 * components
++			 */
++			continue;
+ 		}
+ 
+ 		break;

@@ -1,0 +1,20 @@
+#!/bin/sh
+# Copyright (C) 2021 OpenWrt.org
+
+. /lib/functions/uci-defaults.sh
+. /lib/board-params.sh
+
+board_config_update
+
+BOARD=$(cat /tmp/sysinfo/board_name 2>/dev/null)
+if board_net_params "$BOARD" && [ -n "$WAN_DEV" ]; then
+	ucidef_set_interface_wan "$WAN_DEV"
+
+	mac="$FACTORY_MAC"
+	[ -n "$mac" ] || mac=$(board_fallback_mac)
+	[ -n "$mac" ] && ucidef_set_interface_macaddr "wan" "$mac"
+fi
+
+board_config_flush
+
+exit 0

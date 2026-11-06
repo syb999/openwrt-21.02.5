@@ -1,0 +1,41 @@
+#!/bin/sh
+
+. /lib/board-params.sh
+
+[ -f /etc/config/network ] || exit 0
+
+BOARD=$(cat /tmp/sysinfo/board_name 2>/dev/null)
+board_net_params "$BOARD" || exit 0
+[ -n "$WAN_DEV" ] || exit 0
+
+for dev in $(uci -q show network | sed -n "s/^network\.\(@device\[[0-9]*\]\)\.name='br-lan'/\1/p"); do
+	uci -q delete network.$dev
+done
+
+if [ "$HAS_LAN" = "0" ]; then
+	[ -n "$(uci -q get network.lan)" ] && uci -q delete network.lan
+fi
+
+uci -q set network.wan=interface
+uci -q set network.wan.device="$WAN_DEV"
+uci -q set network.wan.proto='dhcp'
+uci -q delete network.wan.type
+
+mac="$FACTORY_MAC"
+[ -n "$mac" ] || mac=$(board_fallback_mac)
+
+if [ -n "$mac" ]; then
+	uci -q set network.$WAN_DEV=device
+	uci -q set network.$WAN_DEV.name="$WAN_DEV"
+	uci -q set network.$WAN_DEV.macaddr="$mac"
+	uci -q set network.wan.macaddr="$mac"
+fi
+
+uci -q set firewall.@zone[1].input='ACCEPT'
+uci -q set firewall.@zone[1].output='ACCEPT'
+uci -q set firewall.@zone[1].forward='ACCEPT'
+
+uci -q commit network
+uci -q commit firewall
+
+exit 0

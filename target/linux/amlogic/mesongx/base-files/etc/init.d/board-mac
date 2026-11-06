@@ -1,0 +1,38 @@
+#!/bin/sh /etc/rc.common
+
+. /lib/board-params.sh
+
+START=19
+STOP=89
+
+mac_from_cmdline() {
+	grep -o 'mac=[0-9a-fA-F:][0-9a-fA-F:]*' /proc/cmdline 2>/dev/null | head -1 | cut -d= -f2
+}
+
+start() {
+	sleep 1
+
+	BOARD=$(cat /tmp/sysinfo/board_name 2>/dev/null)
+	board_net_params "$BOARD" || return 0
+
+	mac=$(mac_from_cmdline)
+	[ -n "$mac" ] || mac="$FACTORY_MAC"
+	[ -n "$mac" ] || mac=$(board_fallback_mac)
+	[ -n "$mac" ] || return 0
+	[ -n "$WAN_DEV" ] || return 0
+
+	if [ -d "/sys/class/net/$WAN_DEV" ]; then
+		ip link set dev "$WAN_DEV" address "$mac" 2>/dev/null && \
+			logger -t board-mac "$WAN_DEV MAC -> $mac"
+	fi
+
+	if [ "$(uci -q get network.wan.type)" = "bridge" ]; then
+		uci -q delete network.wan.type
+		uci -q commit network
+		logger -t board-mac "removed network.wan.type=bridge"
+	fi
+}
+
+stop() {
+	:
+}

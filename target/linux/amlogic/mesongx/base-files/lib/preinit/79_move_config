@@ -1,0 +1,24 @@
+#!/bin/sh
+# Copyright (C) 2012-2015 OpenWrt.org
+
+# The OneCloud keeps its boot partition as FAT (boot.scr + uImage + dtb), so
+# this differs from the ext4 based mvebu boards it was copied from.
+move_config() {
+	local partdev
+
+	. /lib/upgrade/common.sh
+
+	if export_bootdevice && export_partdevice partdev 1; then
+		mkdir -p /boot
+		if mount -t vfat -o ro,noatime "/dev/$partdev" /boot; then
+			if [ -f /boot/sysupgrade.tgz ]; then
+				mount /boot -o remount,rw,noatime
+				mv -f /boot/sysupgrade.tgz /
+				mount /boot -o remount,ro,noatime
+			fi
+			umount /boot
+		fi
+	fi
+}
+
+boot_hook_add preinit_mount_root move_config

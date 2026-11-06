@@ -1,0 +1,36 @@
+#!/bin/sh
+# ---------------------------------------------------------------------------
+# TCP MSS 钳制 1452 —— 修"浏览器打不开各类网站 / 只有小请求能通"
+#
+# 实测(2026-10-29, 玩客云 meson8b):
+#   eth0 MTU = 1500, 但上游(192.168.109.1)到部分国内 CDN 的路径 MTU 只有
+#   1492(PPPoE), 而且**不返回 ICMP frag-needed** ⇒ 任何 >1452 字节的 TCP 段
+#   被静默丢弃(黑洞):
+#       到 183.131.147.28:443  mss=1452 的段全部被 ACK, mss=1460 的段一个都不过
+#   Chromium/Chrome 的 TLS ClientHello 约 1.8KB, 被切成 1460 + 尾巴 ⇒ 第一段
+#   就丢 ⇒ TLS 握手永远完不成 ⇒ 页面 ERR_TIMED_OUT("各类网站都打不开")。
+#   curl 之类偶尔"正常", 只是因为它们的 ClientHello <1400 字节, 一个段就发完。
+#
+# 只影响**本机(路由器自己)**发出的 TCP: IN 方向改写对端 SYN-ACK 的 MSS,
+# 本机内核就按 1452 发包; OUT 方向同时限制对端, 保护反方向(服务器→本机的大段)。
+# 转发流量(局域网客户端)走 fw3 的 FORWARD 钳制, 本脚本不碰。
+# ---------------------------------------------------------------------------
+BLOCK='TCPMSS --set-mss 1452'
+if [ -f /etc/firewall.user ] && ! grep -q "$BLOCK" /etc/firewall.user; then
+	cat >> /etc/firewall.user <<'EOF'
+
+# MSS 钳制: 上游到国内 CDN 的路径 MTU 1492 且 ICMP 不回, 大段被黑洞
+for chain in INPUT OUTPUT; do
+	iptables -t mangle -C $chain -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1452 2>/dev/null ||
+	iptables -t mangle -A $chain -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1452
+done
+EOF
+fi
+
+# 首次启动时防火墙可能还没跑, 先手动生效一次(幂等)
+for chain in INPUT OUTPUT; do
+	iptables -t mangle -C $chain -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1452 2>/dev/null ||
+	iptables -t mangle -A $chain -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1452
+done
+
+exit 0

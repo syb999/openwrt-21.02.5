@@ -7,7 +7,7 @@ include $(TOPDIR)/rules.mk
 BOARD:=amlogic
 BOARDNAME:=Amlogic Meson family
 FEATURES:=boot-part ext4 audio usb fpu legacy-sdcard squashfs usbgadget display gpio pci pcie
-SUBTARGETS:=meson8b
+SUBTARGETS:=meson8b mesongx
 
 KERNEL_PATCHVER:=5.4
 
