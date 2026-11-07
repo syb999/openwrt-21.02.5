@@ -7,7 +7,9 @@
 # layout that keeps "p1 = FAT boot, p2 = rootfs" works.
 #
 
-RAMFS_COPY_BIN='fw_printenv fw_setenv'
+# /bin/zcat is the gzip package wrapper (not a busybox applet), so the ramfs
+# needs gzip itself or decompression here silently yields nothing.
+RAMFS_COPY_BIN='fw_printenv fw_setenv gzip'
 RAMFS_COPY_DATA='/etc/fw_env.config /var/lock/fw_printenv.lock'
 REQUIRE_IMAGE_METADATA=0
 
@@ -18,13 +20,13 @@ ONECLOUD_BOOT_PART="${ONECLOUD_ROOT_PART%p*}p1"
 onecloud_first_member() {
 	local n
 
-	n="$(zcat "$1" 2>/dev/null | dd bs=1 count=100 2>/dev/null | sed 's/[^[:print:]]//g')"
+	n="$(gzip -dc "$1" 2>/dev/null | dd bs=1 count=100 2>/dev/null | sed 's/[^[:print:]]//g')"
 	[ -n "$n" ] || return 1
 	printf '%s\n' "$n"
 }
 
 onecloud_is_tar() {
-	[ "$(zcat "$1" 2>/dev/null | dd bs=1 skip=257 count=5 2>/dev/null)" = "ustar" ]
+	[ "$(gzip -dc "$1" 2>/dev/null | dd bs=1 skip=257 count=5 2>/dev/null)" = "ustar" ]
 }
 
 onecloud_image_dir() {
@@ -66,6 +68,7 @@ platform_do_upgrade() {
 
 	dir="$(onecloud_image_dir "$1")" || {
 		echo "Image does not contain the boot and root partitions"
+		echo "debug: image=$1 size=$(wc -c <"$1" 2>/dev/null) gzip=$(command -v gzip) err=$(gzip -dc "$1" 2>&1 >/dev/null | head -1)"
 		return 1
 	}
 
@@ -91,7 +94,7 @@ platform_do_upgrade() {
 	img="$1"
 
 	echo "Writing boot partition to $ONECLOUD_BOOT_PART ..."
-	${BB:-} zcat "$img" | $tarbin -xOf - "$dir/boot" > /tmp/oc-boot.img || {
+	gzip -dc "$img" | $tarbin -xOf - "$dir/boot" > /tmp/oc-boot.img || {
 		echo "Failed to unpack the boot partition"
 		return 1
 	}
@@ -102,7 +105,7 @@ platform_do_upgrade() {
 	${BB:-} rm -f /tmp/oc-boot.img
 
 	echo "Writing rootfs to $ONECLOUD_ROOT_PART ..."
-	${BB:-} zcat "$img" | $tarbin -xOf - "$dir/root" | $dd of="$ONECLOUD_ROOT_PART" bs=1M conv=fsync || {
+	gzip -dc "$img" | $tarbin -xOf - "$dir/root" | $dd of="$ONECLOUD_ROOT_PART" bs=1M conv=fsync || {
 		echo "Failed to write the rootfs"
 		return 1
 	}
