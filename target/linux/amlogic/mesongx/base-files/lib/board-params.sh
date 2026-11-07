@@ -1,17 +1,5 @@
 #!/bin/sh
-#
-# 每块板的网络参数表 —— 唯一需要按板子维护的地方。
-# 新增设备时只在这里加一个 case 分支（必要时再改 board.d/02_network 的接线方式）。
-#
-# 参数：
-#   WAN_DEV      上联口的物理设备名
-#   HAS_LAN      是否还有 LAN 桥（单口盒子为 0）
-#   FACTORY_MAC  可选的 MAC 覆盖值。默认留空 —— MAC 应当由 u-boot 从这台
-#                机器的 efuse/VPD 读出来、通过内核 cmdline 的 mac= 传入
-#                （见 image/mesongx-autoscript.cmd 的 addmac），写死在板级
-#                文件里等于全型号共用一个 MAC，是错的。
-#                留空时：cmdline 的 mac= 优先，其次 CID 推导的本地地址。
-#
+
 board_net_params() {
 	WAN_DEV=""
 	HAS_LAN=0
@@ -31,7 +19,18 @@ board_net_params() {
 	return 0
 }
 
-# 未知板子时的兜底 MAC：用 eMMC CID 推导出稳定的 02:xx 本地地址
+mac_from_cmdline() {
+	grep -o 'mac=[0-9a-fA-F:][0-9a-fA-F:]*' /proc/cmdline 2>/dev/null | head -1 | cut -d= -f2
+}
+
+board_resolve_mac() {
+	local m
+	m=$(mac_from_cmdline)
+	[ -n "$m" ] || m="$FACTORY_MAC"
+	[ -n "$m" ] || m=$(board_fallback_mac)
+	[ -n "$m" ] && printf '%s' "$m"
+}
+
 board_fallback_mac() {
 	local h
 	h=$(cat /sys/class/mmc_host/mmc1/mmc1:*/cid 2>/dev/null | head -1 | tr -d ' \n')

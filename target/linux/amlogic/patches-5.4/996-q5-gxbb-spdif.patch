@@ -1,5 +1,5 @@
 --- a/sound/soc/meson/gx-card.c	2026-11-04 20:28:14.797989926 +0800
-+++ b/sound/soc/meson/gx-card.c	2026-11-06 19:22:49.343784633 +0800
++++ b/sound/soc/meson/gx-card.c	2026-11-07 11:11:38.211500313 +0800
 @@ -113,8 +113,12 @@
  	if (ret)
  		return ret;
@@ -15,7 +15,7 @@
  	ret = meson_card_set_be_link(card, dai_link, np);
  	if (ret)
 --- a/sound/soc/meson/aiu.c	2026-11-05 18:16:29.557926001 +0800
-+++ b/sound/soc/meson/aiu.c	2026-11-06 19:22:49.343784633 +0800
++++ b/sound/soc/meson/aiu.c	2026-11-07 11:11:38.215500484 +0800
 @@ -221,7 +221,7 @@
  static int aiu_clk_get(struct device *dev)
  {
@@ -46,31 +46,29 @@
  	if (IS_ERR(aiu->spdif_mclk)) {
  		dev_err(dev, "Can't get the aiu spdif master clock\n");
 --- a/sound/soc/meson/aiu.h	2026-11-06 19:10:05.844573922 +0800
-+++ b/sound/soc/meson/aiu.h	2026-11-06 19:22:49.343784633 +0800
-@@ -39,9 +39,19 @@
++++ b/sound/soc/meson/aiu.h	2026-11-07 12:08:14.584169130 +0800
+@@ -39,9 +39,16 @@
  	const struct aiu_platform_data *platform;
  };
  
-+/*
-+ * Only S16_LE and S32_LE.
-+ *
-+ * In 32-bit mode the 958 (SPDIF) encoder transmits the MSB 24 bits of each
-+ * 32-bit word and there is no control bit for right-aligned 24-bit samples.
-+ * ALSA defines S24_LE as 24 valid bits in the low three bytes of a 4-byte
-+ * word, so advertising it makes the encoder shift every sample by 8 bits and
-+ * the output is pure noise (measured: S16 fine, S24 noise).  Dropping it lets
-+ * ALSA's plug plugin shift S24_LE into S32_LE losslessly before it reaches
-+ * the driver.
-+ */
- #define AIU_FORMATS (SNDRV_PCM_FMTBIT_S16_LE |	\
+-#define AIU_FORMATS (SNDRV_PCM_FMTBIT_S16_LE |	\
 -		     SNDRV_PCM_FMTBIT_S20_LE |	\
 -		     SNDRV_PCM_FMTBIT_S24_LE)
-+		     SNDRV_PCM_FMTBIT_S32_LE)
++/*
++ * S16_LE only.
++ *
++ * The 958 (SPDIF) encoder of GXBB cannot handle 24/32-bit samples with this
++ * driver: MODE_32BITS produces noise for both right-aligned S24_LE and
++ * MSB-aligned S32_LE (measured on hardware), and there is no alignment control
++ * for 24-bit data.  Advertising only S16_LE makes ALSA's plug plugins convert
++ * anything wider to 16 bits, which is the only format that actually works.
++ */
++#define AIU_FORMATS (SNDRV_PCM_FMTBIT_S16_LE)
  
  int aiu_of_xlate_dai_name(struct snd_soc_component *component,
  			  struct of_phandle_args *args,
 --- a/sound/soc/meson/aiu-fifo.c	2026-11-04 21:52:25.580342577 +0800
-+++ b/sound/soc/meson/aiu-fifo.c	2026-11-06 19:22:49.343784633 +0800
++++ b/sound/soc/meson/aiu-fifo.c	2026-11-07 11:11:38.215500484 +0800
 @@ -55,6 +55,12 @@
  				      en_mask, enable ? en_mask : 0);
  }
@@ -103,7 +101,7 @@
  	/* Setup the fifo boundaries */
  	end = runtime->dma_addr + runtime->dma_bytes - fifo->fifo_block;
 --- a/sound/soc/meson/aiu-fifo-i2s.c	2026-11-04 21:52:25.580342577 +0800
-+++ b/sound/soc/meson/aiu-fifo-i2s.c	2026-11-05 21:42:40.826145125 +0800
++++ b/sound/soc/meson/aiu-fifo-i2s.c	2026-11-07 11:11:38.215500484 +0800
 @@ -143,6 +143,7 @@
  	.trigger	= aiu_fifo_i2s_trigger,
  	.prepare	= aiu_fifo_i2s_prepare,
@@ -113,7 +111,7 @@
  	.shutdown	= aiu_fifo_shutdown,
  };
 --- a/sound/soc/meson/aiu-fifo-spdif.c	2026-11-04 21:52:25.580342577 +0800
-+++ b/sound/soc/meson/aiu-fifo-spdif.c	2026-11-06 19:22:49.343784633 +0800
++++ b/sound/soc/meson/aiu-fifo-spdif.c	2026-11-07 11:11:38.215500484 +0800
 @@ -24,6 +24,7 @@
  #define AIU_MEM_IEC958_CONTROL_MODE_16BIT	BIT(7)
  #define AIU_MEM_IEC958_CONTROL_MODE_LINEAR	BIT(8)

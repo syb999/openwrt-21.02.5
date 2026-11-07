@@ -26,7 +26,5 @@ if test "${bdev}" = ""; then if fatload mmc 0 ${krn} uImage; then setenv bdev "m
 if test "${bdev}" = ""; then if fatload usb 0:1 ${krn} uImage; then setenv bdev "usb 0:1"; setenv rootdev "/dev/sda2"; fi; fi
 if test "${bdev}" = ""; then if fatload usb 0 ${krn} uImage; then setenv bdev "usb 0"; setenv rootdev "/dev/sda2"; fi; fi
 
-if test "${bdev}" != ""; then if fatload ${bdev} ${dtbaddr} dtb; then setenv addmac "if printenv mac; then setenv bootargs ${bootargs} mac=${mac}; elif printenv eth_mac; then setenv bootargs ${bootargs} mac=${eth_mac}; elif printenv ethaddr; then setenv bootargs ${bootargs} mac=${ethaddr}; fi"
-setenv bootargs "root=${rootdev} rootwait rw ${condev} fsck.repair=yes net.ifnames=0"
-run addmac; bootm ${krn} - ${dtbaddr}; fi; fi
+if test "${bdev}" != ""; then if fatload ${bdev} ${dtbaddr} dtb; then setenv bootargs "root=${rootdev} rootwait rw ${condev} fsck.repair=yes net.ifnames=0"; if printenv mac; then setenv bootargs ${bootargs} mac=${mac}; elif printenv eth_mac; then setenv bootargs ${bootargs} mac=${eth_mac}; elif printenv ethaddr; then setenv bootargs ${bootargs} mac=${ethaddr}; fi; bootm ${krn} - ${dtbaddr}; fi; fi
 echo "OpenWrt: no bootable medium found"

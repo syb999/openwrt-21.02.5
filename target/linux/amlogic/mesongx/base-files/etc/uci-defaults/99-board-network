@@ -21,8 +21,7 @@ uci -q set network.wan.device="$WAN_DEV"
 uci -q set network.wan.proto='dhcp'
 uci -q delete network.wan.type
 
-mac="$FACTORY_MAC"
-[ -n "$mac" ] || mac=$(board_fallback_mac)
+mac=$(board_resolve_mac)
 
 if [ -n "$mac" ]; then
 	uci -q set network.$WAN_DEV=device

@@ -5,19 +5,13 @@
 START=19
 STOP=89
 
-mac_from_cmdline() {
-	grep -o 'mac=[0-9a-fA-F:][0-9a-fA-F:]*' /proc/cmdline 2>/dev/null | head -1 | cut -d= -f2
-}
-
 start() {
 	sleep 1
 
 	BOARD=$(cat /tmp/sysinfo/board_name 2>/dev/null)
 	board_net_params "$BOARD" || return 0
 
-	mac=$(mac_from_cmdline)
-	[ -n "$mac" ] || mac="$FACTORY_MAC"
-	[ -n "$mac" ] || mac=$(board_fallback_mac)
+	mac=$(board_resolve_mac)
 	[ -n "$mac" ] || return 0
 	[ -n "$WAN_DEV" ] || return 0
 

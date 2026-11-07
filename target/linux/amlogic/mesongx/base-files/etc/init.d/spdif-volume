@@ -1,0 +1,17 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=05
+
+start() {
+	[ -f /etc/asound.conf ] || return 0
+	[ -e /proc/asound/card0 ] || return 0
+
+	aplay -q -D spdifvol -f S16_LE -r 48000 -c 2 -d 1 /dev/zero >/dev/null 2>&1
+
+	amixer -q -c 0 sset SPDIF 100% >/dev/null 2>&1
+}
+
+stop() {
+	:
+}
