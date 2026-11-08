@@ -1,0 +1,98 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=10
+USE_PROCD=1
+
+EXTRA_COMMANDS="conf"
+EXTRA_HELP="	conf	rewrite /var/etc/onmp-nginx.conf from uci (nginx is not restarted)"
+
+ONMP_TEMPLATE=/etc/onmp/nginx.conf
+ONMP_RUN_CONF=/var/etc/onmp-nginx.conf
+NGINX_BIN=/usr/sbin/nginx
+
+onmp_config() {
+	. /lib/functions.sh
+	ONMP_PORT=81
+	ONMP_ROOT=/www/onmp
+	ONMP_FPM=/var/run/php8-fpm.sock
+	config_load onmp
+	config_get ONMP_PORT main port 81
+	config_get ONMP_ROOT main root /www/onmp
+	config_get ONMP_FPM main fpm_socket /var/run/php8-fpm.sock
+}
+
+onmp_dirs() {
+	mkdir -p /var/etc /var/run /var/log/onmp /var/run/mysqld
+	mkdir -p /var/lib/onmp/nginx/body /var/lib/onmp/nginx/fastcgi /var/lib/onmp/nginx/proxy
+	mkdir -p /etc/onmp/vhosts
+	if [ ! -d "$ONMP_ROOT" ]; then
+		mkdir -p "$ONMP_ROOT"
+	fi
+	if [ ! -f "$ONMP_ROOT/index.php" ]; then
+		printf '%s\n' '<?php phpinfo();' > "$ONMP_ROOT/index.php"
+	fi
+}
+
+svc_running() {
+	case "$1" in
+		php8-fpm) pidof php8-fpm > /dev/null 2>&1 ;;
+		mysqld) pidof mysqld > /dev/null 2>&1 ;;
+		redis) pidof redis-server > /dev/null 2>&1 ;;
+		*) return 1 ;;
+	esac
+}
+
+onmp_genconf() {
+	onmp_config
+	onmp_dirs
+	sed -e "s|@PORT@|$ONMP_PORT|g" \
+	    -e "s|@ROOT@|$ONMP_ROOT|g" \
+	    -e "s|@FPM@|$ONMP_FPM|g" \
+	    "$ONMP_TEMPLATE" > "$ONMP_RUN_CONF"
+}
+
+start_service() {
+	onmp_genconf
+
+	if ! "$NGINX_BIN" -t -c "$ONMP_RUN_CONF" > /dev/null 2>&1; then
+		logger -t onmp "config test failed: $("$NGINX_BIN" -t -c "$ONMP_RUN_CONF" 2>&1 | tr '\n' ' ')"
+		return 1
+	fi
+
+	for svc in php8-fpm mysqld redis; do
+		[ -x "/etc/init.d/$svc" ] || continue
+		svc_running "$svc" && continue
+		"/etc/init.d/$svc" start > /dev/null 2>&1
+	done
+
+	procd_open_instance
+	procd_set_param command "$NGINX_BIN" -c "$ONMP_RUN_CONF" -g 'daemon off;'
+	procd_set_param respawn
+	procd_set_param file "$ONMP_RUN_CONF"
+	procd_set_param limits nofile="4096 4096"
+	procd_close_instance
+
+	logger -t onmp "started, port $ONMP_PORT, root $ONMP_ROOT"
+}
+
+stop_service() {
+	for svc in redis mysqld php8-fpm; do
+		[ -x "/etc/init.d/$svc" ] || continue
+		"/etc/init.d/$svc" stop > /dev/null 2>&1
+	done
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger onmp
+}
+
+# regenerate the nginx config only (used by "onmp port" before restarting nginx)
+conf() {
+	onmp_genconf
+}

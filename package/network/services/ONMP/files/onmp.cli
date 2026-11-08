@@ -1,0 +1,300 @@
+#!/bin/sh
+# ONMP control helper
+NGINX_PID=/var/run/onmp-nginx.pid
+MYSQL_SOCK=/var/run/mysqld/mysqld.sock
+MYSQL_CNF=/etc/mysql/my.cnf
+
+onmp_running() {
+	[ -f "$NGINX_PID" ] && kill -0 "$(cat "$NGINX_PID")" 2>/dev/null
+}
+
+lan_ip() {
+	ip=$(uci -q get network.lan.ipaddr)
+	[ -n "$ip" ] || ip="your-router-ip"
+	echo "$ip"
+}
+
+listening() {
+	netstat -lnt 2>/dev/null | grep -q ":$1 "
+}
+
+valid_port() {
+	case "$1" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+sql_escape() {
+	printf '%s' "$1" | sed "s/'/''/g"
+}
+
+gen_pass() {
+	tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 16
+}
+
+read_secret() {
+	prompt="$1"
+	if [ -t 0 ]; then
+		printf '%s' "$prompt"
+		stty -echo 2>/dev/null
+		read -r value
+		stty echo 2>/dev/null
+		printf '\n'
+	else
+		read -r value
+	fi
+	[ -n "$value" ]
+}
+
+mysql_root_ok() {
+	mysql -S "$MYSQL_SOCK" -u root -e 'SELECT 1' > /dev/null 2>&1
+}
+
+wait_port() {
+	i=0
+	while [ $i -lt 15 ]; do
+		listening "$1" && return 0
+		i=$((i + 1))
+		sleep 1
+	done
+	return 1
+}
+
+nginx_restart() {
+	pid=$(cat "$NGINX_PID" 2>/dev/null)
+	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+		kill -TERM "$pid" 2>/dev/null
+		i=0
+		while [ $i -lt 10 ] && kill -0 "$pid" 2>/dev/null; do
+			i=$((i + 1))
+			sleep 1
+		done
+	fi
+	/etc/init.d/onmp start > /dev/null 2>&1
+}
+
+apply_port() {
+	uci -q set onmp.main.port="$1"
+	uci -q commit onmp
+	/etc/init.d/onmp conf > /dev/null 2>&1
+	nginx_restart
+	wait_port "$1"
+}
+
+cmd_port() {
+	old=$(uci -q get onmp.main.port)
+	[ -n "$old" ] || old=81
+
+	if [ -z "$1" ]; then
+		echo "$old"
+		return 0
+	fi
+
+	if ! valid_port "$1"; then
+		echo "invalid port: $1 (1-65535)" >&2
+		return 1
+	fi
+	if [ "$1" = "$old" ]; then
+		echo "port is already $old"
+		return 0
+	fi
+
+	if apply_port "$1"; then
+		echo "nginx port: $old -> $1"
+		echo "url: http://$(lan_ip):$1/"
+		logger -t onmp "nginx port changed to $1"
+		return 0
+	fi
+
+	echo "port $1 did not come up (in use? uhttpd listens on 80), rolling back to $old" >&2
+	apply_port "$old" > /dev/null 2>&1
+	logger -t onmp "port change to $1 failed, rolled back to $old"
+	echo "nginx port stays $old" >&2
+	return 1
+}
+
+cmd_mysql_passwd() {
+	user="$1"
+	pass="$2"
+	[ -n "$user" ] || user=root
+
+	if [ -z "$pass" ]; then
+		read_secret "new password for $user: " || { echo "empty password" >&2; return 1; }
+		pass=$value
+		read_secret "repeat password: " || { echo "empty password" >&2; return 1; }
+		if [ "$pass" != "$value" ]; then
+			echo "passwords do not match" >&2
+			return 1
+		fi
+	fi
+
+	pidof mysqld > /dev/null 2>&1 || {
+		echo "mysqld is not running, start it first: onmp start" >&2
+		return 1
+	}
+
+	if ! mysql_root_ok; then
+		if [ -t 0 ]; then
+			read_secret "current root password: " || { echo "cannot authenticate" >&2; return 1; }
+			export MYSQL_PWD="$value"
+		fi
+		mysql_root_ok || {
+			echo "cannot log in as root over $MYSQL_SOCK" >&2
+			echo "if the root password is lost, use: onmp mysql reset" >&2
+			return 1
+		}
+	fi
+
+	esc=$(sql_escape "$pass")
+	{
+		[ "$user" = root ] || echo "CREATE USER IF NOT EXISTS '$user'@'localhost';"
+		echo "ALTER USER '$user'@'localhost' IDENTIFIED BY '$esc';"
+		[ "$user" = root ] || echo "GRANT ALL PRIVILEGES ON *.* TO '$user'@'localhost' WITH GRANT OPTION;"
+		echo "FLUSH PRIVILEGES;"
+	} | mysql -S "$MYSQL_SOCK" -u root || return 1
+
+	MYSQL_PWD="$pass" mysql -S "$MYSQL_SOCK" -u "$user" -e 'SELECT 1' > /dev/null 2>&1 || {
+		echo "password was set but verification failed" >&2
+		return 1
+	}
+
+	echo "password for '$user'@'localhost' updated"
+	return 0
+}
+
+cmd_mysql_reset() {
+	pass="$1"
+	[ -n "$pass" ] || pass=$(gen_pass)
+
+	[ -n "$pass" ] || { echo "cannot generate a password" >&2; return 1; }
+
+	datadir=$(mysqld --help --verbose 2>/dev/null | sed -n 's/^datadir[[:space:]]\{1,\}//p' | head -1)
+	[ -n "$datadir" ] || datadir=/srv/mysql
+
+	rstdir=$(dirname "$MYSQL_SOCK")
+	mkdir -p "$rstdir" /var/log
+
+	echo "stopping mysqld..."
+	/etc/init.d/mysqld stop > /dev/null 2>&1
+	sleep 2
+	pidof mysqld > /dev/null 2>&1 && { echo "mysqld did not stop" >&2; return 1; }
+
+	rm -f "$MYSQL_SOCK" "$rstdir/onmp-reset.pid"
+	chown mariadb:mariadb "$rstdir" 2>/dev/null
+
+	echo "starting mysqld in recovery mode (skip-grant-tables)..."
+	mysqld --defaults-file="$MYSQL_CNF" --skip-grant-tables --skip-networking \
+		--socket="$MYSQL_SOCK" --pid-file="$rstdir/onmp-reset.pid" --user=mariadb \
+		> /var/log/onmp-mysql-reset.log 2>&1 &
+	rpid=$!
+
+	i=0
+	while [ $i -lt 30 ]; do
+		mysql -S "$MYSQL_SOCK" -u root -e 'SELECT 1' > /dev/null 2>&1 && break
+		i=$((i + 1))
+		sleep 1
+	done
+
+	if ! mysql -S "$MYSQL_SOCK" -u root -e 'SELECT 1' > /dev/null 2>&1; then
+		echo "recovery mode failed, see /var/log/onmp-mysql-reset.log" >&2
+		kill "$rpid" 2>/dev/null
+		/etc/init.d/mysqld start > /dev/null 2>&1
+		return 1
+	fi
+
+	esc=$(sql_escape "$pass")
+	{
+		echo "FLUSH PRIVILEGES;"
+		echo "ALTER USER 'root'@'localhost' IDENTIFIED BY '$esc';"
+		echo "FLUSH PRIVILEGES;"
+	} | mysql -S "$MYSQL_SOCK" -u root || {
+		echo "failed to change the password" >&2
+		kill "$rpid" 2>/dev/null
+		/etc/init.d/mysqld start > /dev/null 2>&1
+		return 1
+	}
+
+	kill "$rpid" 2>/dev/null
+	i=0
+	while [ $i -lt 30 ] && pidof mysqld > /dev/null 2>&1; do i=$((i + 1)); sleep 1; done
+	pidof mysqld > /dev/null 2>&1 && kill -9 "$rpid" 2>/dev/null
+
+	rm -f "$MYSQL_SOCK"
+	/etc/init.d/mysqld start > /dev/null 2>&1
+	sleep 2
+
+	if MYSQL_PWD="$pass" mysql -S "$MYSQL_SOCK" -u root -e 'SELECT 1' > /dev/null 2>&1; then
+		echo "root password reset to: $pass"
+		echo "remember to update your apps (e.g. phpems lib/config.inc.php -> DP)"
+		logger -t onmp "mariadb root password reset"
+		return 0
+	fi
+
+	echo "mysqld did not restart with the new password, check: logread | grep mysqld" >&2
+	return 1
+}
+
+case "$1" in
+	start|stop|restart|enable|disable|reload)
+		/etc/init.d/onmp "$1"
+		;;
+	status)
+		if onmp_running; then
+			echo "nginx:   running (pid $(cat "$NGINX_PID"))"
+		else
+			echo "nginx:   stopped"
+		fi
+		for p in php8-fpm mysqld redis-server; do
+			if pidof "$p" > /dev/null 2>&1; then
+				echo "$p: running"
+			else
+				echo "$p: stopped"
+			fi
+		done
+		port=$(uci -q get onmp.main.port)
+		[ -n "$port" ] || port=81
+		echo "url:     http://$(lan_ip):$port/"
+		echo "php:     $(php-cli -r 'echo PHP_VERSION;' 2>/dev/null || echo n/a)"
+		;;
+	port)
+		cmd_port "$2"
+		;;
+	mysql)
+		case "$2" in
+			passwd|password)
+				cmd_mysql_passwd "$3" "$4"
+				;;
+			reset)
+				cmd_mysql_reset "$3"
+				;;
+			*)
+				cat <<EOF
+usage: onmp mysql <command>
+
+  passwd [user] [password]   change a password (default user: root)
+                             without a password argument it asks twice
+  reset [password]           reset the root password when it is unknown
+                             (stops mysqld, skips grant tables, restarts)
+                             without an argument a random 16 char one is used
+EOF
+				;;
+		esac
+		;;
+	version)
+		echo "onmp 1.0.0 / php $(php-cli -r 'echo PHP_VERSION;' 2>/dev/null || echo n/a)"
+		;;
+	*)
+		cat <<EOF
+usage: onmp <command>
+
+  start | stop | restart | reload
+  enable | disable     (autostart on boot)
+  status               show nginx/mariadb/php-fpm/redis state + url
+  port [port]          show or change the nginx listen port (default 81)
+  mysql passwd [user] [password]   change a mariadb password
+  mysql reset [password]           reset the mariadb root password
+  version              onmp + php version
+EOF
+		;;
+esac

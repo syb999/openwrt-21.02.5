@@ -1,0 +1,73 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+
+# --- MariaDB: enabled + shared unix socket -------------------------------
+[ -f /etc/config/mysqld ] || touch /etc/config/mysqld
+uci -q set mysqld.general.enabled='1'
+uci -q set mysqld.general.init='1'
+uci -q commit mysqld
+
+mkdir -p /etc/mysql/conf.d /var/run/mysqld
+cat > /etc/mysql/conf.d/onmp.cnf <<-EOF
+[client-server]
+socket = /var/run/mysqld/mysqld.sock
+
+[mysqld]
+socket = /var/run/mysqld/mysqld.sock
+bind-address = 127.0.0.1
+EOF
+
+# --- PHP: session dir, sockets, upload limits ----------------------------
+mkdir -p /var/lib/onmp/sessions
+chmod 1777 /var/lib/onmp/sessions
+
+if ! grep -q 'ONMP-PHP-INI' /etc/php.ini 2>/dev/null; then
+	cat >> /etc/php.ini <<-EOF
+
+	; ONMP-PHP-INI
+	session.save_path = "/var/lib/onmp/sessions"
+	mysqli.default_socket = /var/run/mysqld/mysqld.sock
+	pdo_mysql.default_socket = /var/run/mysqld/mysqld.sock
+	memory_limit = 256M
+	upload_max_filesize = 2000M
+	post_max_size = 2000M
+	max_execution_time = 600
+	EOF
+fi
+
+POOL=/etc/php8-fpm.d/www.conf
+if [ -f "$POOL" ]; then
+	sed -i -e 's|^;*listen = .*|listen = /var/run/php8-fpm.sock|' \
+	       -e 's|^;*listen.mode = .*|listen.mode = 0666|' \
+	       -e 's|^pm.max_children = .*|pm.max_children = 10|' "$POOL"
+fi
+
+# --- nginx: only the ONMP instance may run -------------------------------
+[ -x /etc/init.d/nginx ] && /etc/init.d/nginx disable > /dev/null 2>&1
+
+# --- first content + service ---------------------------------------------
+PHPV="$(php-cli -r 'echo PHP_VERSION;' 2>/dev/null)"
+php_ge_8336() {
+	awk -v a="$1" -v b="8.3.36" 'BEGIN{
+		split(a, A, "."); split(b, B, ".");
+		for (i = 1; i <= 3; i++) {
+			if (A[i]+0 > B[i]+0) exit 0;
+			if (A[i]+0 < B[i]+0) exit 1;
+		}
+		exit 0;
+	}'
+}
+if [ -z "$PHPV" ] || ! php_ge_8336 "$PHPV"; then
+	logger -t onmp "WARNING: php ${PHPV:-missing} < 8.3.36, vulnerable to CVE-2026-109618/109619"
+	echo "onmp: WARN php ${PHPV:-missing} is older than 8.3.36 (php2shell), install the 8.3.36 ipks" >&2
+fi
+
+mkdir -p /www/onmp
+[ -f /www/onmp/index.php ] || printf '%s\n' '<?php phpinfo();' > /www/onmp/index.php
+
+/etc/init.d/onmp enable
+if pidof procd > /dev/null 2>&1; then
+	/etc/init.d/onmp restart > /dev/null 2>&1
+fi
+
+exit 0
