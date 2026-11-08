@@ -1,0 +1,31 @@
+Disable libpng ARM NEON filter optimizations in the bundled libpng build.
+
+base/png.mak already passes -DPNG_ARM_NEON_IMPLEMENTATION=0, but since libpng
+1.6.x pngpriv.h decides whether to route the filter setup through
+png_init_filter_functions_neon() based on PNG_ARM_NEON_OPT (derived from
+__ARM_NEON__), not on PNG_ARM_NEON_IMPLEMENTATION.  Ghostscript compiles
+none of libpng/arm/*.c, so on a 32-bit ARMv7 target with NEON enabled
+(cortex-a7+neon-vfpv4, cortex-a5, ...) pngrutil.o keeps an undefined
+reference to png_init_filter_functions_neon and linking bin/gs fails:
+
+  ld: ./obj/pngrutil.o: undefined reference to symbol
+      'png_init_filter_functions_neon'
+  ld: .../libpng16.so.16: error adding symbols: DSO missing from command line
+
+Turning PNG_ARM_NEON_OPT off removes the reference entirely, which is what
+upstream ghostpdl does in later releases.  The only cost is that PNG row
+filters are decoded with the portable C code instead of NEON, which does not
+matter for the print rendering path.
+
+--- a/base/png.mak
++++ b/base/png.mak
+@@ -62,7 +62,8 @@
+ # adds /Za which conflicts with the libpng 1.5.x source.
+ PNGCC=$(CC) $(I_)$(PI_)$(_I) $(I_)$(PNGGENDIR)$(_I) $(PF_) $(CCFLAGS) $(PNG_CFLAGS) \
+ $(D_)PNG_NO_ASSEMBLER_CODE$(_D) $(D_)PNG_INTEL_SSE_OPT=0$(_D) \
+-$(D_)PNG_INTEL_SSE_IMPLEMENTATION=0$(_D) $(D_)PNG_ARM_NEON_IMPLEMENTATION=0$(_D)
++$(D_)PNG_INTEL_SSE_IMPLEMENTATION=0$(_D) $(D_)PNG_ARM_NEON_IMPLEMENTATION=0$(_D) \
++$(D_)PNG_ARM_NEON_OPT=0$(_D)
+ 
+ # Define the name of this makefile.
+ LIBPNG_MAK=$(GLSRC)png.mak $(TOP_MAKEFILES)
