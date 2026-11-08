@@ -1,0 +1,456 @@
+msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "dss"
+msgstr "dss"
+
+msgid "dss &mdash; DeepSeek in your shell"
+msgstr "dss &mdash; 在 Shell 里用 DeepSeek"
+
+msgid ""
+"Uses your own chat.deepseek.com web session. No browser, no paid API. "
+"Values set here are also used by the <code>dss</code> command line tool."
+msgstr "使用你自己的 chat.deepseek.com 网页会话，不需要浏览器、不花 API 费用。这里的设置也会被 <code>dss</code> 命令行使用。"
+
+msgid "Settings"
+msgstr "设置"
+
+msgid "Live log"
+msgstr "对话监听"
+
+msgid "Code files"
+msgstr "代码文件"
+
+msgid "Web helper"
+msgstr "网页服务"
+
+msgid "Web port"
+msgstr "网页端口"
+
+msgid "Port of the token page (http://&lt;router&gt;:PORT/token)."
+msgstr "令牌页面的端口（http://路由器IP:端口/token）。"
+
+msgid "Bind address"
+msgstr "监听地址"
+
+msgid "Use 127.0.0.1 to keep the token page local only."
+msgstr "填 127.0.0.1 则只允许本机访问令牌页面。"
+
+msgid "Model name"
+msgstr "模型名称"
+
+msgid "Service control"
+msgstr "服务控制"
+
+msgid "Restart"
+msgstr "重启"
+
+msgid "Command line defaults"
+msgstr "命令行默认参数"
+
+msgid "Seconds between requests"
+msgstr "请求间隔（秒）"
+
+msgid "DeepSeek blocks clients that send too fast. 5&ndash;8 seconds is safe."
+msgstr "DeepSeek 会拦截发送过快的客户端，建议 5～8 秒。"
+
+msgid "Self-dialogue rounds (0 = unlimited)"
+msgstr "自我对话轮数（0 = 不限）"
+
+msgid "Self-dialogue time limit in minutes (0 = none)"
+msgstr "自我对话时长上限（分钟，0 = 不限）"
+
+msgid "Web search enabled by default"
+msgstr "默认开启联网搜索"
+
+msgid "Code mode enabled by default"
+msgstr "默认开启代码模式"
+
+msgid "Demands complete compilable code and refuses meta-discussion answers."
+msgstr "强制模型给出完整可编译代码，拒绝只做空谈。"
+
+msgid "DeepSeek token"
+msgstr "DeepSeek 令牌"
+
+msgid "The token is stored only in /root/.dss/cred (mode 0600) and is never written to the UCI config."
+msgstr "令牌只保存在 /root/.dss/cred（权限 0600），不会写进 UCI 配置。"
+
+msgid "Current token"
+msgstr "当前令牌"
+
+msgid "not set"
+msgstr "未设置"
+
+msgid "set (%d bytes)"
+msgstr "已设置（%d 字节）"
+
+msgid "Paste a new token"
+msgstr "粘贴新令牌"
+
+msgid ""
+"Chrome: F12 &rarr; <code>copy(localStorage.userToken)</code>, paste here. "
+"Quotes and {\"value\":...} wrappers are stripped automatically. Leave empty to keep the current token."
+msgstr "Chrome 里按 F12 → <code>copy(localStorage.userToken)</code>，粘到这里。自动去掉引号和 {\"value\":...} 外壳；留空则保持当前令牌不变。"
+
+msgid "Delete stored token"
+msgstr "删除已保存的令牌"
+
+msgid "Conversation output of dss, refreshed automatically."
+msgstr "dss 的对话输出，自动刷新。"
+
+msgid "The log file is /tmp/dss/conversation.log (rolling at 2 MB)."
+msgstr "日志文件为 /tmp/dss/conversation.log（超过 2MB 自动轮转）。"
+
+msgid "Auto refresh"
+msgstr "自动刷新"
+
+msgid "loading"
+msgstr "加载中"
+
+msgid "refresh now"
+msgstr "立即刷新"
+
+msgid "empty"
+msgstr "暂无内容"
+
+msgid "Code files the model produced. Saved copies live in /root/.dss/out, session copies in /tmp/dss_output."
+msgstr "模型产出的代码文件。持久副本在 /root/.dss/out，本次会话的副本在 /tmp/dss_output。"
+
+msgid "File"
+msgstr "文件名"
+
+msgid "Location"
+msgstr "位置"
+
+msgid "Type"
+msgstr "类型"
+
+msgid "Size"
+msgstr "大小"
+
+msgid "Modified"
+msgstr "修改时间"
+
+msgid "Download"
+msgstr "下载"
+
+msgid "In the dss prompt"
+msgstr "在 dss 提示符里"
+
+msgid "saved"
+msgstr "持久"
+
+msgid "session"
+msgstr "会话"
+
+msgid "file(s)"
+msgstr "个文件"
+
+msgid "Settings saved and service restarted."
+msgstr "设置已保存，服务已重启。"
+
+msgid "Stored token deleted."
+msgstr "已删除保存的令牌。"
+
+msgid "Token saved."
+msgstr "令牌已保存。"
+
+msgid "Token too short, nothing saved."
+msgstr "令牌太短，未保存。"
+
+msgid "Service started."
+msgstr "服务已启动。"
+
+msgid "Service stopped."
+msgstr "服务已停止。"
+
+msgid "Service restarted."
+msgstr "服务已重启。"
+
+msgid "Port of the token page"
+msgstr "令牌页面端口"
+
+msgid "Save & apply"
+msgstr "保存并应用"
+
+msgid "open token page"
+msgstr "打开令牌页面"
+
+msgid "Chrome: F12 then copy(localStorage.userToken), paste here. Quotes and JSON wrappers are stripped automatically."
+msgstr "Chrome 里按 F12 执行 copy(localStorage.userToken)，粘到这里；会自动去掉引号和 JSON 外壳。"
+
+msgid "Delete the stored token?"
+msgstr "确定删除已保存的令牌？"
+
+msgid "Save token"
+msgstr "保存令牌"
+
+msgid "empty"
+msgstr "空"
+
+msgid "DeepSeek"
+msgstr "DeepSeek"
+
+msgid "Command examples"
+msgstr "命令示例"
+
+msgid "All commands run in a shell on the router (SSH or the ttyd web terminal). The settings page above provides the defaults; command line options always win."
+msgstr "所有命令都在路由器的 Shell 里执行（SSH 或 ttyd 网页终端）。上面的设置页提供默认值，命令行参数优先级更高。"
+
+msgid "Basic"
+msgstr "基本用法"
+
+msgid "Interactive chat"
+msgstr "交互对话"
+
+msgid "Prompt is [shell]&gt;. Type exit to quit. Multi-line answers stream in place."
+msgstr "提示符是 [shell]>，输入 exit 退出；长回答会原地流式输出。"
+
+msgid "One question"
+msgstr "单次提问"
+
+msgid "Pipe several questions"
+msgstr "管道批量提问"
+
+msgid "Attachments and web search"
+msgstr "附件与联网搜索"
+
+msgid "Upload a file with the question"
+msgstr "带文件提问"
+
+msgid "Several --file options are allowed; the files are uploaded once per session."
+msgstr "可以给多个 --file；每个会话只上传一次，不会每轮重传。"
+
+msgid "Web search"
+msgstr "联网搜索"
+
+msgid "Slow down the request rate"
+msgstr "放慢请求频率"
+
+msgid "Seconds between API calls. Raise it when DeepSeek answers \"too frequent\"."
+msgstr "两次请求之间的秒数。遇到 DeepSeek 提示\"消息发送过于频繁\"就调大它。"
+
+msgid "Code mode and self-dialogue"
+msgstr "代码模式与自我对话"
+
+msgid "Demand complete code"
+msgstr "强制输出完整代码"
+
+msgid "Answers without a code block are re-asked automatically. Cut-off code is continued from the break point."
+msgstr "回答里没有代码块会自动重问；代码被截断会从断点续写，不会重写整篇。"
+
+msgid "Self-dialogue (asker / answerer)"
+msgstr "自我对话（一问一答）"
+
+msgid "rounds 0 = unlimited, Ctrl-C stops. The banner shows CODE MODE when it is active."
+msgstr "rounds 0 = 不限轮数，Ctrl-C 停止。横幅出现 CODE MODE 表示代码模式已生效。"
+
+msgid "Slash commands inside the dss prompt"
+msgstr "dss 提示符里的命令"
+
+msgid "Generated code"
+msgstr "生成的代码"
+
+msgid "Attachments"
+msgstr "附件"
+
+msgid "Other"
+msgstr "其它"
+
+msgid "Token management"
+msgstr "令牌管理"
+
+msgid "Token page"
+msgstr "令牌页面"
+
+msgid "Open it in the browser, paste the token, press save. Or use the field on the Settings page."
+msgstr "在浏览器里打开，粘贴令牌后保存；也可以直接用设置页里的输入框。"
+
+msgid "Where things are stored"
+msgstr "文件位置"
+
+msgid "DeepSeek in your shell"
+msgstr "在 Shell 里用 DeepSeek"
+
+msgid "Uses your own chat.deepseek.com web session. No browser, no paid API. Values set here are also used by the dss command line tool."
+msgstr "使用你自己的 chat.deepseek.com 网页会话，不需要浏览器、不花 API 费用。这里的设置也会被 dss 命令行使用。"
+
+msgid "DeepSeek blocks clients that send too fast. 5-8 seconds is safe."
+msgstr "DeepSeek 会拦截发送过快的客户端，建议 5～8 秒。"
+
+msgid "download"
+msgstr "下载"
+
+msgid "Console"
+msgstr "命令台"
+
+msgid "Type a question and run dss right here. The answer streams below; long jobs keep running if you leave the page."
+msgstr "在这里直接向 dss 提问，回答会实时输出到下面；离开页面任务也会继续跑。"
+
+msgid "Run"
+msgstr "运行"
+
+msgid "Stop"
+msgstr "停止"
+
+msgid "Mode"
+msgstr "模式"
+
+msgid "Ask (plain answer)"
+msgstr "普通问答"
+
+msgid "Code mode (demand complete code)"
+msgstr "代码模式（强制完整代码）"
+
+msgid "Self-dialogue (--duet --code)"
+msgstr "自我对话（--duet --code）"
+
+msgid "Question / topic"
+msgstr "问题 / 话题"
+
+msgid "Attachment (optional)"
+msgstr "附件（可选）"
+
+msgid "Absolute path under /root or /tmp. One file per run."
+msgstr "填写 /root 或 /tmp 下的绝对路径；一次一个文件。"
+
+msgid "Rounds (duet only)"
+msgstr "轮数（仅自我对话）"
+
+msgid "Request pace (seconds)"
+msgstr "请求间隔（秒）"
+
+msgid "Output"
+msgstr "输出"
+
+msgid "no output yet"
+msgstr "暂无输出"
+
+msgid "running"
+msgstr "运行中"
+
+msgid "idle"
+msgstr "空闲"
+
+msgid "Absolute path under /root or /tmp. One file per run"
+msgstr "填 /root 或 /tmp 下的绝对路径，一次一个文件"
+
+msgid "Command"
+msgstr "命令"
+
+msgid "Examples"
+msgstr "示例"
+
+msgid "Type a full dss command and press Run. If it does not start with dss, dss is prepended automatically."
+msgstr "直接输入完整的 dss 命令后点运行；如果没写 dss，会自动补上。"
+
+msgid "Runs in /root on the router, in the background; output streams below and keeps running if you close the page"
+msgstr "在路由器的 /root 目录后台运行；输出实时显示在下面，关掉页面任务也会继续。"
+
+msgid "download full log"
+msgstr "下载完整日志"
+
+msgid "Delete"
+msgstr "删除"
+
+msgid "Delete all files?"
+msgstr "确定删除全部文件？"
+
+msgid "Code files the model produced. Files are named after the name the model gave them. Saved copies live in /root/.dss/out, session copies in /tmp/dss_output."
+msgstr "模型产出的代码文件，按模型给出的文件名保存。持久副本在 /root/.dss/out，本次会话副本在 /tmp/dss_output。"
+
+msgid "delete"
+msgstr "删除"
+
+msgid "Delete all"
+msgstr "全部删除"
+
+msgid "Code files the model produced. Files are named after the name the model gave them. All files are stored in /root/.dss/out (single copy)."
+msgstr "模型产出的代码文件，按模型给出的文件名保存；统一存放在 /root/.dss/out（只存一份）。"
+
+msgid "Dialogue roles"
+msgstr "对话角色"
+
+msgid "Pick roles for the two sides of --duet (or for --role in one-shot mode). Nothing checked = no role definition."
+msgstr "给自我对话的双方（或一次性提问的 --role）指定角色；全部不勾选 = 不做角色定义。"
+
+msgid "Role A (asker)"
+msgstr "角色 A（提问方）"
+
+msgid "Role B (answerer)"
+msgstr "角色 B（回答方）"
+
+msgid "Custom role(s), comma separated"
+msgstr "自定义角色，多个用逗号分隔"
+
+msgid "Embedded hardware engineer"
+msgstr "嵌入式硬件开发工程师"
+
+msgid "Android developer"
+msgstr "安卓软件开发工程师"
+
+msgid "C developer"
+msgstr "C 语言开发工程师"
+
+msgid "Novelist"
+msgstr "小说作者"
+
+msgid "System architect"
+msgstr "系统架构师"
+
+msgid "Strict code reviewer"
+msgstr "严格代码审查者"
+
+msgid "Test engineer"
+msgstr "测试工程师"
+
+msgid "Technical writer"
+msgstr "技术文档作者"
+
+msgid "VoIP / voice expert"
+msgstr "VoIP/语音通信专家"
+
+msgid "Network protocol expert"
+msgstr "网络协议专家"
+
+msgid "Security researcher"
+msgstr "安全研究员"
+
+msgid "Product manager"
+msgstr "产品经理"
+
+msgid "Round"
+msgstr "轮"
+
+msgid "expand all"
+msgstr "全部展开"
+
+msgid "collapse all"
+msgstr "全部折叠"
+
+msgid "chars"
+msgstr "字符"
+
+msgid "Subject teacher"
+msgstr "学科老师"
+
+msgid "Game developer"
+msgstr "游戏开发者"
+
+msgid "Web developer"
+msgstr "网站开发者"
+
+msgid "Router / OpenWrt developer"
+msgstr "路由器/OpenWrt 开发者"
+
+msgid "DevOps engineer"
+msgstr "运维工程师"
+
+msgid "Data engineer"
+msgstr "数据工程师"
+
+msgid "AI / algorithm engineer"
+msgstr "AI/算法工程师"
+
+msgid "Technical translator"
+msgstr "技术翻译"

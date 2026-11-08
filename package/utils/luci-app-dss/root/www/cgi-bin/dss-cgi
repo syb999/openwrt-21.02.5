@@ -1,0 +1,119 @@
+#!/bin/sh
+# dss-cgi — small backend for luci-app-dss (LAN only)
+#   ?a=log&n=400     tail of the conversation log (text/plain)
+#   ?a=files         JSON list of generated code files
+#   ?a=get&f=NAME    download one file (basename only)
+#   ?a=status        JSON status (service + token + counts)
+# Only private source addresses are allowed.
+
+LOG=/tmp/dss/conversation.log
+P1=/root/.dss/out
+P2=/tmp/dss_output
+
+remote="${REMOTE_ADDR:-127.0.0.1}"
+case "$remote" in
+	127.*|10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|::1|localhost) : ;;
+	*)
+		printf 'Content-Type: text/plain\r\nStatus: 403 Forbidden\r\n\r\nforbidden\n'
+		exit 0
+		;;
+esac
+
+qs="${QUERY_STRING:-}"
+qget() {
+	echo "$qs" | tr '&' '\n' | sed -n "s/^$1=//p" | head -n1 | sed 's/+/ /g'
+}
+
+json_esc() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+act="$(qget a)"
+
+case "$act" in
+log)
+	n="$(qget n)"
+	[ -z "$n" ] && n=2000
+	printf 'Content-Type: text/plain; charset=utf-8\r\n'
+	printf 'Cache-Control: no-store\r\n\r\n'
+	[ -f "$LOG" ] && tail -n "$n" "$LOG" 2>/dev/null
+	;;
+
+logdl)
+	[ -f "$LOG" ] || { printf 'Content-Type: text/plain\r\nStatus: 404 Not Found\r\n\r\nno log\n'; exit 0; }
+	printf 'Content-Type: text/plain; charset=utf-8\r\n'
+	printf 'Content-Disposition: attachment; filename="conversation.log"\r\n'
+	printf 'Cache-Control: no-store\r\n\r\n'
+	cat "$LOG"
+	;;
+
+files)
+	printf 'Content-Type: application/json\r\nCache-Control: no-store\r\n\r\n'
+	printf '{"files":['
+	first=1
+	for d in "$P1"; do
+		[ -d "$d" ] || continue
+		for f in "$d"/*; do
+			[ -f "$f" ] || continue
+			case "$f" in *.o) continue ;; esac
+			nm="$(basename "$f")"
+			sz="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"
+			mt="$(date -r "$f" +%s 2>/dev/null || echo 0)"
+			[ $first -eq 1 ] || printf ','
+			first=0
+			printf '{"name":"%s","dir":"%s","size":%s,"mtime":%s}' \
+				"$(json_esc "$nm")" "$d" "${sz:-0}" "${mt:-0}"
+		done
+	done
+	printf ']}'
+	;;
+
+get)
+	f="$(qget f)"
+	case "$f" in
+		""|*/*|*..*) printf 'Content-Type: text/plain\r\nStatus: 400 Bad Request\r\n\r\nbad name\n'; exit 0 ;;
+	esac
+	for d in "$P1" "$P2"; do
+		if [ -f "$d/$f" ]; then
+			printf 'Content-Type: application/octet-stream\r\n'
+			printf 'Content-Disposition: attachment; filename="%s"\r\n' "$f"
+			printf 'Cache-Control: no-store\r\n\r\n'
+			cat "$d/$f"
+			exit 0
+		fi
+	done
+	printf 'Content-Type: text/plain\r\nStatus: 404 Not Found\r\n\r\nnot found\n'
+	;;
+
+console)
+	printf 'Content-Type: text/plain; charset=utf-8\r\n'
+	printf 'Cache-Control: no-store\r\n\r\n'
+	pid="$(cat /tmp/dss/console.pid 2>/dev/null)"
+	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+		echo "RUNNING 1"
+	else
+		echo "RUNNING 0"
+	fi
+	echo "RUNID $(cat /tmp/dss/console.run 2>/dev/null || echo 0)"
+	[ -f /tmp/dss/console.out ] && tail -n 20000 /tmp/dss/console.out 2>/dev/null
+	;;
+
+status)
+	printf 'Content-Type: application/json\r\nCache-Control: no-store\r\n\r\n'
+	running=0
+	pgrep -f 'node /usr/bin/dss' >/dev/null 2>&1 && running=1
+	tok=no
+	[ -s /root/.dss/cred ] && tok=yes
+	cnt=0
+	for d in "$P1" "$P2"; do
+		[ -d "$d" ] && cnt=$((cnt + $(ls -1 "$d" 2>/dev/null | grep -vc '\.o$')))
+	done
+	logsz=0
+	[ -f "$LOG" ] && logsz=$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')
+	printf '{"running":%s,"token":%s,"files":%s,"log_size":%s}' "$running" "\"$tok\"" "$cnt" "${logsz:-0}"
+	;;
+
+*)
+	printf 'Content-Type: text/plain\r\nStatus: 400 Bad Request\r\n\r\nusage: ?a=log|files|get|status\n'
+	;;
+esac

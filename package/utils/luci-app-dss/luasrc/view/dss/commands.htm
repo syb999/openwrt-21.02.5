@@ -1,0 +1,161 @@
+<%+header%>
+<h2 name="content"><%:Command examples%></h2>
+
+<div class="cbi-map">
+	<div class="cbi-map-descr">
+		<%:All commands run in a shell on the router (SSH or the ttyd web terminal). The settings page above provides the defaults; command line options always win.%>
+	</div>
+
+	<fieldset class="cbi-section">
+		<legend><%:Basic%></legend>
+		<div class="cbi-section-node">
+			<div class="cbi-value">
+				<label class="cbi-value-title"><%:Interactive chat%></label>
+				<div class="cbi-value-field">
+<pre class="dss-cmd">dss</pre>
+					<div class="cbi-value-description"><%:Prompt is [shell]&gt;. Type exit to quit. Multi-line answers stream in place.%></div>
+				</div>
+			</div>
+
+			<div class="cbi-value">
+				<label class="cbi-value-title"><%:One question%></label>
+				<div class="cbi-value-field">
+<pre class="dss-cmd">dss "用一句话解释什么是 SLIC 接口"</pre>
+				</div>
+			</div>
+
+			<div class="cbi-value">
+				<label class="cbi-value-title"><%:Pipe several questions%></label>
+				<div class="cbi-value-field">
+<pre class="dss-cmd">printf "1+1=?\n中国的首都是哪里？\n" | dss</pre>
+				</div>
+			</div>
+		</div>
+	</fieldset>
+
+	<fieldset class="cbi-section">
+		<legend><%:Attachments and web search%></legend>
+		<div class="cbi-section-node">
+			<div class="cbi-value">
+				<label class="cbi-value-title"><%:Upload a file with the question%></label>
+				<div class="cbi-value-field">
+<pre class="dss-cmd">dss --file /root/AR9341.PDF "这份文档里 SLIC 的 DMA 描述符怎么定义？"</pre>
+					<div class="cbi-value-description"><%:Several --file options are allowed; the files are uploaded once per session.%></div>
+				</div>
+			</div>
+
+			<div class="cbi-value">
+				<label class="cbi-value-title"><%:Web search%></label>
+				<div class="cbi-value-field">
+<pre class="dss-cmd">dss --search "今天有什么重要的科技新闻？"</pre>
+				</div>
+			</div>
+
+			<div class="cbi-value">
+				<label class="cbi-value-title"><%:Slow down the request rate%></label>
+				<div class="cbi-value-field">
+<pre class="dss-cmd">dss --pace 8 "问题"</pre>
+					<div class="cbi-value-description"><%:Seconds between API calls. Raise it when DeepSeek answers "too frequent".%></div>
+				</div>
+			</div>
+		</div>
+	</fieldset>
+
+	<fieldset class="cbi-section">
+		<legend><%:Code mode and self-dialogue%></legend>
+		<div class="cbi-section-node">
+			<div class="cbi-value">
+				<label class="cbi-value-title"><%:Demand complete code%></label>
+				<div class="cbi-value-field">
+<pre class="dss-cmd">dss --code "用 C 写一个读取 /proc/meminfo 打印 MemAvailable 的完整程序"</pre>
+					<div class="cbi-value-description"><%:Answers without a code block are re-asked automatically. Cut-off code is continued from the break point.%></div>
+				</div>
+			</div>
+
+			<div class="cbi-value">
+				<label class="cbi-value-title"><%:Self-dialogue (asker / answerer)%></label>
+				<div class="cbi-value-field">
+<pre class="dss-cmd">dss --code --file /root/AR9341.PDF --file /root/SI3217XB.PDF \
+    --duet --rounds 5 --minutes 30 --pace 8 \
+    "使用 ar9341 通过 slic 接口对接 si3217x 实现 voip 全代码"</pre>
+					<div class="cbi-value-description"><%:rounds 0 = unlimited, Ctrl-C stops. The banner shows CODE MODE when it is active.%></div>
+				</div>
+			</div>
+		</div>
+	</fieldset>
+
+	<fieldset class="cbi-section">
+		<legend><%:Slash commands inside the dss prompt%></legend>
+		<div class="cbi-section-node">
+			<div class="cbi-value">
+				<label class="cbi-value-title"><%:Generated code%></label>
+				<div class="cbi-value-field">
+<pre class="dss-cmd">!list            列出这条回答里保存的代码文件
+!cat 1           查看第 1 个文件
+!run 1           执行（.sh / .py / .c，C 会先 gcc 编译）
+!run 1 send      执行并把输出/编译错误发回给模型继续修
+!out 1           把上次执行输出发回对话</pre>
+				</div>
+			</div>
+
+			<div class="cbi-value">
+				<label class="cbi-value-title"><%:Attachments%></label>
+				<div class="cbi-value-field">
+<pre class="dss-cmd">!upload /root/AR9341.PDF    上传并附加到后续问题
+!files                      列出已附加文件
+!refile                     下次提问重新发送附件
+!detach                     清空附件</pre>
+				</div>
+			</div>
+
+			<div class="cbi-value">
+				<label class="cbi-value-title"><%:Other%></label>
+				<div class="cbi-value-field">
+<pre class="dss-cmd">!search on|off     联网搜索开关
+!help              帮助
+exit               退出</pre>
+				</div>
+			</div>
+		</div>
+	</fieldset>
+
+	<fieldset class="cbi-section">
+		<legend><%:Token management%></legend>
+		<div class="cbi-section-node">
+			<div class="cbi-value">
+				<label class="cbi-value-title"><%:Token page%></label>
+				<div class="cbi-value-field">
+<pre class="dss-cmd">http://&lt;router&gt;:88/token</pre>
+					<div class="cbi-value-description"><%:Open it in the browser, paste the token, press save. Or use the field on the Settings page.%></div>
+				</div>
+			</div>
+
+			<div class="cbi-value">
+				<label class="cbi-value-title"><%:Where things are stored%></label>
+				<div class="cbi-value-field">
+<pre class="dss-cmd">/root/.dss/cred             令牌（0600，可为空）
+/root/.dss/out              保存下来的代码（持久）
+/tmp/dss_output             本次会话的脚本
+/tmp/dss/conversation.log   对话日志（本页/Live log 读取）</pre>
+				</div>
+			</div>
+		</div>
+	</fieldset>
+</div>
+
+<style type="text/css">
+.dss-cmd {
+	margin: 0;
+	padding: 8px 12px;
+	background: #f5f7f9;
+	color: #1f2933;
+	border: 1px solid #dfe3e8;
+	border-left: 3px solid #4a90d9;
+	border-radius: 4px;
+	font: 12px/1.6 "DejaVu Sans Mono", monospace;
+	white-space: pre-wrap;
+	word-break: break-all;
+}
+</style>
+
+<%+footer%>

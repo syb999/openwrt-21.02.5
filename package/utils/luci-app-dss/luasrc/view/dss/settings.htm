@@ -1,0 +1,231 @@
+<%+header%>
+<%
+local uci = require "luci.model.uci".cursor()
+local fs  = require "nixio.fs"
+
+local port    = uci:get("dss", "main", "port")    or "88"
+local bind    = uci:get("dss", "main", "bind")    or "0.0.0.0"
+local model   = uci:get("dss", "main", "model")   or "deepseek-chat"
+local pace    = uci:get("dss", "cli", "pace")     or "5"
+local rounds  = uci:get("dss", "cli", "rounds")   or "0"
+local minutes = uci:get("dss", "cli", "minutes")  or "0"
+local search  = uci:get("dss", "cli", "search")   == "1"
+local code    = uci:get("dss", "cli", "code")     == "1"
+
+local tokstate = translate("not set")
+if fs.access("/root/.dss/cred") then
+	local st = fs.stat("/root/.dss/cred")
+	if st and st.size and st.size > 20 then
+		tokstate = string.format(translate("set (%d bytes)"), st.size)
+	else
+		tokstate = translate("empty")
+	end
+end
+
+local roles = require("luci.controller.dss").role_list()
+local function splitset(x)
+	local t = {}
+	for p in (x or ""):gmatch("[^,，]+") do
+		local v = p:gsub("^%s+", ""):gsub("%s+$", "")
+		if v ~= "" then t[v] = true end
+	end
+	return t
+end
+local selA = splitset(uci:get("dss", "cli", "role_a"))
+local selB = splitset(uci:get("dss", "cli", "role_b"))
+local known = {}
+for _, r in ipairs(roles) do known[r.id] = true end
+local function customs(sel)
+	local out = {}
+	for k in pairs(sel) do if not known[k] then table.insert(out, k) end end
+	return table.concat(out, "，")
+end
+local custA, custB = customs(selA), customs(selB)
+
+local m = luci.http.formvalue("m")
+local msgs = {
+	saved      = translate("Settings saved and service restarted."),
+	cleared    = translate("Stored token deleted."),
+	tokensaved = translate("Token saved."),
+	badtoken   = translate("Token too short, nothing saved."),
+	svcstart   = translate("Service started."),
+	svcstop    = translate("Service stopped."),
+	svcrestart = translate("Service restarted.")
+}
+%>
+
+<h2 name="content">dss &mdash; <%:DeepSeek in your shell%></h2>
+
+<% if m and msgs[m] then %>
+	<div class="alert-message success"><%=pcdata(msgs[m])%></div>
+<% end %>
+
+<div class="cbi-map">
+	<div class="cbi-map-descr">
+		<%:Uses your own chat.deepseek.com web session. No browser, no paid API. Values set here are also used by the dss command line tool.%>
+	</div>
+
+	<form method="post" action="<%=url('admin/services/dss/save')%>">
+		<fieldset class="cbi-section">
+			<legend><%:Web helper%></legend>
+
+			<div class="cbi-section-node">
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="port"><%:Web port%></label>
+					<div class="cbi-value-field">
+						<input type="text" id="port" name="port" value="<%=pcdata(port)%>" size="8" class="cbi-input-text"/>
+						<div class="cbi-value-description"><%:Port of the token page%>: http://&lt;router&gt;:<%=pcdata(port)%>/token</div>
+					</div>
+				</div>
+
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="bind"><%:Bind address%></label>
+					<div class="cbi-value-field">
+						<input type="text" id="bind" name="bind" value="<%=pcdata(bind)%>" size="16" class="cbi-input-text"/>
+						<div class="cbi-value-description"><%:Use 127.0.0.1 to keep the token page local only.%></div>
+					</div>
+				</div>
+
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="model"><%:Model name%></label>
+					<div class="cbi-value-field">
+						<input type="text" id="model" name="model" value="<%=pcdata(model)%>" size="24" class="cbi-input-text"/>
+					</div>
+				</div>
+			</div>
+		</fieldset>
+
+		<fieldset class="cbi-section">
+			<legend><%:Command line defaults%></legend>
+
+			<div class="cbi-section-node">
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="pace"><%:Seconds between requests%></label>
+					<div class="cbi-value-field">
+						<input type="text" id="pace" name="pace" value="<%=pcdata(pace)%>" size="6" class="cbi-input-text"/>
+						<div class="cbi-value-description"><%:DeepSeek blocks clients that send too fast. 5-8 seconds is safe.%></div>
+					</div>
+				</div>
+
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="rounds"><%:Self-dialogue rounds (0 = unlimited)%></label>
+					<div class="cbi-value-field">
+						<input type="text" id="rounds" name="rounds" value="<%=pcdata(rounds)%>" size="6" class="cbi-input-text"/>
+					</div>
+				</div>
+
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="minutes"><%:Self-dialogue time limit in minutes (0 = none)%></label>
+					<div class="cbi-value-field">
+						<input type="text" id="minutes" name="minutes" value="<%=pcdata(minutes)%>" size="6" class="cbi-input-text"/>
+					</div>
+				</div>
+
+				<div class="cbi-value">
+					<label class="cbi-value-title"><%:Web search enabled by default%></label>
+					<div class="cbi-value-field">
+						<input type="checkbox" name="search" value="1"<% if search then %> checked="checked"<% end %>/>
+					</div>
+				</div>
+
+				<div class="cbi-value">
+					<label class="cbi-value-title"><%:Code mode enabled by default%></label>
+					<div class="cbi-value-field">
+						<input type="checkbox" name="code" value="1"<% if code then %> checked="checked"<% end %>/>
+						<div class="cbi-value-description"><%:Demands complete compilable code and refuses meta-discussion answers.%></div>
+					</div>
+				</div>
+			</div>
+		</fieldset>
+
+
+<h3><%:Dialogue roles%></h3>
+<div class="cbi-map">
+	<div class="cbi-map-descr">
+		<%:Pick roles for the two sides of --duet (or for --role in one-shot mode). Nothing checked = no role definition.%>
+	</div>
+
+	<fieldset class="cbi-section">
+		<div class="cbi-section-node">
+			<div style="display:inline-block;width:49%;vertical-align:top">
+				<strong><%:Role A (asker)%></strong>
+				<% for _, r in ipairs(roles) do %>
+					<div style="margin:3px 0">
+						<label><input type="checkbox" name="role_a_<%=r.id%>" value="1"<% if selA[r.id] then %> checked="checked"<% end %>/> <%=pcdata(r.name)%></label>
+					</div>
+				<% end %>
+				<div style="margin-top:8px">
+					<input type="text" name="role_a_custom" value="<%=pcdata(custA)%>" class="cbi-input-text"
+					       style="width:95%" placeholder="<%:Custom role(s), comma separated%>"/>
+				</div>
+			</div>
+
+			<div style="display:inline-block;width:49%;vertical-align:top">
+				<strong><%:Role B (answerer)%></strong>
+				<% for _, r in ipairs(roles) do %>
+					<div style="margin:3px 0">
+						<label><input type="checkbox" name="role_b_<%=r.id%>" value="1"<% if selB[r.id] then %> checked="checked"<% end %>/> <%=pcdata(r.name)%></label>
+					</div>
+				<% end %>
+				<div style="margin-top:8px">
+					<input type="text" name="role_b_custom" value="<%=pcdata(custB)%>" class="cbi-input-text"
+					       style="width:95%" placeholder="<%:Custom role(s), comma separated%>"/>
+				</div>
+			</div>
+
+			<div style="clear:both"></div>
+		</div>
+	</fieldset>
+</div>
+
+		<div class="cbi-page-actions">
+			<input class="cbi-button cbi-button-save" type="submit" value="<%:Save & apply%>"/>
+		</div>
+	</form>
+</div>
+
+<h3><%:DeepSeek token%></h3>
+<div class="cbi-map">
+	<fieldset class="cbi-section">
+		<div class="cbi-section-node">
+			<div class="cbi-value">
+				<label class="cbi-value-title"><%:Current token%></label>
+				<div class="cbi-value-field">
+					<strong><%=pcdata(tokstate)%></strong>
+					&nbsp;<a href="http://<%=luci.http.getenv("SERVER_NAME") or "192.168.1.1"%>:<%=pcdata(port)%>/token" target="_blank"><%:open token page%></a>
+					<div class="cbi-value-description"><%:The token is stored only in /root/.dss/cred (mode 0600) and is never written to the UCI config.%></div>
+				</div>
+			</div>
+		</div>
+	</fieldset>
+
+	<form method="post" action="<%=url('admin/services/dss/token')%>">
+		<fieldset class="cbi-section">
+			<div class="cbi-section-node">
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="token"><%:Paste a new token%></label>
+					<div class="cbi-value-field">
+						<textarea id="token" name="token" rows="3" cols="72" class="cbi-input-textarea"></textarea>
+						<div class="cbi-value-description">
+							<%:Chrome: F12 then copy(localStorage.userToken), paste here. Quotes and JSON wrappers are stripped automatically.%>
+						</div>
+					</div>
+				</div>
+			</div>
+		</fieldset>
+		<div class="cbi-page-actions">
+			<input type="hidden" name="op" value="save"/>
+			<input class="cbi-button cbi-button-save" type="submit" value="<%:Save token%>"/>
+			<input class="cbi-button cbi-button-reset" type="submit" name="op" value="clear" onclick="return confirm('<%:Delete the stored token?%>')"/>
+		</div>
+	</form>
+</div>
+
+<h3><%:Service control%></h3>
+<form method="post" action="<%=url('admin/services/dss/svc')%>">
+	<input class="cbi-button" type="submit" name="op" value="start"/>
+	<input class="cbi-button" type="submit" name="op" value="stop"/>
+	<input class="cbi-button cbi-button-apply" type="submit" name="op" value="restart"/>
+</form>
+
+<%+footer%>

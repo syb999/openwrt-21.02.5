@@ -1,0 +1,20 @@
+{
+	"luci-app-dss": {
+		"description": "Grant access to dss pages and the token file",
+		"read": {
+			"file": {
+				"/root/.dss/cred": [ "read" ],
+				"/tmp/dss/conversation.log": [ "read" ],
+				"/root/.dss/out/*": [ "read" ],
+				"/tmp/dss_output/*": [ "read" ]
+			}
+		},
+		"write": {
+			"file": {
+				"/root/.dss/cred": [ "write" ],
+				"/etc/config/dss": [ "write" ]
+			},
+			"ubus": { "service": [ "list" ] }
+		}
+	}
+}

@@ -1,0 +1,101 @@
+<%+header%>
+<h2 name="content"><%:Code files%></h2>
+
+<div class="cbi-map">
+	<div class="cbi-map-descr">
+		<%:Code files the model produced. Files are named after the name the model gave them. All files are stored in /root/.dss/out (single copy).%>
+		<span id="st" class="cbi-value-description">(<%:loading%>)</span>
+		&nbsp;<a href="javascript:refresh()"><%:refresh now%></a>
+	</div>
+
+	<form method="post" action="<%=url('admin/services/dss/file')%>">
+		<fieldset class="cbi-section">
+			<table class="table" id="tbl" width="100%">
+				<tr class="tr table-titles">
+					<th class="th"><%:File%></th>
+					<th class="th"><%:Size%></th>
+					<th class="th"><%:Modified%></th>
+					<th class="th"><%:Download%></th>
+					<th class="th"><%:Delete%></th>
+				</tr>
+			</table>
+		</fieldset>
+
+		<div class="cbi-page-actions">
+			<button class="cbi-button cbi-button-reset" type="submit" name="op" value="all"
+			        onclick="return confirm('<%:Delete all files?%>')"><%:Delete all%></button>
+		</div>
+	</form>
+
+	<div class="cbi-map-descr">
+		<%:In the dss prompt%>: <code>!list</code> &middot; <code>!cat N</code> &middot;
+		<code>!run N</code> &middot; <code>!run N send</code>
+	</div>
+</div>
+
+<span id="lbl-del" style="display:none"><%:Delete%></span>
+<span id="lbl-dl" style="display:none"><%:download%></span>
+
+<script type="text/javascript">
+(function() {
+	function human(n) {
+		if (n < 1024) return n + ' B';
+		if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+		return (n / 1048576).toFixed(1) + ' MB';
+	}
+
+	window.refresh = function() {
+		var x = new XMLHttpRequest();
+		x.open('GET', '/cgi-bin/dss-cgi?a=files&_=' + Date.now(), true);
+		x.onreadystatechange = function() {
+			if (x.readyState !== 4) return;
+			var st = document.getElementById('st');
+			if (x.status !== 200) { st.textContent = 'HTTP ' + x.status; return; }
+
+			var data;
+			try { data = JSON.parse(x.responseText); } catch (e) { st.textContent = 'bad json'; return; }
+
+			var tbl = document.getElementById('tbl');
+			while (tbl.rows.length > 1) tbl.deleteRow(1);
+
+			var files = data.files || [];
+			st.textContent = files.length + ' <%:file(s)%>';
+			for (var i = 0; i < files.length; i++) {
+				var f = files[i];
+				var tr = tbl.insertRow(-1);
+				tr.className = 'tr';
+
+				var c = tr.insertCell(-1); c.className = 'td'; c.textContent = f.name;
+				c = tr.insertCell(-1); c.className = 'td'; c.textContent = human(f.size);
+				c = tr.insertCell(-1); c.className = 'td';
+				c.textContent = f.mtime ? new Date(f.mtime * 1000).toLocaleString() : '-';
+
+				c = tr.insertCell(-1); c.className = 'td';
+				var a = document.createElement('a');
+				a.href = '/cgi-bin/dss-cgi?a=get&f=' + encodeURIComponent(f.name);
+				a.textContent = document.getElementById('lbl-dl').textContent;
+				c.appendChild(a);
+
+				c = tr.insertCell(-1); c.className = 'td';
+				var b = document.createElement('button');
+				b.className = 'cbi-button cbi-button-reset';
+				b.type = 'submit';
+				b.name = 'name';
+				b.value = f.name;
+				b.textContent = document.getElementById('lbl-del').textContent;
+				b.onclick = function(nm) {
+					return function() {
+						if (!confirm('<%:Delete%> ' + nm + ' ?')) return false;
+					};
+				}(f.name);
+				c.appendChild(b);
+			}
+		};
+		x.send();
+	};
+	window.refresh();
+	setInterval(window.refresh, 5000);
+})();
+</script>
+
+<%+footer%>
