@@ -36,7 +36,7 @@ define Package/ONMP
 	+php8-mod-xmlwriter +php8-mod-simplexml +php8-mod-dom +php8-mod-ctype \
 	+php8-mod-fileinfo +php8-mod-filter +php8-mod-iconv +php8-mod-openssl \
 	+php8-mod-tokenizer +php8-mod-phar +php8-mod-bcmath +php8-mod-calendar \
-	+php8-mod-exif
+	+php8-mod-exif +php8-mod-ftp +php8-mod-gettext +php8-mod-imap
 endef
 
 define Package/ONMP/description
