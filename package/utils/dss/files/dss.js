@@ -57,6 +57,16 @@ const STALL_MS = parseInt(process.env.DSS_STALL_MS || '90000', 10);
 let paceMs = parseInt(process.env.DSS_PACE_MS || '3000', 10);
 const PACE_MAX = parseInt(process.env.DSS_PACE_MAX || '60000', 10);
 let lastReqAt = 0;
+let lastPayloadChars = 0;   // 上次请求体大小
+let lastAnswerChars = 0;    // 上次回答大小
+let rlHits = 0;             // 连续被风控次数
+
+// 长内容很容易触发 DeepSeek 风控：体量越大，下一次请求前等得越久
+function dynamicWaitMs() {
+  const size = lastPayloadChars + lastAnswerChars;
+  const extra = Math.max(0, Math.min(40000, Math.round((size - 8000) / 3)));
+  return paceMs + extra;
+}
 const MAX_RESUME = parseInt(process.env.DSS_MAX_RESUME || '4', 10);
 
 function cred() {
@@ -338,7 +348,7 @@ function roleText(spec, who) {
 // ================= 脚本：检测 / 落盘 / 安全检查 / 执行 =================
 
 let BATCH_LINES = parseInt(process.env.DSS_BATCH || '200', 10);
-const DSS_VERSION = '1.0-43';
+const DSS_VERSION = '1.0-87';
 const OUTDIR = process.env.DSS_OUTDIR || '/root/.dss/out';
 // 只保留一个目录：/root/.dss/out（重启后还在，LuCI 的"文件下载"从这里取）
 // 对话日志：给 LuCI 的"监听对话"页面 tail
@@ -418,66 +428,143 @@ function guessFileName(code, lang) {
 
 function parseBlocks(text) {
   const out = [];
-  const re = /```([A-Za-z0-9_+-]*)\n([\s\S]*?)```/g;
+  const src = String(text || '');
+  // 围栏信息串里也可能带文件名（```c my_strlen.c）
+  const re = /```([A-Za-z0-9_+.-]*)[ \t]*([^\n]*)\n([\s\S]*?)```/g;
   let m;
-  while ((m = re.exec(String(text || ''))) !== null) {
+  while ((m = re.exec(src)) !== null) {
     const lang = (m[1] || '').toLowerCase();
-    const code = m[2];
+    const info = (m[2] || '').trim();
+    const code = m[3];
+    // Kimi/DeepSeek 常在围栏上一行写 **my_strlen.c** 或 ### main.c —— 直接采用这个名字
+    let name = '';
+    const fm = info.match(/([A-Za-z0-9][A-Za-z0-9_.-]*\.[A-Za-z0-9]{1,5})$/);
+    if (fm) name = fm[1];
+    if (!name) {
+      const prev = src.slice(Math.max(0, m.index - 200), m.index).split('\n')
+        .map(x => x.trim()).filter(Boolean);
+      for (let i = prev.length - 1; i >= 0 && i >= prev.length - 3; i--) {
+        const ln = prev[i].replace(/^#+\s*/, '').replace(/\*\*/g, '').replace(/`/g, '')
+          .replace(/[:：]\s*$/, '').trim();
+        const nm = ln.match(/^([A-Za-z0-9][A-Za-z0-9_.-]*\.[A-Za-z0-9]{1,5})$/);
+        if (nm) { name = nm[1]; break; }
+      }
+    }
     const isC = ['c', 'h', 'cpp', 'cc'].includes(lang);
     const isShell = ['sh', 'bash', 'shell', 'zsh', 'ash', 'console', 'shell-session'].includes(lang) ||
       /^\s*#!\s*\/.*\b(ba|a|z)?sh\b/.test(code);
     const isPy = ['python', 'python3', 'py'].includes(lang) ||
       /^\s*#!\s*\/.*python/.test(code);
-    if (isC) out.push({ lang: 'c', code });
-    else if (isShell) out.push({ lang: 'sh', code });
-    else if (isPy) out.push({ lang: 'py', code });
+    if (isC) out.push({ lang: 'c', code, name });
+    else if (isShell) out.push({ lang: 'sh', code, name });
+    else if (isPy) out.push({ lang: 'py', code, name });
   }
   return out;
 }
 
-function saveScripts(answerText) {
-  let blocks = parseBlocks(answerText);
-  // 分段输出（PART k/N）时把相邻同语言块拼起来，避免存成一堆半截文件
-  const merged = [];
-  for (const b of blocks) {
-    const prev = merged[merged.length - 1];
-    if (prev && prev.lang === b.lang) prev.code += '\n' + b.code;
-    else merged.push({ lang: b.lang, code: b.code });
+// 轮次标记用的注释
+function commentFor(name, label) {
+  const ext = (String(name).match(/\.([A-Za-z0-9]+)$/) || [])[1];
+  const e = (ext || '').toLowerCase();
+  if (['sh', 'bash', 'py', 'yaml', 'yml', 'conf', 'ini'].indexOf(e) >= 0) {
+    return '# ===== ' + label + ' =====';
   }
-  blocks = merged;
-  if (!blocks.length) return [];
+  if (['c', 'h', 'cpp', 'cc', 'hpp', 'java', 'kt', 'js', 'ts', 'go', 'rs', 'php'].indexOf(e) >= 0) {
+    return '/* ===== ' + label + ' ===== */';
+  }
+  return '// ===== ' + label + ' =====';
+}
+
+// 判断这段代码是不是"完整文件"（有文件头注释 / include / 头文件保护 / shebang）
+function looksComplete(code) {
+  const head = String(code).slice(0, 600);
+  if (/^#!\s*\//.test(String(code).trim())) return true;
+  if (/#ifndef\s+[A-Z0-9_]+_H\b/.test(head)) return true;
+  if (/^\s*\/\*[\s\S]{0,300}?\*\//.test(head) && /#include\s*</.test(head)) return true;
+  if (/^\s*(package|import)\s+[\w.]+/m.test(head)) return true;
+  if (/^\s*<\?php/.test(head)) return true;
+  return false;
+}
+
+let LAST_FILE = null;   // 上一次落盘的文件名（跨轮次片段续写用）
+
+function saveScripts(answerText, label) {
+  label = label || '新的回答';
+  const blocks = parseBlocks(answerText);
+  // 按"解析出来的文件名"归并：同一份文件的多段拼起来；不同文件即使同语言也分开
+  const byName = new Map();
+  const order = [];
+  let seq = 0;
+  let lastName = null;
+  for (const b of blocks) {
+    seq++;
+    let nm = b.name || guessFileName(b.code, b.lang);
+    if (!nm) {
+      // 没有文件名：如果上一块是同一语言，就当作它的续写（分批时模型常常不再重复文件名）
+      if (lastName && byName.get(lastName) && byName.get(lastName).lang === b.lang) {
+        byName.get(lastName).chunks.push(b.code);
+        continue;
+      }
+      // 跨轮次：上一轮写过这个语言的文件，就当作它的续写
+      const langOfLast = LAST_FILE
+        ? (LAST_FILE.match(/\.py$/) ? 'py' : (LAST_FILE.match(/\.c$|\.h$/) ? 'c' : 'sh'))
+        : null;
+      if (LAST_FILE && LAST_FILE.match(/\.[A-Za-z0-9]+$/) && b.lang === langOfLast) {
+        lastName = LAST_FILE;
+        if (!byName.has(LAST_FILE)) { byName.set(LAST_FILE, { lang: b.lang, chunks: [], name: LAST_FILE }); order.push(LAST_FILE); }
+        byName.get(LAST_FILE).chunks.push(b.code);
+        continue;
+      }
+      nm = 'code_' + seq + ((b.lang === 'py') ? '.py' : (b.lang === 'c' ? '.c' : '.sh'));
+    }
+    nm = require('path').basename(nm).replace(/[^A-Za-z0-9._-]/g, '_');
+    if (!byName.has(nm)) { byName.set(nm, { lang: b.lang, chunks: [], name: nm }); order.push(nm); }
+    byName.get(nm).chunks.push(b.code);
+    lastName = nm;
+  }
+  if (!order.length) return [];
   try {
     fs.mkdirSync(OUTDIR, { recursive: true, mode: 0o700 });
     fs.chmodSync(OUTDIR, 0o700);
   } catch (e) {}
+
   const saved = [];
   const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
-  blocks.forEach((b, i) => {
-    const ext = (b.lang === 'py') ? '.py' : (b.lang === 'c' ? '.c' : '.sh');
-    // 模型给的文件名优先（meminfo_available.c / slic_si3217x_ar9341.h ...）
-    let base = guessFileName(b.code, b.lang) || (ts + '-' + (i + 1) + ext);
-    base = require('path').basename(base).replace(/[^A-Za-z0-9._-]/g, '_');
+
+  order.forEach((name, i) => {
+    const info = byName.get(name);
+    const ext = (info.lang === 'py') ? '.py' : (info.lang === 'c' ? '.c' : '.sh');
+    let base = info.name;
     if (!/\.[A-Za-z0-9]+$/.test(base)) base += ext;
-    let path = OUTDIR + '/' + base;
-    // 同名不同内容 -> 加 -2 / -3，避免互相覆盖
-    if (fs.existsSync(path)) {
-      let old2 = '';
-      try { old2 = fs.readFileSync(path, 'utf8'); } catch (e) {}
-      if (old2 !== b.code) {
-        const dot = base.lastIndexOf('.');
-        const stem = base.slice(0, dot), tail = base.slice(dot);
-        for (let k = 2; k < 50; k++) {
-          const cand = OUTDIR + '/' + stem + '-' + k + tail;
-          if (!fs.existsSync(cand)) { base = stem + '-' + k + tail; path = cand; break; }
-        }
+    const path = OUTDIR + '/' + base;
+
+    // 同一条回答里的多段：第二段起加"（续）"标记，合并成一个文件
+    const body = info.chunks.map((c, k) => (k === 0) ? c
+      : commentFor(base, label + '（续）') + '\n' + c).join('\n\n');
+
+    let existing = '';
+    try { existing = fs.readFileSync(path, 'utf8'); } catch (e) {}
+
+    let mode = 'new';
+    let outText = body;
+    if (existing) {
+      if (existing.indexOf(body.trim()) >= 0) {
+        mode = 'dup';
+        return;                                   // 内容已在文件里，不动
+      }
+      if (looksComplete(body)) {
+        mode = 'replaced';                        // 完整文件：替换（迭代修代码）
       } else {
-        return;   // 内容一样就不重复存（在 forEach 回调里）
+        // 片段：追加，并标出这是"第几轮回答"
+        mode = 'appended';
+        outText = existing.replace(/\s+$/, '') + '\n\n' + commentFor(base, label) + '\n' + body + '\n';
       }
     }
     try {
-      fs.writeFileSync(path, b.code, { mode: 0o600 });
+      fs.writeFileSync(path, outText, { mode: 0o600 });
       fs.chmodSync(path, 0o600);
-      saved.push({ path, lang: b.lang, lines: b.code.split('\n').length });
+      LAST_FILE = base;
+      saved.push({ path, lang: info.lang, lines: outText.split('\n').length, mode });
     } catch (e) { /* ignore */ }
   });
   return saved;
@@ -615,6 +702,39 @@ function makePoller() {
   };
 }
 
+// 按后端选上传通道：deepseek -> /api/v0/file/upload_file；kimi -> /apiv2-files/file/upload
+async function uploadAttachments(state, c, pow, backend, files) {
+  for (const fp of files) {
+    const targets = expandUploadTargets(fp) || [];
+    if (!targets.length) { console.error('[dss] nothing to upload: ' + fp); continue; }
+    if (targets.length > 1) console.error('[dss] ' + fp + ' -> ' + targets.length + ' file(s)');
+    for (const t of targets) {
+      process.stdout.write('[dss] uploading ' + t.name + ' (' + backend + ') ... ');
+      try {
+        if (['api', 'glm', 'openai', 'doubao', 'wenxin'].indexOf(backend) >= 0) {
+          const err = new Error('后端 ' + backend + ' 不支持附件上传（GLM-4-Flash 是纯文本接口）。' +
+            '要么去掉 --file/-a/-b，要么把这一侧换成 deepseek');
+          err.fatalUpload = true;
+          throw err;
+        }
+        if (backend === 'kimi') {
+          const f = await kimiUploadFile(t.path, t.name);
+          state.kimiFiles = state.kimiFiles || [];
+          state.kimiFiles.push(f);
+          console.log('ok (kimi ' + f.size + ' bytes)');
+        } else {
+          const f = await uploadFile(c, pow, t.path, t.name);
+          state.fileIds.push(f.id);
+          console.log('ok (' + f.size + ' bytes, ' + f.status + ')');
+        }
+      } catch (e) {
+        console.log('failed: ' + e.message);
+        if (e.fatalUpload) throw e;
+      }
+    }
+  }
+}
+
 async function waitReady(p, ms) {
   await Promise.race([
     p.start(),
@@ -628,7 +748,17 @@ let powInflight = new Map();  // target_path -> Promise
 async function fetchPow(c, pow, targetPath) {
   const chalRes = await httpJson(c, '/api/v0/chat/create_pow_challenge', { target_path: targetPath });
   const chal = chalRes.j && chalRes.j.data && chalRes.j.data.biz_data && chalRes.j.data.biz_data.challenge;
-  if (!chal) throw new Error('challenge failed: ' + chalRes.code + ' ' + String(chalRes.text).slice(0, 200));
+  if (!chal) {
+    const t = String(chalRes.text || '');
+    // 40003 / Authorization Failed = 网页令牌过期，不是网络问题，重试没用
+    if (/40003|Authorization Failed|invalid token/i.test(t)) {
+      const e = new Error('DeepSeek 网页令牌失效（40003）—— 打开 http://<盒子IP>:88/token ' +
+        '登录 chat.deepseek.com 点一下书签刷新，然后重跑这条命令');
+      e.noRetry = true;
+      throw e;
+    }
+    throw new Error('challenge failed: ' + chalRes.code + ' ' + t.slice(0, 200));
+  }
 
   const forWorker = Object.assign({}, chal, {
     expireAt: chal.expire_at !== undefined ? chal.expire_at : chal.expireAt,
@@ -710,6 +840,7 @@ function stream(c, pow, path, body, targetPath, cur, printer) {
       lastReqAt = Date.now();
       (needPow ? getPow(c, pow, targetPath) : Promise.resolve(null)).then(powHeader => {
       const payload = Buffer.from(JSON.stringify(body));
+      lastPayloadChars = payload.length;
       const headers = Object.assign(baseHeaders(c), {
         'Content-Type': 'application/json',
         'Content-Length': payload.length,
@@ -721,10 +852,11 @@ function stream(c, pow, path, body, targetPath, cur, printer) {
           res.setEncoding('utf8');
           res.on('data', d => { t += d; });
           res.on('end', () => {
-            const waf = /<html|Request Blocked|Rate Limit/i.test(t);
-            end(false, new Error(path + ' HTTP ' + res.statusCode +
-              (waf ? ' —— 被 WAF 限流/拦截了，等几分钟再试（或重新从浏览器复制 cookie 到 /etc/dss/cred 第2行）'
-                  : ': ' + t.slice(0, 200))));
+            const waf = /<html|Request Blocked|Rate Limit|too many/i.test(t);
+            const e = new Error(path + ' HTTP ' + res.statusCode +
+              (waf ? ' —— 被 WAF 限流/拦截了' : ': ' + t.slice(0, 200)));
+            if (res.statusCode === 429 || res.statusCode === 403 || waf || looksRateLimited(t)) e.rateLimited = true;
+            end(false, e);
           });
           return;
         }
@@ -735,12 +867,40 @@ function stream(c, pow, path, body, targetPath, cur, printer) {
           while ((i = buf.indexOf('\n')) >= 0) {
             const line = buf.slice(0, i).trim();
             buf = buf.slice(i + 1);
+            if (process.env.DSS_RAW) process.stderr.write('[raw] ' + line.slice(0, 300) + '\n');
             if (!line.startsWith('data:')) continue;
             const p = line.slice(5).trim();
             if (process.env.DSS_DEBUG) console.error('[sse] ' + p.slice(0, 200));
             if (!p || p === '[DONE]') continue;
             let j;
             try { j = JSON.parse(p); } catch (e) { continue; }
+
+            // 服务端 hint 帧：{"type":"error","content":"Messages too frequent...","finish_reason":"rate_limit_reached"}
+            if (j.type === 'error') {
+              const txt = String(j.content || '');
+              const fr = String(j.finish_reason || '');
+              const e = new Error('server: ' + txt.slice(0, 120) + (fr ? ' (' + fr + ')' : ''));
+              if (/rate_limit/i.test(fr) || looksRateLimited(txt) || /too frequent/i.test(txt)) e.rateLimited = true;
+              if (process.env.DSS_DEBUG || process.env.DSS_RAW) console.error('[dss] server hint: ' + txt + ' / ' + fr);
+              end(false, e);
+              return;
+            }
+
+            // 其它错误帧：{"code":x,"msg":"..."} 或 {"data":{"biz_code":7,"biz_msg":"rate limit reached"}}
+            const errMsg = (typeof j.msg === 'string' && j.msg)
+              || (j.data && typeof j.data.biz_msg === 'string' && j.data.biz_msg)
+              || (j.error && (j.error.message || j.error)) || '';
+            const bizCode = (j.data && typeof j.data.biz_code === 'number') ? j.data.biz_code
+                          : (typeof j.code === 'number' ? j.code : 0);
+            if (!j.v && errMsg && (bizCode !== 0 || looksRateLimited(String(errMsg)))) {
+              const e = new Error('server: ' + String(errMsg).slice(0, 120) + ' (code=' + bizCode + ')');
+              if (looksRateLimited(String(errMsg)) || bizCode === 7 || bizCode === 40003 || bizCode === 429) {
+                e.rateLimited = true;
+              }
+              end(false, e);
+              return;
+            }
+
             lastEvt = Date.now();
             if (!firstToken && typeof j.v === 'string') firstToken = Date.now();
 
@@ -813,7 +973,12 @@ function stream(c, pow, path, body, targetPath, cur, printer) {
       r.end();
       }).catch(e => end(false, e));
     };
-    const waitMs = paceMs - (Date.now() - lastReqAt);
+    const target = dynamicWaitMs();
+    const waitMs = target - (Date.now() - lastReqAt);
+    if (waitMs > 1500) {
+      process.stderr.write('[throttle] wait ' + Math.round(waitMs / 1000) + 's (last req ' +
+        Math.round(lastPayloadChars / 1024) + 'KB, last answer ' + Math.round(lastAnswerChars / 1024) + 'KB)\n');
+    }
     if (waitMs > 0) setTimeout(doReq, waitMs); else doReq();
   });
 }
@@ -907,9 +1072,9 @@ async function ask(c, pow, prompt, state, printer) {
 
   printer.flush();
   logConv('DEEPSEEK', cur.acc);
-  // 每条回答都扫一遍代码块：duet / 一次性模式也要存进 /root/.dss/out（否则该目录永远是空的）
+  // 非代码模式：每条回答都扫一遍代码块；代码模式留给 askCode 在整轮（含续批）结束后统一落盘
   try {
-    const savedNow = saveScripts(cur.acc);
+    const savedNow = CODE_MODE ? [] : saveScripts(cur.acc, CUR_LABEL);
     if (savedNow.length) {
       lastSaved = savedNow;
       process.stderr.write('[dss] ' + savedNow.length + ' code file(s) saved: ' +
@@ -930,7 +1095,7 @@ async function ask(c, pow, prompt, state, printer) {
 
 
 
-const RATE_RE = /(发送过于频繁|请求过于频繁|过于频繁|操作频繁|稍后重试|请稍候|rate limit|too many requests|try again later)/i;
+const RATE_RE = /(发送过于频繁|请求过于频繁|过于频繁|操作频繁|稍后重试|请稍候|系统繁忙|服务繁忙|请求受限|rate limit|too many requests|try again later|slow down)/i;
 
 function looksRateLimited(text) {
   if (!text) return false;
@@ -940,16 +1105,1050 @@ function looksRateLimited(text) {
 }
 
 async function backoff(why) {
-  const wait = Math.min(paceMs, PACE_MAX);
-  process.stderr.write('\n[rate-limited] ' + (why || '') + ' -> wait ' + Math.round(wait / 1000) +
-    's, then retry (pace now ' + Math.round(paceMs / 1000) + 's)\n');
-  await new Promise(r => setTimeout(r, wait));
-  paceMs = Math.min(Math.round(paceMs * 2), PACE_MAX);
+  rlHits++;
+  const SCHEDULE = process.env.DSS_RL_SCHEDULE
+    ? process.env.DSS_RL_SCHEDULE.split(',').map(x => Math.max(1, parseInt(x, 10) || 1))
+    : [300, 600, 1800];   // 5 分钟 -> 10 分钟 -> 30 分钟（之后一直是 30 分钟）
+  const mins = SCHEDULE[Math.min(rlHits - 1, SCHEDULE.length - 1)];
+  const wait = mins * 1000;
+  process.stderr.write('\n[rate-limited #' + rlHits + '] ' + (why || '') +
+    ' -> 被限流，第 ' + rlHits + ' 档退避，等 ' + Math.round(wait / 60000) +
+    ' 分钟（总计时长按档位递增 5→10→30 分钟；Ctrl-C 可中断）\n');
+  const t0 = Date.now();
+  while (Date.now() - t0 < wait) {
+    const left = Math.ceil((wait - (Date.now() - t0)) / 1000);
+    await new Promise(r => setTimeout(r, Math.min(30000, left * 1000)));
+    const rest = Math.ceil((wait - (Date.now() - t0)) / 60000);
+    if (rest > 0) process.stderr.write('[wait] 还剩 ' + rest + ' 分钟…\n');
+  }
+  // 这一轮会话里把基础间隔也抬高（成功后不会马上降回来，避免反复触发）
+  paceMs = Math.min(60000, Math.max(paceMs, wait / 4));
+  lastPayloadChars = 0; lastAnswerChars = 0;
 }
 
 // 空回答重试：服务端偶发（限流/风控）会给 200 但内容为空
 let emptyStreak = 0;
+let CODE_MODE = false;
+let CUR_LABEL = '对话';
+let BACKEND_A = 'deepseek', BACKEND_B = 'deepseek';
+let MODEL_A = '', MODEL_B = '';
+let API_THINK = false;          // glm-4.5* 默认关思考；--api-think 打开
 let lastSaved = [];
+// 当前这次 askText/askCode 走哪个后端 / 哪个模型（duet 每轮切换）
+let CUR_BACKEND = 'deepseek';
+let CUR_MODEL = '';
+
+// ================= Kimi (www.kimi.com) =================
+// 协议（2026-11 实测，一次成功，返回 9413 字节 66 帧）：
+//   POST /apiv2/kimi.gateway.chat.v1.ChatService/Chat
+//   content-type: application/connect+json  （Connect 协议：00 | 4字节大端长度 | JSON）
+//   body: {scenario:"SCENARIO_CHAT", message:{role:"user",blocks:[{message_id:"",text:{content}}]},
+//          options:{thinking,enable_plugin,reasoning_effort,model:"k28-instant"}, project_id, chat_id?}
+//   响应帧（同一个 Connect 封包）：
+//     {"op":"set","chat":{"id":"<chatId>"}}                      -> 会话 id
+//     {"op":"set","mask":"message","message":{id,role,status}}   -> assistant 消息
+//     {"op":"append","mask":"block.text.content","block":{"text":{"content":"…"}}}   -> 正文增量
+//     {"op":"append","mask":"block.think.content","block":{"think":{"content":"…"}}} -> 思考增量
+//     message.status = MESSAGE_STATUS_COMPLETED                  -> 结束
+// 鉴权：authorization: Bearer <15 分钟有效的 access token> + cookie kimi-auth（长期）。
+//   ★ 只带 cookie 当 Bearer 会被 401；access token 过期只能重新从浏览器拿一份 cURL。
+const KIMI_HOST = 'www.kimi.com';
+const KIMI_PATH = '/apiv2/kimi.gateway.chat.v1.ChatService/Chat';
+const KIMI_DEF_MODEL = 'k28-instant';
+let KIMI_THINK = process.env.DSS_KIMI_THINK === '1';
+let KIMI_TOOLS = process.env.DSS_KIMI_TOOLS === '1';
+let KIMI_PLUGIN = process.env.DSS_KIMI_PLUGIN === '1';
+const KIMI_AUTH_HOST='auth.kimi.com';
+const KIMI_REFRESH_PATH = '/api/account.gateway.v1.AuthService/RefreshToken';
+
+function kimiCredPath() { return process.env.DSS_KIMI_CRED || '/root/.dss/kimi.cred'; }
+
+function kimiParseCred(txt) {
+  const out = { cookie: '', bearer: '', refreshToken: '', dev: '', sess: '', traffic: '', model: '', chatId: '' };
+  const t = String(txt || '');
+  const h = (name) => {
+    const re = new RegExp("-H\\s+['\"]" + name + ":\\s*([^'\"\\r\\n]*)['\"]", 'i');
+    const m = t.match(re);
+    return m ? m[1].trim() : '';
+  };
+  const mc = t.match(/--cookie\s+'([^']*)'/) || t.match(/-b\s+'([^']*)'/) ||
+             t.match(/-H\s+['"]cookie:\s*([^'"]*)['"]/i);
+  if (mc) out.cookie = mc[1].trim();
+  const auth = h('authorization');
+  out.bearer = auth.replace(/^Bearer\s+/i, '').trim();
+  out.dev = h('x-msh-device-id');
+  out.sess = h('x-msh-session-id');
+  out.traffic = h('x-traffic-id');
+  const mm = t.match(/"model"\s*:\s*"([^"]+)"/);
+  if (mm) out.model = mm[1];
+  const mc2 = t.match(/"chat_id"\s*:\s*"([^"]+)"/);
+  if (mc2) out.chatId = mc2[1];
+  if (!out.model) {
+    const line = t.split('\n').map(x => x.trim()).find(x => /^model\s*[:=]/i.test(x));
+    if (line) out.model = line.replace(/^model\s*[:=]\s*/i, '').trim();
+  }
+  // 纯文本形式：refresh_token: xxx / access_token: xxx / dev: / sess: / traffic: / cookie:
+  for (const raw of t.split('\n')) {
+    const ln = raw.trim();
+    if (!ln || ln[0] === '#') continue;
+    let m;
+    if ((m = ln.match(/^refresh_token\s*[:=]\s*(\S+)$/i))) out.refreshToken = m[1];
+    else if ((m = ln.match(/^access_token\s*[:=]\s*(\S+)$/i))) out.bearer = out.bearer || m[1];
+    else if ((m = ln.match(/^dev(?:ice)?\s*[:=]\s*(\S+)$/i))) out.dev = out.dev || m[1];
+    else if ((m = ln.match(/^sess(?:ion)?\s*[:=]\s*(\S+)$/i))) out.sess = out.sess || m[1];
+    else if ((m = ln.match(/^traffic\s*[:=]\s*(\S+)$/i))) out.traffic = out.traffic || m[1];
+    else if ((m = ln.match(/^cookie\s*[:=]\s*(.+)$/i))) out.cookie = out.cookie || m[1].trim();
+  }
+  return out;
+}
+
+let KIMI = null;
+function kimiLoad() {
+  if (KIMI) return KIMI;
+  const p = kimiCredPath();
+  let txt = '';
+  try { txt = fs.readFileSync(p, 'utf8'); } catch (e) {
+    throw new Error('没有 Kimi 凭据 ' + p + '（把 /api/chat 的 Copy as cURL 粘进去）');
+  }
+  const d = kimiParseCred(txt);
+  if (!d.bearer && !d.refreshToken) {
+    throw new Error(p + ' 里既没有 authorization: Bearer，也没有 refresh_token（二者必给一个）');
+  }
+  KIMI = d;
+  return KIMI;
+}
+
+// refresh_token 会轮换，必须写回（0600），否则下一次就用旧的
+function kimiPersist() {
+  const k = KIMI;
+  if (!k) return;
+  const p = kimiCredPath();
+  const lines = [];
+  if (k.refreshToken) lines.push('refresh_token: ' + k.refreshToken);
+  if (k.bearer) lines.push('access_token: ' + k.bearer);
+  if (k.cookie) lines.push('cookie: ' + k.cookie);
+  if (k.dev) lines.push('dev: ' + k.dev);
+  if (k.sess) lines.push('sess: ' + k.sess);
+  if (k.traffic) lines.push('traffic: ' + k.traffic);
+  if (k.model) lines.push('model: ' + k.model);
+  try {
+    const tmp = p + '.tmp';
+    fs.writeFileSync(tmp, lines.join('\n') + '\n', { mode: 0o600 });
+    fs.chmodSync(tmp, 0o600);
+    fs.renameSync(tmp, p);
+  } catch (e) { /* 只读根文件系统忽略 */ }
+}
+
+// 把 Kimi 的错误体压成一行人话（外层结构不固定：code / error.code / details[].debug）
+function kimiErrText(s) {
+  const t = String(s || '').slice(0, 800);
+  if (t.indexOf('"') < 0) return t.slice(0, 160);
+  const pick = (re) => { const m = t.match(re); return m ? m[1] : ''; };
+  const code = pick(/"code"\s*:\s*"([^"]+)/);
+  const reason = pick(/"reason"\s*:\s*"([^"]+)/);
+  const lm = pick(/"localizedMessage"\s*:\s*\{[^}]*"message"\s*:\s*"([^"]+)/);
+  const msg = pick(/"message"\s*:\s*"([^"]+)/);
+  const head = [code, reason].filter(Boolean).join('/');
+  const tail = lm || msg;
+  if (head || tail) return (head + (tail ? ' — ' + tail : '')).trim();
+  return t.slice(0, 160);
+}
+
+// 用 refresh_token 换 access_token（auth.kimi.com，字段名是 snake_case）
+function kimiRefresh() {
+  return new Promise(resolve => {
+    let k;
+    try { k = kimiLoad(); } catch (e) { return resolve({ ok: false, err: e.message }); }
+    if (!k.refreshToken) return resolve({ ok: false, err: '没有 refresh_token' });
+    const rt = k.refreshToken;
+    const body = Buffer.from(JSON.stringify({ refresh_token: rt }), 'utf8');
+    const headers = {
+      'accept': '*/*',
+      'accept-language': 'zh-CN,zh;q=0.9',
+      'content-type': 'application/json',
+      'connect-protocol-version': '1',
+      'origin': 'https://www.kimi.com',
+      'referer': 'https://www.kimi.com/',
+      'user-agent': UA,
+      'content-length': body.length,
+    };
+    const r = https.request({ host: KIMI_AUTH_HOST, path: KIMI_REFRESH_PATH, method: 'POST', headers }, res => {
+      let buf = '';
+      res.setEncoding('utf8');
+      res.on('data', d => { buf += d; });
+      res.on('end', () => {
+        let j = null;
+        try { j = JSON.parse(buf); } catch (e) {}
+        const at = j && (j.access_token || j.accessToken);
+        const nrt = j && (j.refresh_token || j.refreshToken);
+        if (res.statusCode === 200 && at) {
+          k.bearer = at;
+          if (nrt && nrt !== rt) { k.refreshToken = nrt; kimiPersist(); }
+          return resolve({ ok: true });
+        }
+        let msg = buf || ('HTTP ' + res.statusCode);
+        try {
+          const d = j && j.details && j.details[0] && j.details[0].debug;
+          if (d && d.reason) msg = d.reason + ' ' + ((d.localizedMessage && d.localizedMessage.message) || '');
+        } catch (e) {}
+        resolve({ ok: false, err: String(msg).slice(0, 200) });
+      });
+    });
+    r.setTimeout(30000, () => r.destroy(new Error('timeout')));
+    r.on('error', e => resolve({ ok: false, err: 'net ' + e.message }));
+    r.write(body);
+    r.end();
+  });
+}
+
+const KIMI_MIME = {
+  txt: 'text/plain', md: 'text/markdown', json: 'application/json', csv: 'text/csv',
+  c: 'text/x-c', h: 'text/x-c', py: 'text/x-python', sh: 'text/x-sh', js: 'text/javascript',
+  html: 'text/html', css: 'text/css', xml: 'text/xml', yaml: 'text/yaml', yml: 'text/yaml',
+  pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+  zip: 'application/zip', gz: 'application/gzip', tar: 'application/x-tar',
+};
+function kimiMime(name) {
+  const ext = (String(name).match(/\.([A-Za-z0-9]+)$/) || [])[1];
+  return KIMI_MIME[String(ext || '').toLowerCase()] || 'application/octet-stream';
+}
+
+// 上传到 Kimi：POST /apiv2-files/file/upload（multipart，字段名固定 file）
+// 返回 { raw: <File 对象，原样放进 message.blocks[].file>, id, name, size }
+async function kimiUploadFile(filePath, displayName) {
+  const fs2 = require('fs'), path2 = require('path');
+  const r0 = resolvePath(filePath);
+  if (!r0.path) throw new Error('找不到文件 ' + filePath);
+  if (r0.note) console.error('[dss] ' + r0.note);
+  const buf = fs2.readFileSync(r0.path);
+  const name = displayName || path2.basename(r0.path);
+  const mime = kimiMime(name);
+  const bnd = '----dss' + Date.now() + Math.random().toString(16).slice(2, 8);
+  const head = Buffer.from('--' + bnd + '\r\nContent-Disposition: form-data; name="file"; filename="' + name +
+    '"\r\nContent-Type: ' + mime + '\r\n\r\n', 'utf8');
+  const tail = Buffer.from('\r\n--' + bnd + '--\r\n', 'utf8');
+  const body = Buffer.concat([head, buf, tail]);
+
+  const post = () => new Promise((resolve, reject) => {
+    let k;
+    try { k = kimiLoad(); } catch (e) { return reject(e); }
+    const h = kimiHeaders(body.length);
+    h['content-type'] = 'multipart/form-data; boundary=' + bnd;
+    delete h['connect-protocol-version'];
+    const r = https.request({ host: KIMI_HOST, path: '/apiv2-files/file/upload', method: 'POST', headers: h }, res => {
+      let t = '';
+      res.setEncoding('utf8');
+      res.on('data', d => { t += d; });
+      res.on('end', () => resolve({ status: res.statusCode, text: t }));
+    });
+    r.setTimeout(180000, () => r.destroy(new Error('upload timeout')));
+    r.on('error', reject);
+    r.write(body);
+    r.end();
+  });
+
+  let r = await post();
+  if (r.status === 401) {
+    const rr = await kimiRefresh();
+    if (!rr.ok) throw new Error('续期失败: ' + rr.err);
+    r = await post();
+  }
+  if (r.status !== 200) throw new Error('HTTP ' + r.status + ' ' + kimiErrText(r.text));
+  let j = null;
+  try { j = JSON.parse(r.text); } catch (e) {}
+  const f = j && (j.file || j.data || j);
+  if (!f || !f.id) throw new Error('返回异常: ' + r.text.slice(0, 200));
+  return { raw: f, id: f.id, name: (f.meta && f.meta.name) || name, size: (f.meta && f.meta.sizeBytes) || buf.length };
+}
+
+function kimiEnvelope(obj) {
+  const payload = Buffer.from(JSON.stringify(obj), 'utf8');
+  const head = Buffer.alloc(5);
+  head[0] = 0;
+  head.writeUInt32BE(payload.length, 1);
+  return Buffer.concat([head, payload]);
+}
+
+function kimiHeaders(len) {
+  const k = kimiLoad();
+  const h = {
+    'accept': '*/*',
+    'accept-language': 'zh-CN,zh;q=0.9',
+    'authorization': 'Bearer ' + k.bearer,
+    'content-type': 'application/connect+json',
+    'connect-protocol-version': '1',
+    'origin': 'https://www.kimi.com',
+    'referer': 'https://www.kimi.com/',
+    'user-agent': UA,
+    'x-language': 'zh-CN',
+    'x-msh-platform': 'web',
+    'x-msh-version': '2.3.0',
+    'r-timezone': 'Asia/Shanghai',
+    'content-length': len,
+  };
+  if (k.cookie) h['cookie'] = k.cookie;
+  if (k.dev) h['x-msh-device-id'] = k.dev;
+  if (k.sess) h['x-msh-session-id'] = k.sess;
+  if (k.traffic) h['x-traffic-id'] = k.traffic;
+  return h;
+}
+
+// 解析 Connect 帧，返回已消费的字节数（未完整的帧留在 buffer 里）
+function kimiParseFrames(buf, acc, printer) {
+  let off = 0;
+  while (off + 5 <= buf.length) {
+    const len = buf.readUInt32BE(off + 1);
+    if (len > buf.length - off - 5) break;
+    const s = buf.slice(off + 5, off + 5 + len).toString('utf8');
+    off += 5 + len;
+    let j;
+    try { j = JSON.parse(s); } catch (e) { continue; }
+    if (j.chat && j.chat.id) acc.chatId = j.chat.id;
+    if (j.message) {
+      if (j.message.id && j.message.role === 'assistant') acc.msgId = j.message.id;
+      if (j.message.status) acc.status = j.message.status;
+    }
+    if (j.mask === 'message.status' && j.message && j.message.status) acc.status = j.message.status;
+    // 错误/限流帧：Kimi 用 code/message 表达，不放在 block.text 里
+    if (typeof j.code === 'string' && j.code !== 'OK' && j.code !== 'ok') {
+      acc.err = acc.err || (j.code + (j.message ? ': ' + String(j.message) : ''));
+      acc.errCode = acc.errCode || j.code;
+    }
+    if (j.error) {
+      const eo = (typeof j.error === 'object' && j.error) ? j.error : null;
+      acc.err = acc.err || (eo ? JSON.stringify(eo).slice(0, 240) : String(j.error).slice(0, 240));
+      if (eo && typeof eo.code === 'string') {
+        acc.errCode = acc.errCode || eo.code;
+        if (typeof eo.message === 'string') acc.err = eo.code + ': ' + eo.message;
+      }
+      // Connect 会把 details/debug 一起塞进 error 里
+      const det = eo && (eo.details || (eo.error && eo.error.details));
+      if (det && det[0]) {
+        const d = det[0].debug || {};
+        if (d.reason) acc.errCode = acc.errCode || String(d.reason);
+        if (d.localizedMessage && d.localizedMessage.message) acc.err = acc.err + ' ' + d.localizedMessage.message;
+      }
+    }
+    if (j.block && j.block.statusMessage) acc.err = acc.err || String(j.block.statusMessage).slice(0, 240);
+    if (j.block) {
+      const b = j.block;
+      if (b.think && typeof b.think.content === 'string' && b.think.content) acc.think += b.think.content;
+      if (b.text && typeof b.text.content === 'string' && b.text.content) {
+        acc.text += b.text.content;
+        if (printer) printer.write(b.text.content);
+      }
+    }
+  }
+  return off;
+}
+
+async function kimiChatOnce(prompt, state, printer, model) {
+  let k;
+  try { k = kimiLoad(); } catch (e) { return { text: '', err: e.message, code: 0 }; }
+  if (!k.bearer && k.refreshToken) {
+    const rr = await kimiRefresh();
+    if (!rr.ok) return { text: '', err: 'refresh 失败: ' + rr.err, code: 401 };
+  }
+  return new Promise(resolve => {
+    const mid = String(model || k.model || KIMI_DEF_MODEL).trim();
+    // 附件：只在会话首条消息带一次（和 DeepSeek 的 filesSent 语义一致）
+    const blocks = [];
+    if (state && state.kimiFiles && state.kimiFiles.length && !state.kimiFilesSent) {
+      for (const f of state.kimiFiles) blocks.push({ file: f.raw });
+    }
+    blocks.push({ message_id: '', text: { content: prompt } });
+    const req = {
+      scenario: 'SCENARIO_CHAT',
+      tools: KIMI_TOOLS ? [{ type: 'TOOL_TYPE_SEARCH', search: {} }, { type: 'TOOL_TYPE_CRON_JOB' }] : [],
+      message: {
+        role: 'user',
+        blocks: blocks,
+        scenario: 'SCENARIO_CHAT',
+        is_goal: false,
+      },
+      options: KIMI_THINK
+        ? { thinking: true, enable_plugin: KIMI_PLUGIN, reasoning_effort: 'REASONING_EFFORT_LOW', model: mid }
+        : { thinking: false, enable_plugin: KIMI_PLUGIN, model: mid },
+      project_id: '',
+    };
+    const cid = state.sessionId || state.kimiChatId;
+    if (cid) req.chat_id = cid;
+    const body = kimiEnvelope(req);
+    const acc = { text: '', think: '', chatId: cid || null, msgId: null, status: null, err: null, errCode: null };
+    const r = https.request({ host: KIMI_HOST, path: KIMI_PATH, method: 'POST', headers: kimiHeaders(body.length) }, res => {
+      if (res.statusCode !== 200) {
+        let buf = '';
+        res.setEncoding('utf8');
+        res.on('data', d => { buf += d; });
+        res.on('end', () => {
+          let ecode = null, msg = buf || ('HTTP ' + res.statusCode);
+          try {
+            const j = JSON.parse(buf);
+            if (typeof j.code === 'string') ecode = j.code;
+            const d = j.details && j.details[0] && j.details[0].debug;
+            if (d) msg = (d.reason || '') + ' ' + ((d.localizedMessage && d.localizedMessage.message) || '');
+          } catch (e) {}
+          resolve({ text: '', err: String(msg).slice(0, 800), errCode: ecode, code: res.statusCode });
+        });
+        return;
+      }
+      let buf = Buffer.alloc(0);
+      const rawDump = [];
+      res.on('data', d => {
+        rawDump.push(d);
+        buf = Buffer.concat([buf, d]);
+        const used = kimiParseFrames(buf, acc, printer);
+        if (used) buf = buf.slice(used);
+      });
+      res.on('end', () => {
+        if (buf.length >= 5) kimiParseFrames(buf, acc, printer);
+        if (printer) printer.flush();
+        if (state && state.kimiFiles && state.kimiFiles.length && (acc.text.trim() || acc.chatId)) {
+          state.kimiFilesSent = true;
+        }
+        if (!acc.text.trim()) {
+          try {
+            const dbg = process.env.DSS_KIMI_DUMP || '/tmp/dss/kimi_last.bin';
+            require('fs').mkdirSync(require('path').dirname(dbg), { recursive: true, mode: 0o700 });
+            require('fs').writeFileSync(dbg, rawDump.slice(-65536), { mode: 0o600 });
+          } catch (e) {}
+        }
+        resolve({ text: acc.text, think: acc.think, chatId: acc.chatId, err: acc.err, errCode: acc.errCode, code: 200, status: acc.status });
+      });
+      res.on('error', e => resolve({ text: acc.text, think: acc.think, chatId: acc.chatId, err: 'stream ' + e.message, code: 200 }));
+    });
+    r.setTimeout(STALL_MS, () => r.destroy(new Error('no data for ' + Math.round(STALL_MS / 1000) + 's')));
+    r.on('error', e => resolve({ text: acc.text, think: acc.think, chatId: acc.chatId, err: 'net ' + e.message, code: 0 }));
+    r.write(body);
+    r.end();
+  });
+}
+
+
+// ================= 豆包 (www.doubao.com) =================
+// 协议（2026-11 抓包 + 实测）：
+//   POST https://www.doubao.com/chat/completion?<aid/device_id/.../msToken/a_bogus>
+//   headers: content-type: application/json, agw-js-conv: str, str, cookie, x-flow-trace,
+//            user-agent 必须与抓包时一致（a_bogus 按它算的）
+//   body: {client_meta:{local_conversation_id,conversation_id,bot_id,last_section_id,last_message_index},
+//          messages:[{local_message_id,content_block:[{block_type:10000,content:{text_block:{text}}}]}],
+//          option:{unique_key,create_time_ms,need_create_conversation,...}, user_context:[], ext:{}}
+//   SSE: event: SSE_ACK(conversation_id/section_id) / STREAM_MSG_NOTIFY / STREAM_CHUNK(正文增量)
+//        / STREAM_ERROR / DOWNLINK_CMD(cmd 50080 = 已答过，去拉历史) / SSE_REPLY_END
+//   匿名态只能续已有会话（need_create_conversation=false），且频控极严（710022002 当前服务访问频繁）。
+const DOUBAO_HOST = 'www.doubao.com';
+
+function doubaoCredPath() { return process.env.DSS_DOUBAO_CRED || '/root/.dss/doubao.cred'; }
+
+function doubaoParseCred(txt) {
+  const t = String(txt || '');
+  const out = { query: '', headers: {}, cookie: '', bodyTpl: null, convId: '', localConv: '', sectionId: '', lastIndex: null, botId: '' };
+
+  const mu = t.match(/curl\s+'([^']+)'/);
+  if (!mu) throw new Error('凭据里没有 "curl \'https://www.doubao.com/chat/completion?...\'"');
+  const u = new URL(mu[1]);
+  out.query = u.search || '';
+
+  const re = /-H\s+'([^']+)'/g;
+  let m;
+  while ((m = re.exec(t)) !== null) {
+    const kv = m[1];
+    const i = kv.indexOf(':');
+    if (i > 0) out.headers[kv.slice(0, i).trim().toLowerCase()] = kv.slice(i + 1).trim();
+  }
+  m = t.match(/-b\s+'([^']*)'/);
+  if (m) out.cookie = m[1];
+
+  m = t.match(/--data-raw\s+'([\s\S]*?)'(?=\s*(?:;|$|\n))/);
+  if (!m) throw new Error('凭据里没有 --data-raw 里的 JSON body');
+  try { out.bodyTpl = JSON.parse(m[1]); } catch (e) { throw new Error('body 不是合法 JSON: ' + e.message); }
+
+  const cm = out.bodyTpl.client_meta || {};
+  out.localConv = cm.local_conversation_id || '';
+  out.convId = cm.conversation_id || '';
+  out.botId = cm.bot_id || '';
+  out.sectionId = cm.last_section_id || '';
+
+  // 可选覆盖行：conversation_id: 3845... / local_conversation_id: local_...
+  for (const raw of t.split('\n')) {
+    const ln = raw.trim();
+    let k;
+    if ((k = ln.match(/^conversation_id\s*[:=]\s*(\S+)$/i))) out.convId = k[1];
+    else if ((k = ln.match(/^local_conversation_id\s*[:=]\s*(\S+)$/i))) out.localConv = k[1];
+    else if ((k = ln.match(/^section_id\s*[:=]\s*(\S+)$/i))) out.sectionId = k[1];
+  }
+  return out;
+}
+
+let DOUBAO = null;
+function doubaoLoad() {
+  if (DOUBAO) return DOUBAO;
+  const p2 = doubaoCredPath();
+  let txt = '';
+  try { txt = fs.readFileSync(p2, 'utf8'); } catch (e) {
+    throw new Error('没有豆包凭据 ' + p2 + '（把 /chat/completion 的 Copy as cURL 粘进去）');
+  }
+  DOUBAO = doubaoParseCred(txt);
+  return DOUBAO;
+}
+
+function doubaoUuid() { return require('crypto').randomUUID(); }
+
+function doubaoBuildBody(prompt, d, state) {
+  const tpl = JSON.parse(JSON.stringify(d.bodyTpl));
+  const now = Date.now();
+  const cm = tpl.client_meta || (tpl.client_meta = {});
+  const conv = state.doubaoConv || d.convId || '';
+  cm.local_conversation_id = state.doubaoLocal || d.localConv || ('local_' + now);
+  cm.conversation_id = conv;
+  if (state.doubaoSection || d.sectionId) cm.last_section_id = state.doubaoSection || d.sectionId;
+  cm.last_message_index = (state.doubaoIndex != null) ? state.doubaoIndex
+    : (d.lastIndex == null ? null : d.lastIndex);
+  if (!cm.bot_id && d.botId) cm.bot_id = d.botId;
+
+  const msg = (tpl.messages && tpl.messages[0]) || { message_status: 0 };
+  msg.local_message_id = doubaoUuid();
+  const blk = (msg.content_block && msg.content_block[0]) || { block_type: 10000, parent_id: '', meta_info: [], extra_info: {}, append_fields: [] };
+  blk.block_type = blk.block_type || 10000;
+  blk.block_id = doubaoUuid();
+  blk.parent_id = '';
+  blk.content = { text_block: { text: prompt, icon_url: '', icon_url_dark: '', summary: '' }, pc_event_block: '' };
+  msg.content_block = [blk];
+  tpl.messages = [msg];
+
+  const opt = tpl.option || (tpl.option = {});
+  opt.unique_key = doubaoUuid();
+  opt.create_time_ms = now;
+  opt.need_create_conversation = !conv;
+  if (opt.recovery_option) opt.recovery_option.req_create_time_sec = Math.floor(now / 1000);
+  return tpl;
+}
+
+// 解析豆包 SSE：event: 行给类型，data: 行给 JSON
+function doubaoParseSSE(block, acc, printer) {
+  let ev = null;
+  const data = [];
+  for (const l of String(block).split('\n')) {
+    if (l.startsWith('event:')) ev = l.slice(6).trim();
+    else if (l.startsWith('data:')) data.push(l.slice(5).trim());
+  }
+  if (!data.length) return;
+  let j = null;
+  try { j = JSON.parse(data.join('\n')); } catch (e) { return; }
+
+  if (ev === 'SSE_ACK') {
+    const cm = j.ack_client_meta || {};
+    if (cm.conversation_id) acc.convId = cm.conversation_id;
+    if (cm.section_id) acc.sectionId = cm.section_id;
+    const ql = j.query_list && j.query_list[0];
+    if (ql && ql.message_index) acc.lastIndex = ql.message_index;
+    return;
+  }
+  if (ev === 'STREAM_ERROR') {
+    acc.errCode = j.error_code || acc.errCode;
+    acc.err = j.error_msg || JSON.stringify(j).slice(0, 200);
+    // shark 风控：extra.decision 里带 type/subtype，verify+slide 就是要求滑块验证
+    try {
+      const dec = j.extra && j.extra.decision;
+      const d = typeof dec === 'string' ? JSON.parse(dec) : dec;
+      if (d && d.type === 'verify') acc.verify = (d.subtype || 'verify') + (d.from ? '@' + d.from : '');
+    } catch (e) {}
+    return;
+  }
+  if (ev === 'DOWNLINK_CMD') {
+    if (j.cmd === 50080 && !acc.text) acc.err = '服务端判定该请求已答过（重复 unique_key），请换会话或稍后再试';
+    return;
+  }
+  if (ev !== 'STREAM_MSG_NOTIFY' && ev !== 'STREAM_CHUNK') return;
+
+  (function walk(o) {
+    if (!o || typeof o !== 'object') return;
+    if (Array.isArray(o.content_block)) {
+      for (const b of o.content_block) {
+        const tb = b && b.content && b.content.text_block;
+        if (tb && typeof tb.text === 'string' && tb.text !== '$' && tb.text !== '') {
+          acc.text += tb.text;
+          if (printer) printer.write(tb.text);
+        }
+      }
+    }
+    for (const k of Object.keys(o)) {
+      if (k === 'content_block') continue;
+      if (o[k] && typeof o[k] === 'object') walk(o[k]);
+    }
+  })(j);
+}
+
+function doubaoAskOnce(prompt, state, printer) {
+  return new Promise(resolve => {
+    let d;
+    try { d = doubaoLoad(); } catch (e) { return resolve({ text: '', err: e.message, code: 0 }); }
+    let body;
+    try { body = Buffer.from(JSON.stringify(doubaoBuildBody(prompt, d, state)), 'utf8'); }
+    catch (e) { return resolve({ text: '', err: 'body 构造失败: ' + e.message, code: 0 }); }
+
+    const h = Object.assign({}, d.headers);
+    h['content-type'] = 'application/json';
+    h['origin'] = 'https://www.doubao.com';
+    h['referer'] = 'https://www.doubao.com/chat/' + (state.doubaoLocal || d.localConv || '');
+    h['content-length'] = body.length;
+    if (d.cookie && !h['cookie']) h['cookie'] = d.cookie;
+    delete h['host']; delete h['content-length'];
+    h['content-length'] = body.length;
+
+    const acc = { text: '', convId: state.doubaoConv || d.convId || null, sectionId: null, lastIndex: null, err: null, errCode: null, verify: null };
+    const r = https.request({ host: DOUBAO_HOST, path: '/chat/completion' + (d.query || ''), method: 'POST', headers: h }, res => {
+      if (res.statusCode !== 200) {
+        let t = '';
+        res.setEncoding('utf8');
+        res.on('data', x => { t += x; });
+        res.on('end', () => resolve({ text: '', err: 'HTTP ' + res.statusCode + ' ' + t.slice(0, 200), code: res.statusCode }));
+        return;
+      }
+      let buf = '';
+      res.setEncoding('utf8');
+      res.on('data', chunk => {
+        buf += chunk;
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          const blk = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          doubaoParseSSE(blk, acc, printer);
+        }
+      });
+      res.on('end', () => {
+        if (buf.trim()) doubaoParseSSE(buf, acc, printer);
+        if (printer) printer.flush();
+        resolve({ text: acc.text, convId: acc.convId, sectionId: acc.sectionId, lastIndex: acc.lastIndex, err: acc.err, errCode: acc.errCode, verify: acc.verify || null, code: 200 });
+      });
+      res.on('error', e => resolve({ text: acc.text, err: 'stream ' + e.message, code: 200 }));
+    });
+    r.setTimeout(STALL_MS, () => r.destroy(new Error('no data for ' + Math.round(STALL_MS / 1000) + 's')));
+    r.on('error', e => resolve({ text: acc.text, err: 'net ' + e.message, code: 0 }));
+    r.write(body);
+    r.end();
+  });
+}
+
+// 单次豆包请求；重试/退避统一由 askText 的循环处理
+async function askDoubaoOnce(prompt, state, printer) {
+  const r = await doubaoAskOnce(prompt, state, printer);
+  if (r.convId) state.doubaoConv = r.convId;
+  if (r.sectionId) state.doubaoSection = r.sectionId;
+  if (r.lastIndex != null) state.doubaoIndex = r.lastIndex;
+  if (!state.doubaoLocal) {
+    try { state.doubaoLocal = doubaoLoad().localConv; } catch (e) {}
+  }
+
+  const text = (r.text || '').trim();
+  if (text.length >= 1) {
+    lastAnswerChars = text.length;
+    logConv('DOUBAO', text);
+    try {
+      const savedNow = CODE_MODE ? [] : saveScripts(text, CUR_LABEL);
+      if (savedNow.length) {
+        lastSaved = savedNow;
+        process.stderr.write('[dss] ' + savedNow.length + ' code file(s) saved: ' +
+          savedNow.map(x => require('path').basename(x.path)).join(', ') + '\n');
+      }
+    } catch (e) {}
+    return text;
+  }
+
+  const why = r.err || ('HTTP/SSE 无正文' + (r.code ? ' (' + r.code + ')' : ''));
+  if (r.verify) {
+    const e = new Error('豆包要求人机验证（shark ' + r.verify + '）—— 纯 HTTP 重放过不去，' +
+      '请在浏览器里打开 www.doubao.com 过一次滑块，再重粘一份 cURL；冷却期内也会被拦');
+    e.noRetry = true;
+    throw e;
+  }
+  if (String(r.errCode) === '710022002' || /频繁|too many|rate/i.test(why)) {
+    const e = new Error('豆包: ' + why);
+    e.rateLimited = true;
+    throw e;
+  }
+  if (r.err) throw new Error('豆包: ' + why);
+  return '';
+}
+
+// 单次 Kimi 请求；重试/限流退避由 askText 的循环统一处理（和 DeepSeek 同一条路）
+async function askKimiOnce(prompt, state, printer) {
+  const r = await kimiChatOnce(prompt, state, printer, CUR_MODEL);
+  if (r.chatId) { state.sessionId = r.chatId; state.kimiChatId = r.chatId; }
+
+  // 401：refresh_token 续期一次
+  if (r.code === 401 || /unauthor|token.*expir|expired/i.test(String(r.err || ''))) {
+    if (!state.kimiRefreshed) {
+      state.kimiRefreshed = true;
+      printer.flush();
+      process.stderr.write('\n[Kimi] access token 过期，用 refresh_token 自动续期…\n');
+      const rr = await kimiRefresh();
+      if (rr.ok) return askKimiOnce(prompt, state, printer);
+      const e = new Error('Kimi 自动续期失败: ' + rr.err);
+      e.kimiExpired = true;
+      throw e;
+    }
+    const e = new Error('Kimi 登录态失效（refresh 之后仍然 401）');
+    e.kimiExpired = true;
+    throw e;
+  }
+
+  const text = (r.text || '').trim();
+  if (text.length >= 1) {
+    lastAnswerChars = text.length;
+    logConv('KIMI', text);
+    try {
+      const savedNow = CODE_MODE ? [] : saveScripts(text, CUR_LABEL);
+      if (savedNow.length) {
+        lastSaved = savedNow;
+        process.stderr.write('[dss] ' + savedNow.length + ' code file(s) saved: ' +
+          savedNow.map(x => require('path').basename(x.path)).join(', ') + '\n');
+      }
+    } catch (e) {}
+    return text;
+  }
+
+  // 没拿到正文：把服务端给的原因亮出来；像限流的交给 backoff
+  const why = kimiErrText(r.err || (r.status ? 'status=' + r.status : '(empty)'));
+  const RETRYABLE = ['resource_exhausted', 'unavailable', 'deadline_exceeded', 'internal', 'aborted', 'rate_limited'];
+  const RETRY_RE = /resource_exhausted|unavailable|deadline_exceeded|server_overload|rate|too many|overload/i;
+  if ((r.errCode && RETRYABLE.indexOf(String(r.errCode)) >= 0) || RETRY_RE.test(String(r.err || '')) || looksRateLimited(why)) {
+    const e = new Error('Kimi: ' + why);
+    e.rateLimited = true;
+    throw e;
+  }
+  if (r.err) throw new Error('Kimi: ' + why);
+  return '';
+}
+
+
+// ================= 浏览器传输（wenxin / doubao） =================
+// 路由器上没有签名环境：用 chrome-headless-shell 的 --remote-debugging-pipe（fd3 写/fd4 读，\0 分隔），
+// 让页面自己去发请求（chat_token / a_bogus / 风控 / 滑块都交给浏览器），dss 只负责输入和读回正文。
+const CHROME_LAUNCHER = process.env.DSS_CHROME || '/opt/chrome-root/run-chrome.sh';
+const BROWSER_SITES = {
+  wenxin: { url: 'https://wenxin.baidu.com/', idle: /(正在思考|正在生成|停止生成|思考中)/ },
+  doubao: { url: 'https://www.doubao.com/chat/', idle: /(正在输入|思考中|停止生成|生成中)/ },
+};
+
+let CH = null;   // { proc, buf, pending, seq, targets: {} }
+
+function chStart() {
+  if (CH) return CH;
+  const args = ['--headless=new', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
+    '--remote-debugging-pipe', '--user-data-dir=' + (process.env.DSS_CHROME_PROFILE || '/root/.dss/chrome-profile'), 'about:blank'];
+  const proc = require('child_process').spawn(CHROME_LAUNCHER, args,
+    { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
+  const ch = { proc, buf: '', pending: new Map(), seq: 1, targets: {}, ready: false };
+  proc.stdio[4].setEncoding('utf8');
+  proc.stdio[4].on('data', d => {
+    ch.buf += d;
+    let i;
+    while ((i = ch.buf.indexOf('\0')) >= 0) {
+      const msg = ch.buf.slice(0, i);
+      ch.buf = ch.buf.slice(i + 1);
+      let j;
+      try { j = JSON.parse(msg); } catch (e) { continue; }
+      if (j.id && ch.pending.has(j.id)) { ch.pending.get(j.id)(j); ch.pending.delete(j.id); }
+    }
+  });
+  proc.on('exit', () => { if (CH === ch) CH = null; });
+  CH = ch;
+  return ch;
+}
+
+function chSend(method, params, sessionId, timeout) {
+  const ch = chStart();
+  const id = ch.seq++;
+  const m = { id, method, params: params || {} };
+  if (sessionId) m.sessionId = sessionId;
+  try { ch.proc.stdio[3].write(JSON.stringify(m) + '\0'); } catch (e) { return Promise.reject(e); }
+  return new Promise((res, rej) => {
+    ch.pending.set(id, res);
+    setTimeout(() => {
+      if (ch.pending.has(id)) { ch.pending.delete(id); rej(new Error('cdp timeout: ' + method)); }
+    }, timeout || 30000);
+  });
+}
+
+async function chAttach(key) {
+  const site = BROWSER_SITES[key];
+  const ch = chStart();
+  if (ch.targets[key]) {
+    try {
+      const ts = await chSend('Target.getTargets', {}, null, 10000);
+      if (ts.result.targetInfos.some(x => x.targetId === ch.targets[key])) {
+        const a = await chSend('Target.attachToTarget', { targetId: ch.targets[key], flatten: true });
+        await chSend('Page.enable', {}, a.result.sessionId, 10000).catch(() => {});
+        return a.result.sessionId;
+      }
+    } catch (e) {}
+  }
+  const t = await chSend('Target.createTarget', { url: site.url }, null, 30000);
+  ch.targets[key] = t.result.targetId;
+  const a = await chSend('Target.attachToTarget', { targetId: t.result.targetId, flatten: true });
+  await chSend('Page.enable', {}, a.result.sessionId, 10000).catch(() => {});
+  return a.result.sessionId;
+}
+
+// 页面跳转会把上下文冲掉：遇到就重新 attach
+async function chEval(key, sid, expr, awaitPromise) {
+  let s = sid;
+  for (let i = 0; i < 5; i++) {
+    try {
+      const r = await chSend('Runtime.evaluate',
+        { expression: expr, returnByValue: true, awaitPromise: !!awaitPromise }, s, 60000);
+      if (r.error && /navigated|closed|Cannot find context|Execution context/i.test(r.error.message)) {
+        await sleep(700);
+        s = await chAttach(key);
+        continue;
+      }
+      return r;
+    } catch (e) {
+      await sleep(700);
+      try { s = await chAttach(key); } catch (x) {}
+    }
+  }
+  return null;
+}
+
+function chVal(r) {
+  return (r && r.result && r.result.result && r.result.result.value !== undefined) ? r.result.result.value : null;
+}
+
+async function chSettle(key, sid) {
+  let prev = '';
+  for (let i = 0; i < 25; i++) {
+    const v = chVal(await chEval(key, sid, 'location.href + "|" + document.readyState'));
+    if (v && v === prev && /complete$/.test(v)) return v;
+    prev = v || prev;
+    await sleep(600);
+  }
+  return prev;
+}
+
+const CH_SUBMIT_JS = (prompt) => `(function(){
+  const q = ${JSON.stringify('__Q__')};
+  const el = document.querySelector('textarea') || document.querySelector('[contenteditable]');
+  if (!el) return 'no-input';
+  if (el.tagName === 'TEXTAREA') {
+    const set = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+    set.call(el, q);
+  } else { el.textContent = q; }
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.focus();
+  el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+  el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+  return 'sent';
+})()`;
+
+const CH_OBSERVE_JS = `(function(){
+  window.__dssBuf = '';
+  try { if (window.__dssObs) window.__dssObs.disconnect(); } catch (e) {}
+  window.__dssObs = new MutationObserver(function (ms) {
+    for (const m of ms) for (const n of m.addedNodes) {
+      if (n && n.nodeType === 1) {
+        const t = n.innerText || n.textContent || '';
+        if (t) window.__dssBuf += t + '\\n';
+      }
+    }
+  });
+  window.__dssObs.observe(document.body, { childList: true, subtree: true });
+  return 'observed';
+})()`;
+
+async function askBrowser(prompt, state, printer) {
+  const key = CUR_BACKEND === 'doubao' ? 'doubao' : 'wenxin';
+  const site = BROWSER_SITES[key];
+  let sid = await chAttach(key);
+  await chSettle(key, sid);
+  sid = await chAttach(key);                 // 跳转后重新拿 sessionId
+
+  // SPA（豆包）挂载很慢：先等输入框真的出现，别急着判定失败
+  let ready = false;
+  for (let i = 0; i < 45; i++) {
+    const v = chVal(await chEval(key, sid,
+      "!!(document.querySelector('textarea')||document.querySelector('[contenteditable]'))"));
+    if (v === true) { ready = true; break; }
+    await sleep(700);
+  }
+  if (!ready) throw new Error('页面一直没有输入框（未加载完或被要求登录）');
+
+  const obs = await chEval(key, sid, CH_OBSERVE_JS);
+  if (chVal(obs) !== 'observed') throw new Error('浏览器注入失败（chrome 未就绪？）');
+
+  const sub = await chEval(key, sid, CH_SUBMIT_JS(prompt).replace('__Q__', prompt));
+  const sv = chVal(sub);
+  if (sv !== 'sent') throw new Error('页面上找不到输入框（页面结构变了或没加载完）');
+
+  let printed = 0, stable = 0, lastLen = 0;
+  const t0 = Date.now();
+  while (Date.now() - t0 < 180000) {
+    await sleep(900);
+    const buf = chVal(await chEval(key, sid, 'window.__dssBuf || ""'));
+    if (typeof buf === 'string' && buf.length > printed) {
+      printer.write(buf.slice(printed));
+      printed = buf.length;
+      stable = 0;
+    } else {
+      stable++;
+    }
+    // 正文稳定 && 页面不在“思考中” → 结束
+    const body = chVal(await chEval(key, sid, '(function(){var t=document.body.innerText||"";return t.slice(-200);})()'));
+    const busy = typeof body === 'string' && site.idle.test(body);
+    if (!busy && stable >= 3 && printed > 0) break;
+    lastLen = printed;
+  }
+  printer.flush();
+
+  const buf = chVal(await chEval(key, sid, 'window.__dssBuf || ""')) || '';
+  // 去掉我们自己的提问回显和常见尾部噪声
+  let text = String(buf)
+    .replace(prompt, '')
+    .replace(/内容由AI生成[^\n]*/g, '')
+    .replace(/对话支持收藏啦?/g, '')
+    .replace(/^\s+|\s+$/g, '');
+  if (!text) throw new Error('浏览器里没抓到正文（页面可能要求登录或一直在思考）');
+  return text;
+}
+
+
+// ================= 通用 OpenAI 兼容后端（智谱 / 硅基流动 / 千帆 / 混元 / Ark / OpenRouter） =================
+// 凭据 /root/.dss/openai.cred（0600），三行：
+//   base: https://open.bigmodel.cn/api/paas/v4
+//   key:  xxxxxxxx
+//   model: glm-4-flash
+// 请求 POST {base}/chat/completions，stream:true，SSE: data:{"choices":[{"delta":{"content":"…"}}]}
+function apiCredPath() { return process.env.DSS_API_CRED || '/root/.dss/openai.cred'; }
+
+let API = null;
+function apiLoad() {
+  if (API) return API;
+  const p2 = apiCredPath();
+  let txt = '';
+  try { txt = fs.readFileSync(p2, 'utf8'); } catch (e) {
+    throw new Error('没有 API 凭据 ' + p2 + '（base/key/model 三行）');
+  }
+  const out = { base: '', key: '', model: '' };
+  for (const raw of txt.split('\n')) {
+    const m = raw.trim().match(/^(base|key|model)\s*:\s*(\S.*)$/i);
+    if (m) out[m[1].toLowerCase()] = m[2].trim();
+  }
+  if (!out.base || !out.key) throw new Error(p2 + ' 缺少 base 或 key');
+  out.base = out.base.replace(/\/+$/, '');
+  API = out;
+  return API;
+}
+
+function apiHistory(state) {
+  if (!state.apiMessages) state.apiMessages = [];
+  return state.apiMessages;
+}
+
+function apiAskOnce(prompt, state, printer) {
+  return new Promise(resolve => {
+    let cfg;
+    try { cfg = apiLoad(); } catch (e) { return resolve({ text: '', err: e.message, code: 0 }); }
+    const model = String(CUR_MODEL || cfg.model || '').trim();
+    if (!model) return resolve({ text: '', err: 'API 后端没有模型名（LuCI 或 --model-a）', code: 0 });
+
+    const hist = apiHistory(state);
+    const msgs = hist.concat([{ role: 'user', content: prompt }]);
+    const reqBody = { model, messages: msgs, stream: true };
+    // 实测：glm-4.5-flash 开思考首字 8.0s / 关思考 5.0s / glm-4-flash 0.67s
+    if (/^glm-4\.[5-9]/.test(model) && !API_THINK) reqBody.thinking = { type: 'disabled' };
+    const payload = Buffer.from(JSON.stringify(reqBody), 'utf8');
+    let u;
+    try { u = new URL(cfg.base + '/chat/completions'); } catch (e) { return resolve({ text: '', err: 'base 不是合法 URL', code: 0 }); }
+    const headers = {
+      'content-type': 'application/json',
+      'authorization': 'Bearer ' + cfg.key,
+      'accept': 'text/event-stream',
+      'content-length': payload.length,
+      'user-agent': UA,
+    };
+    const acc = { text: '', err: null };
+    const lib = (u.protocol === 'http:') ? require('http') : https;
+    const r = lib.request({ host: u.hostname, port: u.port || (u.protocol === 'http:' ? 80 : 443), path: u.pathname + u.search, method: 'POST', headers }, res => {
+      if (res.statusCode !== 200) {
+        let t = '';
+        res.setEncoding('utf8');
+        res.on('data', d => { t += d; });
+        res.on('end', () => resolve({ text: '', err: 'HTTP ' + res.statusCode + ' ' + kimiErrText(t).slice(0, 200), code: res.statusCode }));
+        return;
+      }
+      let buf = '';
+      res.setEncoding('utf8');
+      res.on('data', d => {
+        buf += d;
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i).trim();
+          buf = buf.slice(i + 1);
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim();
+          if (data === '[DONE]') continue;
+          let j;
+          try { j = JSON.parse(data); } catch (e) { continue; }
+          if (j.error) { acc.err = j.error.message || JSON.stringify(j.error).slice(0, 200); continue; }
+          const ch2 = j.choices && j.choices[0];
+          const d2 = ch2 && ch2.delta && ch2.delta.content;
+          const rc = ch2 && ch2.delta && ch2.delta.reasoning_content;
+          if (typeof rc === 'string' && rc) {
+            acc.think = (acc.think || '') + rc;          // 思考内容单独攒着，不打印
+          }
+          if (typeof d2 === 'string' && d2) { acc.text += d2; if (printer) printer.write(d2); }
+        }
+      });
+      res.on('end', () => {
+        if (printer) printer.flush();
+        // GLM-4.5 有时只回思考不回正文：别当空回答，落到 think 上
+        if (!acc.text && acc.think) acc.text = acc.think;
+        resolve({ text: acc.text, err: acc.err, code: 200 });
+      });
+      res.on('error', e => resolve({ text: acc.text, err: 'stream ' + e.message, code: 200 }));
+    });
+    r.setTimeout(STALL_MS, () => r.destroy(new Error('no data for ' + Math.round(STALL_MS / 1000) + 's')));
+    r.on('error', e => resolve({ text: acc.text, err: 'net ' + e.message, code: 0 }));
+    r.write(payload);
+    r.end();
+  });
+}
+
+async function askApiOnce(prompt, state, printer) {
+  const r = await apiAskOnce(prompt, state, printer);
+  const text = (r.text || '').trim();
+  if (text.length >= 1) {
+    const hist = apiHistory(state);
+    hist.push({ role: 'user', content: prompt });
+    hist.push({ role: 'assistant', content: text });
+    if (hist.length > 40) hist.splice(0, hist.length - 40);
+    lastAnswerChars = text.length;
+    logConv('API', text);
+    try {
+      const savedNow = CODE_MODE ? [] : saveScripts(text, CUR_LABEL);
+      if (savedNow.length) {
+        lastSaved = savedNow;
+        process.stderr.write('[dss] ' + savedNow.length + ' code file(s) saved: ' +
+          savedNow.map(x => require('path').basename(x.path)).join(', ') + '\n');
+      }
+    } catch (e) {}
+    return text;
+  }
+  const why = r.err || ('HTTP/SSE 无正文' + (r.code ? ' (' + r.code + ')' : ''));
+  if (r.code === 401 || r.code === 403 || /invalid.*(api.?key|token)|unauthor/i.test(why)) {
+    const e = new Error('API Key 无效或过期：' + why);
+    e.noRetry = true;
+    throw e;
+  }
+  if (r.code === 429 || /rate|too many|频繁|quota/i.test(why)) {
+    const e = new Error('API 限流/额度用尽：' + why);
+    e.rateLimited = true;
+    throw e;
+  }
+  if (r.err) throw new Error('API 错误：' + why);
+  return '';
+}
 
 async function askText(c, pow, prompt, state, printer, tries) {
   if (process.env.DSS_DRY === '1') {
@@ -957,9 +2156,28 @@ async function askText(c, pow, prompt, state, printer, tries) {
     return '（dry-run）';
   }
   tries = tries || 3;
+  if (CUR_BACKEND === 'deepseek' && (!c || !c.token)) {
+    throw new Error('当前后端是 deepseek，但没有 DeepSeek 令牌（改用 --backend-a kimi / doubao / wenxin）');
+  }
   let text = '';
   for (let i = 0; i < tries; i++) {
-    text = (await ask(c, pow, prompt, state, printer)) || '';
+    try {
+      text = (CUR_BACKEND === 'kimi')
+        ? await askKimiOnce(prompt, state, printer)
+        : (CUR_BACKEND === 'doubao' || CUR_BACKEND === 'wenxin')
+          ? await askBrowser(prompt, state, printer)
+          : (CUR_BACKEND === 'api' || CUR_BACKEND === 'glm' || CUR_BACKEND === 'openai')
+            ? await askApiOnce(prompt, state, printer)
+            : ((await ask(c, pow, prompt, state, printer)) || '');
+    } catch (e) {
+      if (e && e.noRetry) throw e;
+      if (e && e.rateLimited) {
+        await backoff(String(e.message || ''));
+        i--;
+        continue;
+      }
+      throw e;
+    }
     if (looksRateLimited(text)) {
       await backoff('server said: ' + String(text).trim().slice(0, 60));
       i--;                       // 限流不算一次失败重试
@@ -967,18 +2185,18 @@ async function askText(c, pow, prompt, state, printer, tries) {
     }
     // 只要不是完全空就算有效（"2"、"ok" 这种短答案很常见）
     if (text.trim().length >= 1) {
-      paceMs = Math.max(3000, Math.round(paceMs * 0.8));
+      lastAnswerChars = text.length;
+      if (rlHits === 0) paceMs = Math.max(3000, Math.round(paceMs * 0.85));
       emptyStreak = 0;
       return text;
     }
     // 连续空回答通常就是被风控了（服务端只回 200+空，不给文字提示）
     emptyStreak++;
-    if (emptyStreak >= 3) {
-      paceMs = Math.min(Math.round(paceMs * 2), PACE_MAX);
-      process.stderr.write('\n[rate-limited?] ' + emptyStreak + ' empty answers in a row -> waiting ' +
-        Math.round(paceMs / 1000) + 's and slowing down to ' + Math.round(paceMs / 1000) + 's/request\n');
-      await new Promise(r => setTimeout(r, paceMs));
+    if (emptyStreak >= 2) {
+      await backoff('连续 ' + emptyStreak + ' 次空回答（服务端多半在限流）');
       emptyStreak = 0;
+      i--;                       // 退避后不算一次失败重试，继续等
+      continue;
     }
     printer.flush();
     process.stderr.write('\n(空回答，重试 ' + (i + 1) + '/' + tries + ')\n');
@@ -1022,7 +2240,7 @@ async function askCode(c, pow, prompt, state, printer) {
       '不要重复已输出的内容，不要开场白；仍然用代码块输出。', state, printer, 2)) || '';
     acc = acc.replace(/\s+$/, '') + '\n' + more;
   }
-  if (hasCode(acc) && !codeTruncated(acc)) return acc;
+  if (hasCode(acc) && !codeTruncated(acc)) { persist(acc); return acc; }
 
   for (let round = 1; round <= 3; round++) {
     printer.flush();
@@ -1035,7 +2253,7 @@ async function askCode(c, pow, prompt, state, printer) {
         '请**从断点继续**输出剩余代码：新开一个 ```' + lang + ' 代码块，接着上面的最后一个函数/语句写；' +
         '不要重复已输出的内容，不要开场白，不要总结。', state, printer, 2)) || '';
       acc = acc.replace(/\s+$/, '') + '\n' + more;
-      if (hasCode(more) && !codeTruncated(more)) return acc;
+      if (hasCode(more) && !codeTruncated(more)) { persist(acc); return acc; }
       continue;
     }
     // 完全没有代码块
@@ -1044,14 +2262,26 @@ async function askCode(c, pow, prompt, state, printer) {
       '你上一条回答里没有任何代码块，属于无效回答。现在只输出一个代码块' +
       '（语言按题目：C 用 ```c、shell 用 ```sh、python 用 ```python、Java 用 ```java 等），完整可直接运行，不要任何解释文字。',
       state, printer, 2)) || acc;
-    if (hasCode(acc) && !codeTruncated(acc)) return acc;
+    if (hasCode(acc) && !codeTruncated(acc)) { persist(acc); return acc; }
   }
+  persist(acc);
   return acc;
+}
+
+function persist(text, label) {
+  try {
+    const saved = saveScripts(text, label || CUR_LABEL);
+    if (saved.length) {
+      process.stderr.write('[dss] ' + saved.length + ' code file(s) [' + (label || CUR_LABEL) + ']: ' +
+        saved.map(x => require('path').basename(x.path) + '(' + x.mode + ')').join(', ') + '\n');
+    }
+  } catch (e) {}
 }
 
 // ---------- 自我对话：两个独立会话，一个只问、一个只答 ----------
 async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
-  pauseMs = (pauseMs === undefined) ? 1000 : pauseMs;
+  pauseMs = (shared && shared.pause !== undefined) ? shared.pause
+          : ((pauseMs === undefined) ? 2000 : pauseMs);
   shared = shared || {};
   const codeMode = !!shared.code;
   const roleA = shared.roleA || '';
@@ -1059,19 +2289,22 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
   let aPromptRole = '';
   const maxMs = (shared.maxMinutes > 0) ? shared.maxMinutes * 60000 : 0;
   const fileIds = (shared.fileIds || []).slice();
+  const kimiFiles = (shared.kimiFiles || []).slice();
   const useSearch = !!shared.search;
   const total = (rounds > 0) ? (rounds + ' rounds') : 'unlimited, Ctrl-C to stop';
   // 横幅用 ASCII：中文在很多终端里是乱码，看不出来模式有没有生效
   const extra = (fileIds.length ? ', ' + fileIds.length + ' attachment(s)' : '') +
     (useSearch ? ', web search' : '') + (codeMode ? ', CODE MODE' : '') +
-    (roleA ? ', roleA=' + roleA : '') + (roleB ? ', roleB=' + roleB : '');
+    (roleA ? ', roleA=' + roleA : '') + (roleB ? ', roleB=' + roleB : '') +
+    ', A=' + (BACKEND_A || 'deepseek') + (MODEL_A ? '/' + MODEL_A : '') +
+    ', B=' + (BACKEND_B || 'deepseek') + (MODEL_B ? '/' + MODEL_B : '');
   printer.write('\n=== dss ' + DSS_VERSION + ' SELF-DIALOGUE: ' + topic + ' (' + total + extra + ')\n');
   printer.flush();
 
-  const A = { sessionId: null, parentId: null, fileIds: fileIds, search: useSearch, filesSent: false };   // 提问方
-  const B = { sessionId: null, parentId: null, fileIds: fileIds, search: useSearch, filesSent: false };   // 回答方
-  try { A.sessionId = await session(c); } catch (e) {}
-  try { B.sessionId = await session(c); } catch (e) {}
+  const A = { sessionId: null, parentId: null, fileIds: (shared.fileIds || []).slice(), kimiFiles: (shared.kimiFiles || []).slice(), search: useSearch, filesSent: false, kimiFilesSent: false };   // 提问方
+  const B = { sessionId: null, parentId: null, fileIds: (shared.fileIdsB || shared.fileIds || []).slice(), kimiFiles: (shared.kimiFilesB || shared.kimiFiles || []).slice(), search: useSearch, filesSent: false, kimiFilesSent: false };   // 回答方
+  try { if ((BACKEND_A || 'deepseek') === 'deepseek') A.sessionId = await session(c); } catch (e) {}
+  try { if ((BACKEND_B || 'deepseek') === 'deepseek') B.sessionId = await session(c); } catch (e) {}
 
   let lastB = '';
   let done = 0;
@@ -1088,17 +2321,21 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
     let qPrompt = codeMode
       ? (i === 1
         ? '你是【架构师/提问方】。围绕「' + topic + '」向实现者提出第一个能推进落地的问题：' +
-          '要求他**分批交付**——第一批只给最核心的 1~2 个文件（约 ' + BATCH_LINES + ' 行以内），' +
-          '并在末尾声明总共要分几批（PART 1/N）以及后续每批包含什么；' +
+          '要求他**以文件为单位分批交付**——第一批给 1~3 个**完整文件**（不要把同一个文件切成两半），' +
+          '并在末尾声明总共要分几批（PART 1/N）以及后续每批包含哪些文件；' +
+          '只有单个文件确实超过约 400 行时，才允许把它拆成多段（每段注释里保留同一文件名，客户端会合并）。' +
           '明确说明"不要一次性输出全部代码"。语言与技术栈按这个项目/题目的实际情况来定，' +
           '不要套用与项目无关的硬件模板（除非题目确实是驱动/寄存器类）。' +
           '不要讨论文档有没有定义。只输出问题本身。'
         : '实现者刚才交付了这一批内容（共 ' + lastB.length + ' 字符）：\n"""\n' +
-          (lastB.length > 8000 ? lastB.slice(0, 4000) + '\n…（中间省略）…\n' + lastB.slice(-4000) : lastB) +
+          (lastB.length > 150000
+            ? lastB.slice(0, 75000) + '\n…（为控制长度省略中段 ' + (lastB.length - 150000) + ' 字符，这是刻意的，不要因此说对方只给了片段）…\n' + lastB.slice(-75000)
+            : lastB) +
           '\n"""\n' +
-          '请审查它：指出具体缺哪段代码、哪处逻辑/接口不对，并要求他补出完整可运行的文件，' +
-          '不要泛泛而谈；不要因为"只看到片段"而重复要求补开头（上面已是完整内容）。' +
-          '你的问题里必须明确写"请给出完整可编译的代码块"。只输出问题本身。')
+          '请审查这一批：**若上面标了 PART k/N 或明显只交付了部分文件，那是刻意的分批，' +
+          '不要因为“文件没写完/只是片段”而要求他重发全部代码**；只指出这一批的具体错误，' +
+          '然后要求交付下一批（PART k+1），同样控制在约 ' + BATCH_LINES + ' 行以内。' +
+          '你的问题里必须明确写"请给出这一批的完整代码块（PART k+1/N）"。只输出问题本身。')
       : (i === 1
         ? '你在和另一个人对话。请围绕「' + topic + '」向对方提出一个具体、有深度的问题。' +
           '只输出问题本身，不要寒暄、不要解释你在做什么。'
@@ -1108,10 +2345,12 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
     if (roleA) qPrompt = roleText(roleA, '提问方') + qPrompt;
     if (roleB) aPromptRole = roleText(roleB, '回答方');
 
-    if (i > 1 && pauseMs > 0) await new Promise(r => setTimeout(r, pauseMs));
+    CUR_LABEL = '第 ' + i + ' 轮回答';
+    if (pauseMs > 0 && i > 1) await new Promise(r => setTimeout(r, pauseMs));
     printer.write('\n--- 第 ' + i + ' 轮 ---\n[A·提问] ');
     printer.flush();
     let q = '';
+    CUR_BACKEND = BACKEND_A || 'deepseek'; CUR_MODEL = MODEL_A || '';
     try { q = (await askText(c, pow, qPrompt, A, printer)) || ''; }
     catch (e) {
       printer.flush();
@@ -1125,6 +2364,7 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
       continue;
     }
 
+    if (pauseMs > 0) await new Promise(r => setTimeout(r, pauseMs));
     printer.write('\n[B·回答] ');
     printer.flush();
     let a = '';
@@ -1136,11 +2376,13 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
           'Java/Kotlin/Android 用 ```java/```kotlin；补丁用 ```diff），' +
           '不要只写片段或伪代码；项目未写清的地方自行取合理值并用注释 /* TODO: 假设 xxx */ 标注，' +
           '绝不允许只说文档没定义或只做元讨论，也不要塞与题目无关的硬件驱动代码。' +
-          '**分批输出**：如果总量超过约 ' + BATCH_LINES + ' 行，这次只输出第 1 批（1~2 个文件），' +
-          '末尾用 /* PART 1/N: 未完，下一批: xxx */ 说明剩余部分；' +
-          '不要把所有代码挤进一条回答，客户端会自动要后续批次。'
+          '**分批输出，但以文件为单位**：这次只输出第 1 批——1~3 个**完整文件**，' +
+          '每个文件开头注释里写清文件名；不要把同一个文件按行数切成几块。' +
+          '只有单个文件超过约 400 行时才拆段，且每段注释里都写同一个文件名（客户端会拼成一个文件）。' +
+          '末尾用 /* PART 1/N: 未完，下一批: xxx */ 说明剩余部分。'
         : '对方问你：\n"""\n' + q + '\n"""\n请直接回答这个问题。';
       if (aPromptRole) aPrompt = aPromptRole + aPrompt;
+      CUR_BACKEND = BACKEND_B || 'deepseek'; CUR_MODEL = MODEL_B || '';
       a = ((codeMode ? await askCode(c, pow, aPrompt, B, printer)
                      : await askText(c, pow, aPrompt, B, printer))) || '';
     } catch (e) {
@@ -1167,8 +2409,65 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
 // ---------- main ----------
 (async () => {
   const args = process.argv.slice(2);
-  // 没令牌时给一句人话（不要 fatal 堆栈）
-  if (!process.env.DSS_CRED && !require('fs').existsSync('/root/.dss/cred')) {
+  // 自检：DSS_DOUBAO_CREDTEST=<file> 验证豆包凭据解析（不打印明文）
+  if (process.env.DSS_DOUBAO_CREDTEST) {
+    const d = doubaoParseCred(fs.readFileSync(process.env.DSS_DOUBAO_CREDTEST, 'utf8'));
+    console.log(JSON.stringify({
+      queryLen: d.query.length,
+      headers: Object.keys(d.headers).sort(),
+      cookie: d.cookie ? (d.cookie.split(';').length + ' pair(s)') : '(none)',
+      bot: d.botId, conv: d.convId || '(empty)', local: d.localConv,
+      bodyKeys: Object.keys(d.bodyTpl || {}).sort(),
+      promptPath: d.bodyTpl && d.bodyTpl.messages && d.bodyTpl.messages[0] &&
+        d.bodyTpl.messages[0].content_block && d.bodyTpl.messages[0].content_block[0] &&
+        d.bodyTpl.messages[0].content_block[0].content &&
+        d.bodyTpl.messages[0].content_block[0].content.text_block &&
+        d.bodyTpl.messages[0].content_block[0].content.text_block.text,
+    }, null, 1));
+    process.exit(0);
+  }
+  // 自检：DSS_KIMI_CREDTEST=<file> 验证 Kimi 凭据解析（不打印明文）
+  if (process.env.DSS_KIMI_CREDTEST) {
+    const d = kimiParseCred(fs.readFileSync(process.env.DSS_KIMI_CREDTEST, 'utf8'));
+    console.log(JSON.stringify({
+      bearer: d.bearer ? (d.bearer.length + 'B ' + d.bearer.slice(0, 8) + '…') : '(none)',
+      cookie: d.cookie ? (d.cookie.split(';').length + ' pair(s), kimi-auth=' + (/kimi-auth=/.test(d.cookie) ? 'yes' : 'no')) : '(none)',
+      dev: d.dev, sess: d.sess, traffic: d.traffic, model: d.model,
+    }));
+    process.exit(0);
+  }
+  // 自检：DSS_KIMI_SELFTEST=<file> 用真机抓到的 Connect 流回放验证解析（不联网）
+  if (process.env.DSS_KIMI_SELFTEST) {
+    const raw = fs.readFileSync(process.env.DSS_KIMI_SELFTEST);
+    const acc = { text: '', think: '', chatId: null, msgId: null, status: null, err: null };
+    let used = 0;
+    const step = parseInt(process.env.DSS_KIMI_CHUNK || '0', 10);
+    if (step > 0) {
+      let off = 0, carry = Buffer.alloc(0);
+      while (off < raw.length) {
+        carry = Buffer.concat([carry, raw.slice(off, off + step)]);
+        off += Math.min(step, raw.length - off);
+        const u = kimiParseFrames(carry, acc, null);   // 模拟网络分片，残留字节留到下一片
+        carry = carry.slice(u);
+        used += u;
+      }
+    } else {
+      used = kimiParseFrames(raw, acc, null);
+    }
+    console.log(JSON.stringify({
+      len: acc.text.length, text: acc.text.slice(0, 120), err: acc.err || null, errCode: acc.errCode || null,
+      thinkLen: acc.think.length, chatId: acc.chatId, status: acc.status,
+      consumed: used, total: raw.length, complete: used === raw.length,
+    }));
+    process.exit(0);
+  }
+  const hasDsCred = !!(process.env.DSS_CRED || require('fs').existsSync('/root/.dss/cred'));
+  const hasKimiCred = !!(process.env.DSS_KIMI_CRED || require('fs').existsSync(kimiCredPath()));
+  const hasApiCred = !!(process.env.DSS_API_CRED || require('fs').existsSync(apiCredPath()));
+  const hasDoubaoCred = !!(process.env.DSS_DOUBAO_CRED || require('fs').existsSync(doubaoCredPath()));
+  const wantAlt = args.some((a, i) => (a === '--backend-a' || a === '--backend-b') &&
+    ['kimi', 'doubao', 'wenxin', 'api', 'glm', 'openai'].indexOf(String(args[i + 1] || '')) >= 0);
+  if (!hasDsCred && !hasKimiCred && !hasDoubaoCred && !hasApiCred && !wantAlt) {
     const port = (uciDefaults().port || '88');
     console.error('[dss] 还没有令牌。打开 http://<盒子IP>:' + port + '/token 粘贴一个，');
     console.error('      或者在 LuCI: 服务 -> dss -> Settings 里粘贴 copy(localStorage.userToken)');
@@ -1180,26 +2479,47 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
     const v = parseInt(uciD.pace, 10);
     if (v > 0) paceMs = Math.max(1000, v * 1000);
   }
+  if (uciD.kimi_think === '1') KIMI_THINK = true;
+  if (uciD.kimi_tools === '1') KIMI_TOOLS = true;
+  if (uciD.kimi_plugin === '1') KIMI_PLUGIN = true;
   if (uciD.search === '1' && !args.includes('--search')) args.push('--search');
   if (uciD.code === '1' && !args.includes('--code')) args.push('--code');
+  for (const [k, flag] of [['backend_a','--backend-a'], ['backend_b','--backend-b'],
+                           ['model_a','--model-a'], ['model_b','--model-b']]) {
+    if (uciD[k] && !args.includes(flag)) { args.push(flag); args.push(uciD[k]); }
+  }
+  if (uciD.pause && !args.includes('--pause')) { args.push('--pause'); args.push(uciD.pause); }
   if (uciD.role_a && !args.includes('--role-a')) { args.push('--role-a'); args.push(uciD.role_a); }
   if (uciD.role_b && !args.includes('--role-b')) { args.push('--role-b'); args.push(uciD.role_b); }
   if (uciD.rounds && !args.includes('--rounds')) { args.push('--rounds'); args.push(uciD.rounds); }
   if (uciD.minutes && !args.includes('--minutes')) { args.push('--minutes'); args.push(uciD.minutes); }
-  const c = cred();
-  const pow = makePoller();
+  let c;
+  try { c = cred(); } catch (e) { c = { token: '', cookie: '' }; }
+  // 只用 Kimi 时不必初始化 DeepSeek 的 PoW worker（真机实测省掉 ~1.4s 启动）
+  const _argv = (f) => { const i = process.argv.indexOf(f); return i >= 0 ? String(process.argv[i + 1] || '') : ''; };
+  const _ba0 = _argv('--backend-a') || _argv('--backend-b') || 'deepseek';
+  const _bb0 = _argv('--backend-b') || _ba0;
+  const NO_DEEPSEEK = (_ba0 !== 'deepseek' && _bb0 !== 'deepseek');
+  const pow = (c.token && !NO_DEEPSEEK) ? makePoller() : null;
   const printer = makePrinter();
   const state = { sessionId: null, parentId: null, fileIds: [], search: false };
 
   async function oneShot(prompt) {
-    if (!state.sessionId) {
+    CUR_BACKEND = BACKEND_A || 'deepseek';
+    CUR_MODEL = MODEL_A || '';
+    if (CUR_BACKEND === 'deepseek' && !state.sessionId) {
       try { state.sessionId = await session(c); } catch (e) {}
     }
-    process.stdout.write('\n[DeepSeek] ');
+    process.stdout.write('\n[' + (CUR_BACKEND === 'kimi' ? 'Kimi' : CUR_BACKEND === 'doubao' ? 'Doubao' : CUR_BACKEND === 'wenxin' ? 'Wenxin' : (CUR_BACKEND === 'api' || CUR_BACKEND === 'glm' || CUR_BACKEND === 'openai') ? 'API' : 'DeepSeek') +
+      (CUR_MODEL ? ' ' + CUR_MODEL : '') + (CUR_BACKEND === 'kimi' && KIMI_THINK ? ' think' : '') +
+      (CUR_BACKEND === 'kimi' && KIMI_TOOLS ? ' tools' : '') + (CUR_BACKEND === 'kimi' && KIMI_PLUGIN ? ' plugin' : '') + '] ');
     try {
-      const txt = await askText(c, pow, prompt, state, printer, 3);
+      const txt = CODE_MODE ? await askCode(c, pow, prompt, state, printer)
+                            : await askText(c, pow, prompt, state, printer, 3);
       return txt || '';
     } catch (e) {
+      // 只有 DeepSeek 才会走“换令牌”流程；API/Kimi/豆包/文心的 401 直接报自己的错
+      if (CUR_BACKEND !== 'deepseek') throw e;
       if (!/401|403|Missing Token|token/i.test(e.message)) throw e;
       printer.flush();
       console.log('\n[令牌失效] 在电脑浏览器打开 http://<盒子IP>:88/token');
@@ -1218,25 +2538,40 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
     return '';
   }
 
-  await waitReady(pow, 10000).catch(e => { console.error('pow: ' + e.message); });
+  if (pow) await waitReady(pow, 10000).catch(e => { console.error('pow: ' + e.message); });
 
   // dss --duet [--rounds N] [话题] —— 两个会话自问自答
   let isDuet = false;
   const di = args.indexOf('--duet');
   if (di >= 0) { isDuet = true; args.splice(di, 1); }
   let rounds = 0;            // 0 = 不限轮数，一直问下去，Ctrl-C 停
-  const ri = args.indexOf('--rounds');
+  let ri = args.indexOf('--rounds');
+  if (ri < 0) ri = args.indexOf('--round');   // 兼容手写的 --round N
   if (ri >= 0) {
     rounds = parseInt(args[ri + 1], 10) || 0;
     args.splice(ri, 2);
   }
   // 文件附件：支持 `dss !upload /path "问题"`（可多个）、`dss --file /path ... "问题"`
   const files = [];
+  const filesA = [];
+  const filesB = [];
   for (;;) {
     const ui = args.indexOf('!upload');
     if (ui < 0) break;
     const p = args[ui + 1];
     if (p && p[0] !== '-') { files.push(p); args.splice(ui, 2); } else { args.splice(ui, 1); }
+  }
+  for (;;) {
+    const fi = args.indexOf('--file-a');
+    if (fi < 0) break;
+    const p = args[fi + 1];
+    if (p && p[0] !== '-') { filesA.push(p); args.splice(fi, 2); } else { args.splice(fi, 1); }
+  }
+  for (;;) {
+    const fi = args.indexOf('--file-b');
+    if (fi < 0) break;
+    const p = args[fi + 1];
+    if (p && p[0] !== '-') { filesB.push(p); args.splice(fi, 2); } else { args.splice(fi, 1); }
   }
   for (;;) {
     const fi = args.indexOf('--file');
@@ -1247,6 +2582,19 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
   if (args.includes('--search')) { state.search = true; args.splice(args.indexOf('--search'), 1); }
   let codeMode = false;
   if (args.includes('--code')) { codeMode = true; args.splice(args.indexOf('--code'), 1); }
+  CODE_MODE = codeMode;
+  let backA = '', backB = '', modelA = '', modelB = '';
+  for (const [key, set] of [['--api-think', () => API_THINK = true],
+    ['--backend-a', v => backA = v], ['--backend-b', v => backB = v],
+                            ['--model-a', v => modelA = v], ['--model-b', v => modelB = v]]) {
+    const idx = args.indexOf(key);
+    if (idx >= 0 && args[idx + 1]) { set(args[idx + 1]); args.splice(idx, 2); }
+  }
+  // --backend-a/--model-a 对所有模式生效（单发、duet、管道批处理、交互）；duet/单发分支后面会再覆盖
+  if (backA || backB) BACKEND_A = backA || backB || 'deepseek';
+  if (backB) BACKEND_B = backB;
+  if (modelA) MODEL_A = modelA;
+  if (modelB) MODEL_B = modelB;
   let roleA = '', roleB = '', roleS = '';
   for (const key of ['--role-a', '--role-b', '--role']) {
     const idx = args.indexOf(key);
@@ -1258,6 +2606,12 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
       args.splice(idx, 2);
     }
   }
+  if (args.includes('--kimi-think')) { KIMI_THINK = true; args.splice(args.indexOf('--kimi-think'), 1); }
+  if (args.includes('--kimi-tools')) { KIMI_TOOLS = true; args.splice(args.indexOf('--kimi-tools'), 1); }
+  if (args.includes('--kimi-plugin')) { KIMI_PLUGIN = true; args.splice(args.indexOf('--kimi-plugin'), 1); }
+  let pauseArg = 0;
+  const pa = args.indexOf('--pause');
+  if (pa >= 0 && args[pa + 1]) { pauseArg = Math.max(0, parseInt(args[pa + 1], 10) || 0); args.splice(pa, 2); }
   const bi = args.indexOf('--batch');
   if (bi >= 0 && args[bi + 1]) { BATCH_LINES = Math.max(40, parseInt(args[bi + 1], 10) || 200); args.splice(bi, 2); }
   let paceArg = 0;
@@ -1271,44 +2625,61 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
   if (isDuet) {
     if (rounds > 0) rounds = Math.max(1, Math.min(rounds, 1000));
     // 组合：--file / !upload 先传上去，--search 透传给双方
-    for (const fp of files) {
-      const targets = expandUploadTargets(fp) || [];
-      if (!targets.length) { console.error('[dss] nothing to upload: ' + fp); continue; }
-      if (targets.length > 1) console.error('[dss] ' + fp + ' -> ' + targets.length + ' file(s)');
-      for (const t of targets) {
-        process.stdout.write('[dss] uploading ' + t.name + ' ... ');
-        try {
-          const f = await uploadFile(c, pow, t.path, t.name);
-          state.fileIds.push(f.id);
-          console.log('ok (' + f.size + ' bytes, ' + f.status + ')');
-        } catch (e) { console.log('failed: ' + e.message); }
+    {
+      const eA = backA || 'deepseek';
+      const eB = backB || backA || 'deepseek';
+      for (const be of (eA === eB ? [eA] : [eA, eB])) {
+        await uploadAttachments(state, c, pow, be, files);
       }
     }
+    BACKEND_A = (backA || 'deepseek');
+    BACKEND_B = (backB || backA || 'deepseek');
+    // 混跑会让网页版被判异常（实测：deepseek+glm 混跑 duet，deepseek 立刻被踢下线要求重登）
+    // 所以强制两侧同一后端：deepseek+deepseek 或 api+api
+    if ((BACKEND_A || 'deepseek') !== (BACKEND_B || 'deepseek')) {
+      console.error('\n[dss] duet 两侧必须使用同一个后端：' + BACKEND_A + ' + ' + BACKEND_B + ' 不行。');
+      console.error('      实测混跑会让网页版被判异常（DeepSeek 会被踢下线要求重登）。');
+      console.error('      用 --backend-a deepseek --backend-b deepseek，或 --backend-a api --backend-b api。\n');
+      process.exit(2);
+    }
+    MODEL_A = modelA; MODEL_B = modelB;
+    const badBackend = [BACKEND_A, BACKEND_B].find(b => b && ['deepseek','kimi','doubao','wenxin','api','glm','openai'].indexOf(b) < 0);
+    if (badBackend) {
+      console.error('\n[dss] 后端 "' + badBackend + '" 还不支持，只认 deepseek / kimi / doubao / wenxin / api（或别名 glm、openai）。\n');
+      process.exit(2);
+    }
+    // 附件按侧上传：--file 两边都给，--file-a / --file-b 只给指定侧
+    const listA = files.concat(filesA), listB = files.concat(filesB);
+    const stateA = { fileIds: [], kimiFiles: [], search: state.search };
+    const stateB2 = { fileIds: [], kimiFiles: [], search: state.search };
+    await uploadAttachments(stateA, c, pow, BACKEND_A || 'deepseek', listA);
+    if (BACKEND_B === BACKEND_A && listB.length === listA.length &&
+        listB.every((x, i) => x === listA[i])) {
+      stateB2.fileIds = stateA.fileIds.slice();
+      stateB2.kimiFiles = stateA.kimiFiles.slice();
+    } else {
+      await uploadAttachments(stateB2, c, pow, BACKEND_B || 'deepseek', listB);
+    }
+
     await duet(c, pow, args.join(' ').trim() || '人工智能与人类未来', rounds, printer, 1000,
-      { fileIds: state.fileIds, search: state.search, code: codeMode, maxMinutes, roleA, roleB });
+      { fileIds: stateA.fileIds, kimiFiles: stateA.kimiFiles,
+        fileIdsB: stateB2.fileIds, kimiFilesB: stateB2.kimiFiles,
+        search: state.search, code: codeMode, maxMinutes, roleA, roleB,
+        pause: pauseArg > 0 ? pauseArg * 1000 : undefined });
     process.exit(0);
   }
 
   if (args.length && args[0] !== '-i') {
-    for (const fp of files) {
-      const targets = expandUploadTargets(fp) || [];
-      if (!targets.length) { console.error('[dss] nothing to upload: ' + fp); continue; }
-      if (targets.length > 1) console.error('[dss] ' + fp + ' -> ' + targets.length + ' file(s)');
-      for (const t of targets) {
-        process.stdout.write('[dss] uploading ' + t.name + ' ... ');
-        try {
-          const f = await uploadFile(c, pow, t.path, t.name);
-          state.fileIds.push(f.id);
-          console.log('ok (' + f.size + ' bytes, ' + f.status + ')');
-        } catch (e) { console.log('failed: ' + e.message); }
-      }
-    }
+    await uploadAttachments(state, c, pow, backA || 'deepseek', files.concat(filesA));
     let q0 = args.join(' ');
     if (roleS) q0 = roleText(roleS, '回答方') + q0;
     if (codeMode) {
       q0 = '（硬要求：直接给出完整、可编译运行的代码，用 ```语言 代码块输出；' +
         '不要只讲原理或只讨论文档；文档没写清的地方自行取保守值并用 TODO 标注）\n' + q0;
     }
+    CUR_LABEL = '一次性提问';
+    BACKEND_A = BACKEND_B = backA || backB || 'deepseek';
+    MODEL_A = modelA; MODEL_B = modelB;
     await oneShot(q0);
     process.exit(0);
   }
@@ -1395,23 +2766,33 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
       if (!targets.length) { console.error('[dss] nothing to upload: ' + fp); return; }
       if (targets.length > 1) console.error('[dss] ' + fp + ' -> ' + targets.length + ' file(s)');
       for (const t of targets) {
-        process.stdout.write('[dss] uploading ' + t.name + ' ... ');
+        process.stdout.write('[dss] uploading ' + t.name + ' (' + CUR_BACKEND + ') ... ');
         try {
-          const f = await uploadFile(c, pow, t.path, t.name);
-          if (!state.fileIds.includes(f.id)) state.fileIds.push(f.id);
-          state.filesSent = false;
-          console.log('ok  id=' + f.id + '  (' + f.size + ' bytes)');
+          if (CUR_BACKEND === 'kimi') {
+            const f = await kimiUploadFile(t.path, t.name);
+            state.kimiFiles = state.kimiFiles || [];
+            state.kimiFiles.push(f);
+            state.kimiFilesSent = false;
+            console.log('ok  kimi id=' + f.id + '  (' + f.size + ' bytes)');
+          } else {
+            const f = await uploadFile(c, pow, t.path, t.name);
+            if (!state.fileIds.includes(f.id)) state.fileIds.push(f.id);
+            state.filesSent = false;
+            console.log('ok  id=' + f.id + '  (' + f.size + ' bytes)');
+          }
         } catch (e) {
           console.log('failed: ' + e.message);
         }
       }
-      console.error('[dss] attached: ' + state.fileIds.length + ' file(s); 下一个问题会带上');
+      console.error('[dss] attached: ' + ((state.fileIds || []).length + (state.kimiFiles || []).length) + ' file(s); 下一个问题会带上');
       return;
     }
 
     if (cmd === 'refile' || cmd === 'reattach') {
       state.filesSent = false;
-      console.error('[dss] 下一次提问会重新附上 ' + state.fileIds.length + ' 个文件');
+      state.kimiFilesSent = false;
+      console.error('[dss] 下一次提问会重新附上 ' +
+        ((state.fileIds || []).length + (state.kimiFiles || []).length) + ' 个文件');
       return;
     }
 
@@ -1424,6 +2805,8 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
     if (cmd === 'detach') {
       state.fileIds = [];
       state.filesSent = false;
+      state.kimiFiles = [];
+      state.kimiFilesSent = false;
       console.error('[dss] attachments cleared');
       return;
     }

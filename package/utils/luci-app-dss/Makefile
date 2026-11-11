@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-dss
-PKG_VERSION:=1.0.26
+PKG_VERSION:=1.0.49
 PKG_RELEASE:=1
 
 LUCI_TITLE:=LuCI app for DeepSeek shell client (dss): settings, command examples, live log, code download

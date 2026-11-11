@@ -95,6 +95,7 @@ console)
 		echo "RUNNING 0"
 	fi
 	echo "RUNID $(cat /tmp/dss/console.run 2>/dev/null || echo 0)"
+	echo "CMD $(cat /tmp/dss/console.cmd 2>/dev/null | head -c 400)"
 	[ -f /tmp/dss/console.out ] && tail -n 20000 /tmp/dss/console.out 2>/dev/null
 	;;
 

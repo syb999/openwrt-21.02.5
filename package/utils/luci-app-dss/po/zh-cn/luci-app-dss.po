@@ -454,3 +454,348 @@ msgstr "AI/算法工程师"
 
 msgid "Technical translator"
 msgstr "技术翻译"
+
+msgid "copy"
+msgstr "复制"
+
+msgid "copied"
+msgstr "已复制"
+
+msgid "copy failed"
+msgstr "复制失败"
+
+msgid "--pace = seconds between API calls (default 5). --pause = seconds to wait before each duet turn (default 2). Raise both when DeepSeek answers "too frequent"."
+msgstr "--pace = 两次 API 请求的间隔秒数（默认 5）；--pause = 自我对话每轮之前的额外停顿秒数（默认 2）。遇到“发送过于频繁”就把两个都调大。"
+
+msgid "Long code in batches"
+msgstr "长代码分批输出"
+
+msgid "--batch = max lines per batch (default 200). The model delivers PART 1/N, then the client asks for the next part automatically."
+msgstr "--batch = 每批最多行数（默认 200）。模型输出 PART 1/N，客户端会自动索要后续批次。"
+
+msgid "Pause between duet turns (seconds)"
+msgstr "自我对话轮次间停顿（秒）"
+
+msgid "Extra wait before each turn of the self-dialogue (default 2). Raise it together with --pace when DeepSeek complains about frequency."
+msgstr "每轮自我对话前的额外等待（默认 2 秒）。遇到限流时和 --pace 一起调大。"
+
+msgid "Port"
+msgstr "端口"
+
+msgid "Token"
+msgstr "令牌"
+
+msgid "stopped"
+msgstr "已停止"
+
+msgid "Clear"
+msgstr "清除"
+
+msgid "Start"
+msgstr "启动"
+
+msgid "selected press ctrl+c"
+msgstr "已选中，请按 Ctrl+C"
+
+msgid "Batching is per complete file, not per N lines: the model delivers PART 1/N with whole files and the client asks for the next part automatically. --batch only sets a soft line hint (default 200); a single file is never cut into pieces."
+msgstr "分批以“完整文件”为单位，不按行数切文件：模型给出 PART 1/N（整文件），客户端自动索要下一批；--batch 只是行数提示（默认 200），单个文件不会被切成几段。"
+
+msgid "Files"
+msgstr "文件数"
+
+msgid "Total size"
+msgstr "总大小"
+
+msgid "filter by name"
+msgstr "按文件名筛选"
+
+msgid "copy all"
+msgstr "复制全部"
+
+msgid "clear view"
+msgstr "清空显示"
+
+msgid "command"
+msgstr "本次命令"
+
+msgid "--pace = seconds between API calls (default 5). --pause = seconds to wait before each duet turn (default 2). Long answers throttle automatically (up to +40s); on "too frequent" dss backs off 30s/60s/120s by itself."
+msgstr "--pace = 两次 API 请求的间隔秒数（默认 5）；--pause = 每轮自我对话前的额外停顿（默认 2）。长回答会自动降速（最多再等 40 秒）；遇到“发送过于频繁”会自动退避 30s/60s/120s。"
+
+msgid "Side A backend / model"
+msgstr "角色 A 的后端 / 模型"
+
+msgid "Side B backend / model"
+msgstr "角色 B 的后端 / 模型"
+
+msgid "Backend name (deepseek / yuanbao) and model for side A. Empty model = default."
+msgstr "A 侧用的后端（deepseek / yuanbao）和模型；模型留空表示用默认。"
+
+msgid "Backend name (deepseek / yuanbao) and model for side B. Empty model = default."
+msgstr "B 侧用的后端（deepseek / yuanbao）和模型；模型留空表示用默认。"
+
+msgid "Yuanbao credential saved."
+msgstr "元宝凭据已保存。"
+
+msgid "Yuanbao credential deleted."
+msgstr "元宝凭据已删除。"
+
+msgid "No hy_user/hy_token in the pasted cURL, nothing saved."
+msgstr "粘进来的 cURL 里没有 hy_user/hy_token，未保存。"
+
+msgid "Yuanbao (Tencent) credential"
+msgstr "腾讯元宝凭据"
+
+msgid "Current credential"
+msgstr "当前凭据"
+
+msgid "Stored in /root/.dss/yuanbao.cred (0600), outside /etc so it never rides along in a backup. Set backend to yuanbao to use it."
+msgstr "存在 /root/.dss/yuanbao.cred（0600），不在 /etc 下，所以不会被打进备份。后端填 yuanbao 才会用到它。"
+
+msgid "Paste \"Copy as cURL\""
+msgstr "粘贴 \"Copy as cURL\""
+
+msgid "yuanbao.tencent.com -> F12 -> Network -> send a message -> right-click the /api/chat request -> Copy as cURL -> paste the whole thing here. It carries the cookie (hy_user/hy_token) and the required x-uskey header. Only headers are kept; the request body is dropped."
+msgstr "yuanbao.tencent.com -> F12 -> Network -> 发一句话 -> 右键 /api/chat 请求 -> Copy as cURL -> 整段粘到这里。里面有 cookie（hy_user/hy_token）和必需的 x-uskey 请求头。只保留请求头，请求正文不落盘。"
+
+msgid "Save credential"
+msgstr "保存凭据"
+
+msgid "Delete the stored yuanbao credential?"
+msgstr "删除已保存的元宝凭据？"
+
+msgid "Kimi credential saved."
+msgstr "Kimi 凭据已保存。"
+
+msgid "Kimi credential deleted."
+msgstr "Kimi 凭据已删除。"
+
+msgid "No authorization Bearer in the pasted cURL, nothing saved."
+msgstr "粘进来的 cURL 里没有 authorization: Bearer，未保存。"
+
+msgid "Kimi credential"
+msgstr "Kimi 凭据"
+
+msgid "Stored in /root/.dss/kimi.cred (0600). The access token lives about 15 minutes, then paste a fresh cURL."
+msgstr "存在 /root/.dss/kimi.cred（0600）。access token 大约 15 分钟就过期，过期后请再粘一份新的 cURL。"
+
+msgid "www.kimi.com -> F12 -> Network -> send a message -> right-click ChatService/Chat -> Copy as cURL -> paste here. Needs the authorization Bearer header and the kimi-auth cookie. Only headers are kept."
+msgstr "www.kimi.com -> F12 -> Network -> 发一句话 -> 右键 ChatService/Chat -> Copy as cURL -> 整段粘到这里。需要 authorization: Bearer 和 kimi-auth cookie。只保留请求头。"
+
+msgid "Delete the stored Kimi credential?"
+msgstr "删除已保存的 Kimi 凭据？"
+
+msgid "Easiest: open www.kimi.com, F12 -> Console, run copy(localStorage.refresh_token) and paste it here; dss then renews the 15-minute access token by itself. A full \"Copy as cURL\" of ChatService/Chat also works."
+msgstr "最简单的做法：打开 www.kimi.com，F12 -> Console 执行 copy(localStorage.refresh_token)，粘到这里；dss 会自己续那 15 分钟的 access token。粘 ChatService/Chat 的整段 \"Copy as cURL\" 也可以。"
+
+msgid "Side A backend and model. Current: "
+msgstr "A 侧后端与模型。当前生效："
+
+msgid "Side B backend and model. Current: "
+msgstr "B 侧后端与模型。当前生效："
+
+msgid "Kimi deep thinking"
+msgstr "Kimi 深度思考"
+
+msgid "Off = answer starts immediately (much faster). On = model thinks first, then answers; slower but better for hard problems."
+msgstr "关闭 = 立刻开始出字（快很多）；开启 = 先思考再回答，慢但适合难题。"
+
+msgid "Kimi credential"
+msgstr "Kimi 凭据"
+
+msgid "Kimi credential saved."
+msgstr "Kimi 凭据已保存。"
+
+msgid "Kimi credential deleted."
+msgstr "Kimi 凭据已删除。"
+
+msgid "Stored in /root/.dss/kimi.cred (0600). The access token is renewed automatically from refresh_token; refresh_token rotates on every renewal, so a changed value is normal."
+msgstr "存在 /root/.dss/kimi.cred（0600）。access token 由 refresh_token 自动续期；refresh_token 每次续期都会轮换，值变了是正常的。"
+
+msgid "Backends and models (deepseek / kimi)"
+msgstr "后端与模型（deepseek / kimi）"
+
+msgid "Pick the backend on the command line"
+msgstr "在命令行上指定后端"
+
+msgid "--backend-a / --backend-b accept deepseek or kimi. Command line wins over the LuCI settings page; LuCI values are only defaults."
+msgstr "--backend-a / --backend-b 只认 deepseek 或 kimi。命令行优先于 LuCI 设置页，LuCI 里的值只是默认值。"
+
+msgid "Mixed self-dialogue with per-side model"
+msgstr "双后端对聊（各自模型）"
+
+msgid "Side A asks, side B answers, then they swap. Each side keeps its own backend, model and session."
+msgstr "A 提问、B 回答，然后互换。两侧各自保留自己的后端、模型和会话。"
+
+msgid "Kimi switches (thinking / tools / plugin)"
+msgstr "Kimi 开关（思考 / 工具 / 插件）"
+
+msgid "Default is the fast path: no thinking, no tools (about 1.1s faster first token measured). --kimi-think enables the thinking stage; --kimi-tools enables search/cron tools; --kimi-plugin enables server-side planning."
+msgstr "默认走快档：不思考、不带工具（实测首字快约 1.1 秒）。--kimi-think 打开思考阶段；--kimi-tools 打开搜索/定时任务工具；--kimi-plugin 打开服务端规划。"
+
+msgid "Upload files to Kimi"
+msgstr "给 Kimi 上传文件"
+
+msgid "Kimi uploads go to /apiv2-files/file/upload and are attached as file blocks on the first message of the session; !refile re-sends them, !detach clears them."
+msgstr "Kimi 上传走 /apiv2-files/file/upload，作为 file 块挂在会话首条消息上；!refile 重发，!detach 清空。"
+
+msgid "Doubao credential"
+msgstr "豆包凭据"
+
+msgid "Doubao credential saved."
+msgstr "豆包凭据已保存。"
+
+msgid "No doubao.com /chat/completion cURL or no --data-raw found, nothing saved."
+msgstr "没找到 doubao.com/chat/completion 的 cURL 或缺少 --data-raw，未保存。"
+
+msgid "Stored in /root/.dss/doubao.cred (0600). Anonymous accounts can only continue an existing conversation and are rate limited after a few messages; log in first for real use."
+msgstr "存在 /root/.dss/doubao.cred（0600）。匿名账号只能续已有会话，且几条就会限流；正式使用请先登录。"
+
+msgid "Paste "Copy as cURL" of /chat/completion"
+msgstr "粘贴 /chat/completion 的 Copy as cURL"
+
+msgid "www.doubao.com -> F12 -> Network -> filter "completion" -> send a message -> right-click the completion request -> Copy as cURL -> paste here. Keep the user-agent original: a_bogus is signed with it."
+msgstr "www.doubao.com -> F12 -> Network -> 过滤 completion -> 发一句话 -> 右键 completion 请求 -> Copy as cURL -> 粘到这里。注意保留原 user-agent，a_bogus 是按它签的。"
+
+msgid "Delete the stored Doubao credential?"
+msgstr "删除已保存的豆包凭据？"
+
+msgid "默认（用抓包里的 bot_id）"
+msgstr "默认（用抓包里的 bot_id）"
+
+msgid "Stored in /root/.dss/doubao.cred (0600). Doubao puts automated replay behind its shark risk control: when it asks for slider verification, dss stops immediately instead of retrying. Re-copy a fresh cURL from the browser after passing the slider."
+msgstr "存在 /root/.dss/doubao.cred（0600）。豆包对自动重放有 shark 风控：一旦要求滑块验证，dss 会立即停止而不是反复重试。浏览器里过完滑块后再重粘一份 cURL。"
+
+msgid "API backend (OpenAI compatible)"
+msgstr "API 后端（OpenAI 兼容）"
+
+msgid "API credential saved."
+msgstr "API 凭据已保存。"
+
+msgid "API credential deleted."
+msgstr "API 凭据已删除。"
+
+msgid "Base URL or API key looks wrong, nothing saved."
+msgstr "Base URL 或 API Key 不对，未保存。"
+
+msgid "Base URL"
+msgstr "Base URL"
+
+msgid "API key"
+msgstr "API Key"
+
+msgid "Model"
+msgstr "模型"
+
+msgid "leave empty to keep the stored key"
+msgstr "留空则保留已存的 key"
+
+msgid "Delete the stored API key?"
+msgstr "删除已保存的 API Key？"
+
+msgid "Free options: 智谱 glm-4-flash (open.bigmodel.cn), 硅基流动 Qwen2.5-7B (siliconflow.cn), 腾讯 hunyuan-lite, 百度 ernie-speed. Any OpenAI compatible endpoint works."
+msgstr "免费选项：智谱 glm-4-flash（open.bigmodel.cn）、硅基流动 Qwen2.5-7B（siliconflow.cn）、腾讯 hunyuan-lite、百度 ernie-speed。任何 OpenAI 兼容端点都能用。"
+
+msgid "默认（用凭据里的 model）"
+msgstr "默认（用凭据里的 model）"
+
+msgid "Current setup: A = DeepSeek (web), B = GLM-4-Flash (API). All commands run in a shell on the router (SSH or the ttyd web terminal). Command line options always win over the settings page."
+msgstr "当前配置：A = DeepSeek（网页）、B = GLM-4-Flash（API）。所有命令都在路由器的 shell 里跑（SSH 或 ttyd 网页终端）。命令行参数永远优先于设置页。"
+
+msgid "One question (default backend)"
+msgstr "单问（用默认后端）"
+
+msgid "Uses side A from the settings page (currently DeepSeek)."
+msgstr "使用设置页里的 Side A（当前是 DeepSeek）。"
+
+msgid "Backends: deepseek and GLM-4-Flash"
+msgstr "后端：deepseek 与 GLM-4-Flash"
+
+msgid "Pick the backend"
+msgstr "选择后端"
+
+msgid "GLM-4-Flash first byte is about 0.7s; DeepSeek about 1s. glm-4.5-flash is much slower (about 8s), do not use it."
+msgstr "GLM-4-Flash 首字约 0.7 秒，DeepSeek 约 1 秒。glm-4.5-flash 慢很多（约 8 秒），不要用。"
+
+msgid "Why DeepSeek asks for a token"
+msgstr "为什么 DeepSeek 要令牌"
+
+msgid "The web token (40003 Authorization Failed) expires; open that page, log in to chat.deepseek.com and click the bookmark. GLM-4-Flash does not need this — it uses the API key from the settings page."
+msgstr "网页令牌（40003 Authorization Failed）会过期；打开这个页面，登录 chat.deepseek.com 后点一下书签。GLM-4-Flash 不需要，它用设置页里的 API Key。"
+
+msgid "Attachments (DeepSeek only)"
+msgstr "附件（仅 DeepSeek）"
+
+msgid "Upload files with the question"
+msgstr "随问题上传文件"
+
+msgid "Several --file options are allowed; files are uploaded once per session. GLM-4-Flash is text-only and rejects attachments — use DeepSeek for PDFs."
+msgstr "可以写多个 --file；每个会话只上传一次。GLM-4-Flash 是纯文本接口，不接受附件 —— PDF 请用 DeepSeek。"
+
+msgid "Bind a file to one side only (duet)"
+msgstr "把文件指定给某一侧（duet）"
+
+msgid "--file = both sides, --file-a / --file-b = that side only. If the side's backend cannot upload (GLM-4-Flash), dss says so and keeps going instead of silently uploading to the wrong backend."
+msgstr "--file = 两侧都给，--file-a / --file-b = 只给指定侧。如果该侧后端不支持上传（GLM-4-Flash），dss 会明确提示并继续，不会偷偷传到错的后端。"
+
+msgid "Code mode"
+msgstr "代码模式"
+
+msgid "Ask for compilable code"
+msgstr "要求可编译的代码"
+
+msgid "CODE MODE asks for complete files, saves each one to /root/.dss/out, and lets you run them with !run N."
+msgstr "代码模式要求输出完整文件，逐个保存到 /root/.dss/out，可用 !run N 执行。"
+
+msgid "Code mode with a datasheet"
+msgstr "带数据手册的代码模式"
+
+msgid "Self-dialogue (duet)"
+msgstr "自问自答（duet）"
+
+msgid "Two sides using the settings defaults"
+msgstr "两侧都用设置页默认值"
+
+msgid "A asks with DeepSeek, B answers with GLM-4-Flash, then they swap. Each side keeps its own session."
+msgstr "A 用 DeepSeek 提问，B 用 GLM-4-Flash 回答，然后互换。两侧各自保留会话。"
+
+msgid "Explicit backends and models"
+msgstr "显式指定后端与模型"
+
+msgid "Throttling"
+msgstr "节流"
+
+msgid "--pace = seconds between API calls (default 5). --pause = seconds before each duet turn (default 2). On rate limiting dss backs off 5/10/30 minutes by itself; DSS_RL_SCHEDULE=30,60 shortens it for testing."
+msgstr "--pace = 两次请求之间秒数（默认 5）。--pause = 每轮 duet 前等待秒数（默认 2）。被限流时 dss 自动按 5/10/30 分钟退避；测试时可用 DSS_RL_SCHEDULE=30,60 缩短。"
+
+msgid "Common errors"
+msgstr "常见错误"
+
+msgid "40003 Authorization Failed"
+msgstr "40003 Authorization Failed"
+
+msgid "DeepSeek web token expired. Log in to chat.deepseek.com in your browser and click the bookmark on that page. Not related to the GLM API key."
+msgstr "DeepSeek 网页令牌过期。在浏览器登录 chat.deepseek.com，再点那个页面上的书签。与 GLM 的 API Key 无关。"
+
+msgid "This backend cannot upload attachments"
+msgstr "该后端不支持上传附件"
+
+msgid "GLM-4-Flash is a text-only endpoint. Bind the file to the DeepSeek side with --file-b (or drop --backend-a api)."
+msgstr "GLM-4-Flash 是纯文本接口。用 --file-b 把文件指定给 DeepSeek 那一侧（或去掉 --backend-a api）。"
+
+msgid "DeepSeek (web, default)"
+msgstr "DeepSeek（网页，默认）"
+
+msgid "GLM-4-Flash (API, free)"
+msgstr "GLM-4-Flash（API，免费）"
+
+msgid "File to side B only (B answers with the datasheet)"
+msgstr "文件只给 B 侧（B 带文档回答）"
+
+msgid "--file = both sides, --file-a / --file-b = that side only. If the side backend cannot upload (GLM-4-Flash), dss says so and keeps going."
+msgstr "--file = 两侧都给，--file-a / --file-b = 只给指定侧。若该侧后端不支持上传（GLM-4-Flash），dss 会提示后继续。"
+
+msgid "File to side A only"
+msgstr "文件只给 A 侧"
+
+msgid "File to both sides"
+msgstr "两侧都给"

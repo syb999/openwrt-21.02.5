@@ -46,6 +46,9 @@ function index()
 
 	entry({"admin", "services", "dss", "save"},  call("act_save")).leaf  = true
 	entry({"admin", "services", "dss", "token"}, call("act_token")).leaf = true
+	entry({"admin", "services", "dss", "kimicred"}, call("act_kimicred")).leaf = true
+	entry({"admin", "services", "dss", "apicred"}, call("act_apicred")).leaf = true
+	entry({"admin", "services", "dss", "doubaocred"}, call("act_doubaocred")).leaf = true
 	entry({"admin", "services", "dss", "svc"},   call("act_svc")).leaf   = true
 	entry({"admin", "services", "dss", "run"},   call("act_run")).leaf   = true
 	entry({"admin", "services", "dss", "file"},  call("act_file")).leaf  = true
@@ -66,6 +69,25 @@ function act_save()
 	c:set("dss", "main", "model", http.formvalue("model") or "deepseek-chat")
 
 	c:set("dss", "cli", "pace",    http.formvalue("pace")    or "5")
+	c:set("dss", "cli", "pause",   http.formvalue("pause")   or "2")
+	c:set("dss", "cli", "backend_a", (http.formvalue("backend_a") or "deepseek"):gsub("%s", ""))
+	c:set("dss", "cli", "backend_b", (http.formvalue("backend_b") or "deepseek"):gsub("%s", ""))
+	-- 模型：必须属于所选后端，否则清掉（避免 deepseek 侧留着 k28-instant）
+	local MODELS = {
+		deepseek = { ["deepseek-chat"] = true, ["deepseek-reasoner"] = true },
+		api      = { ["glm-4-flash"] = true },
+	}
+	local function set_model(model_key, backend_key)
+		local be = (http.formvalue(backend_key) or "deepseek"):gsub("%s", "")
+		local val = (http.formvalue(model_key) or ""):gsub("%s", "")
+		local allowed = MODELS[be] or MODELS.deepseek
+		local free = (be == "api")
+		if val ~= "" and not free and not allowed[val] then val = "" end
+		if val == "" then c:delete("dss", "cli", model_key) else c:set("dss", "cli", model_key, val) end
+	end
+	set_model("model_a", "backend_a")
+	set_model("model_b", "backend_b")
+	c:set("dss", "cli", "kimi_think", http.formvalue("kimi_think") == "1" and "1" or "0")
 	c:set("dss", "cli", "rounds",  http.formvalue("rounds")  or "0")
 	c:set("dss", "cli", "minutes", http.formvalue("minutes") or "0")
 	c:set("dss", "cli", "search",  http.formvalue("search")  == "1" and "1" or "0")
@@ -130,6 +152,142 @@ function act_token()
 	back("tokensaved")
 end
 
+-- Kimi 凭据：可粘 ChatService/Chat 的 Copy as cURL，也可直接粘 localStorage.refresh_token
+function act_kimicred()
+	local op = http.formvalue("op") or "save"
+	local KC = "/root/.dss/kimi.cred"
+
+	if op == "clear" then
+		fs.remove(KC)
+		back("kimcleared")
+		return
+	end
+
+	local txt = http.formvalue("kimicurl") or ""
+
+	-- 读旧值，保留 cookie/device/session/traffic（粘单个 token 时不至于丢）
+	local old, order = {}, {}
+	local of = io.open(KC, "r")
+	if of then
+		for l in of:lines() do
+			local k, v = l:match("^%s*([%w_]+)%s*:%s*(.+)$")
+			if k then
+				if not old[k] then table.insert(order, k) end
+				old[k] = v
+			end
+		end
+		of:close()
+	end
+
+	if not txt:find("curl", 1, true) then
+		-- 直接粘 token
+		local tok = txt:gsub("%s", ""):gsub('^"', ""):gsub('"$', "")
+		if #tok < 40 then
+			back("badkimi")
+			return
+		end
+		old.refresh_token = tok
+		old.access_token = nil          -- 强制用新 token 换一次
+		if not old.model then old.model = "k28-instant" end
+		local lines = {}
+		for _, k in ipairs({ "refresh_token", "access_token", "cookie", "dev", "sess", "traffic", "model" }) do
+			if old[k] and old[k] ~= "" then table.insert(lines, k .. ": " .. old[k]) end
+		end
+		txt = table.concat(lines, "\n")
+	else
+		-- 粘 cURL：截掉 --data-raw 的二进制正文
+		local keep = {}
+		for line in txt:gmatch("[^\r\n]+") do
+			if line:find("^%s*%-%-data") or line:find("^%s*%-d%s") then break end
+			table.insert(keep, line)
+		end
+		txt = table.concat(keep, "\n")
+		if not txt:find("Bearer", 1, true) then
+			back("badkimi")
+			return
+		end
+	end
+
+	fs.mkdirr("/root/.dss", "0700")
+	local f = io.open(KC, "w")
+	if not f then back("badkimi") return end
+	f:write(txt .. "\n")
+	f:close()
+	fs.chmod(KC, "0600")
+	back("kimsaved")
+end
+
+-- 豆包凭据：粘 /chat/completion 的 Copy as cURL（含 cookie、x-flow-trace、a_bogus）
+function act_doubaocred()
+	local op = http.formvalue("op") or "save"
+	local DC = "/root/.dss/doubao.cred"
+
+	if op == "clear" then
+		fs.remove(DC)
+		back("dbsaved")
+		return
+	end
+
+	local txt = http.formvalue("dbcURL") or ""
+	if not txt:find("doubao.com", 1, true) or not txt:find("/chat/completion", 1, true) then
+		back("baddb")
+		return
+	end
+	-- 只要第一条 curl 块（后面常跟着图片等无关请求）
+	local first = txt:match("(curl[^\n]*chat/completion[\s\S]-%-%-data%-raw%s+'[\s\S]-')")
+	if first then txt = first end
+	if not txt:find("%-%-data%-raw", 1) then
+		back("baddb")
+		return
+	end
+
+	fs.mkdirr("/root/.dss", "0700")
+	local f = io.open(DC, "w")
+	if not f then back("baddb") return end
+	f:write(txt .. "\n")
+	f:close()
+	fs.chmod(DC, "0600")
+	back("dbsaved")
+end
+
+-- API 后端（OpenAI 兼容）：base / key / model 三行写到 /root/.dss/openai.cred
+function act_apicred()
+	local op = http.formvalue("op") or "save"
+	local AC = "/root/.dss/openai.cred"
+
+	if op == "clear" then
+		fs.remove(AC)
+		back("apicleared")
+		return
+	end
+
+	local base = (http.formvalue("api_base") or ""):gsub("%s", "")
+	local key  = (http.formvalue("api_key") or ""):gsub("^%s+", ""):gsub("%s+$", "")
+	local model = (http.formvalue("api_model") or ""):gsub("%s", "")
+
+	if base == "" then base = "https://open.bigmodel.cn/api/paas/v4" end
+	if not base:find("^https?://") then back("badapi") return end
+
+	-- key 留空 = 保留已存的（方便只改模型）
+	if key == "" then
+		local old = io.open(AC, "r")
+		if old then
+			local body = old:read("*a") or ""
+			old:close()
+			key = body:match("key%s*:%s*([^\n]+)") or ""
+		end
+	end
+	if #key < 8 then back("badapi") return end
+
+	fs.mkdirr("/root/.dss", "0700")
+	local f = io.open(AC, "w")
+	if not f then back("badapi") return end
+	f:write("base: " .. base .. "\nkey: " .. key .. "\nmodel: " .. (model ~= "" and model or "glm-4-flash") .. "\n")
+	f:close()
+	fs.chmod(AC, "0600")
+	back("apisaved")
+end
+
 function act_svc()
 	local op = http.formvalue("op") or "restart"
 	if op ~= "start" and op ~= "stop" and op ~= "restart" then
@@ -142,6 +300,7 @@ end
 local OUT   = "/tmp/dss/console.out"
 local PIDF  = "/tmp/dss/console.pid"
 local RUND  = "/tmp/dss/console.run"
+local CMDD  = "/tmp/dss/console.cmd"
 
 local function shq(s)
 	return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
@@ -162,6 +321,9 @@ function act_run()
 	end
 
 	luci.sys.exec("mkdir -p /tmp/dss")
+	local cf = io.open(CMDD, "w")
+	if cf then cf:write(cmd .. "\n"); cf:close() end
+
 	luci.sys.exec("sh -c " .. shq("cd /root && date +%s > " .. RUND ..
 		" && nohup " .. cmd .. " > " .. OUT .. " 2>&1 & echo $! > " .. PIDF))
 
@@ -185,9 +347,12 @@ function act_file()
 	local op   = http.formvalue("op") or "del"
 	local name = http.formvalue("name") or ""
 
-	if name:match("/") or name:match("%.%.") or name == "" then
-		http.redirect(luci.dispatcher.build_url("admin/services/dss/files"))
-		return
+	-- op=all（全部删除）不看 name，必须先处理，否则会被下面的空名字校验挡掉
+	if op ~= "all" then
+		if name:match("/") or name:match("%.%.") or name == "" then
+			http.redirect(luci.dispatcher.build_url("admin/services/dss/files"))
+			return
+		end
 	end
 
 	if op == "del" then

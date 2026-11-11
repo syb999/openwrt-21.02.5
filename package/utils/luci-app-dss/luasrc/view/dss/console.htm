@@ -42,7 +42,10 @@
 			&nbsp;<a href="/cgi-bin/dss-cgi?a=logdl" style="font-weight:normal;font-size:12px"><%:download full log%></a>
 			&nbsp;<a href="javascript:expandAll(true)" style="font-weight:normal;font-size:12px"><%:expand all%></a>
 			&nbsp;<a href="javascript:expandAll(false)" style="font-weight:normal;font-size:12px"><%:collapse all%></a>
+			&nbsp;<a href="javascript:copyAll()" style="font-weight:normal;font-size:12px"><%:copy all%></a>
+			&nbsp;<a href="javascript:clearBox()" style="font-weight:normal;font-size:12px"><%:clear view%></a>
 		</legend>
+		<div id="cmdline" style="margin:0 0 8px 0;padding:6px 10px;background:#eef4fb;border:1px solid #d8e2ec;border-radius:4px;font:12px monospace;color:#2b4a66;word-break:break-all"></div>
 		<div id="out" class="dss-out">(<%:loading%>)</div>
 	</fieldset>
 </div>
@@ -51,13 +54,13 @@
 .dss-out details { margin:0 0 8px 0; border:1px solid #e2e6ea; border-radius:4px; background:#fbfcfd; }
 .dss-out details > summary { cursor:pointer; padding:5px 8px; font-weight:bold; color:#2b6fb3; user-select:none; background:#f2f6fa; border-radius:4px 4px 0 0; }
 .dss-out details > pre { margin:0; padding:8px 10px; background:#fafafa; white-space:pre-wrap; word-break:break-word;
-	max-height:38vh; overflow:auto; }
+	height:320px; max-height:320px; overflow:auto; }
 .dss-out {
 	margin: 0;
 	padding: 10px 12px;
-	min-height: 200px;
-	max-height: 55vh;
-	overflow: auto;
+	min-height: 120px;
+	max-height: none;
+	overflow: visible;
 	background: #fafafa;
 	border: 1px solid #d8d8d8;
 	border-radius: 4px;
@@ -133,6 +136,21 @@
 		}
 	}
 
+	window.copyAll = function() {
+		var t = document.getElementById('out').innerText || '';
+		var ta = document.createElement('textarea');
+		ta.value = t; ta.style.position='fixed'; ta.style.opacity='0';
+		document.body.appendChild(ta); ta.focus(); ta.select();
+		var ok = false; try { ok = document.execCommand('copy'); } catch (e) {}
+		document.body.removeChild(ta);
+		alert(ok ? '<%:copied%>' : '<%:selected press ctrl+c%>');
+	};
+
+	window.clearBox = function() {
+		document.getElementById('out').innerHTML = '';
+		seen = 0; lastPre = null;
+	};
+
 	window.expandAll = function(on) {
 		Array.prototype.forEach.call(box.querySelectorAll('details'), function(d) { d.open = !!on; });
 	};
@@ -147,7 +165,10 @@
 			var lines = t.split('\n');
 			var head = lines[0] || '';
 			var runid = (lines[1] || '').indexOf('RUNID') === 0 ? (lines[1].split(' ')[1] || '') : '';
-			var body = lines.slice(2).join('\n');
+			var cmd = (lines[2] || '').indexOf('CMD') === 0 ? (lines[2].substring(4) || '') : '';
+			var body = lines.slice(3).join('\n');
+			var cl = document.getElementById('cmdline');
+			if (cl) { cl.textContent = cmd ? ('<%:command%>: ' + cmd) : ''; cl.style.display = cmd ? 'block' : 'none'; }
 			render(body, head === 'RUNNING 1', runid);
 			kst.textContent = (head === 'RUNNING 1') ? '<%:running%>…' : '<%:idle%>';
 		};

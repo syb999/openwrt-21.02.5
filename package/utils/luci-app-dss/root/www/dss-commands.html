@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-cn"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>dss 命令示例</title></head><body>
+<h2>dss 命令示例</h2>
+
+<div class="cbi-map">
+<div class="cbi-map-descr">
+当前配置：A / B 默认都是 DeepSeek（网页，需令牌）。GLM-4-Flash 作为备用：加 --backend-a api。
+所有命令在路由器的 shell 里执行（SSH 或 ttyd）。命令行参数永远优先于设置页。
+</div>
+
+<fieldset class="cbi-section"><legend>基础</legend><div class="cbi-section-node">
+
+<div class="cbi-value"><label class="cbi-value-title">交互模式</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<div class="cbi-value-description">提示符是 [shell]&gt;，输入 exit 退出。</div></div></div>
+
+<div class="cbi-value"><label class="cbi-value-title">单问（用 A 侧默认后端）</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss "用一句话解释什么是 SLIC 接口"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button></div></div>
+
+<div class="cbi-value"><label class="cbi-value-title">管道批量提问</label><div class="cbi-value-field">
+<pre class="dss-cmd">printf "1+1=?\n中国的首都是哪里？\n" | dss</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button></div></div>
+
+</div></fieldset>
+
+<fieldset class="cbi-section"><legend>后端：DeepSeek 与 GLM-4-Flash</legend><div class="cbi-section-node">
+
+<div class="cbi-value"><label class="cbi-value-title">用 GLM-4-Flash</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss "问题" --backend-a api</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<div class="cbi-value-description">免费、首字约 0.7 秒。glm-4.5-flash 慢很多（约 8 秒），不要用。</div></div></div>
+
+<div class="cbi-value"><label class="cbi-value-title">用 DeepSeek（网页）</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss "问题" --backend-a deepseek</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<div class="cbi-value-description">令牌失效（40003）时打开下一节的令牌页面刷新；被禁言期间不要用。</div></div></div>
+
+<div class="cbi-value"><label class="cbi-value-title">DeepSeek 令牌页</label><div class="cbi-value-field">
+<pre class="dss-cmd">http://10.80.1.112:88/token</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<div class="cbi-value-description">登录 chat.deepseek.com 后点一下书签，token 会自动写入。GLM 不需要这一步。</div></div></div>
+
+</div></fieldset>
+
+<fieldset class="cbi-section"><legend>附件（仅 DeepSeek 支持）</legend><div class="cbi-section-node">
+
+<div class="cbi-value"><label class="cbi-value-title">随问题上传一个文件</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss --file /root/AR9341.PDF "这份文档里 SLIC 的 DMA 描述符怎么定义？"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button></div></div>
+
+<div class="cbi-value"><label class="cbi-value-title">随问题上传多个文件</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss --file /root/AR9341.PDF --file /root/SI3217XB.PDF "对比两边的 SPI 时序"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<div class="cbi-value-description">每个会话只上传一次。GLM-4-Flash 是纯文本接口，不接受附件。</div></div></div>
+
+<div class="cbi-value"><label class="cbi-value-title">duet：文件只给 B 侧</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss --code --duet --pause 3 --pace 8 --file-b /root/AR9341.PDF --file-b /root/SI3217XB.PDF "使用 ar9341 通过 slic 接口对接 si3217x 实现 voip 全代码"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<div class="cbi-value-description">--file 给两侧，--file-a / --file-b 只给指定侧。</div></div></div>
+
+<div class="cbi-value"><label class="cbi-value-title">duet：文件只给 A 侧</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss --duet --file-a /root/AR9341.PDF "问题"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button></div></div>
+
+</div></fieldset>
+
+<fieldset class="cbi-section"><legend>代码模式</legend><div class="cbi-section-node">
+
+<div class="cbi-value"><label class="cbi-value-title">要求可编译的完整代码</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss --code "用 C 写一个读取 /proc/meminfo 打印 MemAvailable 的完整程序"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<div class="cbi-value-description">代码模式要求输出完整文件，逐个存到 /root/.dss/out，可用 !run N 执行。</div></div></div>
+
+<div class="cbi-value"><label class="cbi-value-title">代码模式 + 数据手册</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss --code --file /root/AR9341.PDF --file /root/SI3217XB.PDF "使用 ar9341 通过 slic 接口对接 si3217x 实现 voip 全代码"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button></div></div>
+
+</div></fieldset>
+
+<fieldset class="cbi-section"><legend>自问自答（duet）</legend><div class="cbi-section-node">
+
+<div class="cbi-value"><label class="cbi-value-title">用设置页的两侧默认值</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss --duet --rounds 3 "用三句话说明TCP三次握手，然后指出一次常见误解"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button></div></div>
+
+<div class="cbi-value"><label class="cbi-value-title">显式指定后端与模型</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss --duet --rounds 5 --pause 3 --pace 8 --backend-a api --backend-b api --model-a glm-4-flash --model-b glm-4-flash "对比 RST 与 FIN 的差别并给出抓包判据"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button></div></div>
+
+<div class="cbi-value"><label class="cbi-value-title">节流</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss --pace 8 --pause 3 "问题"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<div class="cbi-value-description">duet 两侧必须同一后端：deepseek+deepseek 或 api+api。实测混跑（deepseek+glm）会让网页版被判异常、DeepSeek 直接被踢下线要求重登。<br/>--pace 是两次请求间隔秒数（默认 5），--pause 是每轮 duet 前等待秒数（默认 2）。被限流时自动按 5/10/30 分钟退避。</div></div></div>
+
+</div></fieldset>
+
+<fieldset class="cbi-section"><legend>会话内斜杠命令</legend><div class="cbi-section-node">
+
+<div class="cbi-value"><label class="cbi-value-title">代码文件</label><div class="cbi-value-field">
+<pre class="dss-cmd">!list            列出这条回答里保存的代码文件
+!cat 1           查看第 1 个文件
+!run 1           执行（.sh / .py / .c，C 会先 gcc 编译）
+!run 1 send      执行并把输出/编译错误发回给模型继续修
+!out 1           把上次执行输出发回对话</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button></div></div>
+
+<div class="cbi-value"><label class="cbi-value-title">附件</label><div class="cbi-value-field">
+<pre class="dss-cmd">!upload /root/AR9341.PDF    上传并附加到后续问题
+!files                      列出已附加文件
+!refile                     下次提问重新发送附件
+!detach                     清空附件</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button></div></div>
+
+<div class="cbi-value"><label class="cbi-value-title">其它</label><div class="cbi-value-field">
+<pre class="dss-cmd">!search on|off     联网搜索开关
+!help              帮助
+exit               退出</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button></div></div>
+
+</div></fieldset>
+
+<fieldset class="cbi-section"><legend>常见错误</legend><div class="cbi-section-node">
+
+<div class="cbi-value"><label class="cbi-value-title">40003 Authorization Failed</label><div class="cbi-value-field">
+<pre class="dss-cmd">http://10.80.1.112:88/token</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<div class="cbi-value-description">DeepSeek 网页令牌过期，去令牌页刷新。与 GLM 的 API Key 无关。</div></div></div>
+
+<div class="cbi-value"><label class="cbi-value-title">该后端不支持上传附件</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss --duet --file-b /root/AR9341.PDF "问题"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<div class="cbi-value-description">GLM-4-Flash 是纯文本接口，用 --file-b 把文件给 DeepSeek 那一侧。</div></div></div>
+
+</div></fieldset>
+
+<fieldset class="cbi-section"><legend>文件位置</legend><div class="cbi-section-node">
+<div class="cbi-value"><label class="cbi-value-title">存放路径</label><div class="cbi-value-field">
+<pre class="dss-cmd">/root/.dss/cred              DeepSeek 网页令牌（0600）
+/root/.dss/openai.cred       API 后端 base / key / model（0600）
+/root/.dss/out               保存下来的代码（持久）
+/tmp/dss_output              本次会话的脚本
+/tmp/dss/conversation.log    对话日志</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button></div></div>
+</div></fieldset>
+</div>
+
+<script type="text/javascript">
+function copyCmd(btn) {
+	var pre = btn.previousElementSibling;
+	if (!pre) return;
+	var t = pre.textContent;
+	var ok = false;
+	try {
+		if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(t); ok = true; }
+	} catch (e) {}
+	if (!ok) {
+		var ta = document.createElement('textarea');
+		ta.value = t; ta.style.position = 'fixed'; ta.style.top = '0'; ta.style.opacity = '0';
+		document.body.appendChild(ta); ta.focus(); ta.select();
+		try { ok = document.execCommand('copy'); } catch (e) {}
+		document.body.removeChild(ta);
+	}
+	if (!ok) {
+		try {
+			var r = document.createRange(); r.selectNodeContents(pre);
+			var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+		} catch (e) {}
+	}
+	btn.textContent = ok ? '已复制' : '请按 Ctrl+C';
+	setTimeout(function () { btn.textContent = '复制'; }, 1600);
+}
+</script>
+
+<style type="text/css">body{font-family:sans-serif;margin:16px;max-width:1000px}
+.dss-copy { margin:4px 0 0 0; padding:2px 8px; font-size:11px; border:1px solid #c8d3de;
+	background:#fff; color:#2b6fb3; border-radius:3px; cursor:pointer; }
+.dss-copy:hover { background:#eef4fb; }
+.dss-cmd { margin:0; padding:8px 12px; background:#f5f7f9; color:#1f2933; border:1px solid #dfe3e8;
+	border-left:3px solid #4a90d9; border-radius:4px; font:12px/1.6 "DejaVu Sans Mono",monospace;
+	white-space:pre-wrap; word-break:break-all; }
+</style>
+
+</body></html>

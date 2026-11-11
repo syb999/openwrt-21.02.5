@@ -7,6 +7,7 @@ local port    = uci:get("dss", "main", "port")    or "88"
 local bind    = uci:get("dss", "main", "bind")    or "0.0.0.0"
 local model   = uci:get("dss", "main", "model")   or "deepseek-chat"
 local pace    = uci:get("dss", "cli", "pace")     or "5"
+local pause   = uci:get("dss", "cli", "pause")    or "2"
 local rounds  = uci:get("dss", "cli", "rounds")   or "0"
 local minutes = uci:get("dss", "cli", "minutes")  or "0"
 local search  = uci:get("dss", "cli", "search")   == "1"
@@ -44,10 +45,15 @@ local custA, custB = customs(selA), customs(selB)
 
 local m = luci.http.formvalue("m")
 local msgs = {
+	apisaved   = translate("API credential saved."),
+	apicleared = translate("API credential deleted."),
+	badapi     = translate("Base URL or API key looks wrong, nothing saved."),
+	baddb      = translate("No doubao.com /chat/completion cURL or no --data-raw found, nothing saved."),
 	saved      = translate("Settings saved and service restarted."),
 	cleared    = translate("Stored token deleted."),
 	tokensaved = translate("Token saved."),
 	badtoken   = translate("Token too short, nothing saved."),
+	badkimi    = translate("No authorization Bearer in the pasted cURL, nothing saved."),
 	svcstart   = translate("Service started."),
 	svcstop    = translate("Service stopped."),
 	svcrestart = translate("Service restarted.")
@@ -60,12 +66,62 @@ local msgs = {
 	<div class="alert-message success"><%=pcdata(msgs[m])%></div>
 <% end %>
 
+<%
+local running = (luci.sys.exec("pgrep -f '/usr/bin/dss-web' >/dev/null 2>&1 && echo yes") or ""):gsub("%s", "")
+local fcount = 0
+local p1 = io.popen("ls -1 /root/.dss/out 2>/dev/null | wc -l")
+if p1 then fcount = tonumber(p1:read("*l")) or 0; p1:close() end
+local hasTok = (tokstate ~= translate("not set")) and (tokstate ~= translate("empty"))
+%>
+<div style="margin:10px 0 14px 0;padding:10px 14px;border:1px solid #d8e2ec;border-radius:4px;background:#f7fafd;font-size:13px">
+	<span style="display:inline-block;padding:1px 8px;border-radius:10px;color:#fff;background:<%= running == "yes" and "#3c9a3c" or "#c0392b" %>">
+		<%= running == "yes" and translate("running") or translate("stopped") %>
+	</span>
+	&nbsp;&nbsp;<b><%:Port%></b> <%=pcdata(port)%>
+	&nbsp;&middot;&nbsp;<b><%:Token%></b> <span style="color:<%= hasTok and "#3c9a3c" or "#c0392b" %>"><%=pcdata(tokstate)%></span>
+	&nbsp;&middot;&nbsp;<b><%:Code files%></b> <%= fcount %>
+	&nbsp;&middot;&nbsp;<a href="http://<%=luci.http.getenv("SERVER_NAME") or "192.168.1.1"%>:<%=pcdata(port)%>/token" target="_blank"><%:open token page%></a>
+</div>
+
 <div class="cbi-map">
 	<div class="cbi-map-descr">
 		<%:Uses your own chat.deepseek.com web session. No browser, no paid API. Values set here are also used by the dss command line tool.%>
 	</div>
 
-	<form method="post" action="<%=url('admin/services/dss/save')%>">
+	<%
+local MODEL_SETS = {
+	deepseek = { { v = "", n = "默认 (deepseek-chat)" }, { v = "deepseek-chat", n = "deepseek-chat" }, { v = "deepseek-reasoner", n = "deepseek-reasoner" } },
+	api      = { { v = "glm-4-flash", n = "glm-4-flash（智谱，免费，首字 0.7s）" } },
+}
+local function model_select(id, cur, be)
+	local set = MODEL_SETS[be] or MODEL_SETS.deepseek
+	local out, known = {}, false
+	for _, m in ipairs(set) do
+		if m.v == cur then known = true end
+		table.insert(out, string.format('<option value="%s"%s>%s</option>',
+			pcdata(m.v), (m.v == cur) and " selected" or "", pcdata(m.n)))
+	end
+	-- 存的值不属于这个后端：不显示成已选（保存时会被清掉）
+	if cur ~= "" and not known then
+		table.insert(out, string.format('<option value="" selected>默认（原值 %s 与后端不符，将清除）</option>', pcdata(cur)))
+	end
+	return table.concat(out, "\n")
+end
+local function backend_select(id, cur)
+	local out = {}
+	for _, b in ipairs({ "deepseek", "api" }) do
+		table.insert(out, string.format('<option value="%s"%s>%s</option>', b, (b == cur) and " selected" or "", b))
+	end
+	return table.concat(out, "\n")
+end
+local curBA = uci:get("dss", "cli", "backend_a") or "deepseek"
+local curBB = uci:get("dss", "cli", "backend_b") or "deepseek"
+local curMA = uci:get("dss", "cli", "model_a") or ""
+local curMB = uci:get("dss", "cli", "model_b") or ""
+local effA = curBA .. " / " .. (curMA ~= "" and curMA or "默认")
+local effB = curBB .. " / " .. (curMB ~= "" and curMB or "默认")
+%>
+<form method="post" action="<%=url('admin/services/dss/save')%>">
 		<fieldset class="cbi-section">
 			<legend><%:Web helper%></legend>
 
@@ -104,6 +160,40 @@ local msgs = {
 					<div class="cbi-value-field">
 						<input type="text" id="pace" name="pace" value="<%=pcdata(pace)%>" size="6" class="cbi-input-text"/>
 						<div class="cbi-value-description"><%:DeepSeek blocks clients that send too fast. 5-8 seconds is safe.%></div>
+					</div>
+				</div>
+
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="pause"><%:Pause between duet turns (seconds)%></label>
+					<div class="cbi-value-field">
+						<input type="text" id="pause" name="pause" value="<%=pcdata(pause)%>" size="6" class="cbi-input-text"/>
+						<div class="cbi-value-description"><%:Extra wait before each turn of the self-dialogue (default 2). Raise it together with --pace when DeepSeek complains about frequency.%></div>
+					</div>
+				</div>
+
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="backend_a"><%:Side A backend / model%></label>
+					<div class="cbi-value-field">
+						<select id="backend_a" name="backend_a" class="cbi-input-select" onchange="this.form.submit()"><%=backend_select("backend_a", curBA)%></select>
+						<select id="model_a" name="model_a" class="cbi-input-select"><%=model_select("model_a", curMA, curBA)%></select>
+						<div class="cbi-value-description"><%:Side A backend and model. Current: %> <strong><%=pcdata(effA)%></strong></div>
+					</div>
+				</div>
+
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="backend_b"><%:Side B backend / model%></label>
+					<div class="cbi-value-field">
+						<select id="backend_b" name="backend_b" class="cbi-input-select" onchange="this.form.submit()"><%=backend_select("backend_b", curBB)%></select>
+						<select id="model_b" name="model_b" class="cbi-input-select"><%=model_select("model_b", curMB, curBB)%></select>
+						<div class="cbi-value-description"><%:Side B backend and model. Current: %> <strong><%=pcdata(effB)%></strong></div>
+					</div>
+				</div>
+
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="kimi_think"><%:Kimi deep thinking%></label>
+					<div class="cbi-value-field">
+						<input type="checkbox" id="kimi_think" name="kimi_think" value="1"<% if uci:get("dss","cli","kimi_think") == "1" then %> checked<% end %>/>
+						<div class="cbi-value-description"><%:Off = answer starts immediately (much faster). On = model thinks first, then answers; slower but better for hard problems.%></div>
 					</div>
 				</div>
 
@@ -216,16 +306,73 @@ local msgs = {
 		<div class="cbi-page-actions">
 			<input type="hidden" name="op" value="save"/>
 			<input class="cbi-button cbi-button-save" type="submit" value="<%:Save token%>"/>
-			<input class="cbi-button cbi-button-reset" type="submit" name="op" value="clear" onclick="return confirm('<%:Delete the stored token?%>')"/>
+			<button class="cbi-button cbi-button-reset" type="submit" name="op" value="clear"
+		onclick="return confirm('<%:Delete the stored token?%>')"><%:Clear%></button>
+		</div>
+	</form>
+</div>
+
+<h3><%:API backend (OpenAI compatible)%></h3>
+<%
+local aBase, aModel, aHave = "https://open.bigmodel.cn/api/paas/v4", "", false
+local fa = io.open("/root/.dss/openai.cred", "r")
+if fa then
+	local body = fa:read("*a") or ""
+	fa:close()
+	local bb = body:match("base%s*:%s*([^\n]+)")
+	local kk = body:match("key%s*:%s*([^\n]+)")
+	local mm = body:match("model%s*:%s*([^\n]+)")
+	if bb then aBase = bb end
+	if mm then aModel = mm end
+	aHave = (kk ~= nil and #kk > 8)
+end
+%>
+<div class="cbi-map">
+	<form method="post" action="<%=url('admin/services/dss/apicred')%>">
+		<fieldset class="cbi-section">
+			<div class="cbi-section-node">
+				<div class="cbi-value">
+					<label class="cbi-value-title"><%:Status%></label>
+					<div class="cbi-value-field">
+						<strong><%= aHave and "key set" or "not set"%></strong>
+						<span> / model: <%=pcdata(aModel ~= "" and aModel or "(default)")%></span>
+						<div class="cbi-value-description"><%:Free options: 智谱 glm-4-flash (open.bigmodel.cn), 硅基流动 Qwen2.5-7B (siliconflow.cn), 腾讯 hunyuan-lite, 百度 ernie-speed. Any OpenAI compatible endpoint works.%></div>
+					</div>
+				</div>
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="api_base"><%:Base URL%></label>
+					<div class="cbi-value-field">
+						<input type="text" id="api_base" name="api_base" value="<%=pcdata(aBase)%>" size="56" class="cbi-input-text"/>
+					</div>
+				</div>
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="api_key"><%:API key%></label>
+					<div class="cbi-value-field">
+						<input type="password" id="api_key" name="api_key" value="" size="56" class="cbi-input-text" placeholder="<%:leave empty to keep the stored key%>"/>
+					</div>
+				</div>
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="api_model"><%:Model%></label>
+					<div class="cbi-value-field">
+						<input type="text" id="api_model" name="api_model" value="<%=pcdata(aModel)%>" size="32" class="cbi-input-text" placeholder="glm-4-flash"/>
+					</div>
+				</div>
+			</div>
+		</fieldset>
+		<div class="cbi-page-actions">
+			<input type="hidden" name="op" value="save"/>
+			<input class="cbi-button cbi-button-save" type="submit" value="<%:Save credential%>"/>
+			<button class="cbi-button cbi-button-reset" type="submit" name="op" value="clear"
+			onclick="return confirm('<%:Delete the stored API key?%>')"><%:Clear%></button>
 		</div>
 	</form>
 </div>
 
 <h3><%:Service control%></h3>
 <form method="post" action="<%=url('admin/services/dss/svc')%>">
-	<input class="cbi-button" type="submit" name="op" value="start"/>
-	<input class="cbi-button" type="submit" name="op" value="stop"/>
-	<input class="cbi-button cbi-button-apply" type="submit" name="op" value="restart"/>
+	<button class="cbi-button" type="submit" name="op" value="start"><%:Start%></button>
+	<button class="cbi-button" type="submit" name="op" value="stop"><%:Stop%></button>
+	<button class="cbi-button cbi-button-apply" type="submit" name="op" value="restart"><%:Restart%></button>
 </form>
 
 <%+footer%>

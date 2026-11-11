@@ -4,15 +4,26 @@
 <div class="cbi-map">
 	<div class="cbi-map-descr">
 		<%:Code files the model produced. Files are named after the name the model gave them. All files are stored in /root/.dss/out (single copy).%>
-		<span id="st" class="cbi-value-description">(<%:loading%>)</span>
-		&nbsp;<a href="javascript:refresh()"><%:refresh now%></a>
 	</div>
 
-	<form method="post" action="<%=url('admin/services/dss/file')%>">
+	<div style="margin:10px 0;padding:8px 12px;border:1px solid #d8e2ec;border-radius:4px;background:#f7fafd;font-size:13px">
+		<b><%:Files%></b> <span id="cnt">-</span>
+		&nbsp;&middot;&nbsp;<b><%:Total size%></b> <span id="total">-</span>
+		&nbsp;&middot;&nbsp;<span id="st" class="cbi-value-description">(<%:loading%>)</span>
+		&nbsp;&middot;&nbsp;<a href="javascript:refresh()"><%:refresh now%></a>
+	</div>
+
+	<div style="margin:0 0 10px 0">
+		<input type="text" id="filter" class="cbi-input-text" style="width:260px"
+		       placeholder="<%:filter by name%>" oninput="window.applyFilter()"/>
+	</div>
+
+	<form method="post" action="<%=url('admin/services/dss/file')%>" id="delform">
 		<fieldset class="cbi-section">
 			<table class="table" id="tbl" width="100%">
 				<tr class="tr table-titles">
 					<th class="th"><%:File%></th>
+					<th class="th"><%:Type%></th>
 					<th class="th"><%:Size%></th>
 					<th class="th"><%:Modified%></th>
 					<th class="th"><%:Download%></th>
@@ -36,66 +47,90 @@
 <span id="lbl-del" style="display:none"><%:Delete%></span>
 <span id="lbl-dl" style="display:none"><%:download%></span>
 
+<style type="text/css">
+.dss-badge { display:inline-block; min-width:34px; text-align:center; padding:1px 6px; border-radius:9px;
+	font-size:11px; color:#fff; background:#8899a6; }
+.dss-badge.c { background:#3f7fbf; }
+.dss-badge.h { background:#8e6cbf; }
+.dss-badge.sh { background:#3f9f6f; }
+.dss-badge.py { background:#c08a2e; }
+.dss-badge.other { background:#8899a6; }
+#tbl tr:hover td { background:#f3f8fd; }
+</style>
+
 <script type="text/javascript">
-(function() {
-	function human(n) {
-		if (n < 1024) return n + ' B';
-		if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
-		return (n / 1048576).toFixed(1) + ' MB';
-	}
+var ALL = [];
 
-	window.refresh = function() {
-		var x = new XMLHttpRequest();
-		x.open('GET', '/cgi-bin/dss-cgi?a=files&_=' + Date.now(), true);
-		x.onreadystatechange = function() {
-			if (x.readyState !== 4) return;
-			var st = document.getElementById('st');
-			if (x.status !== 200) { st.textContent = 'HTTP ' + x.status; return; }
+function human(n) {
+	if (n < 1024) return n + ' B';
+	if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+	return (n / 1048576).toFixed(1) + ' MB';
+}
 
-			var data;
-			try { data = JSON.parse(x.responseText); } catch (e) { st.textContent = 'bad json'; return; }
+function badge(name) {
+	var m = name.match(/\.([A-Za-z0-9]+)$/);
+	var ext = m ? m[1].toLowerCase() : 'other';
+	var cls = ['c','h','sh','py'].indexOf(ext) >= 0 ? ext : 'other';
+	var d = document.createElement('span');
+	d.className = 'dss-badge ' + cls;
+	d.textContent = ext.toUpperCase().slice(0, 4);
+	return d;
+}
 
-			var tbl = document.getElementById('tbl');
-			while (tbl.rows.length > 1) tbl.deleteRow(1);
+window.applyFilter = function() {
+	var q = (document.getElementById('filter').value || '').toLowerCase();
+	var tbl = document.getElementById('tbl');
+	while (tbl.rows.length > 1) tbl.deleteRow(1);
+	var shown = 0, bytes = 0;
+	ALL.forEach(function(f) {
+		if (q && f.name.toLowerCase().indexOf(q) < 0) return;
+		shown++; bytes += f.size;
+		var tr = tbl.insertRow(-1);
+		tr.className = 'tr';
 
-			var files = data.files || [];
-			st.textContent = files.length + ' <%:file(s)%>';
-			for (var i = 0; i < files.length; i++) {
-				var f = files[i];
-				var tr = tbl.insertRow(-1);
-				tr.className = 'tr';
+		var c = tr.insertCell(-1); c.className = 'td'; c.textContent = f.name;
+		c = tr.insertCell(-1); c.className = 'td'; c.appendChild(badge(f.name));
+		c = tr.insertCell(-1); c.className = 'td'; c.textContent = human(f.size);
+		c = tr.insertCell(-1); c.className = 'td';
+		c.textContent = f.mtime ? new Date(f.mtime * 1000).toLocaleString() : '-';
 
-				var c = tr.insertCell(-1); c.className = 'td'; c.textContent = f.name;
-				c = tr.insertCell(-1); c.className = 'td'; c.textContent = human(f.size);
-				c = tr.insertCell(-1); c.className = 'td';
-				c.textContent = f.mtime ? new Date(f.mtime * 1000).toLocaleString() : '-';
+		c = tr.insertCell(-1); c.className = 'td';
+		var a = document.createElement('a');
+		a.href = '/cgi-bin/dss-cgi?a=get&f=' + encodeURIComponent(f.name);
+		a.textContent = document.getElementById('lbl-dl').textContent;
+		c.appendChild(a);
 
-				c = tr.insertCell(-1); c.className = 'td';
-				var a = document.createElement('a');
-				a.href = '/cgi-bin/dss-cgi?a=get&f=' + encodeURIComponent(f.name);
-				a.textContent = document.getElementById('lbl-dl').textContent;
-				c.appendChild(a);
+		c = tr.insertCell(-1); c.className = 'td';
+		var b = document.createElement('button');
+		b.className = 'cbi-button cbi-button-reset';
+		b.type = 'submit'; b.name = 'name'; b.value = f.name;
+		b.textContent = document.getElementById('lbl-del').textContent;
+		b.onclick = (function(nm) {
+			return function() { return confirm('<%:Delete%> ' + nm + ' ?'); };
+		})(f.name);
+		c.appendChild(b);
+	});
+	document.getElementById('cnt').textContent = shown;
+	document.getElementById('total').textContent = human(bytes);
+};
 
-				c = tr.insertCell(-1); c.className = 'td';
-				var b = document.createElement('button');
-				b.className = 'cbi-button cbi-button-reset';
-				b.type = 'submit';
-				b.name = 'name';
-				b.value = f.name;
-				b.textContent = document.getElementById('lbl-del').textContent;
-				b.onclick = function(nm) {
-					return function() {
-						if (!confirm('<%:Delete%> ' + nm + ' ?')) return false;
-					};
-				}(f.name);
-				c.appendChild(b);
-			}
-		};
-		x.send();
+window.refresh = function() {
+	var x = new XMLHttpRequest();
+	x.open('GET', '/cgi-bin/dss-cgi?a=files&_=' + Date.now(), true);
+	x.onreadystatechange = function() {
+		if (x.readyState !== 4) return;
+		var st = document.getElementById('st');
+		if (x.status !== 200) { st.textContent = 'HTTP ' + x.status; return; }
+		var data;
+		try { data = JSON.parse(x.responseText); } catch (e) { st.textContent = 'bad json'; return; }
+		ALL = (data.files || []).sort(function(a, b) { return (b.mtime || 0) - (a.mtime || 0); });
+		st.textContent = '(' + new Date().toLocaleTimeString() + ')';
+		window.applyFilter();
 	};
-	window.refresh();
-	setInterval(window.refresh, 5000);
-})();
+	x.send();
+};
+window.refresh();
+setInterval(window.refresh, 8000);
 </script>
 
 <%+footer%>
