@@ -4,7 +4,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=ONMP
-PKG_VERSION:=1.0.0
+PKG_VERSION:=1.0.1
 PKG_RELEASE:=1
 PKG_LICENSE:=GPL-2.0
 PKG_MAINTAINER:=syb999
@@ -45,6 +45,10 @@ define Package/ONMP/description
   Uses the firmware php8 (patched against CVE-2026-109618/109619).
   It runs its own nginx instance with a private pid/log/config and does
   not touch the nginx-rtmp-server package.
+  uci-defaults also makes the stack bootable as-is: creates the mariadb
+  runtime user, writes datadir/sql_mode into /etc/mysql/conf.d/onmp.cnf,
+  clears php.ini doc_root (php-fpm refuses scripts outside it) and gives
+  php-fpm (nobody) a writable session dir.
 endef
 
 define Package/ONMP/conffiles

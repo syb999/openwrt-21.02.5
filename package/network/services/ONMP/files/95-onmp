@@ -7,6 +7,19 @@ uci -q set mysqld.general.enabled='1'
 uci -q set mysqld.general.init='1'
 uci -q commit mysqld
 
+# mariadb-server needs a runtime user owning /srv/mysql; some images ship
+# /etc/passwd without it, which makes the init script fail on chown.
+mysql_ensure_user() {
+	grep -q '^mariadb:' /etc/passwd && return 0
+	uid=376
+	while awk -F: -v u="$uid" '$3 == u { found = 1 } END { exit !found }' /etc/passwd; do
+		uid=$((uid + 1))
+	done
+	echo "mariadb:x:$uid:$uid:mariadb:/srv/mysql:/bin/false" >> /etc/passwd
+	grep -q '^mariadb:' /etc/group || echo "mariadb:x:$uid:" >> /etc/group
+}
+mysql_ensure_user
+
 mkdir -p /etc/mysql/conf.d /var/run/mysqld
 cat > /etc/mysql/conf.d/onmp.cnf <<-EOF
 [client-server]
@@ -15,16 +28,24 @@ socket = /var/run/mysqld/mysqld.sock
 [mysqld]
 socket = /var/run/mysqld/mysqld.sock
 bind-address = 127.0.0.1
+datadir = /srv/mysql
+tmpdir = /tmp
+sql_mode = "NO_ENGINE_SUBSTITUTION"
 EOF
 
-# --- PHP: session dir, sockets, upload limits ----------------------------
+# --- PHP: doc_root, session dir, sockets, upload limits -------------------
+# php.ini ships doc_root = "/www"; php-fpm then refuses any script outside it
+sed -i 's|^doc_root *=.*|doc_root = ""|' /etc/php.ini
+
 mkdir -p /var/lib/onmp/sessions
-chmod 1777 /var/lib/onmp/sessions
+chown nobody /var/lib/onmp/sessions 2> /dev/null
+chmod 1733 /var/lib/onmp/sessions
 
 if ! grep -q 'ONMP-PHP-INI' /etc/php.ini 2>/dev/null; then
 	cat >> /etc/php.ini <<-EOF
 
 	; ONMP-PHP-INI
+	doc_root = ""
 	session.save_path = "/var/lib/onmp/sessions"
 	mysqli.default_socket = /var/run/mysqld/mysqld.sock
 	pdo_mysql.default_socket = /var/run/mysqld/mysqld.sock
@@ -64,6 +85,16 @@ fi
 
 mkdir -p /www/onmp
 [ -f /www/onmp/index.php ] || printf '%s\n' '<?php phpinfo();' > /www/onmp/index.php
+
+# serve an existing phpems tree by default instead of the phpinfo page
+if [ -d /opt/phpems ] && [ "$(uci -q get onmp.main.root)" = "/www/onmp" ]; then
+	uci -q set onmp.main.root='/opt/phpems'
+	uci -q commit onmp
+fi
+# php-fpm runs as nobody: phpems needs to write its cache/upload dirs
+for d in /opt/phpems/data /opt/phpems/files; do
+	[ -d "$d" ] && chown -R nobody "$d" 2> /dev/null
+done
 
 /etc/init.d/onmp enable
 if pidof procd > /dev/null 2>&1; then

@@ -25,6 +25,9 @@ onmp_config() {
 onmp_dirs() {
 	mkdir -p /var/etc /var/run /var/log/onmp /var/run/mysqld
 	mkdir -p /var/lib/onmp/nginx/body /var/lib/onmp/nginx/fastcgi /var/lib/onmp/nginx/proxy
+	mkdir -p /var/lib/onmp/sessions
+	chown nobody /var/lib/onmp/sessions 2> /dev/null
+	chmod 1733 /var/lib/onmp/sessions
 	mkdir -p /etc/onmp/vhosts
 	if [ ! -d "$ONMP_ROOT" ]; then
 		mkdir -p "$ONMP_ROOT"
@@ -63,7 +66,20 @@ start_service() {
 	for svc in php8-fpm mysqld redis; do
 		[ -x "/etc/init.d/$svc" ] || continue
 		svc_running "$svc" && continue
+		# wait for old instance to exit: mysqld needs ~2s to shut down,
+		# otherwise start aborts with "server is already running"
+		i=0
+		while svc_running "$svc" && [ "$i" -lt 30 ]; do
+			sleep 1
+			i=$((i + 1))
+		done
 		"/etc/init.d/$svc" start > /dev/null 2>&1
+		i=0
+		while ! svc_running "$svc" && [ "$i" -lt 20 ]; do
+			sleep 1
+			i=$((i + 1))
+		done
+		svc_running "$svc" || logger -t onmp "failed to start $svc"
 	done
 
 	procd_open_instance
