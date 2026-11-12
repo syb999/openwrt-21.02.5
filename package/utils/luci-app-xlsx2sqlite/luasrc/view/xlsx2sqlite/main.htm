@@ -1,0 +1,944 @@
+<%+header%>
+
+<style type="text/css">
+#x2s-app {
+	--x2s-accent: #2f7cf6;
+	--x2s-ok: #17a45f;
+	--x2s-bad: #e0484d;
+	--x2s-line: rgba(127,127,127,.26);
+	--x2s-fill: rgba(127,127,127,.07);
+	--x2s-fill2: rgba(127,127,127,.13);
+	max-width: 1240px;
+	font-size: 14px;
+	line-height: 1.55;
+}
+#x2s-app * { box-sizing: border-box; }
+#x2s-app .x2s-hero {
+	padding: 18px 22px;
+	border-radius: 14px;
+	margin-bottom: 16px;
+	border: 1px solid var(--x2s-line);
+	background: linear-gradient(135deg, rgba(47,124,246,.14), rgba(23,164,95,.10) 70%, transparent);
+}
+#x2s-app .x2s-hero h2 {
+	margin: 0 0 6px !important;
+	padding: 0 !important;
+	border: 0 !important;
+	font-size: 20px !important;
+	line-height: 1.3 !important;
+	font-weight: 700;
+	letter-spacing: .2px;
+}
+#x2s-app .x2s-ver {
+	display: inline-block;
+	margin-left: 8px;
+	padding: 1px 8px;
+	border-radius: 999px;
+	font-size: 12px;
+	font-weight: 600;
+	vertical-align: 2px;
+	color: #fff;
+	background: var(--x2s-accent);
+}
+#x2s-app .x2s-hero p { margin: 0; opacity: .78; font-size: 13px; }
+#x2s-app .x2s-grid {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	align-items: stretch;
+	gap: 16px;
+	margin-bottom: 16px;
+}
+#x2s-app .x2s-card-fill { display: flex; flex-direction: column; }
+#x2s-app .x2s-card-fill .x2s-files { flex: 0 0 auto; }
+#x2s-app .x2s-card {
+	border: 1px solid var(--x2s-line);
+	border-radius: 14px;
+	background: var(--x2s-fill);
+	padding: 16px 18px;
+}
+#x2s-app .x2s-card + .x2s-card { margin-top: 16px; }
+#x2s-app .x2s-h {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin: 0 0 12px !important;
+	padding: 0 !important;
+	border: 0 !important;
+	font-size: 15px !important;
+	line-height: 1.35 !important;
+	font-weight: 600;
+}
+#x2s-app .x2s-step {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 22px;
+	height: 22px;
+	border-radius: 50%;
+	font-size: 12px;
+	font-weight: 700;
+	color: #fff;
+	background: var(--x2s-accent);
+}
+#x2s-app .x2s-field { margin-bottom: 12px; }
+#x2s-app .x2s-label {
+	display: block;
+	margin-bottom: 6px;
+	font-size: 13px;
+	font-weight: 600;
+	line-height: 1.4;
+	opacity: .82;
+}
+/* 主题会给 input/select 设 height/padding，叠加后文字被切一半；这里一律钉死 */
+#x2s-app .x2s-field input[type=text],
+#x2s-app .x2s-field select,
+#x2s-app .x2s-pager select {
+	box-sizing: border-box !important;
+	display: block;
+	width: 100%;
+	height: 38px !important;
+	min-height: 38px !important;
+	max-height: 38px !important;
+	line-height: 36px !important;
+	padding: 0 12px !important;
+	margin: 0 !important;
+	font-family: inherit !important;
+	font-size: 13px !important;
+	font-weight: 400;
+	color: inherit !important;
+	background-color: rgba(127,127,127,.06) !important;
+	border: 1px solid var(--x2s-line) !important;
+	border-radius: 9px !important;
+	box-shadow: none !important;
+	outline: none;
+	transition: border-color .15s, box-shadow .15s;
+}
+#x2s-app .x2s-field input[type=text]:focus,
+#x2s-app .x2s-field select:focus,
+#x2s-app .x2s-pager select:focus {
+	border-color: var(--x2s-accent) !important;
+	box-shadow: 0 0 0 3px rgba(47,124,246,.16) !important;
+}
+#x2s-app .x2s-pager select {
+	width: auto !important;
+	height: 34px !important;
+	min-height: 34px !important;
+	max-height: 34px !important;
+	line-height: 32px !important;
+	padding: 0 8px !important;
+	font-size: 12px !important;
+}
+/* ---- 去重：用单选块代替 select，避免不同主题下 option 文字被裁 ---- */
+#x2s-app .x2s-radio { display: flex; flex-direction: column; gap: 8px; }
+#x2s-app .x2s-radio-item {
+	display: flex !important;
+	align-items: center;
+	gap: 9px;
+	box-sizing: border-box;
+	min-height: 38px;
+	padding: 6px 12px;
+	margin: 0 !important;
+	font-size: 13px;
+	font-weight: 500;
+	line-height: 1.45;
+	border: 1px solid var(--x2s-line);
+	border-radius: 9px;
+	background: rgba(127,127,127,.05);
+	cursor: pointer;
+}
+#x2s-app .x2s-radio-item.x2s-on {
+	border-color: var(--x2s-accent);
+	background: rgba(47,124,246,.10);
+	box-shadow: inset 0 0 0 1px var(--x2s-accent);
+}
+#x2s-app .x2s-radio-item input[type=radio] {
+	flex: 0 0 auto;
+	position: static !important;
+	top: 0 !important;
+	right: 0 !important;
+	width: 15px !important;
+	height: 15px !important;
+	margin: 0 !important;
+	vertical-align: middle !important;
+	accent-color: var(--x2s-accent);
+}
+#x2s-app .x2s-radio-item span { flex: 1 1 auto; }
+#x2s-app .x2s-hint { margin: 5px 0 0; font-size: 12px; opacity: .62; }
+#x2s-app .x2s-row2 { display: grid; grid-template-columns: 1fr 140px; gap: 12px; }
+#x2s-app .x2s-drop {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	flex: 1 1 auto;
+	min-height: 120px;
+	position: relative;
+	padding: 22px 16px;
+	text-align: center;
+	border: 2px dashed var(--x2s-line);
+	border-radius: 12px;
+	background: rgba(127,127,127,.03);
+	cursor: pointer;
+	transition: border-color .15s, background .15s;
+}
+#x2s-app .x2s-drop:hover,
+#x2s-app .x2s-drop.x2s-over {
+	border-color: var(--x2s-accent);
+	background: rgba(47,124,246,.08);
+}
+#x2s-app .x2s-drop input[type=file] {
+	position: absolute;
+	left: 0; top: 0;
+	width: 100%; height: 100%;
+	opacity: 0;
+	cursor: pointer;
+}
+#x2s-app .x2s-drop b { display: block; font-size: 14px; margin-bottom: 4px; }
+#x2s-app .x2s-drop span { font-size: 12px; opacity: .62; }
+#x2s-app .x2s-files { list-style: none; margin: 12px 0 0; padding: 0; }
+#x2s-app .x2s-files li {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 6px 10px;
+	margin-bottom: 6px;
+	font-size: 13px;
+	border-radius: 8px;
+	background: var(--x2s-fill2);
+}
+#x2s-app .x2s-files .x2s-fn {
+	flex: 1;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+#x2s-app .x2s-files .x2s-fs { opacity: .62; font-size: 12px; }
+#x2s-app .x2s-x {
+	width: 22px; height: 22px;
+	line-height: 20px;
+	text-align: center;
+	border: 0;
+	border-radius: 50%;
+	font-size: 14px;
+	color: inherit;
+	opacity: .55;
+	background: transparent;
+	cursor: pointer;
+}
+#x2s-app .x2s-x:hover { opacity: 1; background: rgba(224,72,77,.18); color: var(--x2s-bad); }
+#x2s-app .x2s-btn {
+	display: inline-block;
+	box-sizing: border-box;
+	height: auto !important;
+	min-height: 34px !important;
+	line-height: 1.4 !important;
+	padding: 8px 16px !important;
+	font-family: inherit !important;
+	font-size: 13px !important;
+	font-weight: 600;
+	text-transform: none !important;
+	color: inherit;
+	background: var(--x2s-fill2);
+	border: 1px solid var(--x2s-line) !important;
+	border-radius: 9px !important;
+	box-shadow: none !important;
+	cursor: pointer;
+	transition: transform .06s, filter .15s;
+}
+#x2s-app .x2s-btn:hover { filter: brightness(1.08); }
+#x2s-app .x2s-btn:active { transform: translateY(1px); }
+#x2s-app .x2s-btn[disabled] { opacity: .45; cursor: not-allowed; filter: none; }
+#x2s-app .x2s-btn-primary {
+	color: #fff !important;
+	border-color: transparent !important;
+	background: linear-gradient(135deg, #2f7cf6, #1f63d0) !important;
+	box-shadow: 0 2px 8px rgba(47,124,246,.28) !important;
+}
+#x2s-app .x2s-btn-go {
+	width: 100%;
+	min-height: 42px !important;
+	padding: 10px 16px !important;
+	font-size: 14px !important;
+}
+#x2s-app .x2s-btn-ok { color: #fff; border-color: transparent; background: linear-gradient(135deg,#17a45f,#128a4e); }
+#x2s-app #x2s-out:not(:empty) {
+	margin-bottom: 16px;
+	padding: 16px 18px;
+	border: 1px solid var(--x2s-line);
+	border-radius: 14px;
+	background: #fff;
+}
+@media (prefers-color-scheme: dark) {
+	#x2s-app #x2s-out:not(:empty) { background: #1b1e23; }
+}
+#x2s-app .x2s-btn-danger {
+	color: #fff !important;
+	border-color: transparent !important;
+	background: linear-gradient(135deg,#e0484d,#c33a3f) !important;
+}
+#x2s-app .x2s-msg { margin: 0 0 14px; }
+#x2s-app .x2s-msg:empty { display: none; }
+#x2s-app .x2s-alert {
+	padding: 10px 14px;
+	border-radius: 10px;
+	font-size: 13px;
+	font-weight: 600;
+	border: 1px solid transparent;
+}
+#x2s-app .x2s-alert-ok {
+	background: rgba(23,164,95,.14);
+	border-color: rgba(23,164,95,.38);
+	box-shadow: inset 3px 0 0 var(--x2s-ok);
+}
+#x2s-app .x2s-alert-ok::before { content: "\2713 "; color: var(--x2s-ok); font-weight: 700; }
+#x2s-app .x2s-alert-bad {
+	background: rgba(224,72,77,.13);
+	border-color: rgba(224,72,77,.38);
+	box-shadow: inset 3px 0 0 var(--x2s-bad);
+}
+#x2s-app .x2s-alert-bad::before { content: "\2715 "; color: var(--x2s-bad); font-weight: 700; }
+#x2s-app .x2s-chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 14px; }
+#x2s-app .x2s-chip {
+	display: inline-flex;
+	align-items: baseline;
+	gap: 6px;
+	padding: 6px 12px;
+	font-size: 12px;
+	border-radius: 999px;
+	border: 1px solid var(--x2s-line);
+	background: var(--x2s-fill2);
+}
+#x2s-app .x2s-chip b { font-size: 15px; font-weight: 700; }
+#x2s-app .x2s-acts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+#x2s-app .x2s-act {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	padding: 8px 14px;
+	font-size: 13px;
+	font-weight: 600;
+	color: inherit;
+	text-decoration: none;
+	border: 1px solid var(--x2s-line);
+	border-radius: 9px;
+	background: var(--x2s-fill2);
+}
+#x2s-app .x2s-act:hover { filter: brightness(1.1); text-decoration: none; }
+#x2s-app .x2s-act.x2s-act-primary {
+	color: #fff;
+	border-color: transparent;
+	background: linear-gradient(135deg,#2f7cf6,#1f63d0);
+	box-shadow: 0 2px 8px rgba(47,124,246,.26);
+}
+#x2s-app .x2s-scroll {
+	overflow: auto;
+	max-height: 66vh;
+	border: 1px solid var(--x2s-line);
+	border-radius: 10px;
+}
+#x2s-app table.x2s-tbl {
+	width: 100%;
+	border-collapse: collapse;
+	table-layout: fixed;
+	font-size: 13px !important;
+	box-shadow: none !important;
+}
+#x2s-app table.x2s-tbl th,
+#x2s-app table.x2s-tbl td {
+	font-size: 13px !important;
+	line-height: 1.5 !important;
+	padding: 9px 12px !important;
+	text-align: left;
+	vertical-align: top;
+	border-bottom: 1px solid var(--x2s-line);
+	overflow-wrap: anywhere;
+	word-break: break-word;
+}
+#x2s-app table.x2s-tbl thead th {
+	position: sticky;
+	top: 0;
+	z-index: 2;
+	font-size: 12px;
+	font-weight: 700;
+	line-height: 1.35;
+	background: #e9edf2;          /* 实色，滚动时不透出下面的行 */
+	border-bottom: 1px solid rgba(0,0,0,.14);
+	box-shadow: 0 1px 0 rgba(0,0,0,.04);
+}
+@media (prefers-color-scheme: dark) {
+	#x2s-app table.x2s-tbl thead th {
+		background: #262b31;
+		border-bottom-color: rgba(255,255,255,.16);
+	}
+}
+#x2s-app table.x2s-tbl tbody tr:nth-child(even) { background: rgba(127,127,127,.05); }
+#x2s-app table.x2s-tbl tbody tr:hover { background: rgba(47,124,246,.09); }
+#x2s-app .x2s-pre {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+#x2s-app .x2s-narrow {
+	white-space: nowrap;
+	overflow-wrap: normal;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+#x2s-app .x2s-pager {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px;
+	margin: 12px 0;
+	font-size: 13px;
+}
+#x2s-app .x2s-pager .x2s-count { margin-left: auto; opacity: .72; }
+#x2s-app .x2s-pager select {
+	padding: 6px 8px;
+	font-size: 12px;
+	color: inherit;
+	background: rgba(127,127,127,.05);
+	border: 1px solid var(--x2s-line);
+	border-radius: 8px;
+}
+#x2s-app .x2s-empty {
+	padding: 18px;
+	text-align: center;
+	font-size: 13px;
+	opacity: .6;
+	border: 1px dashed var(--x2s-line);
+	border-radius: 10px;
+}
+#x2s-app .x2s-dbname { word-break: break-all; font-family: monospace; font-size: 12px; }
+#x2s-app .x2s-dbacts { display: flex; flex-wrap: wrap; gap: 5px; }
+#x2s-app .x2s-dbacts .x2s-btn {
+	min-height: 28px !important;
+	padding: 4px 9px !important;
+	font-size: 12px !important;
+	font-weight: 500;
+}
+#x2s-app .x2s-spin {
+	display: inline-block;
+	width: 12px; height: 12px;
+	margin-right: 6px;
+	border: 2px solid rgba(255,255,255,.45);
+	border-top-color: #fff;
+	border-radius: 50%;
+	animation: x2s-rot .7s linear infinite;
+	vertical-align: -1px;
+}
+@keyframes x2s-rot { to { transform: rotate(360deg); } }
+@media (max-width: 900px) {
+	#x2s-app .x2s-scroll table.x2s-tbl { min-width: 780px; }
+}
+@media (max-width: 820px) {
+	#x2s-app .x2s-grid { grid-template-columns: 1fr; }
+	#x2s-app .x2s-row2 { grid-template-columns: 1fr; }
+}
+</style>
+
+<div id="x2s-app">
+
+	<div class="x2s-hero">
+		<h2>Excel 汇总 ⇄ SQLite<span class="x2s-ver" id="x2s-ver"></span></h2>
+		<p>把 .xlsx / .xls / .csv / .sql 按表头内容合并成一张表（类似 1.xlsx 的结构），写成 sqlite3 数据库；
+		   也能把库再导回 .xlsx / .csv / .sql。选项被拆成多列时会自动合成 “A、…\nB、…” 单元格。</p>
+	</div>
+
+	<div class="x2s-grid">
+
+		<section class="x2s-card x2s-card-fill">
+			<h3 class="x2s-h"><span class="x2s-step">1</span>选择文件</h3>
+			<label class="x2s-drop" id="x2s-drop">
+				<input type="file" id="x2s-files" multiple="multiple"
+				       accept=".xlsx,.xlsm,.xls,.csv,.tsv,.txt,.sql" />
+				<b>点击选择文件</b>
+				<span>也可以把文件拖到这个框里（单次 48MB / 最多 24 个）</span>
+			</label>
+			<ul class="x2s-files" id="x2s-filelist"></ul>
+		</section>
+
+		<section class="x2s-card">
+			<h3 class="x2s-h"><span class="x2s-step">2</span>输出设置</h3>
+			<div class="x2s-field">
+				<span class="x2s-label">数据库路径</span>
+				<input type="text" id="x2s-db" spellcheck="false" />
+				<p class="x2s-hint">只能位于 /root/xlsx2sqlite/ 下</p>
+			</div>
+			<div class="x2s-row2">
+				<div class="x2s-field">
+					<span class="x2s-label">表名</span>
+					<input type="text" id="x2s-tbl" spellcheck="false" />
+				</div>
+				<div class="x2s-field">
+					<span class="x2s-label">表头行</span>
+					<input type="text" id="x2s-hdr" />
+				</div>
+			</div>
+			<div class="x2s-field">
+				<span class="x2s-label">去重</span>
+				<div class="x2s-radio">
+					<label class="x2s-radio-item" id="x2s-ded-exact">
+						<input type="radio" name="x2s-dedupe" value="exact" checked="checked" />
+						<span>按序号精确去重（保留首次出现）</span>
+					</label>
+					<label class="x2s-radio-item" id="x2s-ded-off">
+						<input type="radio" name="x2s-dedupe" value="off" />
+						<span>不去重（全部保留）</span>
+					</label>
+				</div>
+				<p class="x2s-hint">只有 序号 / 题干 / 答案 三列全同才算重复；第04697题 与 第4697题 不会合并。</p>
+			</div>
+			<button class="x2s-btn x2s-btn-primary x2s-btn-go" id="x2s-go">开始汇总</button>
+		</section>
+	</div>
+
+	<div class="x2s-msg" id="x2s-msg"></div>
+	<div id="x2s-out"></div>
+
+	<section class="x2s-card">
+		<h3 class="x2s-h">已有数据库
+			<button class="x2s-btn" id="x2s-refresh" style="margin-left:auto;padding:5px 12px;font-size:12px">刷新</button>
+		</h3>
+		<div id="x2s-dbs"></div>
+	</section>
+</div>
+
+<script type="text/javascript">
+var X2S_API = '/cgi-bin/xlsx2sqlite';
+var X2S_SID = '<%=luci.dispatcher.context.authsession or ""%>';
+var X2S_VER = 'v1.2.9';
+var X2S_MAXFILES = 24;
+var X2S_FILES = [];
+
+if (X2S_SID) {
+	try { document.cookie = 'x2s_sid=' + X2S_SID + '; path=/; SameSite=Lax'; } catch (e) { }
+}
+
+function x2sReq(url, opt) {
+	var h = (opt && opt.headers) ? opt.headers : {};
+	var s = X2S_SID || '';
+	if (s) h['X-X2S-Sid'] = s;
+	opt = opt || {};
+	opt.headers = h;
+	opt.cache = 'no-store';
+	opt.credentials = 'same-origin';
+	return fetch(url, opt);
+}
+
+function x2sQs(o) {
+	var out = [], k;
+	for (k in o) {
+		if (o[k] !== null && o[k] !== undefined)
+			out.push(encodeURIComponent(k) + '=' + encodeURIComponent(o[k]));
+	}
+	return out.join('&');
+}
+
+function x2sGet(p) {
+	return x2sReq(X2S_API + '?' + x2sQs(p)).then(function (r) {
+		return r.text().then(function (t) {
+			try { return JSON.parse(t); }
+			catch (e) { throw new Error('HTTP ' + r.status + ': ' + t.substring(0, 200)); }
+		});
+	});
+}
+
+function x2sEsc(s) {
+	if (s === null || s === undefined) return '';
+	return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function x2sSize(n) {
+	n = Number(n) || 0;
+	if (n < 1024) return n + ' B';
+	if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+	return (n / 1048576).toFixed(2) + ' MB';
+}
+
+function x2sSt(k, d) {
+	try {
+		var v = window.localStorage.getItem('x2s.' + k);
+		return (v === null || v === '') ? d : v;
+	} catch (e) { return d; }
+}
+
+function x2sSet(k, v) {
+	try { window.localStorage.setItem('x2s.' + k, v); } catch (e) { }
+}
+
+function x2sDl(db, table, fmt) {
+	if (fmt === 'db')
+		window.open(X2S_API + '?' + x2sQs({ action: 'download', db: db }));
+	else
+		window.open(X2S_API + '?' + x2sQs({ action: 'export', db: db, table: table, fmt: fmt }));
+}
+
+function x2sDedupeItems() {
+	return document.getElementsByName ? document.getElementsByName('x2s-dedupe') : null;
+}
+
+function x2sDedupeVal() {
+	var r = x2sDedupeItems(), i;
+	for (i = 0; r && i < r.length; i++)
+		if (r[i].checked) return r[i].value;
+	return 'exact';
+}
+
+function x2sSetDedupe(v) {
+	var r = x2sDedupeItems(), i, on;
+	for (i = 0; r && i < r.length; i++) {
+		on = (r[i].value === v);
+		r[i].checked = on;
+		if (r[i].parentNode && r[i].parentNode.className !== undefined)
+			r[i].parentNode.className = 'x2s-radio-item' + (on ? ' x2s-on' : '');
+		r[i].onchange = x2sSyncDedupe;
+	}
+}
+
+function x2sSyncDedupe() {
+	x2sSetDedupe(x2sDedupeVal());
+}
+
+function x2sPageSize() {
+	var n = parseInt(x2sSt('pagesize', '20'), 10);
+	return (n > 0 && n <= 500) ? n : 20;
+}
+
+/* ---------- file picker ---------- */
+
+function x2sSizeOf(f) {
+	return f && f.size ? f.size : 0;
+}
+
+function x2sAddFiles(list) {
+	var i, added = 0, dup, j;
+	for (i = 0; list && i < list.length; i++) {
+		if (X2S_FILES.length >= X2S_MAXFILES)
+			break;
+		dup = 0;
+		for (j = 0; j < X2S_FILES.length; j++)
+			if (X2S_FILES[j].name === list[i].name && X2S_FILES[j].size === list[i].size)
+				dup = 1;
+		if (!dup) {
+			X2S_FILES.push(list[i]);
+			added++;
+		}
+	}
+	x2sRenderFiles();
+	return added;
+}
+
+function x2sRenderFiles() {
+	var box = document.getElementById('x2s-filelist'), h = '', i;
+
+	for (i = 0; i < X2S_FILES.length; i++) {
+		h += '<li><span class="x2s-fn">' + x2sEsc(X2S_FILES[i].name) + '</span>' +
+			'<span class="x2s-fs">' + x2sSize(x2sSizeOf(X2S_FILES[i])) + '</span>' +
+			'<button type="button" class="x2s-x" title="移除" ' +
+			'onclick="x2sDelFile(' + i + ')">×</button></li>';
+	}
+	box.innerHTML = h;
+}
+
+function x2sDelFile(i) {
+	X2S_FILES.splice(i, 1);
+	x2sRenderFiles();
+}
+
+function x2sDropSetup() {
+	var drop = document.getElementById('x2s-drop');
+	var inp = document.getElementById('x2s-files');
+
+	inp.onchange = function () {
+		x2sAddFiles(inp.files);
+		try { inp.value = ''; } catch (e) { }
+	};
+	drop.ondragover = function (e) {
+		e.preventDefault();
+		drop.className = 'x2s-drop x2s-over';
+	};
+	drop.ondragleave = function () { drop.className = 'x2s-drop'; };
+	drop.ondrop = function (e) {
+		e.preventDefault();
+		drop.className = 'x2s-drop';
+		var dt = e.dataTransfer;
+		if (dt && dt.files) x2sAddFiles(dt.files);
+	};
+}
+
+/* ---------- preview with paging ---------- */
+
+var X2S_PVC = 0, X2S_PV = {};
+
+/* fixed table layout needs explicit widths; guess them from the header text */
+function x2sColWeight(name) {
+	var n = String(name || '');
+	if (/序号|题号|编号|^id$/i.test(n)) return 10;
+	if (/题干|题目|试题|stem|question/i.test(n)) return 21;
+	if (/选项|option|choice/i.test(n)) return 25;
+	if (/答案|answer/i.test(n)) return 7;
+	if (/题型|类型|type/i.test(n)) return 8;
+	if (/依据|法条|法律|note|remark/i.test(n)) return 20;
+	return 13;
+}
+
+/* short columns (序号/答案/题型) get nowrap so a character is never cut in half */
+function x2sColClass(name) {
+	return x2sColWeight(name) <= 10 ? 'x2s-pre x2s-narrow' : 'x2s-pre';
+}
+
+function x2sColgroup(cols) {
+	var w = [], sum = 0, i, h = '<colgroup>';
+	for (i = 0; i < cols.length; i++) {
+		w.push(x2sColWeight(cols[i]));
+		sum += w[i];
+	}
+	for (i = 0; i < w.length; i++)
+		h += '<col style="width:' + (w[i] / sum * 100).toFixed(2) + '%" />';
+	return h + '</colgroup>';
+}
+
+function x2sPreview(db, table, box, offset) {
+	var limit = x2sPageSize();
+	var id;
+
+	if (!box) box = document.getElementById('x2s-out');
+	if (offset === undefined || offset === null || offset < 0) offset = 0;
+	if (!box.__x2sId) box.__x2sId = 'pv' + (++X2S_PVC);
+	id = box.__x2sId;
+	X2S_PV[id] = { db: db, table: table, box: box, offset: offset };
+
+	box.innerHTML = '<p class="x2s-hint">读取中 ...</p>';
+	x2sGet({ action: 'preview', db: db, table: table, limit: limit, offset: offset })
+		.then(function (r) {
+			if (!r.ok) {
+				box.innerHTML = '<div class="x2s-alert x2s-alert-bad">预览失败: ' +
+					x2sEsc(r.error) + '</div>';
+				return;
+			}
+			var start = r.offset || 0, shown = r.shown || 0, total = r.total || 0;
+			var pages = Math.ceil(total / limit);
+			if (pages < 1) pages = 1;
+			var cur = Math.floor(start / limit) + 1;
+			var h = '<div class="x2s-pager">' +
+				'<button class="x2s-btn" ' + (cur <= 1 ? 'disabled ' : '') +
+				'onclick="x2sPvGo(\'' + id + '\',0)">« 首页</button>' +
+				'<button class="x2s-btn" ' + (cur <= 1 ? 'disabled ' : '') +
+				'onclick="x2sPvGo(\'' + id + '\',' + Math.max(0, start - limit) + ')">‹ 上一页</button>' +
+				'<button class="x2s-btn" ' + (cur >= pages ? 'disabled ' : '') +
+				'onclick="x2sPvGo(\'' + id + '\',' + (start + limit) + ')">下一页 ›</button>' +
+				'<button class="x2s-btn" ' + (cur >= pages ? 'disabled ' : '') +
+				'onclick="x2sPvGo(\'' + id + '\',' + ((pages - 1) * limit) + ')">末页 »</button>' +
+				'<select onchange="x2sPvSize(\'' + id + '\',this.value)">';
+			var sizes = [20, 50, 100, 200], k;
+			for (k = 0; k < sizes.length; k++)
+				h += '<option value="' + sizes[k] + '"' + (sizes[k] === limit ? ' selected' : '') +
+					'>' + sizes[k] + ' 行/页</option>';
+			h += '</select>' +
+				'<span class="x2s-count">第 ' + cur + ' / ' + pages + ' 页 · ' +
+				(total ? (start + 1) : 0) + '-' + (start + shown) + ' 行 · 共 ' + total + ' 行</span>' +
+				'</div>';
+
+			h += '<div class="x2s-scroll"><table class="x2s-tbl">' + x2sColgroup(r.columns) +
+				'<thead><tr>';
+			var i, j;
+			for (i = 0; i < r.columns.length; i++)
+				h += '<th>' + x2sEsc(r.columns[i]) + '</th>';
+			h += '</tr></thead><tbody>';
+			for (i = 0; i < r.rows.length; i++) {
+				h += '<tr>';
+				for (j = 0; j < r.columns.length; j++)
+					h += '<td class="' + x2sColClass(r.columns[j]) + '">' +
+						x2sEsc(r.rows[i][j]) + '</td>';
+				h += '</tr>';
+			}
+			if (!r.rows.length)
+				h += '<tr><td colspan="' + r.columns.length + '" class="x2s-empty">这一页没有数据</td></tr>';
+			box.innerHTML = h + '</tbody></table></div>';
+		}).catch(function (e) {
+			box.innerHTML = '<div class="x2s-alert x2s-alert-bad">预览失败: ' +
+				x2sEsc(e.message || e) + '</div>';
+		});
+}
+
+function x2sPvGo(id, offset) {
+	var p = X2S_PV[id];
+	if (p) x2sPreview(p.db, p.table, p.box, offset);
+}
+
+function x2sPvSize(id, n) {
+	x2sSet('pagesize', String(n));
+	var p = X2S_PV[id];
+	if (p) x2sPreview(p.db, p.table, p.box, 0);
+}
+
+/* ---------- existing databases ---------- */
+
+function x2sShowDbs(r) {
+	var box = document.getElementById('x2s-dbs');
+	var list = (r && r.dbs) ? r.dbs : [], h = '', i, full, tbl, fq, tq;
+
+	if (!list.length) {
+		box.innerHTML = '<div class="x2s-empty">' + x2sEsc((r && r.dir) || '') +
+			' 下还没有数据库</div>';
+		return;
+	}
+	h = '<div class="x2s-scroll"><table class="x2s-tbl">' +
+		'<colgroup><col style="width:26%" /><col style="width:11%" />' +
+		'<col style="width:8%" /><col style="width:10%" /><col style="width:45%" /></colgroup>' +
+		'<thead><tr><th>数据库文件</th><th>表</th><th>行数</th><th>大小</th><th>操作</th>' +
+		'</tr></thead><tbody>';
+	for (i = 0; i < list.length; i++) {
+		full = ((r.dir || '') + '/' + list[i].name);
+		tbl = (list[i].tables && list[i].tables.length) ? list[i].tables[0].table : x2sTblName();
+		fq = x2sEsc(full).replace(/'/g, '');
+		tq = x2sEsc(tbl).replace(/'/g, '');
+		h += '<tr><td class="x2s-dbname">' + x2sEsc(full) + '</td>' +
+			'<td>' + x2sEsc(tbl) + '</td>' +
+			'<td>' + ((list[i].tables && list[i].tables.length) ? list[i].tables[0].rows : '-') + '</td>' +
+			'<td>' + x2sSize(list[i].size) + '</td><td><div class="x2s-dbacts">' +
+			'<button class="x2s-btn" onclick="x2sRowPreview(\'' + fq + '\',\'' + tq + '\')">预览</button>' +
+			'<button class="x2s-btn" onclick="x2sDl(\'' + fq + '\',\'' + tq + '\',\'db\')">.db</button>' +
+			'<button class="x2s-btn x2s-btn-primary" onclick="x2sDl(\'' + fq + '\',\'' + tq + '\',\'xlsx\')">XLSX</button>' +
+			'<button class="x2s-btn" onclick="x2sDl(\'' + fq + '\',\'' + tq + '\',\'csv\')">CSV</button>' +
+			'<button class="x2s-btn" onclick="x2sDl(\'' + fq + '\',\'' + tq + '\',\'sql\')">SQL</button>' +
+			'<button class="x2s-btn x2s-btn-danger" onclick="x2sDelDb(\'' + fq + '\')">删除</button>' +
+			'</div></td></tr>';
+	}
+	box.innerHTML = h + '</tbody></table></div>';
+}
+
+function x2sDelDb(db) {
+	if (!window.confirm('删除这个数据库？\n\n' + db + '\n\n删掉之后不可恢复。'))
+		return;
+	x2sGet({ action: 'del', db: db }).then(function (r) {
+		if (!r.ok) {
+			x2sMsg('删除失败: ' + x2sEsc(r.error || 'unknown'), 0);
+			return;
+		}
+		x2sMsg('已删除 ' + x2sEsc(r.deleted || db), 1);
+		x2sLoadDbs();
+	}).catch(function (e) {
+		x2sMsg('删除失败: ' + x2sEsc(e.message || e), 0);
+	});
+}
+
+function x2sLoadDbs() {
+	x2sGet({ action: 'dbs' }).then(x2sShowDbs).catch(function (e) {
+		document.getElementById('x2s-dbs').innerHTML =
+			'<div class="x2s-empty">后端未就绪: ' + x2sEsc(e.message || e) + '</div>';
+	});
+}
+
+function x2sTblName() {
+	return document.getElementById('x2s-tbl').value || 'questions';
+}
+
+function x2sRowPreview(db, table) {
+	x2sPreview(db, table || x2sTblName(), document.getElementById('x2s-out'));
+}
+
+function x2sMsg(txt, ok) {
+	var m = document.getElementById('x2s-msg');
+	m.innerHTML = txt ? ('<div class="x2s-alert ' + (ok ? 'x2s-alert-ok' : 'x2s-alert-bad') +
+		'">' + txt + '</div>') : '';
+}
+
+function x2sChip(label, value) {
+	return '<span class="x2s-chip">' + label + ' <b>' + x2sEsc(value) + '</b></span>';
+}
+
+/* ---------- merge ---------- */
+
+function x2sMerge() {
+	var btn = document.getElementById('x2s-go');
+	var out = document.getElementById('x2s-out');
+	var fd, i;
+
+	if (!X2S_FILES.length) {
+		x2sMsg('请先选择至少一个文件', 0);
+		return;
+	}
+	x2sSet('db', document.getElementById('x2s-db').value);
+	x2sSet('tbl', document.getElementById('x2s-tbl').value);
+	x2sSet('dedupe', x2sDedupeVal());
+	x2sSet('hdr', document.getElementById('x2s-hdr').value);
+
+	btn.disabled = true;
+	btn.innerHTML = '<span class="x2s-spin"></span>处理中 ...';
+	x2sMsg('', 0);
+
+	try {
+		fd = new FormData();
+		fd.append('db', document.getElementById('x2s-db').value);
+		fd.append('table', document.getElementById('x2s-tbl').value);
+		fd.append('dedupe', x2sDedupeVal());
+		fd.append('header_row', document.getElementById('x2s-hdr').value);
+		for (i = 0; i < X2S_FILES.length; i++)
+			fd.append('files[]', X2S_FILES[i], X2S_FILES[i].name);
+	} catch (e) {
+		btn.disabled = false;
+		btn.innerHTML = '开始汇总';
+		x2sMsg('浏览器不接受这些文件，请重新选择: ' + x2sEsc(e.message || e), 0);
+		return;
+	}
+
+	x2sReq(X2S_API, { method: 'POST', body: fd }).then(function (r) {
+		return r.text().then(function (t) {
+			try { return JSON.parse(t); }
+			catch (e) { throw new Error('HTTP ' + r.status + ': ' + t.substring(0, 300)); }
+		});
+	}).then(function (res) {
+		btn.disabled = false;
+		btn.innerHTML = '开始汇总';
+		if (!res.ok) {
+			x2sMsg('失败: ' + x2sEsc(res.error || 'unknown error'), 0);
+			return;
+		}
+		x2sMsg('汇总完成 · ' + x2sEsc(res.table) + ' 表已写入 ' + x2sEsc(res.db), 1);
+		var h = '<h3 class="x2s-h">本次结果</h3>' +
+			'<p class="x2s-hint" style="margin:-6px 0 10px">' +
+			x2sEsc(res.table) + ' · ' + x2sEsc(res.db) + '</p><div class="x2s-chips">' +
+			x2sChip('输入行', res.in_rows) +
+			x2sChip('写入行', res.rows) +
+			x2sChip('去重删除', res.dropped) +
+			x2sChip('字段', (res.columns || []).length) +
+			x2sChip('大小', x2sSize(res.size)) +
+			'</div>';
+		h += '<div class="x2s-acts">' +
+			'<a class="x2s-act x2s-act-primary" href="' + X2S_API + '?' +
+			x2sQs({ action: 'download', db: res.db }) + '">下载 .db</a>' +
+			'<a class="x2s-act" href="' + X2S_API + '?' +
+			x2sQs({ action: 'export', fmt: 'xlsx', db: res.db, table: res.table }) + '">导出 XLSX</a>' +
+			'<a class="x2s-act" href="' + X2S_API + '?' +
+			x2sQs({ action: 'export', fmt: 'csv', db: res.db, table: res.table }) + '">导出 CSV</a>' +
+			'<a class="x2s-act" href="' + X2S_API + '?' +
+			x2sQs({ action: 'export', fmt: 'sql', db: res.db, table: res.table }) + '">导出 SQL</a>' +
+			'</div>';
+		h += '<p class="x2s-hint">字段: ' + x2sEsc((res.columns || []).join(' · ')) + '</p>';
+		h += '<p class="x2s-hint">' + x2sEsc(res.stat || '') + '</p>';
+		h += '<div id="x2s-result-pv"></div>';
+		out.innerHTML = h;
+		x2sPreview(res.db, res.table, document.getElementById('x2s-result-pv'));
+		x2sLoadDbs();
+	}).catch(function (e) {
+		btn.disabled = false;
+		btn.innerHTML = '开始汇总';
+		x2sMsg('失败: ' + x2sEsc(e.message || e), 0);
+	});
+}
+
+document.getElementById('x2s-db').value = x2sSt('db', '/root/xlsx2sqlite/merge.db');
+document.getElementById('x2s-tbl').value = x2sSt('tbl', 'questions');
+document.getElementById('x2s-hdr').value = x2sSt('hdr', '0');
+x2sSetDedupe(x2sSt('dedupe', 'exact'));
+document.getElementById('x2s-ver').innerHTML = X2S_VER;
+document.getElementById('x2s-go').onclick = x2sMerge;
+document.getElementById('x2s-refresh').onclick = x2sLoadDbs;
+x2sDropSetup();
+x2sRenderFiles();
+x2sLoadDbs();
+</script>
+
+<%+footer%>
