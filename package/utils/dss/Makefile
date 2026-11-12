@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=dss
 PKG_VERSION:=1.0
-PKG_RELEASE:=83
+PKG_RELEASE:=93
 PKGARCH:=all
 
 include $(INCLUDE_DIR)/package.mk
@@ -47,14 +47,13 @@ define Package/dss/install
 
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/dss.init $(1)/etc/init.d/dss
-	$(INSTALL_DIR) $(1)/usr/share/dss
-	$(INSTALL_DATA) ./files/dss.config $(1)/usr/share/dss/dss.config
+
+	$(INSTALL_DIR) $(1)/etc/config
+	$(INSTALL_CONF) ./files/dss.config $(1)/etc/config/dss
 endef
 
-define Package/dss/postinst
-#!/bin/sh
-[ -f /etc/config/dss ] || { mkdir -p /etc/config; cp /usr/share/dss/dss.config /etc/config/dss; }
-exit 0
+define Package/dss/conffiles
+/etc/config/dss
 endef
 
 $(eval $(call BuildPackage,dss))

@@ -53,7 +53,6 @@ local msgs = {
 	cleared    = translate("Stored token deleted."),
 	tokensaved = translate("Token saved."),
 	badtoken   = translate("Token too short, nothing saved."),
-	badkimi    = translate("No authorization Bearer in the pasted cURL, nothing saved."),
 	svcstart   = translate("Service started."),
 	svcstop    = translate("Service stopped."),
 	svcrestart = translate("Service restarted.")
@@ -186,14 +185,6 @@ local effB = curBB .. " / " .. (curMB ~= "" and curMB or "默认")
 						<select id="backend_b" name="backend_b" class="cbi-input-select" onchange="this.form.submit()"><%=backend_select("backend_b", curBB)%></select>
 						<select id="model_b" name="model_b" class="cbi-input-select"><%=model_select("model_b", curMB, curBB)%></select>
 						<div class="cbi-value-description"><%:Side B backend and model. Current: %> <strong><%=pcdata(effB)%></strong></div>
-					</div>
-				</div>
-
-				<div class="cbi-value">
-					<label class="cbi-value-title" for="kimi_think"><%:Kimi deep thinking%></label>
-					<div class="cbi-value-field">
-						<input type="checkbox" id="kimi_think" name="kimi_think" value="1"<% if uci:get("dss","cli","kimi_think") == "1" then %> checked<% end %>/>
-						<div class="cbi-value-description"><%:Off = answer starts immediately (much faster). On = model thinks first, then answers; slower but better for hard problems.%></div>
 					</div>
 				</div>
 

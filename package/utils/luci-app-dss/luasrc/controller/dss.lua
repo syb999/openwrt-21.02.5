@@ -87,7 +87,6 @@ function act_save()
 	end
 	set_model("model_a", "backend_a")
 	set_model("model_b", "backend_b")
-	c:set("dss", "cli", "kimi_think", http.formvalue("kimi_think") == "1" and "1" or "0")
 	c:set("dss", "cli", "rounds",  http.formvalue("rounds")  or "0")
 	c:set("dss", "cli", "minutes", http.formvalue("minutes") or "0")
 	c:set("dss", "cli", "search",  http.formvalue("search")  == "1" and "1" or "0")
@@ -321,6 +320,8 @@ function act_run()
 	end
 
 	luci.sys.exec("mkdir -p /tmp/dss")
+	-- 先清掉上一次没退出的进程：stale pid 会让旧进程继续往同一个 console.out 里刷
+	luci.sys.exec("/usr/lib/dss/console-reset.sh >/dev/null 2>&1")
 	local cf = io.open(CMDD, "w")
 	if cf then cf:write(cmd .. "\n"); cf:close() end
 
@@ -338,6 +339,7 @@ function act_stop()
 		if pid and tonumber(pid) then
 			luci.sys.exec("kill " .. tonumber(pid) .. " >/dev/null 2>&1")
 		end
+		local g = io.open(PIDF, "w"); if g then g:close() end
 	end
 	http.redirect(luci.dispatcher.build_url("admin/services/dss/console"))
 end

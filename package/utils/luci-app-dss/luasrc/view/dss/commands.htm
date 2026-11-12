@@ -66,6 +66,26 @@
 
 </div></fieldset>
 
+<fieldset class="cbi-section"><legend>自动运行产物（--autorun）</legend><div class="cbi-section-node">
+
+<div class="cbi-value"><label class="cbi-value-title">让模型直接生成 PPT（存盘后自动执行）</label><div class="cbi-value-field">
+<pre class="dss-cmd">cd /root/.dss/out && dss --code --autorun "做一份 5 页的 AR9341 VoIP 方案 PPT，保存为 voip.pptx"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<div class="cbi-value-description">--autorun（别名 --run）会在代码存盘后立刻在路由器上执行 .py / .sh，并打印这一轮新增的产物路径，例如 <b>[dss] 产物: /root/.dss/out/voip.pptx</b>；随后到「代码文件」页下载即可。</div></div></div>
+
+<div class="cbi-value"><label class="cbi-value-title">只存不跑（默认行为）</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss --code "用 python-pptx 生成 3 页 PPT，保存为 demo.pptx"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<div class="cbi-value-description">不加 --autorun 时只保存脚本到 /root/.dss/out，可用 !run N 在会话里手动执行。</div></div></div>
+
+<div class="cbi-value"><label class="cbi-value-title">运行失败会自动回炉</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss --code --autorun "生成 PPT 并保存为 out.pptx"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<div class="cbi-value-description">脚本跑挂时，dss 把完整 traceback 发回模型，要求它重写完整脚本（不是打补丁）并重跑，最多 2 次。环境是 OpenWrt + python3.9，已装 python-pptx / lxml / Pillow。</div></div></div>
+
+<div class="cbi-value"><label class="cbi-value-title">duet + 代码模式</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss --code --autorun --duet --rounds 2 "写两个独立的 python 脚本：a 生成 PPT，b 生成 CSV"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<div class="cbi-value-description">duet 时两侧文件自动加前缀：A 侧 a_*.py、B 侧 b_*.py，不会因为同名被追加合并成坏文件。</div></div></div>
+
+</div></fieldset>
+
 <fieldset class="cbi-section"><legend>自问自答（duet）</legend><div class="cbi-section-node">
 
 <div class="cbi-value"><label class="cbi-value-title">用设置页的两侧默认值</label><div class="cbi-value-field">

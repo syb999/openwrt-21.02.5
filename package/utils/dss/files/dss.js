@@ -536,6 +536,7 @@ function saveScripts(answerText, label) {
     const ext = (info.lang === 'py') ? '.py' : (info.lang === 'c' ? '.c' : '.sh');
     let base = info.name;
     if (!/\.[A-Za-z0-9]+$/.test(base)) base += ext;
+    if (SAVE_PREFIX && base.indexOf(SAVE_PREFIX) !== 0) base = SAVE_PREFIX + base;
     const path = OUTDIR + '/' + base;
 
     // 同一条回答里的多段：第二段起加"（续）"标记，合并成一个文件
@@ -1077,6 +1078,7 @@ async function ask(c, pow, prompt, state, printer) {
     const savedNow = CODE_MODE ? [] : saveScripts(cur.acc, CUR_LABEL);
     if (savedNow.length) {
       lastSaved = savedNow;
+      maybeAutorun(savedNow);
       process.stderr.write('[dss] ' + savedNow.length + ' code file(s) saved: ' +
         savedNow.map(x => require('path').basename(x.path)).join(', ') + '\n');
     }
@@ -1129,6 +1131,44 @@ async function backoff(why) {
 // 空回答重试：服务端偶发（限流/风控）会给 200 但内容为空
 let emptyStreak = 0;
 let CODE_MODE = false;
+let AUTORUN = false;
+let AUTORUN_FAIL = null;
+let SAVE_PREFIX = '';      // duet 时给两侧文件加前缀（a_ / b_），避免同名追加成拼盘   // 上一次 autorun 的失败（traceback），用于自动修            // --autorun：代码存盘后在设备上直接执行，产物留在同一目录
+
+// 跑本轮保存下来的 .py / .sh，并报告新增产物（pptx/pdf/png/csv…）
+function maybeAutorun(saved) {
+  if (!AUTORUN || !saved || !saved.length) return;
+  const cp = require('child_process');
+  const path = require('path');
+  const dir = path.dirname(saved[0].path);
+  let before = [];
+  try { before = fs.readdirSync(dir); } catch (e) { return; }
+
+  for (const it of saved) {
+    const ext = path.extname(it.path).toLowerCase();
+    let argv = null;
+    if (ext === '.py') argv = ['python3', it.path];
+    else if (ext === '.sh') argv = ['sh', it.path];
+    if (!argv) continue;
+    process.stderr.write('[dss] run ' + path.basename(it.path) + ' ...\n');
+    const r = cp.spawnSync(argv[0], [argv[1]], { cwd: dir, timeout: 240000, encoding: 'utf8' });
+    const log = ((r.stdout || '') + (r.stderr || '')).trim();
+    if (log) process.stderr.write(log + '\n');
+    if (r.status !== 0) {
+      const why = (r.status === null) ? 'timeout' : ('exit=' + r.status);
+      process.stderr.write('[dss] run ' + why + '\n');
+      AUTORUN_FAIL = { path: it.path, log: log || ('run ' + why) };
+    }
+  }
+
+  let after = [];
+  try { after = fs.readdirSync(dir); } catch (e) {}
+  const fresh = after.filter(f => before.indexOf(f) < 0);
+  if (fresh.length) {
+    process.stderr.write('[dss] 产物: ' + fresh.map(f => path.join(dir, f)).join(', ') + '\n');
+    lastSaved = lastSaved.concat(fresh.map(f => ({ path: path.join(dir, f), name: f })));
+  }
+}
 let CUR_LABEL = '对话';
 let BACKEND_A = 'deepseek', BACKEND_B = 'deepseek';
 let MODEL_A = '', MODEL_B = '';
@@ -1748,6 +1788,7 @@ async function askDoubaoOnce(prompt, state, printer) {
       const savedNow = CODE_MODE ? [] : saveScripts(text, CUR_LABEL);
       if (savedNow.length) {
         lastSaved = savedNow;
+        maybeAutorun(savedNow);
         process.stderr.write('[dss] ' + savedNow.length + ' code file(s) saved: ' +
           savedNow.map(x => require('path').basename(x.path)).join(', ') + '\n');
       }
@@ -1801,6 +1842,7 @@ async function askKimiOnce(prompt, state, printer) {
       const savedNow = CODE_MODE ? [] : saveScripts(text, CUR_LABEL);
       if (savedNow.length) {
         lastSaved = savedNow;
+        maybeAutorun(savedNow);
         process.stderr.write('[dss] ' + savedNow.length + ' code file(s) saved: ' +
           savedNow.map(x => require('path').basename(x.path)).join(', ') + '\n');
       }
@@ -2129,6 +2171,7 @@ async function askApiOnce(prompt, state, printer) {
       const savedNow = CODE_MODE ? [] : saveScripts(text, CUR_LABEL);
       if (savedNow.length) {
         lastSaved = savedNow;
+        maybeAutorun(savedNow);
         process.stderr.write('[dss] ' + savedNow.length + ' code file(s) saved: ' +
           savedNow.map(x => require('path').basename(x.path)).join(', ') + '\n');
       }
@@ -2227,7 +2270,7 @@ function partInfo(t) {
   return { k: parseInt(m[1], 10), n: parseInt(m[2], 10) };
 }
 
-async function askCode(c, pow, prompt, state, printer) {
+async function askCodeInner(c, pow, prompt, state, printer) {
   let acc = (await askText(c, pow, prompt, state, printer, 2)) || '';
   // 模型自己标了 PART k/N 且还没完 -> 直接要下一段，拼起来
   for (let round = 1; round <= 8; round++) {
@@ -2268,12 +2311,37 @@ async function askCode(c, pow, prompt, state, printer) {
   return acc;
 }
 
+// --autorun 失败时，把 traceback 发回模型，让它重写完整脚本并重跑（最多 2 次）
+async function askCode(c, pow, prompt, state, printer) {
+  let acc = await askCodeInner(c, pow, prompt, state, printer);
+  for (let fix = 0; fix < 2 && AUTORUN_FAIL; fix++) {
+    const f = AUTORUN_FAIL;
+    AUTORUN_FAIL = null;
+    printer.flush();
+    process.stderr.write('\n[dss] 脚本运行失败（' + require('path').basename(f.path) +
+      '），把报错发回模型修复 (' + (fix + 1) + '/2)\n');
+    const repair = (await askText(c, pow,
+      '你刚才生成的脚本在运行时出错，下面是完整报错：\n' +
+      '```\n' + String(f.log).slice(-1800) + '\n```\n' +
+      '请修正后**重新输出完整可运行的脚本**（一个代码块，不要只给补丁、不要解释、不要省略未改动的部分）；' +
+      '环境是 OpenWrt + python3.9，产物写到当前目录。', state, printer, 2)) || '';
+    if (!hasCode(repair)) continue;
+    acc = repair;
+    // 覆盖掉跑失败的那份，避免 saveScripts 追加成拼盘
+    try { fs.unlinkSync(f.path); } catch (e) {}
+    persist(repair);
+  }
+  return acc;
+}
+
 function persist(text, label) {
   try {
     const saved = saveScripts(text, label || CUR_LABEL);
     if (saved.length) {
       process.stderr.write('[dss] ' + saved.length + ' code file(s) [' + (label || CUR_LABEL) + ']: ' +
         saved.map(x => require('path').basename(x.path) + '(' + x.mode + ')').join(', ') + '\n');
+      lastSaved = saved;
+      maybeAutorun(saved);
     }
   } catch (e) {}
 }
@@ -2351,6 +2419,7 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
     printer.flush();
     let q = '';
     CUR_BACKEND = BACKEND_A || 'deepseek'; CUR_MODEL = MODEL_A || '';
+    SAVE_PREFIX = 'a_';        // A 侧的文件统一 a_ 前缀，避免和 B 侧同名合并
     try { q = (await askText(c, pow, qPrompt, A, printer)) || ''; }
     catch (e) {
       printer.flush();
@@ -2368,6 +2437,7 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
     printer.write('\n[B·回答] ');
     printer.flush();
     let a = '';
+    SAVE_PREFIX = 'b_';        // B 侧的文件统一 b_ 前缀
     try {
       let aPrompt = codeMode
         ? '你是【实现者/回答方】。对方问：\n"""\n' + q + '\n"""\n' +
@@ -2399,6 +2469,7 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
     lastB = a;
     done = i;
   }
+  SAVE_PREFIX = '';
   const why = (rounds > 0)
     ? 'round limit reached (--rounds ' + rounds + '); rerun with a bigger --rounds or none for unlimited'
     : 'stopped';
@@ -2582,6 +2653,8 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
   if (args.includes('--search')) { state.search = true; args.splice(args.indexOf('--search'), 1); }
   let codeMode = false;
   if (args.includes('--code')) { codeMode = true; args.splice(args.indexOf('--code'), 1); }
+  if (args.includes('--autorun')) { AUTORUN = true; args.splice(args.indexOf('--autorun'), 1); }
+  if (args.includes('--run')) { AUTORUN = true; args.splice(args.indexOf('--run'), 1); }
   CODE_MODE = codeMode;
   let backA = '', backB = '', modelA = '', modelB = '';
   for (const [key, set] of [['--api-think', () => API_THINK = true],
@@ -2674,7 +2747,13 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
     let q0 = args.join(' ');
     if (roleS) q0 = roleText(roleS, '回答方') + q0;
     if (codeMode) {
-      q0 = '（硬要求：直接给出完整、可编译运行的代码，用 ```语言 代码块输出；' +
+      q0 = (AUTORUN
+        ? '（硬要求：直接给出完整、可编译运行的代码，用 ```语言 代码块输出；' +
+          '脚本会立刻在路由器上执行（OpenWrt + python3.9，已装 python-pptx 1.0.2 / lxml / Pillow），' +
+          '所以：所有产物写到当前工作目录、不要交互式输入、不要 pip install、用相对路径；' +
+          '注意 python-pptx 的占位符文本框默认只有 1 个段落——追加要点必须用 ' +
+          'text_frame.add_paragraph()，禁止直接索引 paragraphs[1]；'
+        : '（硬要求：直接给出完整、可编译运行的代码，用 ```语言 代码块输出；') +
         '不要只讲原理或只讨论文档；文档没写清的地方自行取保守值并用 TODO 标注）\n' + q0;
     }
     CUR_LABEL = '一次性提问';
