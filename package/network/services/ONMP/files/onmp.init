@@ -73,7 +73,9 @@ start_service() {
 			sleep 1
 			i=$((i + 1))
 		done
-		"/etc/init.d/$svc" start > /dev/null 2>&1
+		# close procd's lock fd, else the daemon started by the called
+		# script inherits it and keeps procd_<name>.lock locked forever
+		"/etc/init.d/$svc" start > /dev/null 2>&1 1000<&- 1000>&-
 		i=0
 		while ! svc_running "$svc" && [ "$i" -lt 20 ]; do
 			sleep 1
@@ -95,7 +97,7 @@ start_service() {
 stop_service() {
 	for svc in redis mysqld php8-fpm; do
 		[ -x "/etc/init.d/$svc" ] || continue
-		"/etc/init.d/$svc" stop > /dev/null 2>&1
+		"/etc/init.d/$svc" stop > /dev/null 2>&1 1000<&- 1000>&-
 	done
 }
 
