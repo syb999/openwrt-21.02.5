@@ -7,8 +7,8 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-vputrans
-PKG_VERSION:=2026-10-02.4
-PKG_RELEASE:=5
+PKG_VERSION:=2026-11-12
+PKG_RELEASE:=1
 PKG_LICENSE:=Apache-2.0
 PKG_MAINTAINER:=Panther X2 Project
 
@@ -53,6 +53,11 @@ define Package/luci-app-vputrans/postinst
 	done
 	exit 0
 }
+endef
+
+# /etc/config/vputrans holds the cluster token: it must survive an upgrade.
+define Package/luci-app-vputrans/conffiles
+/etc/config/vputrans
 endef
 
 include $(TOPDIR)/feeds/luci/luci.mk

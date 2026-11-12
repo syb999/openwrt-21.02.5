@@ -1,0 +1,18 @@
+#!/bin/sh
+#
+# luci-app-vputrans - cluster endpoint
+#
+# Another box of the cluster calls /cgi-bin/vputrans-node?action=...&token=...
+# and this hands the query to the backend, which owns every bit of the logic
+# (token check, job dirs, ffmpeg, status, streaming).  Installing nothing but a
+# CGI means the feature needs no extra daemon: uhttpd is already running.
+#
+# Actions (all token protected, see /etc/config/vputrans):
+#   ping    who are you / are you busy
+#   start   encode one segment in the background
+#   status  progress of that segment
+#   get     stream the finished segment back to the master
+#   src     master side: stream one source segment to a node
+#   clean   drop the job directory
+#
+exec /usr/bin/vputrans node "$QUERY_STRING"

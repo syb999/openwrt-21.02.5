@@ -27,7 +27,7 @@
  * them), and so are regex literals containing "://" (jsmin truncates them).
  */
 
-var VPU_VER = 'v3.3.3';
+var VPU_VER = 'v3.4.0';
 
 /* ---------------------------------------------------------------------------
  * Backend vocabulary.  The backend sends these strings as message templates
@@ -206,12 +206,13 @@ return view.extend({
 		return Promise.all([
 			vexec([ 'version' ]),
 			vexec([ 'status' ]),
-			vexec([ 'history' ])
+			vexec([ 'history' ]),
+			vexec([ 'clustercfg' ])
 		]);
 	},
 
 	render: function(data) {
-		var sres = data[1], hres = data[2];
+		var sres = data[1], hres = data[2], clres = data[3];
 		var files = [];
 		var st = parseJSON(sres.out, { state: 'idle' });
 		var self = this;
@@ -287,7 +288,8 @@ return view.extend({
 			E('option', { value: 'auto' }, [ _('Auto (live → mkv, file → mp4)') ]),
 			E('option', { value: 'mp4' }, [ 'mp4' ]),
 			E('option', { value: 'mkv' }, [ 'mkv' ]),
-			E('option', { value: 'ts' }, [ 'ts' ])
+			E('option', { value: 'ts' }, [ 'ts' ]),
+			E('option', { value: 'gif' }, [ 'gif' + ' (' + _('animated picture') + ')' ])
 		]);
 		var outIn = E('input', Object.assign(inputOpts(), { placeholder: _('empty = generate automatically') }));
 
@@ -517,8 +519,205 @@ return view.extend({
 			});
 		}
 
+		/* ---- cluster: several boxes on one file -------------------------------
+		 * The token and the node list live in /etc/config/vputrans: this view
+		 * has no write ACL, so the backend stores them (same pattern as the
+		 * batch list above).  A node is another box running this firmware; it
+		 * is driven over HTTP through /cgi-bin/vputrans-node, so there is
+		 * nothing to install and no ssh key to copy around.
+		 */
+		var clTokenIn = E('input', Object.assign(inputOpts(), {
+			id: 'vpu-cltoken', autocomplete: 'off',
+			placeholder: _('shared token (identical on every node)') }));
+		var clNodesIn = E('textarea', {
+			id: 'vpu-clnodes', rows: 3,
+			style: 'width:100%;box-sizing:border-box;font-family:monospace;font-size:12px',
+			placeholder: '10.80.1.126\n10.80.1.127:80' });
+		var clSegIn = E('input', Object.assign(inputOpts(), { id: 'vpu-clseg', value: '0', style: 'width:90px' }));
+		var clLocalIn = E('input', { id: 'vpu-cllocal', type: 'checkbox', checked: true });
+		var btnClSave = E('button', { class: 'cbi-button vpu-btn', id: 'vpu-clsave' }, [ _('Save cluster settings') ]);
+		var btnClCheck = E('button', { class: 'cbi-button vpu-btn', id: 'vpu-clcheck' }, [ _('Check nodes') ]);
+		var btnClRun = E('button', { class: 'cbi-button cbi-button-apply vpu-btn', id: 'vpu-clrun' }, [ _('Cluster transcode') ]);
+		var clStat = E('div', { class: 'vpu-dim', style: 'margin-top:6px' }, [ '' ]);
+		var clBox = E('div', { style: 'margin-top:6px' }, []);
+
+		function clNodeLines() {
+			return (clNodesIn.value || '').split('\n')
+				.map(function (x) { return x.trim(); })
+				.filter(function (x) { return x.length > 0; });
+		}
+		function loadClusterCfg(j) {
+			if (!j) { return; }
+			clTokenIn.value = j.token || '';
+			clNodesIn.value = (j.nodes || []).join('\n');
+			clSegIn.value = String(j.segments || 0);
+			clLocalIn.checked = (String(j.local) !== '0');
+		}
+		function renderNodes(j) {
+			clBox.innerHTML = '';
+			if (!j || !j.ok) { clStat.textContent = _('Cannot read the cluster status'); return; }
+			var tbl = E('table', { class: 'vpu-table' });
+			var hr = E('tr', {});
+			[ _('Node'), _('State'), _('Version') ].forEach(function (h) { hr.appendChild(E('th', {}, [ h ])); });
+			tbl.appendChild(hr);
+			(j.nodes || []).forEach(function (n) {
+				var tr = E('tr', {});
+				tr.appendChild(E('td', { class: 'vpu-clip' }, [ n.node ]));
+				var txt = n.up ? (n.busy ? _('busy') : _('ready')) : _('unreachable');
+				tr.appendChild(E('td', { class: n.up ? (n.busy ? 'vpu-warn' : 'vpu-ok') : 'vpu-err' }, [ txt ]));
+				tr.appendChild(E('td', {}, [ n.ver || '' ]));
+				tbl.appendChild(tr);
+			});
+			var lc = j.local || {};
+			var lt = E('tr', {});
+			lt.appendChild(E('td', { class: 'vpu-clip' }, [ (lc.node || '?') + '  (' + _('this box') + ')' ]));
+			lt.appendChild(E('td', { class: 'vpu-ok' }, [ _('ready') ]));
+			lt.appendChild(E('td', {}, [ lc.ver || '' ]));
+			tbl.appendChild(lt);
+			clBox.appendChild(tbl);
+			clStat.textContent = j.token_set ? _('Cluster settings loaded')
+				: _('No token yet - type one and press Save cluster settings');
+		}
+		function refreshNodes() {
+			vexec([ 'clusterlist' ]).then(function (r) { renderNodes(parseJSON(r.out, null)); });
+		}
+		function renderCluster(j) {
+			if (!j) { return; }
+			var st = j.state || 'idle';
+			if (st === 'idle') { clStat.textContent = _('Idle'); clBox.innerHTML = ''; return; }
+			var done = 0;
+			(j.segs || []).forEach(function (x) { if (x.state === 'done') { done++; } });
+			var word = (st === 'finished') ? _('finished') : stateText(st);
+			clStat.textContent = _('Segments') + ' ' + done + '/' + (j.n || 0) + '  ·  ' + word;
+			clBox.innerHTML = '';
+			var tbl = E('table', { class: 'vpu-table' });
+			var hr = E('tr', {});
+			[ _('Segment'), _('Node'), _('State'), '%' ].forEach(function (h) { hr.appendChild(E('th', {}, [ h ])); });
+			tbl.appendChild(hr);
+			(j.segs || []).forEach(function (x) {
+				var tr = E('tr', {});
+				tr.appendChild(E('td', {}, [ String(x.i) ]));
+				tr.appendChild(E('td', { class: 'vpu-clip' }, [ x.node || '-' ]));
+				var cls = (x.state === 'done') ? 'vpu-ok' : ((x.state === 'error') ? 'vpu-err' : 'vpu-warn');
+				tr.appendChild(E('td', { class: cls }, [ stateText(x.state) ]));
+				tr.appendChild(E('td', {}, [ (Number(x.pct) || 0).toFixed(1) ]));
+				tbl.appendChild(tr);
+			});
+			clBox.appendChild(tbl);
+		}
+		function refreshCluster() {
+			vexec([ 'clusterstatus' ]).then(function (r) { renderCluster(parseJSON(r.out, null)); });
+		}
+		btnClSave.addEventListener('click', function () {
+			btnClSave.disabled = true;
+			vexec([ 'clusterset',
+				'--token', clTokenIn.value.trim(),
+				'--nodes', clNodeLines().join(','),
+				'--segments', (clSegIn.value.trim() || '0'),
+				'--local', clLocalIn.checked ? '1' : '0' ]).then(function (r) {
+				btnClSave.disabled = false;
+				var j = parseJSON(r.out, null);
+				if (!j || !j.ok) {
+					banner.className = 'vpu-banner vpu-banner-bad';
+					banner.textContent = _('Cannot save the cluster settings') + ': ' + (r.err || _('Unknown error'));
+					return;
+				}
+				banner.className = 'vpu-banner';
+				banner.textContent = _('Cluster settings saved');
+				refreshNodes();
+			});
+		});
+		btnClCheck.addEventListener('click', function () {
+			clStat.textContent = _('Checking…');
+			refreshNodes();
+		});
+		function clusterArgs() {
+			var a = [ 'cluster', pathIn.value.trim(),
+				'--quality', qualitySel.value,
+				'--codec', encSel.value,
+				'--res', resSel.value,
+				'--scaler', scalerSel.value,
+				'--fps', (fpsIn.value.trim() || 'source'),
+				'--audio', audioSel.value,
+				'--container', contSel.value,
+				'--local', clLocalIn.checked ? '1' : '0',
+				'--segments', (clSegIn.value.trim() || '0') ];
+			var n = clNodeLines();
+			if (n.length) { a.push('--nodes', n.join(',')); }
+			if (qualitySel.value === 'crf') { a.push('--qp', (qpIn.value.trim() || '26')); }
+			else if (brIn.value.trim()) { a.push('--bitrate', brIn.value.trim()); }
+			if (ssIn.value.trim() && ssIn.value.trim() !== '0') { a.push('--ss', ssIn.value.trim()); }
+			if (durIn.value.trim() && durIn.value.trim() !== '0') { a.push('--dur', durIn.value.trim()); }
+			if (outIn.value.trim()) { a.push('--out', outIn.value.trim()); }
+			return a;
+		}
+		btnClRun.addEventListener('click', function () {
+			if (!pathIn.value.trim()) {
+				banner.className = 'vpu-banner vpu-banner-bad';
+				banner.textContent = _('Please enter a local path or URL first.');
+				return;
+			}
+			btnClRun.disabled = true;
+			vexec(clusterArgs()).then(function (r) {
+				btnClRun.disabled = false;
+				var j = parseJSON(r.out, null);
+				if (!j || !j.ok) {
+					banner.className = 'vpu-banner vpu-banner-bad';
+					banner.textContent = _('Cannot start') + ': ' + (msg(j, 'error') || r.err || _('Unknown error, please check the log'));
+					return;
+				}
+				banner.className = 'vpu-banner';
+				banner.textContent = fmtTpl(_('Cluster job started: %s segments, %s workers'), [ String(j.segments), String(j.workers) ]);
+				refreshStatus();
+				refreshCluster();
+			});
+		});
+
+		/* ---- effects / logo / pip / join / gif -------------------------------
+		 * Everything here rides on what ffmpeg-rkrga can actually do on this
+		 * SoC (checked on the box, not assumed):
+		 *   flip / rotate  -> vpp_rkrga (RGA hardware, zero copy)
+		 *   black and white-> VPU decode + format=gray, hardware encode
+		 *   gif            -> RGA NV12->BGRA in hardware, software gif writer
+		 *   logo / pip     -> software overlay/hstack after one hwdownload
+		 *                     (overlay_rkrga needs DRM_PRIME frames and this
+		 *                     kernel brings up no real DRM device)
+		 *   two files      -> both re-encoded to the same parameters, then
+		 *                     concatenated with -c copy
+		 */
+		var fxSel = E('select', selectOpts(), [
+			E('option', { value: 'none' }, [ _('No effect') ]),
+			E('option', { value: 'gray' }, [ _('Black and white') ]),
+			E('option', { value: 'hflip' }, [ _('Mirror horizontally') ]),
+			E('option', { value: 'vflip' }, [ _('Mirror vertically') ]),
+			E('option', { value: 'reversal' }, [ _('Turn 180°') ]),
+			E('option', { value: 'rot90' }, [ _('Rotate 90° right') ]),
+			E('option', { value: 'rot270' }, [ _('Rotate 90° left') ])
+		]);
+		var logoIn = E('input', Object.assign(inputOpts(), { placeholder: '/root/logo.png   ' + _('(png with transparency)') }));
+		var logoPosSel = E('select', selectOpts(), [
+			E('option', { value: 'tr' }, [ _('top right') ]),
+			E('option', { value: 'tl' }, [ _('top left') ]),
+			E('option', { value: 'br' }, [ _('bottom right') ]),
+			E('option', { value: 'bl' }, [ _('bottom left') ])
+		]);
+		var logoSizeIn = E('input', Object.assign(inputOpts(), { placeholder: _('empty = original size, or WxH, e.g. 160x48') }));
+		var pipIn = E('input', Object.assign(inputOpts(), { placeholder: '/mnt/b.mp4   ' + _('(second video)') }));
+		var pipPosSel = E('select', selectOpts(), [
+			E('option', { value: 'br' }, [ _('small in bottom right') ]),
+			E('option', { value: 'bl' }, [ _('small in bottom left') ]),
+			E('option', { value: 'tr' }, [ _('small in top right') ]),
+			E('option', { value: 'tl' }, [ _('small in top left') ]),
+			E('option', { value: 'side' }, [ _('side by side') ]),
+			E('option', { value: 'top' }, [ _('one above the other') ])
+		]);
+		var pipScaleIn = E('input', Object.assign(inputOpts(), { value: '30', style: 'width:70px', placeholder: '30' }));
+		var joinIn = E('input', Object.assign(inputOpts(), { placeholder: '/mnt/b.mp4   ' + _('(appended after the source)') }));
+		var gifFpsIn = E('input', Object.assign(inputOpts(), { value: '12', style: 'width:70px' }));
+
 		/* ---- events ---- */
 		pathIn.addEventListener('change', doProbe);
+
 		btnProbe.addEventListener('click', doProbe);
 
 		/* ---- batch (queue) ----------------------------------------------------
@@ -646,6 +845,17 @@ return view.extend({
 			else if (brIn.value.trim()) args.push('--bitrate', brIn.value.trim());
 			if (ssIn.value.trim() && ssIn.value.trim() !== '0') args.push('--ss', ssIn.value.trim());
 			if (durIn.value.trim() && durIn.value.trim() !== '0') args.push('--dur', durIn.value.trim());
+			if (fxSel.value !== 'none') args.push('--effect', fxSel.value);
+			if (logoIn.value.trim()) {
+				args.push('--logo', logoIn.value.trim(), '--logo-pos', logoPosSel.value);
+				if (logoSizeIn.value.trim()) args.push('--logo-size', logoSizeIn.value.trim());
+			}
+			if (pipIn.value.trim()) {
+				args.push('--pip', pipIn.value.trim(), '--pip-pos', pipPosSel.value,
+					'--pip-scale', (pipScaleIn.value.trim() || '30'));
+			}
+			if (joinIn.value.trim()) args.push('--join', joinIn.value.trim());
+			if (contSel.value === 'gif') args.push('--gif-fps', (gifFpsIn.value.trim() || '12'));
 			var o = outIn.value.trim();
 			if (o) args.push('--out', o);
 			vexec(args).then(function(r) {
@@ -764,24 +974,70 @@ return view.extend({
 				bRes
 			]),
 			E('div', { 'class': 'vpu-card' }, [
-				E('h3', {}, [ _('④ Progress and log') ]),
+				E('h3', {}, [ _('④ Cluster (several boxes transcode one file)') ]),
+				E('div', { 'class': 'vpu-row' }, [
+					E('div', { 'style': 'flex:2 1 320px' }, [ E('label', {}, [ _('Shared token') ]), clTokenIn ]),
+					E('div', { 'style': 'flex:0 0 110px' }, [ E('label', {}, [ _('Segments') ]), clSegIn ]),
+					E('div', { 'style': 'flex:0 0 auto' }, [ E('label', {}, [ ' ' ]),
+						E('label', {}, [ clLocalIn, ' ' + _('this box also encodes') ]) ])
+				]),
+				E('div', { 'style': 'margin-top:8px' }, [
+					E('label', {}, [ _('Nodes (one per line: ip or ip:port, empty = this box only)') ]),
+					clNodesIn
+				]),
+				E('div', { 'class': 'vpu-row', 'style': 'margin-top:8px' }, [
+					E('div', { 'style': 'display:flex;gap:8px;flex-wrap:wrap' }, [ btnClSave, btnClCheck, btnClRun ])
+				]),
+				E('div', { 'class': 'vpu-dim', 'style': 'margin-top:6px' }, [
+					_('The source is cut into keyframe-aligned pieces, every box encodes one piece and the master joins them. Stop stops all workers. The nodes must run this same package with the same token.')
+				]),
+				clStat, clBox
+			]),
+			E('div', { 'class': 'vpu-card' }, [
+				E('h3', {}, [ _('⑤ Effects, logo, second video and GIF') ]),
+				E('div', { 'class': 'vpu-row' }, [
+					E('div', {}, [ E('label', {}, [ _('Effect') ]), fxSel ]),
+					E('div', {}, [ E('label', {}, [ _('GIF frame rate') ]), gifFpsIn ])
+				]),
+				E('div', { 'class': 'vpu-row', 'style': 'margin-top:8px' }, [
+					E('div', { 'style': 'flex:2 1 260px' }, [ E('label', {}, [ _('Logo (png)') ]), logoIn ]),
+					E('div', { 'style': 'flex:0 0 150px' }, [ E('label', {}, [ _('Position') ]), logoPosSel ]),
+					E('div', { 'style': 'flex:1 1 160px' }, [ E('label', {}, [ _('Logo size') ]), logoSizeIn ])
+				]),
+				E('div', { 'class': 'vpu-row', 'style': 'margin-top:8px' }, [
+					E('div', { 'style': 'flex:2 1 260px' }, [ E('label', {}, [ _('Second video (picture in picture / side by side)') ]), pipIn ]),
+					E('div', { 'style': 'flex:0 0 170px' }, [ E('label', {}, [ _('Layout') ]), pipPosSel ]),
+					E('div', { 'style': 'flex:0 0 90px' }, [ E('label', {}, [ _('PIP width %') ]), pipScaleIn ])
+				]),
+				E('div', { 'class': 'vpu-row', 'style': 'margin-top:8px' }, [
+					E('div', { 'style': 'flex:2 1 260px' }, [ E('label', {}, [ _('Append a second video (one file after another)') ]), joinIn ])
+				]),
+				E('div', { 'class': 'vpu-dim', 'style': 'margin-top:6px' }, [
+					_('Effect and GIF work with the shipped transcoder (flip/rotate run on the RGA, black and white keeps the hardware encoder). Logo and picture in picture need the overlay filter: if it is missing the backend says so - rebuild ffmpeg-rkrga once. Cluster mode ignores this card.')
+				])
+			]),
+			E('div', { 'class': 'vpu-card' }, [
+				E('h3', {}, [ _('⑥ Progress and log') ]),
 				logPre
 			]),
 			E('div', { 'class': 'vpu-card' }, [
-			E('h3', {}, [ _('⑤ Recent jobs (newest 5)') ]),
+			E('h3', {}, [ _('⑦ Recent jobs (newest 5)') ]),
 				histBox
 			])
 		]);
 
 		applyStatus(st);
+		loadClusterCfg(parseJSON(clres.out, null));
 		renderHistory();
 		loadFileList();
 		setTimeout(refreshStatus, 400);
+		refreshCluster();
 
 		this._vpuTimer = setInterval(function() {
 			if (!document.body.contains(wrap)) { clearInterval(self._vpuTimer); return; }
 			refreshStatus();
 			refreshBatch();
+			refreshCluster();
 			renderHistory();   /* 🔴 原来漏了这句，Recent jobs 只在加载时刷一次 ✗ */
 		}, 4000);
 		refreshBatch();

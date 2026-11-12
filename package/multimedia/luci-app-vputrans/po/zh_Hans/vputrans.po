@@ -441,11 +441,11 @@ msgstr "① 源（可自由手填本地路径 或 在线 URL，自动识别）"
 msgid "② Parameters"
 msgstr "② 参数"
 
-msgid "④ Progress and log"
-msgstr "③ 进度与日志"
+msgid "⑥ Progress and log"
+msgstr "⑤ 进度与日志"
 
-msgid "⑤ Recent jobs (newest 5)"
-msgstr "④ 最近任务（最多 5 条）"
+msgid "⑦ Recent jobs (newest 5)"
+msgstr "⑥ 最近任务（最多 5 条）"
 
 msgid "▶ Starting: %s (%s) | %s %s | %s + hardware encode %s | %s %s"
 msgstr "▶ 开始任务：%s（%s） ｜ %s %s ｜ %s + 硬编 %s ｜ %s %s"
@@ -601,3 +601,240 @@ msgstr "跟随源片（默认）"
 
 msgid "CBR: following the source"
 msgstr "CBR：跟随源片码率"
+
+msgid "④ Cluster (several boxes transcode one file)"
+msgstr "④ 集群（多台设备同时转码一个文件）"
+
+msgid "Shared token"
+msgstr "共享密钥"
+
+msgid "shared token (identical on every node)"
+msgstr "共享密钥（每台节点必须一致）"
+
+msgid "Segments"
+msgstr "分段数"
+
+msgid "Segment"
+msgstr "分段"
+
+msgid "this box also encodes"
+msgstr "本机也参与编码"
+
+msgid "this box"
+msgstr "本机"
+
+msgid "Nodes (one per line: ip or ip:port, empty = this box only)"
+msgstr "节点（每行一个：IP 或 IP:端口，留空 = 只用本机）"
+
+msgid "Save cluster settings"
+msgstr "保存集群设置"
+
+msgid "Cluster settings saved"
+msgstr "集群设置已保存"
+
+msgid "Cluster settings loaded"
+msgstr "集群设置已载入"
+
+msgid "Cannot save the cluster settings"
+msgstr "保存集群设置失败"
+
+msgid "No token yet - type one and press Save cluster settings"
+msgstr "还没有密钥：先填一个再点“保存集群设置”"
+
+msgid "Check nodes"
+msgstr "检查节点"
+
+msgid "Checking…"
+msgstr "检查中…"
+
+msgid "Cluster transcode"
+msgstr "集群转码"
+
+msgid "Cluster job started: %s segments, %s workers"
+msgstr "集群任务已启动：%s 个分段，%s 个工作节点"
+
+msgid "Node"
+msgstr "节点"
+
+msgid "State"
+msgstr "状态"
+
+msgid "Version"
+msgstr "版本"
+
+msgid "ready"
+msgstr "就绪"
+
+msgid "busy"
+msgstr "忙"
+
+msgid "unreachable"
+msgstr "连不上"
+
+msgid "Cannot read the cluster status"
+msgstr "读不到集群状态"
+
+msgid "The source is cut into keyframe-aligned pieces, every box encodes one piece and the master joins them. Stop stops all workers. The nodes must run this same package with the same token."
+msgstr "源文件按关键帧切成若干段，每台设备编码一段，最后由主机拼接。点“停止”会停掉所有工作节点。各节点需安装同一份 vputrans 并使用相同密钥。"
+
+msgid "▶ Cluster job on %s workers, %s segments: %s"
+msgstr "▶ 集群任务：%s 个工作节点，%s 个分段：%s"
+
+msgid "Splitting the source into %s segments (stream copy)"
+msgstr "正在拆分源文件为 %s 段（流复制）"
+
+msgid "Plan ready: %s segment(s)"
+msgstr "分段计划就绪：%s 段"
+
+msgid "All %s segments finished, joining"
+msgstr "%s 段全部完成，正在拼接"
+
+msgid "Segment(s) failed on the cluster: %s"
+msgstr "集群上有分段失败：%s"
+
+msgid "No segment could be produced from the source"
+msgstr "无法从源文件产生任何分段"
+
+msgid "Cluster job stopped"
+msgstr "集群任务已停止"
+
+msgid "Cluster needs at least two workers (add a node, or keep local enabled)"
+msgstr "集群至少需要两个工作节点（添加一台节点，或保留本机参与）"
+
+msgid "Cluster is not configured: set a shared token first"
+msgstr "集群未配置：先设置共享密钥"
+
+msgid "A live stream cannot be split across boxes"
+msgstr "直播流无法拆分到多台设备"
+
+msgid "Join failed (exit code %s)"
+msgstr "拼接失败（退出码 %s）"
+
+msgid "Expected %ss, got %ss"
+msgstr "预期 %s 秒，实际 %s 秒"
+
+msgid "⑤ Effects, logo, second video and GIF"
+msgstr "⑤ 特效、LOGO、第二个视频、GIF"
+
+msgid "Effect"
+msgstr "特效"
+
+msgid "No effect"
+msgstr "不加特效"
+
+msgid "Black and white"
+msgstr "黑白"
+
+msgid "Mirror horizontally"
+msgstr "水平镜像"
+
+msgid "Mirror vertically"
+msgstr "垂直镜像"
+
+msgid "Turn 180°"
+msgstr "上下翻转 180°"
+
+msgid "Rotate 90° right"
+msgstr "右转 90°"
+
+msgid "Rotate 90° left"
+msgstr "左转 90°"
+
+msgid "GIF frame rate"
+msgstr "GIF 帧率"
+
+msgid "animated picture"
+msgstr "动图"
+
+msgid "Logo (png)"
+msgstr "LOGO（png）"
+
+msgid "(png with transparency)"
+msgstr "（带透明的 png）"
+
+msgid "Position"
+msgstr "位置"
+
+msgid "top right"
+msgstr "右上"
+
+msgid "top left"
+msgstr "左上"
+
+msgid "bottom right"
+msgstr "右下"
+
+msgid "bottom left"
+msgstr "左下"
+
+msgid "Logo size"
+msgstr "LOGO 尺寸"
+
+msgid "empty = original size, or WxH, e.g. 160x48"
+msgstr "留空 = 原尺寸，或写 WxH，例如 160x48"
+
+msgid "Second video (picture in picture / side by side)"
+msgstr "第二个视频（画中画 / 并排）"
+
+msgid "(second video)"
+msgstr "（第二个视频）"
+
+msgid "Layout"
+msgstr "布局"
+
+msgid "small in bottom right"
+msgstr "右下小窗"
+
+msgid "small in bottom left"
+msgstr "左下小窗"
+
+msgid "small in top right"
+msgstr "右上小窗"
+
+msgid "small in top left"
+msgstr "左上小窗"
+
+msgid "side by side"
+msgstr "左右并排"
+
+msgid "one above the other"
+msgstr "上下并排"
+
+msgid "PIP width %"
+msgstr "画中画宽度 %"
+
+msgid "Append a second video (one file after another)"
+msgstr "拼接第二个视频（两个文件首尾相接）"
+
+msgid "(appended after the source)"
+msgstr "（接在源文件后面）"
+
+msgid "Effect and GIF work with the shipped transcoder (flip/rotate run on the RGA, black and white keeps the hardware encoder). Logo and picture in picture need the overlay filter: if it is missing the backend says so - rebuild ffmpeg-rkrga once. Cluster mode ignores this card."
+msgstr "特效和 GIF 现在就能用（翻转/旋转走 RGA 硬件，黑白保留硬件编码器）。LOGO 和画中画需要 overlay 滤镜：没有时后端会直接说明，重编一次 ffmpeg-rkrga 即可。集群模式不使用本卡的选项。"
+
+msgid "Unknown effect: %s"
+msgstr "未知特效：%s"
+
+msgid "Logo file not found: %s"
+msgstr "找不到 LOGO 文件：%s"
+
+msgid "Second video not found: %s"
+msgstr "找不到第二个视频：%s"
+
+msgid "This ffmpeg-rkrga build has no overlay/hstack filter - rebuild ffmpeg-rkrga with overlay/hstack/vstack enabled to use the logo or picture-in-picture option"
+msgstr "这个 ffmpeg-rkrga 没有 overlay/hstack 滤镜：需要用启用了 overlay/hstack/vstack 的版本重编 ffmpeg-rkrga，才能用 LOGO 和画中画"
+
+msgid "▶ Joining two files: %s"
+msgstr "▶ 正在拼接两个文件：%s"
+
+msgid "One of the two halves could not be encoded"
+msgstr "两段中有一段编码失败"
+
+msgid "Finished: %s (%s) in %ss"
+msgstr "完成：%s（%s）用时 %s 秒"
+
+msgid "Only %s usable keyframe boundary(ies) here: using %s segment(s)"
+msgstr "这段范围内只有 %s 个可用关键帧切点：改为 %s 段"
+
+msgid "The selected range has no keyframe to split on - use fewer segments, or drop the duration limit"
+msgstr "选定范围内没有可切的关键帧：减少分段数，或去掉时长限制"

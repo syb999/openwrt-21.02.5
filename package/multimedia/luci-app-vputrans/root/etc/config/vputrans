@@ -1,0 +1,6 @@
+config cluster 'main'
+	option token ''
+	option segments '0'
+	option local '1'
+	option workdir ''
+	list node ''

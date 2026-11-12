@@ -34,6 +34,10 @@
 #   vputrans status                 -> current status JSON
 #   vputrans stop                   -> terminate a running job
 #   vputrans history                -> last 5 finished jobs
+#   vputrans cluster <src> [opts]   -> transcode one file on several boxes
+#     --nodes ip[,ip...]  --segments N  --local 0|1
+#   vputrans clusterstatus | clustercfg | clusterset | clusterlist
+#   vputrans node "<query>"         -> CGI endpoint driven by the master
 #
 # run options (all optional; sane defaults):
 #   --out <path>            output file (default: auto)
@@ -74,7 +78,7 @@
 #     touches the frames.
 #   * Only ONE job may run at a time (weak 4-core box); enforced with flock.
 
-VERSION="3.3.2"
+VERSION="3.4.0"
 
 FFMPEG_HW="/usr/bin/ffmpeg-rkrga"
 FFPROBE="/usr/bin/ffprobe"
@@ -94,6 +98,9 @@ BATCHRES="/tmp/vputrans.batch.result"   # state<TAB>src<TAB>out per finished fil
 BATCHSTOP="/tmp/vputrans.batch.stop"
 MAX_BATCH=500
 HIST="/tmp/vputrans.history"
+# effects / logo / pip / join options: written by `run`, read by the worker
+# (the detached worker would need 10 more positional arguments otherwise)
+OPTS="/tmp/vputrans.opts"
 
 LOG_TAIL=14
 UA="Mozilla/5.0"                 # plain user agent, no shell metacharacters
@@ -319,6 +326,12 @@ ff_probe_v() { # $1=proto $2=src -> sets S_CODEC S_PIX S_W S_H S_FR S_DUR
 	done <<PROBEEOF
 $pout
 PROBEEOF
+}
+
+ff_kf() { # $1 = src -> video keyframe timestamps, one per line
+	"$FFPROBE" -v error -rw_timeout "$NET_TIMEOUT_US" -select_streams v:0 \
+		-show_entries packet=pts_time,flags -of csv=p=0 "$1" 2>/dev/null \
+		| sed -n 's/^\([0-9][0-9.]*\),K.*$/\1/p'
 }
 
 ff_duration() { # $1=proto $2=src -> container duration (seconds)
@@ -739,6 +752,8 @@ do_run() {
 	in=""; out=""; quality="cbr"; br=""; qp=""; enc=""
 	res="source"; scaler="bicubic"; audio="copy"; container="auto"
 	ss="0"; dur="0"; fps="source"
+	effect="none"; logo=""; logopos="tr"; logosize=""; logoalpha="200"
+	pip=""; pippos="br"; pipscale="30"; join2=""; giffps="12"
 
 	while [ $# -gt 0 ]; do
 		case "$1" in
@@ -754,6 +769,16 @@ do_run() {
 			--dur|-t)       dur="$2"; shift 2 ;;
 			--audio|-a)     audio="$2"; shift 2 ;;
 			--container|-f) container="$2"; shift 2 ;;
+			--effect)       effect="$2"; shift 2 ;;
+			--logo)         logo="$2"; shift 2 ;;
+			--logo-pos)     logopos="$2"; shift 2 ;;
+			--logo-size)    logosize="$2"; shift 2 ;;
+			--logo-alpha)   logoalpha="$2"; shift 2 ;;
+			--pip)          pip="$2"; shift 2 ;;
+			--pip-pos)      pippos="$2"; shift 2 ;;
+			--pip-scale)    pipscale="$2"; shift 2 ;;
+			--join)         join2="$2"; shift 2 ;;
+			--gif-fps)      giffps="$2"; shift 2 ;;
 			-*) fail 'Unknown argument: %s' "$1"; return 1 ;;
 			*) in="$1"; shift ;;
 		esac
@@ -764,6 +789,19 @@ do_run() {
 		fail 'Transcoder %s is missing, please install ffmpeg-rkrga' "$FFMPEG_HW"; return 1
 	fi
 	if ! res_ok "$res"; then fail 'Invalid resolution: %s' "$res"; return 1; fi
+	case "$effect" in
+		none|gray|hflip|vflip|reversal|rot90|rot270) ;;
+		*) fail 'Unknown effect: %s' "$effect"; return 1 ;;
+	esac
+	if [ -n "$logo" ] && [ "$logo" != "none" ] && [ ! -f "$logo" ]; then
+		fail 'Logo file not found: %s' "$logo"; return 1
+	fi
+	if [ -n "$pip" ] && [ "$pip" != "none" ] && ! is_url "$pip" && [ ! -f "$pip" ]; then
+		fail 'Second video not found: %s' "$pip"; return 1
+	fi
+	if [ -n "$join2" ] && [ ! -f "$join2" ] && ! is_url "$join2"; then
+		fail 'Second video not found: %s' "$join2"; return 1
+	fi
 
 	# ---- probe ----
 	if ! probe_common "$in"; then
@@ -800,9 +838,24 @@ do_run() {
 # SMART-CBR-DEFAULT-END
 	[ -n "$qp" ]  || qp="26"
 	E=$(enc_of "$enc")
+	if [ "$container" = "gif" ]; then
+		E="gif"
+	elif [ -z "$E" ]; then
+		fail 'Unsupported encoder: %s (this SoC only has H.264/H.265 hardware encoders)' "$enc"
+		return 1
+	fi
 	if [ -z "$E" ]; then
 		fail 'Unsupported encoder: %s (this SoC only has H.264/H.265 hardware encoders)' "$enc"
 		return 1
+	fi
+	# logo / pip need the software overlay/hstack filters.  They are NOT part of
+	# the shipped ffmpeg-rkrga (its RGA mutator needs DRM_PRIME frames and
+	# /dev/dri/card0 is vgem here), so say so instead of failing inside ffmpeg.
+	if [ -n "$logo" ] || [ -n "$pip" ]; then
+		if ! "$FFMPEG_HW" -hide_banner -filters 2>/dev/null | grep -qE "^ *[A-Z.]+ +(overlay|hstack) "; then
+			fail 'This ffmpeg-rkrga build has no overlay/hstack filter - rebuild ffmpeg-rkrga with overlay/hstack/vstack enabled to use the logo or picture-in-picture option'
+			return 1
+		fi
 	fi
 
 	# container: resolve auto
@@ -819,7 +872,9 @@ do_run() {
 	if [ "$container" = "auto" ] || [ -z "$container" ]; then
 		if [ "$live" = "true" ]; then container="mkv"; else container="mp4"; fi
 	fi
-	case "$container" in mp4|mkv|ts) ;; *) container="mp4" ;; esac
+	case "$container" in mp4|mkv|ts|gif) ;; *) container="mp4" ;; esac
+	# a GIF has no audio track and no bitrate; frame rate comes from --gif-fps
+	if [ "$container" = "gif" ]; then audio="none"; fi
 
 	# audio: auto-fix copy when the container cannot hold the codec
 	notice=""; notice_args=""
@@ -837,7 +892,7 @@ do_run() {
 	# output path
 	if [ -z "$out" ]; then
 		case "$container" in
-			mkv) ext="mkv" ;; ts) ext="ts" ;; *) ext="mp4" ;;
+			mkv) ext="mkv" ;; ts) ext="ts" ;; gif) ext="gif" ;; *) ext="mp4" ;;
 		esac
 		if [ "$stype" = "local" ]; then
 			dir=$(dirname "$in"); base=$(basename "$in"); base="${base%.*}"
@@ -858,8 +913,10 @@ do_run() {
 		# if user gave -o without a known ext, honour the resolved container
 		case "$out" in
 			*.mkv) container="mkv" ;; *.ts) container="ts" ;; *.mp4) container="mp4" ;;
+			*.gif) container="gif" ;;
 			*) case "$container" in
-					mkv) out="$out.mkv" ;; ts) out="$out.ts" ;; *) out="$out.mp4" ;;
+					mkv) out="$out.mkv" ;; ts) out="$out.ts" ;; gif) out="$out.gif" ;;
+					*) out="$out.mp4" ;;
 			   esac ;;
 		esac
 	fi
@@ -893,14 +950,26 @@ do_run() {
 	: > "$EV"
 	write_status "$reason_args"
 
+	# effects / logo / pip / join: hand them to the worker through a file
+	{
+		printf '%s\n' "$effect" "$logo" "$logopos" "$logosize" "$logoalpha" \
+			"$pip" "$pippos" "$pipscale" "$join2" "$giffps"
+	} > "$OPTS"
+
 	# the worker inherits the notice (it cannot re-derive it)
 	VPU_NOTICE="$notice"; VPU_NOTICE_ARGS="$notice_args"; export VPU_NOTICE VPU_NOTICE_ARGS
 
 	# detach the real worker (survives the ~60s uhttpd CGI limit)
-	( exec "$0" __worker "$in" "$out" "$quality" "$qp" "$br" "$enc" "$res" "$scaler" \
-		"$audio" "$container" "$ss" "$dur" "$fps" "$codec" "$pix" "$live" "$stype" \
-		"${S_W:-0}" "${S_H:-0}" "${S_DUR:-0}" ) \
-		</dev/null >/dev/null 2>&1 &
+	if [ -n "$join2" ]; then
+		( exec "$0" __join "$in" "$join2" "$out" "$quality" "$qp" "$br" "$enc" "$res" \
+			"$scaler" "$audio" "$container" "$fps" "$effect" "$giffps" "$ss" "$dur" ) \
+			</dev/null >/dev/null 2>&1 &
+	else
+		( exec "$0" __worker "$in" "$out" "$quality" "$qp" "$br" "$enc" "$res" "$scaler" \
+			"$audio" "$container" "$ss" "$dur" "$fps" "$codec" "$pix" "$live" "$stype" \
+			"${S_W:-0}" "${S_H:-0}" "${S_DUR:-0}" ) \
+			</dev/null >/dev/null 2>&1 &
+	fi
 
 	printf '{"ok":true,"in":%s,"out":%s,"sourcetype":%s,"mode":%s,"decoder":%s,"encoder":%s,%s}\n' \
 		"$(jstr "$in")" "$(jstr "$out")" "$(jstr "$stype")" \
@@ -916,6 +985,18 @@ do_worker() {
 	audio="$9"; container="${10}"; ss="${11}"; dur="${12}"; fps="${13}"
 	codec="${14}"; pix="${15}"; live="${16}"; stype="${17}"
 	srcw="${18:-0}"; srch="${19:-0}"; dur_hint="${20:-0}"
+
+	# effects / logo / pip / join (written by do_run, see $OPTS)
+	FX_EFFECT="none"; FX_LOGO=""; FX_LOGOPOS="tr"; FX_LOGOSIZE=""; FX_LOGOALPHA="200"
+	FX_PIP=""; FX_PIPPOP="br"; FX_PIPSCALE="30"; FX_JOIN=""; FX_GIFFPS="12"
+	if [ -f "$OPTS" ]; then
+		{ IFS= read -r FX_EFFECT; IFS= read -r FX_LOGO; IFS= read -r FX_LOGOPOS
+		  IFS= read -r FX_LOGOSIZE; IFS= read -r FX_LOGOALPHA; IFS= read -r FX_PIP
+		  IFS= read -r FX_PIPPOP; IFS= read -r FX_PIPSCALE; IFS= read -r FX_JOIN
+		  IFS= read -r FX_GIFFPS; } < "$OPTS" 2>/dev/null
+	fi
+	[ -n "$FX_EFFECT" ] || FX_EFFECT="none"
+	[ -n "$FX_GIFFPS" ] || FX_GIFFPS=12
 
 	E=$(enc_of "$enc")
 	proto=$(proto_of "$in")
@@ -977,16 +1058,96 @@ do_worker() {
 
 	# ---- video encode options ----
 	venc=""
-	[ "$quality" = "crf" ] && venc="-rc_mode CQP -qp_init $qp" || venc="-b:v $br"
-	vopts="$venc"
-	# 🔴 hw mode = DRM prime zero copy: NO -pix_fmt (see the header notes)
-	if [ "$mode" = "hw" ]; then
-		[ -n "$R_VF" ] && vopts="$vopts -vf $R_VF"
+	if [ "$container" = "gif" ]; then
+		# the gif encoder has no rate control (and this build has no
+		# palettegen, so it uses the default 256 colour palette)
+		venc=""
 	else
-		vopts="$vopts -pix_fmt yuv420p"
-		[ -n "$R_VF" ] && vopts="$vopts -vf $R_VF"
+		[ "$quality" = "crf" ] && venc="-rc_mode CQP -qp_init $qp" || venc="-b:v $br"
 	fi
-	[ -n "$fps" ] && [ "$fps" != "source" ] && vopts="$vopts -r $fps"
+	vopts="$venc"
+
+	# ---- ONE video filter chain: resolution + effect + gif/logo/pip ----
+	# chain_add keeps the commas right; every piece must be space free
+	VCH=""
+	chain_add() { if [ -z "$VCH" ]; then VCH="$1"; else VCH="$VCH,$1"; fi; }
+	[ -n "$R_VF" ] && chain_add "$R_VF"
+	case "$FX_EFFECT" in
+		hflip)    chain_add "vpp_rkrga=transpose=hflip:format=nv12" ;;
+		vflip)    chain_add "vpp_rkrga=transpose=vflip:format=nv12" ;;
+		reversal) chain_add "vpp_rkrga=transpose=reversal:format=nv12" ;;
+		rot90)    chain_add "vpp_rkrga=transpose=clock:format=nv12" ;;
+		rot270)   chain_add "vpp_rkrga=transpose=cclock:format=nv12" ;;
+		gray)
+			# neither the VPU nor the RGA has a grey path: download, convert
+			# to grey and hand yuv420p frames to the hardware encoder
+			if [ "$mode" = "hw" ]; then
+				chain_add "hwdownload,format=nv12"
+			fi
+			chain_add "format=gray,format=yuv420p" ;;
+	esac
+	if [ "$container" = "gif" ]; then
+		if [ "$mode" = "hw" ]; then
+			# RGA does NV12 -> BGRA in hardware, only the gif writer is software
+			chain_add "scale_rkrga=format=bgra"
+			chain_add "hwdownload,format=bgra"
+		else
+			chain_add "format=bgra"
+		fi
+		chain_add "fps=$FX_GIFFPS"
+	fi
+
+	# logo / picture-in-picture / side-by-side need the (software) overlay or
+	# hstack filter: the RGA mutator is useless on this firmware because
+	# /dev/dri/card0 is vgem, so hwupload cannot make a DRM_PRIME frame out of
+	# a PNG and overlay_rkrga refuses software frames.
+	FC=""
+	if [ -n "$FX_LOGO" ] || [ -n "$FX_PIP" ]; then
+		[ "$mode" = "hw" ] && chain_add "hwdownload,format=nv12"
+		chain_add "format=yuv420p"
+		FC="[0:v]$VCH[v0]"
+		if [ -n "$FX_LOGO" ]; then
+			case "$FX_LOGOPOS" in
+				tl) lx="20"; ly="20" ;;
+				tr) lx="W-w-20"; ly="20" ;;
+				bl) lx="20"; ly="H-h-20" ;;
+				*)  lx="W-w-20"; ly="H-h-20" ;;
+			esac
+			lsz=""; [ -n "$FX_LOGOSIZE" ] && lsz="scale=$FX_LOGOSIZE,"
+			FC="$FC;[1:v]${lsz}format=rgba[lg];[v0][lg]overlay=x=$lx:y=$ly:format=yuv420p:eof_action=repeat[v]"
+		else
+			case "$FX_PIPPOS" in
+				side) FC="$FC;[1:v]format=yuv420p[p1];[v0][p1]hstack=inputs=2[v]" ;;
+				top)  FC="$FC;[1:v]format=yuv420p[p1];[v0][p1]vstack=inputs=2[v]" ;;
+				*)
+					case "$FX_PIPPOS" in
+						tl) px="20"; py="20" ;;
+						tr) px="W-w-20"; py="20" ;;
+						bl) px="20"; py="H-h-20" ;;
+						*)  px="W-w-20"; py="H-h-20" ;;
+					esac
+					# --pip-scale = percentage of the main width
+					FC="$FC;[1:v]scale=w=iw*$FX_PIPSCALE/100:h=-2,format=yuv420p[p1];[v0][p1]overlay=x=$px:y=$py:format=yuv420p:eof_action=repeat[v]"
+					;;
+			esac
+		fi
+		vopts="$vopts -pix_fmt yuv420p -filter_complex $FC -map [v]"
+		[ "$audio" != "none" ] && vopts="$vopts -map 0:a?"
+	else
+		if [ "$mode" = "hw" ] && [ "$container" != "gif" ] && [ "$FX_EFFECT" != "gray" ]; then
+			# zero copy: DRM prime straight into the hardware encoder
+			:
+		else
+			# gif / grey / software decode hand plain yuv420p frames over
+			case "$container" in
+				gif) : ;;
+				*)   vopts="$vopts -pix_fmt yuv420p" ;;
+			esac
+		fi
+		[ -n "$VCH" ] && vopts="$vopts -vf $VCH"
+	fi
+	[ -n "$fps" ] && [ "$fps" != "source" ] && [ "$container" != "gif" ] && vopts="$vopts -r $fps"
+
 	case "$audio" in
 		copy) aopts="-c:a copy" ;;
 		none) aopts="-an" ;;
@@ -996,6 +1157,7 @@ do_worker() {
 		mp4) copts="-movflags +faststart -f mp4" ;;
 		mkv) copts="-f matroska" ;;
 		ts)  copts="-f mpegts" ;;
+		gif) copts="-loop 0 -f gif" ;;
 	esac
 	ssopt=""; [ -n "$ss" ] && [ "$ss" != "0" ] && ssopt="-ss $ss"
 	d_opt=""; [ -n "$dur" ] && [ "$dur" != "0" ] && d_opt="-t $dur"
@@ -1020,11 +1182,17 @@ do_worker() {
 		set -- "$@" -c:v "$dec"
 	fi
 	set -- "$@" -i "$in"
-	set -- "$@" -c:v "$E"
+	[ -n "$FX_LOGO" ] && set -- "$@" -i "$FX_LOGO"
+	[ -n "$FX_PIP" ] && set -- "$@" -i "$FX_PIP"
+	if [ "$container" = "gif" ]; then
+		set -- "$@" -an -c:v gif
+	else
+		set -- "$@" -c:v "$E"
+	fi
 	# shellcheck disable=SC2086
 	[ -n "$vopts" ] && set -- "$@" $vopts
 	# shellcheck disable=SC2086
-	set -- "$@" $aopts
+	[ "$container" != "gif" ] && set -- "$@" $aopts
 	[ -n "$d_opt" ] && set -- "$@" $d_opt
 	# shellcheck disable=SC2086
 	set -- "$@" $copts "$out"
@@ -1138,6 +1306,136 @@ do_worker() {
 }
 
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# join - two files into one
+#
+# Sequential join: both halves are re-encoded with the SAME parameters (they may
+# be different codecs, resolutions or frame rates on input, that is fine) and
+# then concatenated with -c copy.  A plain `-f concat` on the originals only
+# works when every stream parameter already matches, which is exactly what a
+# user with two random files cannot rely on.
+# ---------------------------------------------------------------------------
+
+do_join_worker() { # in1 in2 out quality qp br enc res scaler audio container fps effect giffps
+	jin="$1"; jin2="$2"; jout="$3"; jq="$4"; jqp="$5"; jbr="$6"; jenc="$7"; jres="$8"
+	jsc="$9"; jau="${10}"; jcont="${11}"; jfps="${12}"; jfx="${13}"; jgif="${14}"
+	jss="${15:-0}"; jdur="${16:-0}"
+
+	jdir="/tmp/vputrans.join"
+	rm -rf "$jdir"
+	mkdir -p "$jdir" || exit 1
+	jp1="$jdir/p1.ts"; jp2="$jdir/p2.ts"
+	jd1=$(ff_duration "$(proto_of "$jin")" "$jin")
+	jd2=$(ff_duration "$(proto_of "$jin2")" "$jin2")
+	# --ss/--dur trim the FIRST file only (the second one is always whole)
+	if [ "$(awk -v v="$jdur" 'BEGIN{print (v+0>0)?1:0}')" = "1" ]; then
+		jd1="$jdur"
+	elif [ "$(awk -v v="$jss" 'BEGIN{print (v+0>0)?1:0}')" = "1" ]; then
+		jd1=$(awk -v a="$jd1" -v s="$jss" 'BEGIN{ d=a-s; if (d<0) d=0; printf "%.3f", d }')
+	fi
+
+	# the two halves must share the audio codec, otherwise -c copy on the join
+	# produces a broken second half
+	ja1=$(ff_audio "" "$jin"); ja2=$(ff_audio "" "$jin2")
+	[ "$ja1" = "$ja2" ] || jau="aac"
+	if [ "$jcont" = "mp4" ] && [ "$jau" = "copy" ]; then
+		case "$ja1" in
+			aac|mp3|ac3|eac3|alac|mp2) ;;
+			*) jau="aac" ;;
+		esac
+	fi
+
+	start_ts=$(date +%s)
+	st_state="running"; st_progress=0; st_speed=""
+	st_in="$jin"; st_out="$jout"; st_stype="local"; st_live=false
+	st_mode="hw"; st_dec=""; st_enc=$(enc_of "$jenc")
+	st_reason=""; st_reason_args=""; st_error=""; st_error_args=""
+	st_detail=""; st_detail_args=""; st_notice=""; st_notice_args=""; st_fpsval=""
+	st_total=$(awk -v a="$jd1" -v b="$jd2" 'BEGIN{ printf "%.0f", a+b }')
+	st_out_time=0; st_outsize=0; st_progmode="pct"; st_scaleeng=""
+	st_elapsed=0
+	: > "$LOG"; : > "$EV"; : > "$PROG"
+	log_ev '▶ Joining two files: %s' "$(tjoin "$jin" "$jin2")"
+	write_status ""
+
+	jpart() { # <in> <out> <prog> <base-pct> <len> [ss] [dur]
+		CLU_SEEKMODE=out
+		export CLU_SEEKMODE
+		clu_encode "$1" "$2" "$3" "${6:-0}" "${7:-0}" "$jq" "$jqp" "$jbr" "$jenc" "$jres" \
+			"$jsc" "$jau" "$jfps" &
+		jpid=$!
+		echo "$jpid" > "$PIDF"
+		while kill -0 "$jpid" 2>/dev/null; do
+			[ -f "$STOPFLAG" ] && break
+			jot=$(grep '^out_time_us=' "$3" 2>/dev/null | tail -n 1 | cut -d= -f2)
+			jot=${jot:-0}
+			jsp=$(grep '^speed=' "$3" 2>/dev/null | tail -n 1 | cut -d= -f2)
+			st_progress=$(awk -v b="$4" -v t="$jot" -v d="$5" \
+				'BEGIN{ if (d+0>0) { p=t/(d*1000000); if (p>1) p=1; if (p<0) p=0; printf "%.1f", b + p*50 } else printf "%.1f", b }')
+			st_elapsed=$(( $(date +%s) - start_ts ))
+			st_speed="$jsp"
+			st_out_time=$(awk -v t="$jot" 'BEGIN{ printf "%.1f", t/1000000 }')
+			write_status ""
+			sleep 2
+		done
+		wait "$jpid"
+	}
+
+	jpart "$jin" "$jp1" "$jdir/p1.prog" 0 "$jd1" "$jss" "$jdur"
+	if [ -f "$STOPFLAG" ]; then
+		st_state="stopped"; st_error='Stopped manually'; st_progress=100
+		write_status ""; add_history "stopped"; rm -rf "$jdir"; exit 0
+	fi
+	jpart "$jin2" "$jp2" "$jdir/p2.prog" 50 "$jd2"
+	if [ -f "$STOPFLAG" ]; then
+		st_state="stopped"; st_error='Stopped manually'; st_progress=100
+		write_status ""; add_history "stopped"; rm -rf "$jdir"; exit 0
+	fi
+
+	if [ ! -s "$jp1" ] || [ ! -s "$jp2" ]; then
+		st_state="error"; st_progress=0
+		st_error='One of the two halves could not be encoded'
+		write_status ""; add_history "error"; rm -rf "$jdir"; exit 1
+	fi
+
+	printf "file '%s'\nfile '%s'\n" "$jp1" "$jp2" > "$jdir/list.txt"
+	case "$jau" in
+		none) ja="-an" ;;
+		aac)  ja="-c:a aac -b:a 128k" ;;
+		*)    ja="-c:a copy" ;;
+	esac
+	case "$jcont" in
+		mkv) jc="-f matroska" ;;
+		ts)  jc="-f mpegts" ;;
+		*)   jc="-movflags +faststart -f mp4" ;;
+	esac
+	# shellcheck disable=SC2086
+	"$FFMPEG_HW" -y -hide_banner -loglevel warning -f concat -safe 0 \
+		-i "$jdir/list.txt" -c:v copy $ja $jc "$jout" >> "$LOG" 2>&1
+	jrc=$?
+
+	jod=$(ff_duration "" "$jout")
+	jexpect=$(awk -v a="$jd1" -v b="$jd2" 'BEGIN{ printf "%.3f", a+b }')
+	st_elapsed=$(( $(date +%s) - start_ts ))
+	st_outsize=$(fsize "$jout")
+	if [ -s "$jout" ] && [ -n "$jod" ] && \
+	   [ "$(awk -v d="$jod" 'BEGIN{ print (d+0>0)?1:0 }')" = "1" ] && \
+	   [ "$(awk -v a="$jod" -v b="$jexpect" 'BEGIN{ print ((a+0) >= (b+0)*0.97) ? 1 : 0 }')" = "1" ]; then
+		st_state="done"; st_progress=100; st_error=""; st_error_args=""
+		st_out_time=$(awk -v d="$jod" 'BEGIN{ printf "%.1f", d+0 }')
+		write_status ""; add_history "done"
+		log_ev '✔ Finished: %s (%s) in %ss' "$(tjoin "$jout" "$(fmt_size "$st_outsize")" "$st_elapsed")"
+		rm -rf "$jdir"
+	else
+		st_state="error"
+		st_error='Join failed (exit code %s)'; st_error_args=$(tjoin "$jrc")
+		st_detail='Expected %ss, got %ss'; st_detail_args=$(tjoin "$jexpect" "${jod:-0}")
+		write_status ""; add_history "error"
+		log_ev "✘ Join failed: %s" "$(tjoin "$jout")"
+		rm -rf "$jdir"
+	fi
+}
 
 # ---------------------------------------------------------------------------
 # batch (queue) processing
@@ -1309,6 +1607,927 @@ do_batch() {
 	printf '{"ok":true,"count":%s}\n' "$bn"
 }
 
+# ---------------------------------------------------------------------------
+# cluster: several boxes transcode ONE file in parallel
+#
+# The box the job is started on is the master.  It cuts the source into
+# keyframe-aligned segments with -c copy (fast), gives every node one segment,
+# encodes one itself when asked, then concatenates the pieces in order with
+# -c copy.  A node is another box with this same package: it is driven over
+# HTTP through /cgi-bin/vputrans-node, which just execs this script in "node"
+# mode.  No extra daemon and no ssh keys - uhttpd is already running, and the
+# only credential is the shared token from /etc/config/vputrans.
+#
+# Why the master splits instead of letting every node seek: only segments that
+# start on a source keyframe concatenate without a visible glitch, and -f
+# segment gives exactly that for a local file.  For URL sources there is no
+# local file to cut, so each node seeks its own slice with -ss/-t instead
+# (each slice still starts with a fresh IDR, because it is re-encoded).
+# ---------------------------------------------------------------------------
+
+CLU_ROOT="/tmp/vputrans.cluster"
+CLU_NODE_ROOT="/tmp/vputrans.node"
+CLU_STATUS="/tmp/vputrans.cluster.status"
+CLU_MAX_SEGS=16
+
+clu_conf() { uci -q get "vputrans.cluster.$1" 2>/dev/null; }
+
+clu_url() { # $1 = node spec (ip | ip:port | http://ip) -> CGI endpoint
+	local n="$1"
+	case "$n" in *://*) ;; *) n="http://$n" ;; esac
+	n="${n%/}"
+	printf '%s/cgi-bin/vputrans-node' "$n"
+}
+
+clu_lan_ip() { # [target] -> the local address a peer reaches us on
+	# NOT network.lan.ipaddr: on this box br-lan is 192.168.28.1 while the LAN
+	# the other boxes live on is 10.80.1.0/24, so only the route table tells
+	# us which source address a peer will see.
+	local t="$1" ip=""
+	[ -n "$t" ] && ip=$(ip -4 route get "$t" 2>/dev/null \
+		| awk '{for (i=1;i<=NF;i++) if ($i=="src") { print $(i+1); exit }}')
+	[ -n "$ip" ] || ip=$(ip -4 route get 1.1.1.1 2>/dev/null \
+		| awk '{for (i=1;i<=NF;i++) if ($i=="src") { print $(i+1); exit }}')
+	[ -n "$ip" ] || ip=$(uci -q get network.lan.ipaddr 2>/dev/null)
+	printf '%s' "$ip"
+}
+
+qs_get() { # $1 = raw query string, $2 = key -> value
+	local rest="$1" part
+	while [ -n "$rest" ]; do
+		part="${rest%%&*}"
+		case "$rest" in *'&'*) rest="${rest#*&}" ;; *) rest="" ;; esac
+		[ "${part%%=*}" = "$2" ] || continue
+		printf '%s' "${part#*=}"
+		return 0
+	done
+	return 1
+}
+
+# base64url so that a path/URL survives a query string untouched
+b64e() { printf '%s' "$1" | base64 | tr '+/' '-_' | tr -d '\n'; }
+b64d() { printf '%s' "$1" | tr '_-' '/+' | base64 -d 2>/dev/null; }
+
+clu_okjob() { # job id is generated by us; never let it walk out of the tree
+	case "$1" in ''|*[!A-Za-z0-9-]*) return 1 ;; esac
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# node side
+# ---------------------------------------------------------------------------
+
+clu_node_dir() { printf '%s/%s' "$CLU_NODE_ROOT" "$1"; }
+# one directory per (job, slice): a node may carry several slices of the same
+# job (more segments than workers), and they must not share out.ts
+clu_seg_dir() { printf '%s/%s/s%s' "$CLU_NODE_ROOT" "$1" "$2"; }
+
+node_hdr() { # $1 = content type
+	printf 'Status: 200 OK\r\nContent-Type: %s\r\nCache-Control: no-store\r\n\r\n' "$1"
+}
+
+node_die() { # $1 = http status line, $2 = text
+	printf 'Status: %s\r\nContent-Type: text/plain\r\n\r\n%s\n' "$1" "$2"
+	exit 0
+}
+
+node_busy() {
+	bst=$(do_status 2>/dev/null | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p')
+	[ "$bst" = "running" ]
+}
+
+# encode ONE segment.  Runs ffmpeg in the FOREGROUND; the caller backgrounds
+# this function.  Input is a TS slice or the source URL with -ss/-t, output is
+# always mpegts (concat-safe, and no moov atom to rewrite per segment).
+clu_encode() { # <in> <out> <prog> <ss> <dur> <quality> <qp> <br> <enc> <res> <scaler> <audio> <fps>
+	cin="$1"; cout="$2"; cprog="$3"; css="$4"; cdur="$5"
+	cq="$6"; cqp="$7"; cbr="$8"; cenc="$9"; cres="${10}"; csc="${11}"; caudio="${12}"; cfps="${13}"
+
+	E=$(enc_of "$cenc")
+	[ -n "$E" ] || return 1
+	# codec/pixel format/resolution of THIS slice decide the pipeline
+	probe_common "$cin" || return 1
+	decide_pipeline "$S_CODEC" "$S_PIX"
+	cmode="$P_MODE"; cdec="$P_DEC"
+	resolve_res "$cres" "$cmode" "$csc" "${S_W:-0}" "${S_H:-0}"
+
+	[ "$cq" = "crf" ] && venc="-rc_mode CQP -qp_init $cqp" || venc="-b:v $cbr"
+	cvopts="$venc"
+	# hw path = DRM prime zero copy: -pix_fmt must NOT be added (see the notes
+	# at the top of this file - it costs 4x the speed on this SoC)
+	[ "$cmode" = "hw" ] || cvopts="$cvopts -pix_fmt yuv420p"
+	[ -n "$R_VF" ] && cvopts="$cvopts -vf $R_VF"
+	[ -n "$cfps" ] && [ "$cfps" != "source" ] && cvopts="$cvopts -r $cfps"
+	case "$caudio" in
+		none) caopts="-an" ;;
+		aac)  caopts="-c:a aac -b:a 128k" ;;
+		*)    caopts="-c:a copy" ;;
+	esac
+	# Where the seek goes matters:
+	#  * URL slice  -> INPUT seek, so the node does not pull from the beginning
+	#  * local slice -> OUTPUT seek: a .ts has no index, so an input seek lands
+	#    on the NEXT keyframe and silently drops the packet range in between
+	#    (measured: -ss 5 on a TS cut gave 251 frames for an 11.7s slice, i.e.
+	#    a 3.3s hole).  Decoding the head and discarding it is exact.
+	# CLU_SEEKMODE comes from the plan: our own sliced .ts has no index, so it
+	# must be sought on the OUTPUT side (decode the head and throw it away),
+	# while a real online source is sought on the INPUT side so the node does
+	# not pull it from the beginning.
+	cssin=""; cssout=""
+	if [ -n "$css" ] && [ "$css" != "0" ]; then
+		case "${CLU_SEEKMODE:-}" in
+			in)  cssin="-ss $css" ;;
+			out) cssout="-ss $css" ;;
+			*) case "$cin" in
+				*://*) cssin="-ss $css" ;;
+				*)     cssout="-ss $css" ;;
+			   esac ;;
+		esac
+	fi
+	cdopt="";  [ -n "$cdur" ] && [ "$cdur" != "0" ] && cdopt="-t $cdur"
+	chw=""; [ "$cmode" = "hw" ] && [ -n "$cdec" ] && chw="-hwaccel rkmpp -hwaccel_output_format drm_prime"
+
+	: > "$cprog"
+	# shellcheck disable=SC2086
+	set -- "$FFMPEG_HW" -y -hide_banner -loglevel warning -nostats -progress "$cprog" \
+		-rw_timeout "$NET_TIMEOUT_US"
+	[ -n "$chw" ] && set -- "$@" $chw
+	# clone the network input options of the normal path for URL slices
+	case "$cin" in *://*) set -- "$@" $(net_in_opts "$(proto_of "$cin")") ;; esac
+	[ -n "$cssin" ] && set -- "$@" $cssin
+	[ "$cmode" = "hw" ] && [ -n "$cdec" ] && set -- "$@" -c:v "$cdec"
+	set -- "$@" -i "$cin"
+	[ -n "$cssout" ] && set -- "$@" $cssout
+	set -- "$@" -c:v "$E"
+	# shellcheck disable=SC2086
+	[ -n "$cvopts" ] && set -- "$@" $cvopts
+	# shellcheck disable=SC2086
+	set -- "$@" $caopts
+	[ -n "$cdopt" ] && set -- "$@" $cdopt
+	set -- "$@" -f mpegts "$cout"
+	"$@" >> "${cprog%.prog}.log" 2>&1
+}
+
+node_job() { # <job> <i> <src> <ss> <dur> <quality> <qp> <br> <enc> <res> <scaler> <audio> <fps>
+	njob="$1"; ni="$2"; nsrc="$3"; nss="$4"; ndur="$5"
+	nq="$6"; nqp="$7"; nbr="$8"; nenc="$9"; nres="${10}"; nsc="${11}"; naudio="${12}"; nfps="${13}"
+	CLU_SEEKMODE="${14:-}"; export CLU_SEEKMODE
+	nd=$(clu_seg_dir "$njob" "$ni")
+	mkdir -p "$nd" || return 1
+	nprog="$nd/prog"
+	: > "$nprog"
+	nout="$nd/out.ts"
+	# expected length drives the percentage; the caller passes it for a URL
+	# slice, for a local slice we measure it
+	nlen="$ndur"
+	if [ "$(awk -v v="$nlen" 'BEGIN{print (v+0>0)?1:0}')" != "1" ]; then
+		nlen=$(ff_duration "$(proto_of "$nsrc")" "$nsrc")
+	fi
+	nlen_us=$(awk -v d="$nlen" 'BEGIN{ if (d+0>0) printf "%.0f", d*1000000; else printf "0" }')
+	nstart=$(date +%s)
+
+	clu_encode "$nsrc" "$nout" "$nprog" "$nss" "$ndur" "$nq" "$nqp" "$nbr" "$nenc" \
+		"$nres" "$nsc" "$naudio" "$nfps" &
+	npid=$!
+	echo "$npid" > "$nd/pid"
+
+	while kill -0 "$npid" 2>/dev/null; do
+		nel=$(( $(date +%s) - nstart ))
+		not=$(grep '^out_time_us=' "$nprog" 2>/dev/null | tail -n 1 | cut -d= -f2)
+		not=${not:-0}
+		nspd=$(grep '^speed=' "$nprog" 2>/dev/null | tail -n 1 | cut -d= -f2)
+		npct=$(awk -v t="$not" -v d="$nlen_us" 'BEGIN{ if (d>0) { p=t/d*100; if (p>99) p=99; if (p<0) p=0; printf "%.1f", p } else printf "0" }')
+		{ printf '{"ok":true,"state":"running","pct":%s,"speed":%s,"out_time":%.1f,"elapsed":%s}\n' \
+			"$npct" "$(jstr "${nspd:-}")" "$(awk -v t="$not" 'BEGIN{printf "%.1f", t/1000000}')" "$nel"
+		} > "$nd/status.tmp" 2>/dev/null
+		mv "$nd/status.tmp" "$nd/status" 2>/dev/null
+		sleep 2
+	done
+	wait "$npid"; nrc=$?
+	nel=$(( $(date +%s) - nstart ))
+
+	nod=$(ff_duration "" "$nout")
+	if [ -s "$nout" ] && [ -n "$nod" ] && [ "$(awk -v d="$nod" 'BEGIN{print (d+0>0)?1:0}')" = "1" ]; then
+		printf '{"ok":true,"state":"done","pct":100,"dur":%.3f,"size":%s,"elapsed":%s}\n' \
+			"$nod" "$(fsize "$nout")" "$nel" > "$nd/status"
+	else
+		nraw=$(tail -n 3 "${nprog%.prog}.log" 2>/dev/null | tr '\n' ' ' | tr -d '"' | cut -c1-300)
+		printf '{"ok":false,"state":"error","pct":0,"rc":%s,"detail":%s,"elapsed":%s}\n' \
+			"$nrc" "$(jstr "${nraw:-ffmpeg failed}")" "$nel" > "$nd/status"
+	fi
+}
+
+do_node() { # $1 = raw CGI query string -> HTTP response on stdout
+	nq_str="$1"
+	ntok=$(qs_get "$nq_str" token) || node_die "403 Forbidden" "forbidden"
+	nwant=$(clu_conf token)
+	[ -n "$nwant" ] || node_die "403 Forbidden" "no cluster token configured on this box"
+	[ "$ntok" = "$nwant" ] || node_die "403 Forbidden" "forbidden"
+	nact=$(qs_get "$nq_str" action) || node_die "400 Bad Request" "no action"
+	njob=$(qs_get "$nq_str" job)
+
+	case "$nact" in
+	ping)
+		nbusy=false; node_busy && nbusy=true
+		node_hdr "application/json"
+		printf '{"ok":true,"ver":%s,"busy":%s,"cpus":%s,"token_set":true}\n' \
+			"$(jstr "$VERSION")" "$nbusy" "$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)"
+		;;
+	start)
+		clu_okjob "$njob" || node_die "400 Bad Request" "bad job id"
+		nb=$(qs_get "$nq_str" b64src) || node_die "400 Bad Request" "no source"
+		nsrc=$(b64d "$nb")
+		[ -n "$nsrc" ] || node_die "400 Bad Request" "empty source"
+		nd=$(clu_seg_dir "$njob" "$(qs_get "$nq_str" i)")
+		mkdir -p "$nd" || node_die "500 Internal Error" "cannot create the job directory"
+		printf '{"ok":true,"state":"queued","pct":0}\n' > "$nd/status"
+		( exec "$0" __nodejob "$njob" "$(qs_get "$nq_str" i)" "$nsrc" \
+			"$(qs_get "$nq_str" ss)" "$(qs_get "$nq_str" dur)" \
+			"$(qs_get "$nq_str" q)" "$(qs_get "$nq_str" qp)" "$(qs_get "$nq_str" br)" \
+			"$(qs_get "$nq_str" enc)" "$(qs_get "$nq_str" res)" "$(qs_get "$nq_str" scaler)" \
+			"$(qs_get "$nq_str" audio)" "$(qs_get "$nq_str" fps)" "$(qs_get "$nq_str" sm)" ) \
+			</dev/null >/dev/null 2>&1 &
+		node_hdr "application/json"
+		printf '{"ok":true,"job":%s,"i":%s}\n' "$(jstr "$njob")" "$(qs_get "$nq_str" i)"
+		;;
+	status)
+		clu_okjob "$njob" || node_die "400 Bad Request" "bad job id"
+		nd=$(clu_seg_dir "$njob" "$(qs_get "$nq_str" i)")
+		node_hdr "application/json"
+		if [ -f "$nd/status" ]; then cat "$nd/status"; else printf '{"ok":false,"state":"unknown"}\n'; fi
+		;;
+	get)	# a finished segment, pulled by the master
+		clu_okjob "$njob" || node_die "400 Bad Request" "bad job id"
+		nfi=$(qs_get "$nq_str" f)
+		case "$nfi" in ''|*/*|*..*) node_die "400 Bad Request" "bad file name" ;; esac
+		np=$(clu_seg_dir "$njob" "$(qs_get "$nq_str" i)")/$nfi
+		[ -f "$np" ] || node_die "404 Not Found" "no such file"
+		printf 'Status: 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %s\r\nCache-Control: no-store\r\n\r\n' "$(fsize "$np")"
+		cat "$np"
+		;;
+	src)	# master: hand one source segment to a node
+		clu_okjob "$njob" || node_die "400 Bad Request" "bad job id"
+		nfi=$(qs_get "$nq_str" f)
+		case "$nfi" in ''|*/*|*..*) node_die "400 Bad Request" "bad file name" ;; esac
+		np="$CLU_ROOT/$njob/seg/$nfi"
+		[ -f "$np" ] || node_die "404 Not Found" "no such segment"
+		printf 'Status: 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: %s\r\nCache-Control: no-store\r\n\r\n' "$(fsize "$np")"
+		cat "$np"
+		;;
+	clean)
+		clu_okjob "$njob" || node_die "400 Bad Request" "bad job id"
+		nd=$(clu_node_dir "$njob")
+		[ -n "$nd" ] && rm -rf "$nd"
+		node_hdr "application/json"
+		printf '{"ok":true}\n'
+		;;
+	*)
+		node_die "400 Bad Request" "unknown action"
+		;;
+	esac
+}
+
+# ---------------------------------------------------------------------------
+# master side
+# ---------------------------------------------------------------------------
+
+clu_state_file() { printf '%s/%s/state/%s' "$CLU_ROOT" "$1" "$2"; }
+
+clu_mark() { # <job> <i> <state> <pct> <label>
+	{ printf '%s\t%s\t%s\n' "$3" "${4:-0}" "${5:-}" > "$(clu_state_file "$1" "$2").tmp" 2>/dev/null; } &&
+		mv "$(clu_state_file "$1" "$2").tmp" "$(clu_state_file "$1" "$2")" 2>/dev/null
+	return 0
+}
+
+clu_plan_line() { # <job> <i> -> the plan line for segment i
+	awk -F'\t' -v want="$2" '$1 == want { print; exit }' "$CLU_ROOT/$1/plan" 2>/dev/null
+}
+
+clu_slot_remote() { # <job> <node> <i-list...>
+	slot_job="$1"; slot_node="$2"; shift 2
+	slot_tok=$(clu_conf token)
+	slot_base=$(clu_url "$slot_node")
+	for slot_i in "$@"; do
+		slot_ln=$(clu_plan_line "$slot_job" "$slot_i")
+		[ -n "$slot_ln" ] || continue
+		slot_src=$(printf '%s' "$slot_ln" | cut -f2)
+		slot_ss=$(printf '%s' "$slot_ln" | cut -f3)
+		slot_du=$(printf '%s' "$slot_ln" | cut -f4)
+		slot_q=$(printf '%s' "$slot_ln" | cut -f5)
+		slot_qp=$(printf '%s' "$slot_ln" | cut -f6)
+		slot_br=$(printf '%s' "$slot_ln" | cut -f7)
+		slot_enc=$(printf '%s' "$slot_ln" | cut -f8)
+		slot_res=$(printf '%s' "$slot_ln" | cut -f9)
+		slot_sc=$(printf '%s' "$slot_ln" | cut -f10)
+		slot_au=$(printf '%s' "$slot_ln" | cut -f11)
+		slot_fps=$(printf '%s' "$slot_ln" | cut -f12)
+		slot_sm=$(printf '%s' "$slot_ln" | cut -f13)
+		[ -n "$slot_sm" ] || slot_sm="in"
+
+		clu_mark "$slot_job" "$slot_i" running 0 "$slot_node"
+		# ONE argument: curl would treat further arguments as extra URLs
+		slot_url="$slot_base?action=start&token=$slot_tok&job=$slot_job&i=$slot_i"
+		slot_url="$slot_url&b64src=$(b64e "$slot_src")&ss=$slot_ss&dur=$slot_du"
+		slot_url="$slot_url&q=$slot_q&qp=$slot_qp&br=$slot_br&enc=$slot_enc"
+		slot_url="$slot_url&res=$slot_res&scaler=$slot_sc&audio=$slot_au&fps=$slot_fps&sm=$slot_sm"
+		slot_r=$(curl -s -m 20 "$slot_url" 2>/dev/null)
+		case "$slot_r" in
+			*'"ok":true'*) ;;
+			*) clu_mark "$slot_job" "$slot_i" error 0 "$slot_node"; continue ;;
+		esac
+		# poll until this node reports a terminal state
+		while :; do
+			[ -f "$STOPFLAG" ] && { CURL_STOP=1; break; }
+			slot_s=$(curl -s -m 10 "$slot_base?action=status&token=$slot_tok&job=$slot_job&i=$slot_i" 2>/dev/null)
+			slot_st=$(printf '%s' "$slot_s" | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p')
+			slot_pc=$(printf '%s' "$slot_s" | sed -n 's/.*"pct":\([0-9.]*\).*/\1/p')
+			clu_mark "$slot_job" "$slot_i" "${slot_st:-running}" "${slot_pc:-0}" "$slot_node"
+			case "$slot_st" in
+				done)  break ;;
+				error|stopped) break ;;
+			esac
+			sleep 2
+		done
+		if [ "${slot_st:-}" = "done" ]; then
+			curl -s -m 600 -o "$CLU_ROOT/$slot_job/out/seg$slot_i.ts" \
+				"$slot_base?action=get&token=$slot_tok&job=$slot_job&i=$slot_i&f=out.ts" 2>/dev/null
+			if [ -s "$CLU_ROOT/$slot_job/out/seg$slot_i.ts" ]; then
+				clu_mark "$slot_job" "$slot_i" done 100 "$slot_node"
+			else
+				clu_mark "$slot_job" "$slot_i" error 0 "$slot_node"
+			fi
+		fi
+		curl -s -m 10 "$slot_base?action=clean&token=$slot_tok&job=$slot_job" >/dev/null 2>&1
+	done
+}
+
+clu_slot_local() { # <job> <i-list...>  - this box encodes its own slice
+	slot_job="$1"; shift
+	for slot_i in "$@"; do
+		slot_ln=$(clu_plan_line "$slot_job" "$slot_i")
+		[ -n "$slot_ln" ] || continue
+		slot_src=$(printf '%s' "$slot_ln" | cut -f2)
+		slot_ss=$(printf '%s' "$slot_ln" | cut -f3)
+		slot_du=$(printf '%s' "$slot_ln" | cut -f4)
+		slot_q=$(printf '%s' "$slot_ln" | cut -f5)
+		slot_qp=$(printf '%s' "$slot_ln" | cut -f6)
+		slot_br=$(printf '%s' "$slot_ln" | cut -f7)
+		slot_enc=$(printf '%s' "$slot_ln" | cut -f8)
+		slot_res=$(printf '%s' "$slot_ln" | cut -f9)
+		slot_sc=$(printf '%s' "$slot_ln" | cut -f10)
+		slot_au=$(printf '%s' "$slot_ln" | cut -f11)
+		slot_fps=$(printf '%s' "$slot_ln" | cut -f12)
+		slot_sm=$(printf '%s' "$slot_ln" | cut -f13)
+		[ -n "$slot_sm" ] || slot_sm="in"
+		slot_prog="$CLU_ROOT/$slot_job/prog$slot_i.prog"
+		slot_out="$CLU_ROOT/$slot_job/out/seg$slot_i.ts"
+
+		clu_mark "$slot_job" "$slot_i" running 0 "local"
+		CLU_SEEKMODE="$slot_sm"; export CLU_SEEKMODE
+		clu_encode "$slot_src" "$slot_out" "$slot_prog" "$slot_ss" "$slot_du" \
+			"$slot_q" "$slot_qp" "$slot_br" "$slot_enc" "$slot_res" "$slot_sc" "$slot_au" "$slot_fps" &
+		slot_pid=$!
+		while kill -0 "$slot_pid" 2>/dev/null; do
+			slot_ot=$(grep '^out_time_us=' "$slot_prog" 2>/dev/null | tail -n 1 | cut -d= -f2)
+			slot_ot=${slot_ot:-0}
+			slot_pc=$(awk -v t="$slot_ot" -v d="$slot_du" 'BEGIN{ d=d*1000000; if (d>0) { p=t/d*100; if (p>99) p=99; if (p<0) p=0; printf "%.1f", p } else printf "0" }')
+			[ -f "$STOPFLAG" ] && break
+			clu_mark "$slot_job" "$slot_i" running "$slot_pc" "local"
+			sleep 2
+		done
+		wait "$slot_pid"; slot_rc=$?
+		if [ -s "$slot_out" ]; then clu_mark "$slot_job" "$slot_i" done 100 "local"
+		else clu_mark "$slot_job" "$slot_i" error 0 "local"; fi
+		[ "$slot_rc" -ne 0 ] && [ -s "$slot_out" ] && clu_mark "$slot_job" "$slot_i" done 100 "local"
+	done
+}
+
+# mark every slice that is not done yet with $2 (stop / abort paths)
+clu_mark_rest() { # <job> <n> <state>
+	cmr=1
+	while [ "$cmr" -le "$2" ]; do
+		if [ -f "$(clu_state_file "$1" "$cmr")" ]; then
+			IFS="$TAB" read -r cmr_st _ cmr_lb < "$(clu_state_file "$1" "$cmr")"
+			[ "$cmr_st" = "done" ] || clu_mark "$1" "$cmr" "$3" 0 "${cmr_lb:-}"
+		else
+			clu_mark "$1" "$cmr" "$3" 0 ""
+		fi
+		cmr=$((cmr + 1))
+	done
+}
+
+clu_status_write() { # <job> <i> <n> <state> : aggregate rows for the UI
+	{
+		printf '{"state":%s,"i":%s,"n":%s,"segs":[' "$(jstr "$4")" "${2:-0}" "${3:-0}"
+		first=1
+		k=1
+		while [ "$k" -le "${3:-0}" ]; do
+			[ "$first" = "1" ] || printf ','
+			first=0
+			sf=$(clu_state_file "$1" "$k")
+			if [ -f "$sf" ]; then
+				IFS="$TAB" read -r ss_st ss_pc ss_lb < "$sf"
+			else
+				ss_st="queued"; ss_pc=0; ss_lb=""
+			fi
+			printf '{"i":%s,"state":%s,"pct":%s,"node":%s}' "$k" \
+				"$(jstr "${ss_st:-queued}")" "${ss_pc:-0}" "$(jstr "${ss_lb:-}")"
+			k=$((k + 1))
+		done
+		printf ']}'
+		printf '\n'
+	} > "$CLU_STATUS.tmp" 2>/dev/null
+	mv "$CLU_STATUS.tmp" "$CLU_STATUS" 2>/dev/null
+}
+
+do_cluster_status() {
+	if [ -f "$CLU_STATUS" ]; then
+		cat "$CLU_STATUS" 2>/dev/null
+		printf '\n'
+	else
+		printf '{"state":"idle","i":0,"n":0,"segs":[]}\n'
+	fi
+}
+
+# probe the configured nodes (and the local box) so the UI can show who is there
+do_clusterlist() {
+	ctok=$(clu_conf token)
+	printf '{"ok":true,"token_set":%s,"nodes":[' "$([ -n "$ctok" ] && printf true || printf false)"
+	cfirst=1
+	for cn in $(clu_conf node); do
+		[ -n "$cn" ] || continue
+		cu=$(clu_url "$cn")
+		cb=$(curl -s -m 6 "$cu?action=ping&token=$ctok" 2>/dev/null)
+		[ "$cfirst" = "1" ] || printf ','
+		cfirst=0
+		case "$cb" in
+			*'"ok":true'*)
+				printf '{"node":%s,"up":true,"busy":%s,"ver":%s}' "$(jstr "$cn")" \
+					"$(printf '%s' "$cb" | sed -n 's/.*"busy":\(true\|false\).*/\1/p')" \
+					"$(jstr "$(printf '%s' "$cb" | sed -n 's/.*"ver":"\([^"]*\)".*/\1/p')")"
+				;;
+			*) printf '{"node":%s,"up":false}' "$(jstr "$cn")" ;;
+		esac
+	done
+	printf '],"local":{"node":%s,"up":true,"ver":%s,"cpus":%s}}\n' \
+		"$(jstr "$(clu_lan_ip "$(printf '%s' "$(clu_conf node)" | awk '{print $1}')")")" \
+		"$(jstr "$VERSION")" "$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)"
+}
+
+# cluster settings: the UI cannot write /etc/config itself (rpcd ACL)
+do_cluster_cfg() {
+	cc_tok=$(clu_conf token)
+	cc_seg=$(clu_conf segments)
+	cc_wd=$(clu_conf workdir)
+	cc_loc=$(clu_conf local)
+	printf '{"ok":true,"token":%s,"segments":%s,"workdir":%s,"local":%s,"nodes":[' \
+		"$(jstr "$cc_tok")" "${cc_seg:-0}" "$(jstr "$cc_wd")" "${cc_loc:-1}"
+	cfirst=1
+	for cn in $(clu_conf node); do
+		[ -n "$cn" ] || continue
+		[ "$cfirst" = "1" ] || printf ','
+		cfirst=0
+		printf '%s' "$(jstr "$cn")"
+	done
+	printf ']}\n'
+}
+
+do_cluster_set() {
+	cs_tok=""; cs_seg=""; cs_wd=""; cs_loc=""; cs_nodes=""; cs_have_nodes=0
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--token)    shift; cs_tok="$1" ;;
+			--segments) shift; cs_seg="$1" ;;
+			--workdir)  shift; cs_wd="$1" ;;
+			--local)    shift; cs_loc="$1" ;;
+			--nodes)    shift; cs_nodes="$1"; cs_have_nodes=1 ;;
+		esac
+		shift
+	done
+	# uci cannot create a missing config file in this build, so make sure it
+	# exists before touching it
+	[ -f /etc/config/vputrans ] || : > /etc/config/vputrans
+	uci -q get vputrans.cluster >/dev/null 2>&1 || uci -q set vputrans.cluster=cluster
+	[ -n "$cs_tok" ] && uci -q set vputrans.cluster.token="$cs_tok"
+	[ -n "$cs_seg" ] && uci -q set vputrans.cluster.segments="$cs_seg"
+	[ -n "$cs_loc" ] && uci -q set vputrans.cluster.local="$cs_loc"
+	uci -q set vputrans.cluster.workdir="$cs_wd"
+	if [ "$cs_have_nodes" = "1" ]; then
+		uci -q delete vputrans.cluster.node 2>/dev/null
+		for cn in $(printf '%s' "$cs_nodes" | tr ',;' '  '); do
+			[ -n "$cn" ] && uci -q add_list vputrans.cluster.node="$cn"
+		done
+	fi
+	uci -q commit vputrans 2>/dev/null
+	printf '{"ok":true,"token_set":%s}\n' "$([ -n "$(clu_conf token)" ] && printf true || printf false)"
+}
+
+clu_out_path() { # <src> <container> -> default output path
+	oc="$2"
+	case "$oc" in mkv) oext="mkv" ;; ts) oext="ts" ;; *) oext="mp4" ;; esac
+	case "$1" in
+		*://*) obase=$(printf '%s' "$1" | sed -e 's/[?#].*$//' -e 's,/*$,,' | awk -F/ '{print $NF}')
+			[ -z "$obase" ] && obase="stream"
+			obase=$(printf '%s' "$obase" | sed 's/[^A-Za-z0-9._-]/_/g')
+			odir="/tmp"; [ -d /mnt ] && [ -w /mnt ] && odir="/mnt"
+			printf '%s/%s_cluster_%s.%s' "$odir" "$obase" "$(date +%Y%m%d_%H%M%S)" "$oext" ;;
+		*) od=$(dirname "$1"); ob=$(basename "$1"); ob="${ob%.*}"
+			[ -z "$ob" ] && ob="vput"
+			[ -w "$od" ] || od="/tmp"
+			printf '%s/%s_cluster.%s' "$od" "$ob" "$oext" ;;
+	esac
+}
+
+do_cluster() {
+	cin=""; cout=""; cquality="cbr"; cbr=""; cqp=""; cenc="h264"; cres="source"
+	cscaler="bicubic"; caudio="copy"; ccontainer="auto"; cfps="source"
+	cnodes=""; cnodes_set=0; csegs=""; clocal=""
+	css_off="0"; cdur_len="0"
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--out|-o)     shift; cout="$1" ;;
+			--quality)    shift; cquality="$1" ;;
+			--bitrate|-b) shift; cbr="$1" ;;
+			--qp)         shift; cqp="$1" ;;
+			--codec|-c)   shift; cenc="$1" ;;
+			--fps)        shift; cfps="$1" ;;
+			--res|-r)     shift; cres="$1" ;;
+			--scaler|-s)  shift; cscaler="$1" ;;
+			--audio|-a)   shift; caudio="$1" ;;
+			--container|-f) shift; ccontainer="$1" ;;
+			--ss)         shift; css_off="$1" ;;
+			--dur|-t)     shift; cdur_len="$1" ;;
+			--nodes)      shift; cnodes="$1"; cnodes_set=1 ;;
+			--segments)   shift; csegs="$1" ;;
+			--local)      shift; clocal="$1" ;;
+			-*) fail 'Unknown argument: %s' "$1"; return 1 ;;
+			*) cin="$1" ;;
+		esac
+		shift
+	done
+
+	[ -n "$cin" ] || { fail 'No input selected (local path or URL)'; return 1; }
+	[ -x "$FFMPEG_HW" ] || { fail 'Transcoder %s is missing, please install ffmpeg-rkrga' "$FFMPEG_HW"; return 1; }
+	ctok=$(clu_conf token)
+	[ -n "$ctok" ] || { fail 'Cluster is not configured: set a shared token first'; return 1; }
+	[ "$cnodes_set" = "1" ] || cnodes=$(clu_conf node)
+	[ -n "$clocal" ] || clocal=$(clu_conf local)
+	[ -n "$clocal" ] || clocal=1
+	[ -n "$csegs" ] || csegs=$(clu_conf segments)
+	[ -n "$csegs" ] || csegs=0
+
+	cw=0; cl=0
+	for cnull in $cnodes; do [ -n "$cnull" ] && cw=$((cw + 1)); done
+	[ "$clocal" = "1" ] && cl=$((cw + 1)) || cl=$cw
+	[ "$cl" -ge 2 ] || { fail 'Cluster needs at least two workers (add a node, or keep local enabled)'; return 1; }
+
+	cst0=$(do_status 2>/dev/null | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p')
+	[ "$cst0" = "running" ] && { fail 'Another job is already running, wait for it or press Stop first'; return 1; }
+
+	if ! probe_common "$cin"; then
+		printf '{"ok":false,%s}\n' "$(jm error "$S_ERR" "$S_ERR_ARGS")"
+		return 1
+	fi
+	cdur_src="$S_DUR"; clive="$S_LIVE"; cstype="$S_STYPE"
+	[ "$clive" = "true" ] && { fail 'A live stream cannot be split across boxes'; return 1; }
+
+	cwork=$(clu_conf workdir); [ -n "$cwork" ] || cwork="$CLU_ROOT"
+	cjob=$(date +%Y%m%d%H%M%S)-$$
+	mkdir -p "$cwork/$cjob/seg" "$cwork/$cjob/out" "$cwork/$cjob/state" 2>/dev/null || {
+		fail 'Cannot create the work directory: %s' "$cwork/$cjob"; return 1; }
+
+	# the segment count: explicit, else one per worker
+	[ "$(awk -v v="$csegs" 'BEGIN{print (v+0>0)?1:0}')" = "1" ] || csegs="$cl"
+	[ "$csegs" -gt "$CLU_MAX_SEGS" ] && csegs="$CLU_MAX_SEGS"
+	[ "$csegs" -lt 2 ] && csegs=2
+
+	[ -z "$cout" ] && cout=$(clu_out_path "$cin" "$ccontainer")
+	case "$cout" in
+		*.mkv) ccontainer="mkv" ;; *.ts) ccontainer="ts" ;; *.mp4) ccontainer="mp4" ;;
+		*) case "$ccontainer" in auto|"") ccontainer="mp4" ;; esac
+		   case "$ccontainer" in mkv) cout="$cout.mkv" ;; ts) cout="$cout.ts" ;; *) cout="$cout.mp4" ;; esac ;;
+	esac
+	[ "$cout" = "$cin" ] && { fail 'Output must differ from the input file'; return 1; }
+	codir=$(dirname "$cout")
+	[ -d "$codir" ] || mkdir -p "$codir" 2>/dev/null || { fail 'Cannot create the output directory: %s' "$codir"; return 1; }
+
+	rm -f "$STOPFLAG"
+	# hand the whole job over to a detached worker (the CGI call must return)
+	{
+		printf '%s\n' "$cin" "$cout" "$cquality" "${cqp:-26}" "${cbr:-}" "$cenc" "$cres" \
+			"$cscaler" "$caudio" "$ccontainer" "$cfps" "$csegs" "$clocal" "$cwork" "$cjob" \
+			"${css_off:-0}" "${cdur_len:-0}"
+		printf '%s\n' "$cnodes"
+	} > "$cwork/$cjob/meta"
+	( exec "$0" __cluster "$cwork" "$cjob" ) </dev/null >/dev/null 2>&1 &
+
+	printf '{"ok":true,"job":%s,"in":%s,"out":%s,"segments":%s,"workers":%s}\n' \
+		"$(jstr "$cjob")" "$(jstr "$cin")" "$(jstr "$cout")" "$csegs" "$cl"
+}
+
+do_cluster_worker() { # <workdir> <job>
+	cw="$1"; cjob="$2"; cm="$cw/$cjob"
+	cmeta="$cm/meta"
+	[ -f "$cmeta" ] || exit 1
+	{ IFS= read -r cin; IFS= read -r cout; IFS= read -r cquality; IFS= read -r cqp
+	  IFS= read -r cbr; IFS= read -r cenc; IFS= read -r cres; IFS= read -r cscaler
+	  IFS= read -r caudio; IFS= read -r ccontainer; IFS= read -r cfps; IFS= read -r csegs
+	  IFS= read -r clocal; IFS= read -r cwork; IFS= read -r cjob2
+	  IFS= read -r css_off; IFS= read -r cdur_len
+	  IFS= read -r cnodes; } < "$cmeta"
+	[ -n "$css_off" ] || css_off=0
+	[ -n "$cdur_len" ] || cdur_len=0
+	ctok=$(clu_conf token)
+	start_ts=$(date +%s)
+	# the worker is a fresh process: the meta file carries the options, not the
+	# probed length, so measure it here (the segment plan depends on it)
+	cdur_src=$(ff_duration "$(proto_of "$cin")" "$cin")
+	[ -n "$cdur_src" ] || cdur_src=0
+	# trim: the pieces cover [css_off, css_off+cdur_len] of the source
+	ceff=$(awk -v d="$cdur_src" -v o="$css_off" -v l="$cdur_len" 'BEGIN{
+		r = d - o; if (r < 0) r = 0
+		if (l+0 > 0 && l+0 < r) r = l+0
+		printf "%.3f", r }')
+	cdur_src="$ceff"
+
+	# do_stop() kills $PIDF -> this worker.  It must take the peers down with
+	# it and still leave a terminal status behind, so trap instead of dying.
+	clu_abort_peers() {
+		for apn in $cnodes; do
+			[ -n "$apn" ] || continue
+			curl -s -m 5 "$(clu_url "$apn")?action=clean&token=$ctok&job=$cjob" >/dev/null 2>&1
+		done
+		st_state="stopped"; st_error='Stopped manually'; st_progress=100
+		st_speed=""; st_elapsed=$(( $(date +%s) - start_ts ))
+		write_status ""; add_history "stopped"
+		clu_mark_rest "$cjob" "$cnsegs" "stopped"
+		clu_status_write "$cjob" 0 "$cnsegs" "stopped"
+		log_ev '⏹ Cluster job stopped'
+		rm -rf "$cm/seg" "$cm/out" 2>/dev/null
+		exit 0
+	}
+	trap clu_abort_peers TERM INT HUP
+	echo "$$" > "$PIDF" 
+
+	# --- status globals for the existing UI panel ---
+	st_state="running"; st_progress=0; st_speed=""; st_elapsed=0
+	st_in="$cin"; st_out="$cout"; st_stype="local"; st_live=false
+	st_mode="hw"; st_dec=""; st_enc=$(enc_of "$cenc")
+	st_reason=""; st_reason_args=""; st_error=""; st_error_args=""
+	st_detail=""; st_detail_args=""; st_notice=""; st_notice_args=""; st_fpsval=""
+	st_total=$(awk -v d="$cdur_src" 'BEGIN{ printf "%.0f", d+0 }')
+	st_out_time=0; st_outsize=0; st_progmode="pct"; st_scaleeng=""
+	: > "$EV"; : > "$LOG"
+	log_ev '▶ Cluster job on %s workers, %s segments: %s' \
+		"$(tjoin "$(( $(printf '%s' "$cnodes" | wc -w) + clocal ))" "$csegs" "$cin")"
+	write_status ""
+
+	# --- build the plan ---
+	mkdir -p "$cm/seg" "$cm/out" "$cm/state"
+	clanip=$(clu_lan_ip "$(printf '%s' "$cnodes" | awk '{print $1}')")
+	[ -n "$clanip" ] || clanip="127.0.0.1"
+	cport=$(uci -q get uhttpd.main.listen_http 2>/dev/null | awk '{print $1}' | sed 's/.*://')
+	cnsegs=0
+
+	if is_url "$cin"; then
+		# no local file to cut: every node seeks its own slice
+		cdur_src=$(ff_duration "$(proto_of "$cin")" "$cin")
+		cseglen=$(awk -v d="$cdur_src" -v n="$csegs" 'BEGIN{ if (n<1) n=1; printf "%.3f", d/n }')
+		ci=0
+		while [ "$ci" -lt "$csegs" ]; do
+			css=$(awk -v l="$cseglen" -v i="$ci" -v o="$css_off" 'BEGIN{ printf "%.3f", o + l*i }')
+			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+				"$((ci + 1))" "$cin" "$css" "$cseglen" "$cquality" "$cqp" "$cbr" "$cenc" \
+				"$cres" "$cscaler" "$caudio" "$cfps" "in" >> "$cm/plan"
+			printf '%s\t%s\n' "$((ci + 1))" "$cseglen" >> "$cm/seglen"
+			ci=$((ci + 1))
+		done
+		cnsegs="$csegs"
+	else
+		# Cut at REAL keyframe timestamps.  With -c copy a seek snaps to the
+		# previous keyframe, so cutting at "ideal" times would duplicate a GOP
+		# at every join; picking the keyframe closest to each ideal boundary
+		# keeps the pieces gapless (measured: 16.667+16.672+28.377 = 61.716s
+		# for a 61.700s source, and the concatenated frame count matches).
+		log_ev 'Splitting the source into %s segments (stream copy)' "$(tjoin "$csegs")"
+		ckf=$(ff_kf "$cin")
+		cbase="http://$clanip${cport:+:$cport}/cgi-bin/vputrans-node"
+		kend=$(awk -v o="$css_off" -v e="$ceff" 'BEGIN{ printf "%.3f", o+e }')
+		# first boundary = closest keyframe at or before the trim start; the
+		# leftover head of that GOP is handed to the node as -ss (the node
+		# re-encodes, so a seek there is frame exact - cutting it with -c copy
+		# would drag in the whole GOP and make the output longer).
+		kstart=$(printf '%s\n' "$ckf" | awk -v o="$css_off" '
+			BEGIN { m = -1 }
+			{ v = $1+0; if (v <= o+0.001 && v > m) m = v }
+			END { if (o+0 <= 0.001) m = 0; if (m < 0) m = 0; printf "%.3f", m }')
+		# How many pieces the source can actually give us: every cut must land on
+		# a keyframe, otherwise -c copy snaps back and the piece silently repeats
+		# the previous GOP (measured: a 4-way split of an 8 s range with a single
+		# 8.3 s GOP produced a 2 s file out of 8 s).  Reduce, and refuse to
+		# pretend when there is nothing to split on.
+		cnkf=$(printf '%s\n' "$ckf" | awk -v a="$kstart" -v e="$kend" \
+			'{ v=$1+0; if (v > a+0.001 && v < e-0.001) c++ } END { print c+0 }')
+		callow=$((cnkf + 1))
+		if [ "$csegs" -gt "$callow" ]; then
+			log_ev 'Only %s usable keyframe boundary(ies) here: using %s segment(s)' \
+				"$(tjoin "$cnkf" "$csegs")"
+			csegs="$callow"
+		fi
+		if [ "$csegs" -lt 2 ]; then
+			st_state="error"; st_progress=0
+			st_error='The selected range has no keyframe to split on - use fewer segments, or drop the duration limit'
+			write_status ""
+			log_ev '✘ %s' "$st_error"
+			clu_status_write "$cjob" 0 1 "error"
+			exit 1
+		fi
+		cbounds="$kstart"
+		cprev="$kstart"
+		ci=1
+		while [ "$ci" -lt "$csegs" ]; do
+			cid=$(awk -v o="$css_off" -v e="$ceff" -v n="$csegs" -v i="$ci" \
+				'BEGIN{ printf "%.3f", o + e*i/n }')
+			cpick=$(printf '%s\n' "$ckf" | awk -v t="$cid" -v p="$cprev" -v e="$kend" \
+				'BEGIN { best=""; bd=1e18 }
+				 { v=$1+0; if (v <= p+0.001) next; if (v >= e-0.001) next
+				   d=v-t; if (d<0) d=-d; if (d<bd) { bd=d; best=v } }
+				 END { if (best != "") printf "%.6f", best }')
+			[ -n "$cpick" ] || cpick="$cid"
+			cprev="$cpick"
+			cbounds="$cbounds $cpick"
+			ci=$((ci + 1))
+		done
+		cbounds="$cbounds $kend"
+		set -- $cbounds
+		cfrom="$1"; shift
+		ci=0
+		for cto in "$@"; do
+			clen=$(awk -v a="$cfrom" -v b="$cto" 'BEGIN{ printf "%.3f", b-a }')
+			if [ "$(awk -v v="$clen" 'BEGIN{ print (v>0.05)?1:0 }')" != "1" ]; then
+				cfrom="$cto"; continue
+			fi
+			ci=$((ci + 1))
+			css=$(awk -v o="$css_off" -v a="$cfrom" 'BEGIN{ d=o-a; if (d<0) d=0; printf "%.3f", d }')
+			cdur=$(awk -v a="$css" -v l="$clen" 'BEGIN{ d=l-a; if (d<0) d=0; printf "%.3f", d }')
+			csf="$cm/seg/seg$(printf %03d "$ci").ts"
+			"$FFMPEG_HW" -y -hide_banner -loglevel warning -ss "$cfrom" -i "$cin" -t "$clen" \
+				-map 0:v:0 -map 0:a? -c copy -avoid_negative_ts make_zero \
+				-f mpegts "$csf" >> "$LOG" 2>&1
+			[ -s "$csf" ] || continue
+			cnsegs=$((cnsegs + 1))
+			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+				"$cnsegs" "$cbase?action=src&token=$ctok&job=$cjob&f=$(basename "$csf")" \
+				"$css" "$cdur" "$cquality" "$cqp" "$cbr" "$cenc" "$cres" "$cscaler" "$caudio" "$cfps" \
+				"out" >> "$cm/plan"
+			cfrom="$cto"
+		done
+	fi
+	[ "$cnsegs" -ge 1 ] || { st_state="error"; st_error='No segment could be produced from the source'
+		write_status ""; exit 1; }
+	log_ev 'Plan ready: %s segment(s)' "$(tjoin "$cnsegs")"
+	clu_status_write "$cjob" 0 "$cnsegs" "running"
+
+	# --- dispatch: one subshell per worker, round-robin over the segments ---
+	cslot=0
+	for cnode in $cnodes; do
+		[ -n "$cnode" ] || continue
+		cslot=$((cslot + 1))
+		cidx=$(awk -F'\t' -v s="$cslot" -v n="$(( $(printf '%s' "$cnodes" | wc -w) + clocal ))" \
+			'{ if (((($1 - 1) % n) + 1) == s) print $1 }' "$cm/plan")
+		[ -n "$cidx" ] || continue
+		# shellcheck disable=SC2086
+		clu_slot_remote "$cjob" "$cnode" $cidx &
+	done
+	if [ "$clocal" = "1" ]; then
+		cslot=$((cslot + 1))
+		cidx=$(awk -F'\t' -v s="$cslot" -v n="$cslot" \
+			'{ if (((($1 - 1) % n) + 1) == s) print $1 }' "$cm/plan")
+		[ -n "$cidx" ] && { clu_slot_local "$cjob" $cidx & }
+	fi
+
+	# --- monitor ---
+	while :; do
+		cndel=0; cnerr=0; cnact=0; cpsu=0
+		ck=1
+		while [ "$ck" -le "$cnsegs" ]; do
+			cf2=$(clu_state_file "$cjob" "$ck")
+			if [ -f "$cf2" ]; then
+				IFS="$TAB" read -r ms_st ms_pc ms_lb < "$cf2"
+				[ "$ms_st" = "done" ] && cndel=$((cndel + 1))
+				[ "$ms_st" = "error" ] && cnerr=$((cnerr + 1))
+				cpsu=$(awk -v a="$cpsu" -v b="${ms_pc:-0}" 'BEGIN{ printf "%.1f", a + b }')
+				case "$ms_st" in running|queued) cnact=$((cnact + 1)) ;; esac
+			fi
+			ck=$((ck + 1))
+		done
+		st_elapsed=$(( $(date +%s) - start_ts ))
+		st_progress=$(awk -v s="$cpsu" -v n="$cnsegs" \
+			'BEGIN{ if (n>0) { p=s/n; if (p>99) p=99; if (p<0) p=0; printf "%.1f", p } else printf "0" }')
+		write_status ""
+		clu_status_write "$cjob" "$cndel" "$cnsegs" "running"
+		[ "$cnact" -eq 0 ] && break
+		[ -f "$STOPFLAG" ] && { cnstop=1; break; }
+		sleep 2
+	done
+	wait
+
+	# --- cancel the peers if the user pressed Stop ---
+	if [ "${cnstop:-0}" = "1" ] || [ -f "$STOPFLAG" ]; then
+		for cnode in $cnodes; do
+			[ -n "$cnode" ] || continue
+			curl -s -m 8 "$(clu_url "$cnode")?action=clean&token=$ctok&job=$cjob" >/dev/null 2>&1 &
+		done
+		wait
+		st_state="stopped"; st_error='Stopped manually'; st_progress=100
+		write_status ""; add_history "stopped"
+		clu_mark_rest "$cjob" "$cnsegs" "stopped"
+		clu_status_write "$cjob" 0 "$cnsegs" "stopped"
+		log_ev '⏹ Cluster job stopped'
+		rm -rf "$cm/seg" "$cm/out"
+		exit 0
+	fi
+
+	# --- any failed slice is fatal (a hole in the middle is worse than an error) ---
+	cbad=""
+	ck=1
+	while [ "$ck" -le "$cnsegs" ]; do
+		cf2=$(clu_state_file "$cjob" "$ck")
+		if [ -f "$cf2" ]; then
+			IFS="$TAB" read -r ms_st ms_pc ms_lb < "$cf2"
+			[ "$ms_st" = "done" ] || cbad="$cbad $ck"
+		fi
+		ck=$((ck + 1))
+	done
+	if [ -n "$cbad" ]; then
+		st_state="error"; st_progress=0
+		st_error='Segment(s) failed on the cluster: %s'
+		st_error_args=$(tjoin "$(printf '%s' "$cbad" | sed 's/^ *//')")
+		write_status ""; add_history "error"
+		log_ev '✘ Cluster job failed, segment(s): %s' "$st_error_args"
+		clu_mark_rest "$cjob" "$cnsegs" "error"
+		clu_status_write "$cjob" 0 "$cnsegs" "error"
+		exit 1
+	fi
+
+	# --- concatenate in order ---
+	log_ev '✔ All %s segments finished, joining' "$(tjoin "$cnsegs")"
+	: > "$cm/list.txt"
+	ck=1
+	while [ "$ck" -le "$cnsegs" ]; do
+		printf "file '%s/out/seg%s.ts'\n" "$cm" "$ck" >> "$cm/list.txt"
+		ck=$((ck + 1))
+	done
+	case "$caudio" in
+		none) jopts="-an" ;;
+		aac)  jopts="-c:a aac -b:a 128k" ;;
+		*)    jopts="-c:a copy" ;;
+	esac
+	# mp4 cannot carry every audio codec the source may use
+	if [ "$caudio" = "copy" ] && [ "$ccontainer" = "mp4" ]; then
+		case "$(ff_audio "" "$cm/out/seg1.ts")" in
+			aac|mp3|ac3|eac3|alac|mp2) ;;
+			*) jopts="-c:a aac -b:a 128k" ;;
+		esac
+	fi
+	case "$ccontainer" in
+		mkv) jcont="-f matroska" ;;
+		ts)  jcont="-f mpegts" ;;
+		*)   jcont="-movflags +faststart -f mp4" ;;
+	esac
+	# shellcheck disable=SC2086
+	"$FFMPEG_HW" -y -hide_banner -loglevel warning -f concat -safe 0 -i "$cm/list.txt" \
+		-c:v copy $jopts $jcont "$cout" >> "$LOG" 2>&1
+	crc=$?
+
+	coutdur=$(ff_duration "" "$cout")
+	csum=0
+	csum=$(awk -F'\t' '{ s += $4 } END { printf "%.3f", s }' "$cm/plan" 2>/dev/null)
+	[ -n "$csum" ] || csum="$cdur_src"
+	st_elapsed=$(( $(date +%s) - start_ts ))
+	st_outsize=$(fsize "$cout")
+	if [ -s "$cout" ] && [ -n "$coutdur" ] && [ "$(awk -v d="$coutdur" 'BEGIN{print (d+0>0)?1:0}')" = "1" ] \
+	   && { [ "$crc" -eq 0 ] || [ "$(awk -v a="$coutdur" -v b="$csum" 'BEGIN{ if (b<=0) print 1; else print ((a+0) >= b*0.98) ? 1 : 0 }')" = "1" ]; }; then
+		st_state="done"; st_progress=100; st_error=""; st_error_args=""
+		st_out_time=$(awk -v d="$coutdur" 'BEGIN{ printf "%.1f", d+0 }')
+		st_total=$(awk -v d="$coutdur" 'BEGIN{ printf "%.0f", d+0 }')
+		write_status ""; add_history "done"
+		clu_status_write "$cjob" "$cnsegs" "$cnsegs" "finished"
+		cavg=$(awk -v t="$coutdur" -v e="$st_elapsed" 'BEGIN{ if (e>0) printf "%.2fx", t/e; else printf "" }')
+		log_ev '✔ Finished: %s (%s) in %ss, average %s' \
+			"$(tjoin "$cout" "$(fmt_size "$st_outsize")" "$st_elapsed" "$cavg")"
+		rm -rf "$cm/seg" "$cm/out"
+	else
+		st_state="error"
+		st_error='Join failed (exit code %s)'; st_error_args=$(tjoin "$crc")
+		st_detail='Expected %ss, got %ss'; st_detail_args=$(tjoin "$csum" "${coutdur:-0}")
+		write_status ""; add_history "error"
+		clu_status_write "$cjob" 0 "$cnsegs" "error"
+		log_ev "✘ Join failed: %s" "$(tjoin "$cout")"
+	fi
+}
+
 case "$1" in
 	version) printf '{"version":"%s"}\n' "$VERSION" ;;
 	probe)   shift; do_probe "$@" ;;
@@ -1318,13 +2537,22 @@ case "$1" in
 	batchstatus) do_batch_status ;;
 	batchstop)   do_batch_stop ;;
 	__batch) shift; do_batch_worker "$@" ;;
+	cluster) shift; do_cluster "$@" ;;
+	clusterstatus) do_cluster_status ;;
+	clusterlist)   do_clusterlist ;;
+	clustercfg)    do_cluster_cfg ;;
+	clusterset)    shift; do_cluster_set "$@" ;;
+	node)    shift; do_node "$1" ;;
+	__cluster) shift; do_cluster_worker "$@" ;;
+	__nodejob) shift; node_job "$@" ;;
 	run)     shift; do_run "$@" ;;
 	status)  do_status ;;
 	stop)    do_stop ;;
 	history) do_history ;;
 	__worker) shift; do_worker "$@" ;;
+	__join)   shift; do_join_worker "$@" ;;
 	*)
-		fail 'usage: vputrans {version|probe <src>|list|run <src> [opt]|status|stop|history}'
+		fail 'usage: vputrans {version|probe <src>|list|run <src> [opt]|status|stop|history|cluster <src> [opt]}'
 		exit 2
 		;;
 esac
