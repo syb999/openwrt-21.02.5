@@ -348,7 +348,12 @@ function roleText(spec, who) {
 // ================= 脚本：检测 / 落盘 / 安全检查 / 执行 =================
 
 let BATCH_LINES = parseInt(process.env.DSS_BATCH || '200', 10);
-const DSS_VERSION = '1.0-87';
+let DSS_VERSION = '1.0-95';
+// 优先用安装包写入的版本文件，避免"HSS 常量忘了同步"这类显示不一致
+try {
+  const _v = require('fs').readFileSync('/usr/share/dss/version', 'utf8').trim();
+  if (_v) DSS_VERSION = _v;
+} catch (e) {}
 const OUTDIR = process.env.DSS_OUTDIR || '/root/.dss/out';
 // 只保留一个目录：/root/.dss/out（重启后还在，LuCI 的"文件下载"从这里取）
 // 对话日志：给 LuCI 的"监听对话"页面 tail
@@ -531,17 +536,65 @@ function saveScripts(answerText, label) {
   const saved = [];
   const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
 
+  // duet 时给文件加 a_/b_ 前缀；同时要把脚本里对这些文件名的引用一起改掉，
+  // 否则 b_run.sh 里写的是 run.sh / write_p.py，实际文件叫 b_run.sh / b_write_p.py，必然找不到
+  const renameMap = new Map();
+  if (SAVE_PREFIX) {
+    order.forEach((name) => {
+      const info = byName.get(name);
+      const ext = (info.lang === 'py') ? '.py' : (info.lang === 'c' ? '.c' : '.sh');
+      let base = info.name;
+      if (!/\.[A-Za-z0-9]+$/.test(base)) base += ext;
+      if (base.indexOf(SAVE_PREFIX) !== 0) renameMap.set(base, SAVE_PREFIX + base);
+    });
+  }
+
   order.forEach((name, i) => {
     const info = byName.get(name);
     const ext = (info.lang === 'py') ? '.py' : (info.lang === 'c' ? '.c' : '.sh');
     let base = info.name;
     if (!/\.[A-Za-z0-9]+$/.test(base)) base += ext;
-    if (SAVE_PREFIX && base.indexOf(SAVE_PREFIX) !== 0) base = SAVE_PREFIX + base;
+    if (renameMap.has(base)) base = renameMap.get(base);
     const path = OUTDIR + '/' + base;
 
     // 同一条回答里的多段：第二段起加"（续）"标记，合并成一个文件
-    const body = info.chunks.map((c, k) => (k === 0) ? c
+    let body = info.chunks.map((c, k) => (k === 0) ? c
       : commentFor(base, label + '（续）') + '\n' + c).join('\n\n');
+    if (renameMap.size) {
+      // 单遍正则替换：长名优先 + 不回头再匹配已替换的结果
+      // （逐个 split/join 会把 test_write_hello.py 先变 b_test_write_hello.py，再被 write_hello.py 规则二次加前缀）
+      const keys = [...renameMap.keys()]
+        .filter(k => renameMap.get(k) !== k)
+        .sort((a2, b2) => b2.length - a2.length);
+      const esc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      if (keys.length) {
+        body = body.replace(new RegExp(keys.map(esc).join('|'), 'g'), (m2) => renameMap.get(m2));
+      }
+      // 模块名（不带扩展名）：import write_hello / from write_hello import x
+      const modMap = new Map();
+      for (const [o, n] of renameMap) {
+        if (o === n) continue;
+        const os = o.replace(/\.[^.]+$/, ''), ns = n.replace(/\.[^.]+$/, '');
+        if (os !== ns) modMap.set(os, ns);
+      }
+      if (modMap.size) {
+        body = body.replace(/\bimport\s+([A-Za-z_][\w.]*(?:\s*,\s*[A-Za-z_][\w.]*)*)/g, (all, list) => {
+          const parts = list.split(',').map(x => x.trim()).map(mod => {
+            const first = mod.split('.')[0];
+            return modMap.has(first) ? modMap.get(first) + mod.slice(first.length) : mod;
+          });
+          return 'import ' + parts.join(', ');
+        });
+        body = body.replace(/\b(from\s+)([A-Za-z_][\w.]*)(\s+import\b)/g, (all, kw, mod, tail) => {
+          const first = mod.split('.')[0];
+          return modMap.has(first) ? kw + modMap.get(first) + mod.slice(first.length) + tail : all;
+        });
+        // 模块属性访问：import 改过了，write_hello.hello() 也得跟着改
+        for (const [o, n] of modMap) {
+          body = body.replace(new RegExp('\\b' + esc(o) + '\\.', 'g'), n + '.');
+        }
+      }
+    }
 
     let existing = '';
     try { existing = fs.readFileSync(path, 'utf8'); } catch (e) {}
@@ -1026,7 +1079,8 @@ function waitForCredChange(timeoutMs) {
   });
 }
 
-function session(c) {
+async function session(c) {
+  await requestGate();
   return httpJson(c, '/api/v0/chat_session/create', { character_id: null }).then(r => {
     const d = r.j && r.j.data && r.j.data.biz_data;
     return (d && d.chat_session && d.chat_session.id) || null;
@@ -1034,6 +1088,7 @@ function session(c) {
 }
 
 async function ask(c, pow, prompt, state, printer) {
+  await requestGate();
   logConv('USER', prompt);
   const cur = { acc: '', msgId: state.parentId };
   const tStart = Date.now();
@@ -1132,7 +1187,7 @@ async function backoff(why) {
 let emptyStreak = 0;
 let CODE_MODE = false;
 let AUTORUN = false;
-let AUTORUN_FAIL = null;
+let AUTORUN_FAILS = [];     // autorun 失败清单，逐个回炉
 let SAVE_PREFIX = '';      // duet 时给两侧文件加前缀（a_ / b_），避免同名追加成拼盘   // 上一次 autorun 的失败（traceback），用于自动修            // --autorun：代码存盘后在设备上直接执行，产物留在同一目录
 
 // 跑本轮保存下来的 .py / .sh，并报告新增产物（pptx/pdf/png/csv…）
@@ -1144,7 +1199,28 @@ function maybeAutorun(saved) {
   let before = [];
   try { before = fs.readdirSync(dir); } catch (e) { return; }
 
-  for (const it of saved) {
+  // 只跑“入口”脚本：多文件工程里 __init__.py / 被别的文件 import 的模块都不要单独执行，
+  // 否则每个都会报错，还会触发回炉，白白多打一轮请求
+  const srcOf = (f) => { try { return fs.readFileSync(f.path, 'utf8'); } catch (e) { return ''; } };
+  const stem = (f) => require('path').basename(f.path).replace(/\.[^.]+$/, '');
+  const isInit = (f) => /(^|_)__init__$|^__init__$/i.test(stem(f));
+  const importedByOther = (f) => saved.some(o => {
+    if (o.path === f.path) return false;
+    const src = srcOf(o);
+    const st = stem(f);
+    return new RegExp('(^|[\\s;]) *(import|from) +' + st.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b').test(src);
+  });
+  const entries = saved.filter(f => {
+    const ext = path.extname(f.path).toLowerCase();
+    if (ext !== '.py' && ext !== '.sh') return false;
+    if (isInit(f)) return false;
+    if (/if\s+__name__\s*==\s*['"]__main__['"]/.test(srcOf(f))) return true;
+    if (importedByOther(f)) return false;
+    return true;
+  });
+  const runList = entries.length ? entries : saved.slice(0, 1);
+
+  for (const it of runList) {
     const ext = path.extname(it.path).toLowerCase();
     let argv = null;
     if (ext === '.py') argv = ['python3', it.path];
@@ -1157,13 +1233,15 @@ function maybeAutorun(saved) {
     if (r.status !== 0) {
       const why = (r.status === null) ? 'timeout' : ('exit=' + r.status);
       process.stderr.write('[dss] run ' + why + '\n');
-      AUTORUN_FAIL = { path: it.path, log: log || ('run ' + why) };
+      AUTORUN_FAILS.push({ path: it.path, log: log || ('run ' + why) });
     }
   }
 
   let after = [];
   try { after = fs.readdirSync(dir); } catch (e) {}
-  const fresh = after.filter(f => before.indexOf(f) < 0);
+  const fresh = after.filter(f => before.indexOf(f) < 0)
+    .filter(f => !/^__pycache__$|^\..*cache$/.test(f))
+    .filter(f => !/\.pyc$/.test(f));
   if (fresh.length) {
     process.stderr.write('[dss] 产物: ' + fresh.map(f => path.join(dir, f)).join(', ') + '\n');
     lastSaved = lastSaved.concat(fresh.map(f => ({ path: path.join(dir, f), name: f })));
@@ -1814,6 +1892,7 @@ async function askDoubaoOnce(prompt, state, printer) {
 
 // 单次 Kimi 请求；重试/限流退避由 askText 的循环统一处理（和 DeepSeek 同一条路）
 async function askKimiOnce(prompt, state, printer) {
+  await requestGate();
   const r = await kimiChatOnce(prompt, state, printer, CUR_MODEL);
   if (r.chatId) { state.sessionId = r.chatId; state.kimiChatId = r.chatId; }
 
@@ -2158,6 +2237,7 @@ function apiAskOnce(prompt, state, printer) {
 }
 
 async function askApiOnce(prompt, state, printer) {
+  await requestGate();
   const r = await apiAskOnce(prompt, state, printer);
   const text = (r.text || '').trim();
   if (text.length >= 1) {
@@ -2191,6 +2271,40 @@ async function askApiOnce(prompt, state, printer) {
   }
   if (r.err) throw new Error('API 错误：' + why);
   return '';
+}
+
+
+// ================= 全局请求节流器 =================
+// 目的：防止 --duet + --code + --autorun 叠加时打出 4~6 秒一条的突发（这是网页版风控最敏感的形态）
+// 规则：任意两次请求之间至少 DSS_MIN_GAP 秒（默认 8），且每 60 秒最多 DSS_MAX_PER_MIN 条（默认 6）
+const REQ_MIN_GAP = Math.max(0, parseInt(process.env.DSS_MIN_GAP || '8', 10) || 0) * 1000;
+const REQ_MAX_PER_MIN = Math.max(1, parseInt(process.env.DSS_MAX_PER_MIN || '6', 10) || 6);
+let _lastReqAt = 0;
+const _reqStamps = [];
+
+function _gatePlan() {
+  const now = Date.now();
+  while (_reqStamps.length && now - _reqStamps[0] > 60000) _reqStamps.shift();
+  let wait = Math.max(0, REQ_MIN_GAP - (now - _lastReqAt));
+  if (_reqStamps.length >= REQ_MAX_PER_MIN) {
+    wait = Math.max(wait, 60000 - (now - _reqStamps[0]) + 100);
+  }
+  return wait;
+}
+
+async function requestGate() {
+  if (REQ_MIN_GAP === 0 && REQ_MAX_PER_MIN >= 9999) return;
+  let wait = _gatePlan();
+  if (wait <= 0) { _lastReqAt = Date.now(); _reqStamps.push(_lastReqAt); return; }
+  process.stderr.write('[throttle] 请求节流：等 ' + Math.ceil(wait / 1000) + 's' +
+    '（最近一分钟 ' + _reqStamps.length + '/' + REQ_MAX_PER_MIN + ' 条，最短间隔 ' +
+    Math.round(REQ_MIN_GAP / 1000) + 's）\n');
+  const t0 = Date.now();
+  while (Date.now() - t0 < wait) {
+    await new Promise(r => setTimeout(r, Math.min(2000, wait - (Date.now() - t0))));
+  }
+  _lastReqAt = Date.now();
+  _reqStamps.push(_lastReqAt);
 }
 
 async function askText(c, pow, prompt, state, printer, tries) {
@@ -2314,16 +2428,19 @@ async function askCodeInner(c, pow, prompt, state, printer) {
 // --autorun 失败时，把 traceback 发回模型，让它重写完整脚本并重跑（最多 2 次）
 async function askCode(c, pow, prompt, state, printer) {
   let acc = await askCodeInner(c, pow, prompt, state, printer);
-  for (let fix = 0; fix < 2 && AUTORUN_FAIL; fix++) {
-    const f = AUTORUN_FAIL;
-    AUTORUN_FAIL = null;
+  for (let fix = 0; fix < 3 && AUTORUN_FAILS.length; fix++) {
+    const f = AUTORUN_FAILS.shift();
     printer.flush();
     process.stderr.write('\n[dss] 脚本运行失败（' + require('path').basename(f.path) +
       '），把报错发回模型修复 (' + (fix + 1) + '/2)\n');
+    let src = '';
+    try { src = require('fs').readFileSync(f.path, 'utf8').slice(0, 2000); } catch (e) {}
     const repair = (await askText(c, pow,
-      '你刚才生成的脚本在运行时出错，下面是完整报错：\n' +
-      '```\n' + String(f.log).slice(-1800) + '\n```\n' +
-      '请修正后**重新输出完整可运行的脚本**（一个代码块，不要只给补丁、不要解释、不要省略未改动的部分）；' +
+      '你刚才生成的文件 ' + require('path').basename(f.path) + ' 在运行时出错，完整报错：\n' +
+      '```\n' + String(f.log).slice(-1500) + '\n```\n' +
+      (src ? '该文件当前内容（供参考）：\n```\n' + src + '\n```\n' : '') +
+      '请只重新输出这一个文件的**完整可运行内容**（一个代码块，第一行就是代码，' +
+      '代码块内不要出现用法示例、命令行或解释文字；不要只给补丁、不要省略未改动的部分）；' +
       '环境是 OpenWrt + python3.9，产物写到当前目录。', state, printer, 2)) || '';
     if (!hasCode(repair)) continue;
     acc = repair;
