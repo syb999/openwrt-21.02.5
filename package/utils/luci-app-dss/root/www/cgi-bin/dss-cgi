@@ -89,7 +89,8 @@ console)
 	printf 'Content-Type: text/plain; charset=utf-8\r\n'
 	printf 'Cache-Control: no-store\r\n\r\n'
 	pid="$(cat /tmp/dss/console.pid 2>/dev/null)"
-	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+	# 必须是"活着 + 确实是 dss 进程"：pid 被复用时 kill -0 也会成功，会让页面永远显示运行中
+	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q '/usr/bin/dss '; then
 		echo "RUNNING 1"
 	else
 		echo "RUNNING 0"

@@ -799,3 +799,18 @@ msgstr "文件只给 A 侧"
 
 msgid "File to both sides"
 msgstr "两侧都给"
+
+msgid "PPT specialist"
+msgstr "PPT 制作专家"
+
+msgid "Short-video scriptwriter"
+msgstr "短视频脚本专家"
+
+msgid "JS reverse-engineering expert"
+msgstr "JS 逆向专家"
+
+msgid "Selenium expert"
+msgstr "Selenium 专家"
+
+msgid "Pick roles for the two sides of --duet (or for --role in one-shot mode). Nothing checked = no role definition. Checked roles apply automatically to every command (one-shot uses side A); passing --role / --role-a / --role-b overrides this page."
+msgstr "给自我对话的双方（或单发模式的 --role）勾选角色；全部不勾选 = 不做角色定义。勾选后自动对所有命令生效（单发用 A 侧角色）；命令行写 --role / --role-a / --role-b 时以命令行为准，忽略本页勾选。"

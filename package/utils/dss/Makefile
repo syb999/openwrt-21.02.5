@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=dss
 PKG_VERSION:=1.0
-PKG_RELEASE:=101
+PKG_RELEASE:=110
 PKGARCH:=all
 
 include $(INCLUDE_DIR)/package.mk

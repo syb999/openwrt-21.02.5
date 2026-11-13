@@ -8,7 +8,8 @@ pid=$(cat "$P" 2>/dev/null)
 case "$pid" in
 	''|*[!0-9]*) : > "$P"; exit 0 ;;
 esac
-if [ -d "/proc/$pid" ]; then
+# 只处理确实是 dss 的进程：pid 可能已被系统复用给别的程序
+if [ -d "/proc/$pid" ] && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q '/usr/bin/dss '; then
 	kill "$pid" 2>/dev/null
 	sleep 1
 	[ -d "/proc/$pid" ] && kill -9 "$pid" 2>/dev/null

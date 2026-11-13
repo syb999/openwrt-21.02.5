@@ -4,7 +4,7 @@
 
 <div class="cbi-map">
 <div class="cbi-map-descr">
-当前配置：A / B 默认都是 DeepSeek（网页，需令牌）。GLM-4-Flash 作为备用：加 --backend-a api。
+当前配置：A / B 默认都是 DeepSeek（网页，需令牌）。GLM-4-Flash 作为备用：加 --backend-a api。<br/><b>注意</b>：命令台只执行以 <code>dss</code> 开头的命令；其它内容一律当作一句话提问传给 dss（<code>dss "…"</code>），不会执行任何外部命令。
 所有命令在路由器的 shell 里执行（SSH 或 ttyd）。命令行参数永远优先于设置页。
 </div>
 
@@ -18,7 +18,7 @@
 <pre class="dss-cmd">dss "用一句话解释什么是 SLIC 接口"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button></div></div>
 
 <div class="cbi-value"><label class="cbi-value-title">管道批量提问</label><div class="cbi-value-field">
-<pre class="dss-cmd">printf "1+1=?\n中国的首都是哪里？\n" | dss</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button></div></div>
+<pre class="dss-cmd">printf "1+1=?\n中国的首都是哪里？\n" | dss</pre><div class="cbi-value-description">这条请在 SSH 里执行（命令台只接受 dss 命令）。</div><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button></div></div>
 
 </div></fieldset>
 
@@ -67,10 +67,38 @@
 
 </div></fieldset>
 
+<fieldset class="cbi-section"><legend>抓取网页 / JS 分析（--url / --url-dom）</legend><div class="cbi-section-node">
+
+<div class="cbi-value"><label class="cbi-value-title">分析网页里的 JS 文件</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss --url https://example.com/static/app.js --role jsrev "分析这个文件的接口、签名参数和反调试手段"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<div class="cbi-value-description">--url 用 curl 抓原始内容（静态 HTML / .js / .json 最快），抓下来的文件当附件上传给模型。</div></div></div>
+
+<div class="cbi-value"><label class="cbi-value-title">让 Selenium 专家给某个按钮的点击代码</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss --url-dom https://example.com/login --role selenium "给出点击『登录』按钮并输入用户名的 Python Selenium 代码，用显式等待"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<div class="cbi-value-description">--url-dom 用 chrome-headless-shell 渲染后再导 DOM（SPA、JS 生成的元素必须用这个），首次约 30 秒。拿到的 DOM 里能直接看到真实的选择器/类名。</div></div></div>
+
+<div class="cbi-value"><label class="cbi-value-title">两个一起用</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss --url-dom https://example.com/login --url https://example.com/static/app.js --role jsrev,selenium "结合页面 DOM 和这个 JS，说明登录接口的参数怎么算，并给出 Selenium 自动化脚本"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<div class="cbi-value-description">都能重复写。注意：模型本身不能联网，只能分析抓下来的内容；附件只支持 DeepSeek 后端（GLM-4-Flash 是纯文本接口）。<br/>环境缺失时会自动跳过并提示补全命令：<code>--url</code> 需要 curl（<code>opkg install curl</code>）、<code>--url-dom</code> 需要 chrome（<code>opkg install chrome-glibc-runtime chrome-headless-shell</code>）、<code>--autorun</code> 需要 python3（<code>opkg install python3</code>）。</div></div></div>
+
+</div></fieldset>
+
+<fieldset class="cbi-section"><legend>对话角色</legend><div class="cbi-section-node">
+
+<div class="cbi-value"><label class="cbi-value-title">单发指定角色</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss --role ppt "做一份 AR9341 VoIP 方案 PPT 的大纲"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<div class="cbi-value-description">可用角色：embedded / android / cdev / novelist / arch / reviewer / tester / doc / voip / net / security / teacher / gamedev / webdev / routerdev / devops / dataeng / ai / translator / pm / ppt / shortvideo / jsrev / selenium（也可直接写自定义中文角色名）。</div></div></div>
+
+<div class="cbi-value"><label class="cbi-value-title">duet 两侧各自指定角色</label><div class="cbi-value-field">
+<pre class="dss-cmd">dss --duet --rounds 3 --role-a arch --role-b reviewer "评审这套 VoIP 方案"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<div class="cbi-value-description">不写 --role/--role-a/--role-b 时，自动用设置页里勾选的角色（单发用 A 侧）；写了就完全以命令行为准。</div></div></div>
+
+</div></fieldset>
+
 <fieldset class="cbi-section"><legend>自动运行产物（--autorun）</legend><div class="cbi-section-node">
 
 <div class="cbi-value"><label class="cbi-value-title">让模型直接生成 PPT（存盘后自动执行）</label><div class="cbi-value-field">
-<pre class="dss-cmd">cd /root/.dss/out && dss --code --autorun "做一份 5 页的 AR9341 VoIP 方案 PPT，保存为 voip.pptx"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
+<pre class="dss-cmd">dss --code --autorun "做一份 5 页的 AR9341 VoIP 方案 PPT，保存为 voip.pptx"</pre><button type="button" class="dss-copy" onclick="copyCmd(this)">复制</button>
 <div class="cbi-value-description">--autorun（别名 --run）会在代码存盘后立刻在路由器上执行 .py / .sh，并打印这一轮新增的产物路径，例如 <b>[dss] 产物: /root/.dss/out/voip.pptx</b>；随后到「代码文件」页下载即可。</div></div></div>
 
 <div class="cbi-value"><label class="cbi-value-title">只存不跑（默认行为）</label><div class="cbi-value-field">

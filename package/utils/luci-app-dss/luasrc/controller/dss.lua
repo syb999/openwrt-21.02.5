@@ -33,6 +33,10 @@ function role_list()
 		{ id = "ai",       name = i18n.translate("AI / algorithm engineer") },
 		{ id = "translator",name = i18n.translate("Technical translator") },
 		{ id = "pm",       name = i18n.translate("Product manager") },
+		{ id = "ppt",      name = i18n.translate("PPT specialist") },
+		{ id = "shortvideo", name = i18n.translate("Short-video scriptwriter") },
+		{ id = "jsrev",    name = i18n.translate("JS reverse-engineering expert") },
+		{ id = "selenium", name = i18n.translate("Selenium expert") },
 	}
 end
 
@@ -314,12 +318,13 @@ function act_run()
 		return
 	end
 
-	-- 没写 dss 就自动补上，这样直接敲问题也行
+	-- 安全策略：只执行 dss 命令；任何其它内容一律当"提问"整句加引号传给 dss，
+	-- 绝不直接执行外部命令（cd/ls/sh/&&/| 全都不放行）
 	if cmd ~= "dss" and not cmd:match("^dss%s") then
-		cmd = "dss " .. cmd
+		cmd = "dss " .. shq(cmd)
 	end
 
-	luci.sys.exec("mkdir -p /tmp/dss")
+luci.sys.exec("mkdir -p /tmp/dss")
 	-- 先清掉上一次没退出的进程：stale pid 会让旧进程继续往同一个 console.out 里刷
 	luci.sys.exec("/usr/lib/dss/console-reset.sh >/dev/null 2>&1")
 	local cf = io.open(CMDD, "w")

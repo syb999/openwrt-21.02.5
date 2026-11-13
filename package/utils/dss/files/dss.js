@@ -316,6 +316,10 @@ const ROLE_CATALOG = {
   voip:     { name: 'VoIP/语音通信专家',    desc: '熟悉 SIP/RTP、PCM 时序、SLIC/Codec、抖动缓冲与回声消除。' },
   net:      { name: '网络协议专家',         desc: '熟悉 TCP/IP、抓包分析、Linux netfilter 与转发面性能。' },
   security: { name: '安全研究员',           desc: '威胁建模、攻击面分析、CVE 与最小权限；给可用 PoC 思路。' },
+  ppt:      { name: 'PPT 制作专家',   desc: '熟练用 python-pptx 出成品：版式栅格、配色、字号层级、图表与图示；一页一个观点，不堆文字；脚本必须能直接跑出 .pptx。' },
+  shortvideo: { name: '短视频脚本专家', desc: '3 秒钩子、分镜表、口播文案、字幕与节奏、时长控制；按平台（抖音/B站/视频号）给可直接拍摄或剪辑的方案。' },
+  jsrev:    { name: 'JS 逆向专家',     desc: '浏览器调试、AST 与混淆还原（obfuscator/控制流平坦化）、webpack 拆包、运行时 hook 与补环境；只在合法授权与自有系统范围内工作。' },
+  selenium: { name: 'Selenium 专家',   desc: 'WebDriver 实战：显式等待、稳定选择器、无头模式、CDP 与反检测边界、失败重试与并发控制；优先给能长期稳定运行的写法。' },
   teacher:  { name: '学科老师',             desc: '把复杂概念讲成学生能懂的话：先给直观类比，再给严格定义，最后给例题与易错点。' },
   gamedev:  { name: '游戏开发者',           desc: '熟悉玩法循环、数值平衡、状态机、存档与资源管理；给的设计要能真正落地成代码。' },
   webdev:   { name: '网站开发者',           desc: '熟悉 HTML/CSS/JS、前端框架、HTTP/API 设计、鉴权与部署；给可运行的完整文件。' },
@@ -355,11 +359,124 @@ try {
   if (_v) DSS_VERSION = _v;
 } catch (e) {}
 const OUTDIR = process.env.DSS_OUTDIR || '/root/.dss/out';
+// 任何退出都要留痕：进程被杀/崩溃时，console.out 里能看到 exit / signal
+let _exitPrinted = false;
+process.on('exit', (code) => {
+  if (_exitPrinted) return;
+  _exitPrinted = true;
+  try { process.stderr.write('\n[dss] exit=' + code + '\n'); } catch (e) {}
+});
+['SIGTERM', 'SIGINT', 'SIGHUP'].forEach((sig) => {
+  process.on(sig, () => {
+    try { process.stderr.write('\n[dss] 收到 ' + sig + '，退出\n'); } catch (e) {}
+    _exitPrinted = true;
+    process.exit(0);
+  });
+});
 // 只保留一个目录：/root/.dss/out（重启后还在，LuCI 的"文件下载"从这里取）
 // 对话日志：给 LuCI 的"监听对话"页面 tail
 const CONV_LOG = process.env.DSS_LOG || '/tmp/dss/conversation.log';
 const RUN_TIMEOUT = parseInt(process.env.DSS_RUN_TIMEOUT || '60000', 10);
 const MAX_SHOW = 4000;
+
+// ================= 运行环境探测：有就执行，没有就跳过 =================
+function haveCmd(name) {
+  if (!name) return false;
+  const fsv = require('fs');
+  if (name.indexOf('/') >= 0) {
+    try { fsv.accessSync(name, fsv.constants.X_OK); return true; } catch (e) { return false; }
+  }
+  const dirs = String(process.env.PATH || '/usr/sbin:/usr/bin:/sbin:/bin').split(':');
+  for (const d of dirs) {
+    if (!d) continue;
+    try { fsv.accessSync(d + '/' + name, fsv.constants.X_OK); return true; } catch (e) {}
+  }
+  return false;
+}
+
+// 缺命令时给一句"怎么补"，别只报跳过
+function cmdHint(what) {
+  if (what === 'curl') return '安装：opkg update && opkg install curl（或 DSS_CURL=/path/to/curl 指定）';
+  if (what === 'chrome') return '安装：opkg install chrome-glibc-runtime chrome-headless-shell（或 DSS_CHROME=/path/to/run-chrome.sh 指定）';
+  if (what === 'python3') return '安装：opkg update && opkg install python3';
+  if (what === 'gcc') return '安装：opkg update && opkg install gcc';
+  if (what === 'sh') return '系统缺少 /bin/sh（busybox），无法执行 shell 脚本';
+  return '请先安装 ' + what;
+}
+
+// ================= URL 抓取（--url / --url-dom） =================
+// --url      : curl 抓原始内容（静态 HTML / .js 文件，最省事）
+// --url-dom  : 用 chrome-headless-shell 渲染后再导 DOM（SPA、JS 生成的元素必须走这个）
+const URL_DIR = OUTDIR + '/_url';
+const CHROME_LAUNCHER = process.env.DSS_CHROME || '/opt/chrome-root/run-chrome.sh';
+const UA_CHROME = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36';
+
+function urlToName(u, rendered) {
+  let host = 'page', path = '', ext = '.html';
+  try {
+    const o = new URL(u);
+    host = o.hostname.replace(/[^A-Za-z0-9.-]/g, '_');
+    path = o.pathname.replace(/^\/+/, '').replace(/[^A-Za-z0-9._-]/g, '_');
+    if (/\.js(\?|$)/i.test(o.pathname)) ext = '.js';
+    else if (/\.css(\?|$)/i.test(o.pathname)) ext = '.css';
+    else if (/\.json(\?|$)/i.test(o.pathname)) ext = '.json';
+  } catch (e) {}
+  const base = (path || 'index').replace(/\.[A-Za-z0-9]+$/, '');
+  const h = require('crypto').createHash('md5').update(u).digest('hex').slice(0, 6);
+  return host + '_' + base.slice(0, 40) + '_' + h + (rendered ? '.dom' : '') + ext;
+}
+
+function fetchUrl(u, rendered) {
+  const cp = require('child_process');
+  const fsx = require('fs');
+  try { fsx.mkdirSync(URL_DIR, { recursive: true, mode: 0o700 }); } catch (e) {}
+  // 环境里没有对应工具就跳过这一条，不影响整轮
+  if (rendered) {
+    const launcher = CHROME_LAUNCHER;
+    const realBin = '/opt/chrome-root/opt/chrome/chrome-headless-shell';
+    if (!haveCmd(launcher) || !haveCmd(realBin)) {
+      process.stderr.write('[url] 跳过 ' + u + '：环境里没有 chrome-headless-shell（' + realBin + '）\n' +
+        '        ' + cmdHint('chrome') + '\n');
+      return null;
+    }
+  } else {
+    const curlBin = process.env.DSS_CURL || 'curl';
+    if (!haveCmd(curlBin)) {
+      process.stderr.write('[url] 跳过 ' + u + '：环境里没有 curl\n' +
+        '        ' + cmdHint('curl') + '\n');
+      return null;
+    }
+  }
+
+  const name = urlToName(u, rendered);
+  const out = URL_DIR + '/' + name;
+  process.stderr.write('[url] ' + (rendered ? '渲染 ' : '抓取 ') + u + ' ... ');
+
+  if (rendered) {
+    const r = cp.spawnSync(CHROME_LAUNCHER, ['--dump-dom', u], { timeout: 180000, encoding: 'buffer' });
+    const html = (r.stdout || Buffer.alloc(0)).toString('utf8').trim();
+    if (r.status !== 0 || !html) {
+      process.stderr.write('失败\n');
+      throw new Error('Chrome 渲染失败（' + (r.status === null ? 'timeout' : 'exit=' + r.status) + '）：' +
+        String(r.stderr || '').slice(-300));
+    }
+    fsx.writeFileSync(out, Buffer.from(html, 'utf8'), { mode: 0o600 });
+    process.stderr.write('ok (' + html.length + ' 字节, 渲染后 DOM)\n');
+  } else {
+    // 用 buffer 存原始字节：按 utf8 字符串落盘会改变长度、破坏二进制/编码
+    const r = cp.spawnSync('curl', ['-sSL', '--max-time', '40', '-A', UA_CHROME, u],
+      { timeout: 50000, encoding: 'buffer' });
+    const body = r.stdout || Buffer.alloc(0);
+    if (r.status !== 0 || !body.length) {
+      process.stderr.write('失败\n');
+      throw new Error('抓取失败（' + (r.status === null ? 'timeout' : 'exit=' + r.status) + '）：' +
+        String(r.stderr || '').slice(-300));
+    }
+    fsx.writeFileSync(out, body, { mode: 0o600 });
+    process.stderr.write('ok (' + body.length + ' 字节)\n');
+  }
+  return out;
+}
 
 // 危险命令黑名单（宁可误杀，不可放过）
 const BLOCK = [
@@ -1226,6 +1343,11 @@ function maybeAutorun(saved) {
     if (ext === '.py') argv = ['python3', it.path];
     else if (ext === '.sh') argv = ['sh', it.path];
     if (!argv) continue;
+    if (!haveCmd(argv[0])) {
+      process.stderr.write('[dss] 跳过 ' + path.basename(it.path) + '：环境里没有 ' + argv[0] + '\n' +
+        '      ' + cmdHint(argv[0]) + '\n');
+      continue;
+    }
     process.stderr.write('[dss] run ' + path.basename(it.path) + ' ...\n');
     const r = cp.spawnSync(argv[0], [argv[1]], { cwd: dir, timeout: 240000, encoding: 'utf8' });
     const log = ((r.stdout || '') + (r.stderr || '')).trim();
@@ -1946,7 +2068,6 @@ async function askKimiOnce(prompt, state, printer) {
 // ================= 浏览器传输（wenxin / doubao） =================
 // 路由器上没有签名环境：用 chrome-headless-shell 的 --remote-debugging-pipe（fd3 写/fd4 读，\0 分隔），
 // 让页面自己去发请求（chat_token / a_bogus / 风控 / 滑块都交给浏览器），dss 只负责输入和读回正文。
-const CHROME_LAUNCHER = process.env.DSS_CHROME || '/opt/chrome-root/run-chrome.sh';
 const BROWSER_SITES = {
   wenxin: { url: 'https://wenxin.baidu.com/', idle: /(正在思考|正在生成|停止生成|思考中)/ },
   doubao: { url: 'https://www.doubao.com/chat/', idle: /(正在输入|思考中|停止生成|生成中)/ },
@@ -2442,11 +2563,21 @@ async function askCode(c, pow, prompt, state, printer) {
       '请只重新输出这一个文件的**完整可运行内容**（一个代码块，第一行就是代码，' +
       '代码块内不要出现用法示例、命令行或解释文字；不要只给补丁、不要省略未改动的部分）；' +
       '环境是 OpenWrt + python3.9，产物写到当前目录。', state, printer, 2)) || '';
-    if (!hasCode(repair)) continue;
+    if (!hasCode(repair)) {
+      process.stderr.write('[dss] 修复回答里没有完整代码块，保留原文件不动\n');
+      continue;
+    }
     acc = repair;
-    // 覆盖掉跑失败的那份，避免 saveScripts 追加成拼盘
-    try { fs.unlinkSync(f.path); } catch (e) {}
-    persist(repair);
+    // 不再"先删再写"：上次因为写之前删了旧文件、修复又中断，结果文件彻底丢失
+    const got = persist(repair);
+    if (got && got.length) {
+      if (got[0].mode === 'appended') {
+        process.stderr.write('[dss] 警告：修复内容是片段，已追加到原文件，可能仍然不可运行\n');
+      }
+      if (got[0].path !== f.path) {
+        try { fs.unlinkSync(f.path); } catch (e) {}   // 模型换了文件名，旧的才删
+      }
+    }
   }
   return acc;
 }
@@ -2460,7 +2591,8 @@ function persist(text, label) {
       lastSaved = saved;
       maybeAutorun(saved);
     }
-  } catch (e) {}
+    return saved;
+  } catch (e) { return []; }
 }
 
 // ---------- 自我对话：两个独立会话，一个只问、一个只答 ----------
@@ -2677,8 +2809,16 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
     if (uciD[k] && !args.includes(flag)) { args.push(flag); args.push(uciD[k]); }
   }
   if (uciD.pause && !args.includes('--pause')) { args.push('--pause'); args.push(uciD.pause); }
-  if (uciD.role_a && !args.includes('--role-a')) { args.push('--role-a'); args.push(uciD.role_a); }
-  if (uciD.role_b && !args.includes('--role-b')) { args.push('--role-b'); args.push(uciD.role_b); }
+  // 命令行没写任何 --role* 时才用 LuCI 里勾的角色；写了就完全听命令行的
+  const _hasRoleCli = args.includes('--role') || args.includes('--role-a') || args.includes('--role-b');
+  if (!_hasRoleCli) {
+    if (uciD.role_a) { args.push('--role-a'); args.push(uciD.role_a); }
+    if (uciD.role_b) { args.push('--role-b'); args.push(uciD.role_b); }
+    if (uciD.role_a || uciD.role_b) {
+      process.stderr.write('[role] 使用 LuCI 设置的角色：A=' + (uciD.role_a || '-') +
+        ' B=' + (uciD.role_b || '-') + '（命令行写 --role/--role-a/--role-b 可覆盖）\n');
+    }
+  }
   if (uciD.rounds && !args.includes('--rounds')) { args.push('--rounds'); args.push(uciD.rounds); }
   if (uciD.minutes && !args.includes('--minutes')) { args.push('--minutes'); args.push(uciD.minutes); }
   let c;
@@ -2704,6 +2844,10 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
     try {
       const txt = CODE_MODE ? await askCode(c, pow, prompt, state, printer)
                             : await askText(c, pow, prompt, state, printer, 3);
+      if (CODE_MODE && (!lastSaved || !lastSaved.length)) {
+        process.stderr.write('\n[dss] 本轮没有产出任何文件（回答被截断/被中断，或模型没给完整代码块）。' +
+          '可以重跑，或把要求写得更具体（文件名、页数、保存位置）。\n');
+      }
       return txt || '';
     } catch (e) {
       // 只有 DeepSeek 才会走“换令牌”流程；API/Kimi/豆包/文心的 401 直接报自己的错
@@ -2762,6 +2906,20 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
     if (p && p[0] !== '-') { filesB.push(p); args.splice(fi, 2); } else { args.splice(fi, 1); }
   }
   for (;;) {
+    const di2 = args.indexOf('--url-dom');
+    if (di2 < 0) break;
+    const u = args[di2 + 1];
+    if (u && u[0] !== '-') { const got = fetchUrl(u, true); if (got) files.push(got); args.splice(di2, 2); }
+    else args.splice(di2, 1);
+  }
+  for (;;) {
+    const ui2 = args.indexOf('--url');
+    if (ui2 < 0) break;
+    const u = args[ui2 + 1];
+    if (u && u[0] !== '-') { const got = fetchUrl(u, false); if (got) files.push(got); args.splice(ui2, 2); }
+    else args.splice(ui2, 1);
+  }
+  for (;;) {
     const fi = args.indexOf('--file');
     if (fi < 0) break;
     const p = args[fi + 1];
@@ -2796,6 +2954,8 @@ async function duet(c, pow, topic, rounds, printer, pauseMs, shared) {
       args.splice(idx, 2);
     }
   }
+  // 单发（--role 没写）时沿用 A 侧角色，否则 LuCI 勾的角色对单发命令无效
+  if (!roleS && roleA) roleS = roleA;
   if (args.includes('--kimi-think')) { KIMI_THINK = true; args.splice(args.indexOf('--kimi-think'), 1); }
   if (args.includes('--kimi-tools')) { KIMI_TOOLS = true; args.splice(args.indexOf('--kimi-tools'), 1); }
   if (args.includes('--kimi-plugin')) { KIMI_PLUGIN = true; args.splice(args.indexOf('--kimi-plugin'), 1); }
