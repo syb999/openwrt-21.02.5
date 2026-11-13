@@ -1,0 +1,146 @@
+#!/bin/sh
+# 音画同步修复 —— 独立动作，不读取 video_setting / audio_setting 里的设置。
+#
+# 原理：容器的视频时间轴和音频时钟是两条独立的时间轴。源片的时间戳坏了，或者
+# 音频的采样漂了一点，播放器就会"开头好好的，几分钟后声音跑偏，拖一下进度又好
+# 一会儿"。这里按帧序号重建视频时间轴（setpts=N/(fps*TB) + 恒定帧率），并把音
+# 轨用 aresample=async 粘到这条新时钟上。像素不动，画面不重新缩放。
+#
+# 用法：sh /usr/ffmpegtool/syncaction
+LOG=/tmp/ffmpeg.log
+PIDF=/tmp/ffmpegtool_sync.pid
+
+cfg() { uci -q get "ffmpegtool.@ffmpegtool[0].$1" 2>/dev/null || true; }
+say() { echo "$*" >> "$LOG"; }
+
+: > "$LOG"
+echo "$$" > "$PIDF"
+
+SRC=$(cfg sync_src)
+[ -n "$SRC" ] || SRC=$(cfg src_file_path)
+
+case "$SRC" in
+http://*|https://*|rtsp://*|rtmps://*|rtmp://*|udp://*|hls://*|mms://*) isurl=1 ;;
+*) isurl=0 ;;
+esac
+
+if [ -z "$SRC" ]; then
+	say "音画同步修复：没有源文件。请在本页填写源文件，或先在“基本设置”里选好输入源。"
+	exit 1
+fi
+
+if [ "$isurl" = "0" ] && [ ! -f "$SRC" ]; then
+	say "音画同步修复：源文件不存在：$SRC"
+	exit 1
+fi
+
+ENC=$(cfg sync_encoder)
+case "$ENC" in hardware|software) ;; *) ENC=auto ;; esac
+AUD=$(cfg sync_audio)
+case "$AUD" in drop|rebuild) ;; *) AUD=rebuild ;; esac
+FPSW=$(cfg sync_fps)
+BRW=$(cfg sync_bitrate)
+OUT=$(cfg sync_out)
+
+# 编码器：auto 时优先用硬件（ffmpeg-rkrga），没有就退回系统的软件 ffmpeg
+FF=ffmpeg
+HW=0
+if [ -x /usr/bin/ffmpeg-rkrga ] && [ "$ENC" != "software" ]; then
+	FF=/usr/bin/ffmpeg-rkrga
+	HW=1
+fi
+
+# 源信息（先写进日志，状态页会显示时长/音轨）
+ffprobe "$SRC" > "$LOG" 2>&1
+if ! grep -q "Duration" "$LOG"; then
+	say "音画同步修复：读不到源文件信息（不是视频、或路径不对）：$SRC"
+	exit 1
+fi
+
+rawfps=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$SRC" 2>/dev/null)
+if [ -n "$FPSW" ]; then
+	fps="$FPSW"
+else
+	fps=$(printf '%s' "$rawfps" | awk -F/ '
+		{ if ($2 + 0 > 0) printf "%.3f", $1 / $2; else printf "0" }' | awk '
+		{ v = $1 + 0
+		  if (v <= 0) { print "0"; exit }
+		  n = split("23.976 24 25 29.97 30 50 59.94 60", st, " ")
+		  best = 0; bd = 1e9
+		  for (i = 1; i <= n; i++) { d = v - st[i]; if (d < 0) d = -d; if (d < bd) { bd = d; best = st[i] } }
+		  if (bd / v < 0.03) printf "%.3f", best
+		  else if (v >= 5 && v <= 120) printf "%.3f", v
+		  else printf "0" }')
+fi
+if [ "$(awk -v v="$fps" 'BEGIN{print (v+0>0)?1:0}')" != "1" ]; then
+	say "音画同步修复：源帧率无法确定（探测到 ${rawfps:-空}），请在“帧率”里手工填一个（例如 25）"
+	exit 1
+fi
+
+vbr="$BRW"
+if [ -z "$vbr" ] && [ "$HW" = "1" ]; then
+	vbr=$(ffprobe -v error -select_streams v:0 -show_entries stream=bit_rate -of csv=p=0 "$SRC" 2>/dev/null)
+	case "$vbr" in ''|0|N/A) vbr="" ;; esac
+fi
+
+# 输出文件：默认放在目标目录，名字后面加 _sync，绝不覆盖源文件
+if [ -z "$OUT" ]; then
+	base=$(basename "$SRC")
+	base="${base%.*}"
+	dir=$(dirname "$SRC")
+	ddir=$(cfg dest_directory_path)
+	if [ -n "$ddir" ] && [ -d "$ddir" ]; then dir="$ddir"; fi
+	[ "$isurl" = "1" ] && dir=/tmp
+	OUT="$dir/${base}_sync.mp4"
+fi
+outdir=$(dirname "$OUT")
+[ -d "$outdir" ] || mkdir -p "$outdir" 2>/dev/null
+if [ "$OUT" = "$SRC" ]; then
+	say "音画同步修复：输出文件名不能和源文件相同（$OUT）"
+	exit 1
+fi
+
+# ffmpeg 命令行：输入侧 +genpts，视频按帧序号重定时 + 恒定帧率
+set -- "$FF" -hide_banner -nostdin -y
+if [ "$HW" = "1" ]; then
+	set -- "$@" -hwaccel rkmpp -hwaccel_output_format drm_prime
+fi
+set -- "$@" -fflags +genpts -i "$SRC" -map 0:v:0
+if [ "$HW" = "1" ]; then
+	set -- "$@" -vf "setpts=N/($fps*TB)" -r "$fps" -fps_mode cfr -c:v h264_rkmpp
+	if [ -n "$vbr" ]; then set -- "$@" -b:v "$vbr"; fi
+else
+	set -- "$@" -vf "setpts=N/($fps*TB)" -r "$fps" -fps_mode cfr \
+		-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p
+fi
+if [ "$AUD" = "drop" ]; then
+	set -- "$@" -an
+else
+	set -- "$@" -map 0:a:0? -c:a aac -b:a 128k -af "aresample=async=1:first_pts=0"
+fi
+set -- "$@" -movflags +faststart "$OUT"
+
+say ""
+say "音画同步修复：$SRC"
+say "  输出：$OUT"
+say "  编码：$([ "$HW" = "1" ] && echo '硬件 h264_rkmpp' || echo '软件 libx264')   帧率：$fps   音轨：$AUD"
+say "  命令：$*"
+say ""
+
+"$@" >> "$LOG" 2>&1
+rc=$?
+
+if [ "$rc" = "0" ] && [ -s "$OUT" ]; then
+	vd=$(ffprobe -v error -select_streams v:0 -show_entries stream=duration -of csv=p=0 "$OUT" 2>/dev/null)
+	ad=$(ffprobe -v error -select_streams a:0 -show_entries stream=duration -of csv=p=0 "$OUT" 2>/dev/null)
+	nf=$(ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=nb_read_frames -of csv=p=0 "$OUT" 2>/dev/null)
+	dv=$(awk -v a="$vd" -v b="${ad:-$vd}" 'BEGIN{ d = a - b; if (d < 0) d = -d; printf "%.3f", d }')
+	sa="无音轨"
+	[ -n "$ad" ] && sa="${ad}s"
+	say "修复完毕：$OUT"
+	say "  视频 ${vd}s / 音频 ${sa} / 两轨相差 ${dv}s / 视频 $nf 帧"
+else
+	say "修复失败（ffmpeg 退出码 $rc），输出文件可能不完整：$OUT"
+fi
+
+rm -f "$PIDF"

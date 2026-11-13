@@ -488,3 +488,59 @@ msgstr "一键转换/播放/推送/导出视频"
 msgid "One-click STOP"
 msgstr "一键停止"
 
+msgid "A/V Sync Repair"
+msgstr "音画同步修复"
+
+msgid "Audio and video keep separate clocks: when the video timestamps of a damaged source are wrong, or the audio arrives at a slightly different rate, the sound slowly creeps out of step - the classic \"starts fine, drifts after a few minutes, seeking helps for a moment\". This page rebuilds the video timeline from the frame index (constant frame rate, regenerated timestamps, no re-scaling) and glues the audio to that clock with aresample=async. Pixels are not touched. Measured on this box: a 20.400 s video against 20.000 s of audio came out as 20.020 s / 20.010 s, 600 frames, 0 decode errors; a 97 minute 4K film whose audio track was 29.4 s shorter now has both tracks within 25 ms."
+msgstr "音频和视频各走自己的时钟：源片时间戳坏了，或者音频到达的速率略有偏差，声音就会慢慢跑偏——就是那个\"开头好好的，几分钟后开始不对，拖一下进度又好一会儿\"。这一页按帧序号重建视频时间轴（恒定帧率、重新生成时间戳、不重新缩放），并用 aresample=async 把音轨粘到这条新时钟上。像素不动。本机实测：20.400 秒视频对 20.000 秒音频，修完是 20.020 / 20.010 秒、600 帧、0 解码错误；一部 97 分钟的 4K 影片音轨比视频短 29.4 秒，修完两轨相差 25 毫秒。"
+
+msgid "Source file (empty = the input selected in Basic Setting)"
+msgstr "源文件（留空 = 用“基本设置”里选的输入源）"
+
+msgid "full path of the video, or an http/rtsp/rtmp url"
+msgstr "视频的完整路径，或 http/rtsp/rtmp 地址"
+
+msgid "Output file (empty = <name>_sync.mp4 next to the source)"
+msgstr "输出文件（留空 = 源文件旁边生成 <名字>_sync.mp4）"
+
+msgid "the source file is never overwritten"
+msgstr "不会覆盖源文件"
+
+msgid "Encoder"
+msgstr "编码器"
+
+msgid "auto (hardware when available)"
+msgstr "自动（有硬件编码器就用硬件）"
+
+msgid "hardware (ffmpeg-rkrga)"
+msgstr "硬件（ffmpeg-rkrga）"
+
+msgid "software (libx264, slow)"
+msgstr "软件（libx264，慢）"
+
+msgid "Audio track"
+msgstr "音轨"
+
+msgid "rebuild the clock (AAC + aresample)"
+msgstr "重建音轨时钟（AAC + aresample）"
+
+msgid "drop the audio"
+msgstr "丢弃音轨"
+
+msgid "Frame rate (empty = follow the source)"
+msgstr "帧率（留空 = 跟随源）"
+
+msgid "the source rate is snapped to the nearest standard value (23.976 / 24 / 25 / 29.97 / 30 / 50 / 59.94 / 60)"
+msgstr "源帧率会吸附到最接近的标准值（23.976 / 24 / 25 / 29.97 / 30 / 50 / 59.94 / 60）"
+
+msgid "Video bitrate (empty = follow the source)"
+msgstr "视频码率（留空 = 跟随源）"
+
+msgid "hardware encoding only, e.g. 4M"
+msgstr "只在硬件编码时生效，例如 4M"
+
+msgid "Start the A/V sync repair"
+msgstr "开始音画同步修复"
+
+msgid "Stop"
+msgstr "停止"

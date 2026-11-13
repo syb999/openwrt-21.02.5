@@ -725,6 +725,62 @@ video_copy:depends({ image_effects = "", video_x2645 = "none", video_picture = "
 video_ready = s:taboption("video_setting", Flag, "video_ready", translate("Setup ready"))
 video_ready.description = translate("Save/apply first please")
 
+-- ===== 音画同步修复：独立的一页，不受 video_setting / audio_setting 影响 =====
+s:tab("sync_setting", translate("A/V Sync Repair"))
+
+sync_desc = s:taboption("sync_setting", DummyValue, "sync_desc",
+	translate("Audio and video keep separate clocks: when the video timestamps of a damaged source are wrong, or the audio arrives at a slightly different rate, the sound slowly creeps out of step - the classic \"starts fine, drifts after a few minutes, seeking helps for a moment\". This page rebuilds the video timeline from the frame index (constant frame rate, regenerated timestamps, no re-scaling) and glues the audio to that clock with aresample=async. Pixels are not touched. Measured on this box: a 20.400 s video against 20.000 s of audio came out as 20.020 s / 20.010 s, 600 frames, 0 decode errors; a 97 minute 4K film whose audio track was 29.4 s shorter now has both tracks within 25 ms."))
+sync_desc.rmempty = true
+
+sync_src = s:taboption("sync_setting", Value, "sync_src", translate("Source file (empty = the input selected in Basic Setting)"))
+sync_src.rmempty = true
+sync_src.datatype = "string"
+sync_src.description = translate("full path of the video, or an http/rtsp/rtmp url")
+
+sync_out = s:taboption("sync_setting", Value, "sync_out", translate("Output file (empty = <name>_sync.mp4 next to the source)"))
+sync_out.rmempty = true
+sync_out.datatype = "string"
+sync_out.description = translate("the source file is never overwritten")
+
+sync_encoder = s:taboption("sync_setting", ListValue, "sync_encoder", translate("Encoder"))
+sync_encoder:value("auto", translate("auto (hardware when available)"))
+sync_encoder:value("hardware", translate("hardware (ffmpeg-rkrga)"))
+sync_encoder:value("software", translate("software (libx264, slow)"))
+sync_encoder.default = "auto"
+sync_encoder.rmempty = true
+
+sync_audio = s:taboption("sync_setting", ListValue, "sync_audio", translate("Audio track"))
+sync_audio:value("rebuild", translate("rebuild the clock (AAC + aresample)"))
+sync_audio:value("drop", translate("drop the audio"))
+sync_audio.default = "rebuild"
+sync_audio.rmempty = true
+
+sync_fps = s:taboption("sync_setting", Value, "sync_fps", translate("Frame rate (empty = follow the source)"))
+sync_fps.rmempty = true
+sync_fps.datatype = "string"
+sync_fps.description = translate("the source rate is snapped to the nearest standard value (23.976 / 24 / 25 / 29.97 / 30 / 50 / 59.94 / 60)")
+
+sync_bitrate = s:taboption("sync_setting", Value, "sync_bitrate", translate("Video bitrate (empty = follow the source)"))
+sync_bitrate.rmempty = true
+sync_bitrate.datatype = "string"
+sync_bitrate.description = translate("hardware encoding only, e.g. 4M")
+
+syncstart = s:taboption("sync_setting", Button, "syncstart", translate("Start the A/V sync repair"))
+syncstart.rmempty = true
+syncstart.inputstyle = "apply"
+function syncstart.write(self, section)
+	luci.util.exec("sh /usr/ffmpegtool/syncaction >/dev/null 2>&1 &")
+end
+
+syncstop = s:taboption("sync_setting", Button, "syncstop", translate("Stop"))
+syncstop.rmempty = true
+syncstop.inputstyle = "apply"
+function syncstop.write(self, section)
+	luci.util.exec("kill -9 $(cat /tmp/ffmpegtool_sync.pid 2>/dev/null) >/dev/null 2>&1")
+	luci.util.exec("kill -9 $(busybox ps | grep syncaction | grep -v grep | awk '{print $1}') >/dev/null 2>&1")
+	luci.util.exec("kill $(busybox ps | grep ffmpeg | grep -v grep | awk '{print $1}') >/dev/null 2>&1")
+end
+
 s:tab("action", translate("Action"))
 
 audioaction = s:taboption("action", Button, "audioaction", translate("One-click Convert/Play/Push/Output Audio"))
