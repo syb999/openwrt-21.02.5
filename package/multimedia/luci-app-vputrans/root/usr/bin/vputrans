@@ -101,6 +101,10 @@ HIST="/tmp/vputrans.history"
 # effects / logo / pip / join options: written by `run`, read by the worker
 # (the detached worker would need 10 more positional arguments otherwise)
 OPTS="/tmp/vputrans.opts"
+# followers announce themselves here (one file per box, refreshed every
+# `interval` seconds): this is what makes "start on the master, the others
+# follow" work without filling in a node list on every box
+ROSTER="/tmp/vputrans.roster"
 
 LOG_TAIL=14
 UA="Mozilla/5.0"                 # plain user agent, no shell metacharacters
@@ -355,6 +359,23 @@ ff_probe_err() { # $1=proto $2=src -> last error line
 
 fps_of() { awk -v r="$1" 'BEGIN{n=split(r,a,"/"); if(n==2 && a[2]+0>0) printf "%.3f", a[1]/a[2]; else printf "0"}'; }
 
+# Snap a measured rate to the nearest standard one (within 5%).  A container
+# whose timestamps drifted reports a rate off by the same factor (30 fps
+# stretched 2% -> 29.41) and a raw .ts has no reliable rate at all, so the
+# measured value must never be trusted blindly.
+fps_snap() {
+	awk -v r="$1" 'BEGIN{
+		n = split("23.976 24 25 29.97 30 48 50 59.94 60", a, " ")
+		best = 0; bd = 1e9
+		for (i = 1; i <= n; i++) {
+			d = a[i] - r; if (d < 0) d = -d
+			if (d < bd) { bd = d; best = a[i] }
+		}
+		if (r+0 > 1 && bd/r <= 0.05) printf "%.3f", best
+		else printf "%.3f", r+0
+	}'
+}
+
 # ---------------------------------------------------------------------------
 # pipeline decision - THE core bit
 # ---------------------------------------------------------------------------
@@ -534,6 +555,23 @@ do_history() {
 # ---------------------------------------------------------------------------
 
 # fills S_* globals for a local file or URL source. Returns 0 / sets S_ERR.
+# "video_duration audio_duration" of the first stream of each kind
+ffprobe_stream_durs() { # $1 = proto, $2 = src
+	"$FFPROBE" -v error -rw_timeout 8000000 ${1:+-f $1} \
+		-show_entries stream=codec_type,duration -of csv=p=0 "$2" 2>/dev/null | \
+		awk -F, '$1=="video" && v=="" { v=$2 } $1=="audio" && a=="" { a=$2 }
+			END { printf "%.3f %.3f", v+0, a+0 }'
+}
+
+# Size of the dedicated video CMA pool in MB, taken from the bootargs
+# (rk_video_cma=512M).  When the split is not enabled every CMA user shares one
+# area and the total is the honest answer.
+video_pool_mb() {
+	_vmb=$(sed -n 's/.*rk_video_cma=\([0-9][0-9]*\)[mM].*/\1/p' /proc/cmdline 2>/dev/null)
+	[ -n "$_vmb" ] && { printf '%s' "$_vmb"; return; }
+	awk '/^CmaTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null
+}
+
 probe_common() { # $1 = src
 	S_SRC="$1"; S_ERR=""; S_ERR_ARGS=""; S_ERR_DETAIL=""
 	if is_url "$S_SRC"; then
@@ -595,12 +633,20 @@ do_probe() {
 	fi
 	asize=0
 	[ "$S_STYPE" = "local" ] && asize=$(fsize "$S_SRC")
-	printf '{"ok":true,"src":%s,"sourcetype":%s,"protocol":%s,"codec":%s,"pix_fmt":%s,"width":%s,"height":%s,"fps":%s,"duration":%s,"live":%s,"size":%s,"bitrate":%s,"audio":%s,"mode":%s,"decoder":%s,%s}\n' \
+	# per-stream lengths: the A/V sync page shows these next to each other, the
+	# difference IS the drift the user complains about
+	vdur=0; adur=0
+	[ "$S_LIVE" = "true" ] || {
+		set -- $(ffprobe_stream_durs "$S_PROTO" "$S_SRC")
+		vdur=${1:-0}; adur=${2:-0}
+	}
+	pextra="\"vdur\":$vdur,\"adur\":$adur"
+	printf '{"ok":true,"src":%s,"sourcetype":%s,"protocol":%s,"codec":%s,"pix_fmt":%s,"width":%s,"height":%s,"fps":%s,"duration":%s,"live":%s,"size":%s,"bitrate":%s,"audio":%s,"mode":%s,"decoder":%s,%s,%s}\n' \
 		"$(jstr "$S_SRC")" "$(jstr "$S_STYPE")" "$(jstr "$S_PROTO")" "$(jstr "$S_CODEC")" \
 		"$(jstr "$S_PIX")" "${S_W:-0}" "${S_H:-0}" "${S_FPS:-0}" "${S_DUR:-0}" \
 		"$S_LIVE" "${asize:-0}" "${S_VBR:-${S_BR:-0}}" "$(jstr "$S_ACODEC")" \
 		"$(jstr "$S_MODE")" "$(jstr "$S_DEC")" \
-		"$(jm reason "$S_REASON" "$S_REASON_ARGS")"
+		"$(jm reason "$S_REASON" "$S_REASON_ARGS")" "$pextra"
 }
 
 # ---------------------------------------------------------------------------
@@ -752,7 +798,7 @@ do_run() {
 	in=""; out=""; quality="cbr"; br=""; qp=""; enc=""
 	res="source"; scaler="bicubic"; audio="copy"; container="auto"
 	ss="0"; dur="0"; fps="source"
-	effect="none"; logo=""; logopos="tr"; logosize=""; logoalpha="200"
+	effect="none"; resync="0"; logo=""; logopos="tr"; logosize=""; logoalpha="200"
 	pip=""; pippos="br"; pipscale="30"; join2=""; giffps="12"
 
 	while [ $# -gt 0 ]; do
@@ -770,6 +816,7 @@ do_run() {
 			--audio|-a)     audio="$2"; shift 2 ;;
 			--container|-f) container="$2"; shift 2 ;;
 			--effect)       effect="$2"; shift 2 ;;
+			--resync)       resync="1"; [ "$2" = "0" ] && { resync="0"; shift; }; shift ;;
 			--logo)         logo="$2"; shift 2 ;;
 			--logo-pos)     logopos="$2"; shift 2 ;;
 			--logo-size)    logosize="$2"; shift 2 ;;
@@ -809,6 +856,31 @@ do_run() {
 		[ -n "$S_ERR_DETAIL" ] && printf ',%s' "$(jm detail "$S_ERR_DETAIL" "$S_ERR_DETAIL_ARGS")"
 		printf '}\n'
 		return 1
+	fi
+	# 2K/4K OUTPUT: the hardware encoder on this SoC is specified up to
+	# 1920x1080, so these targets are above its rating.  The attempt is not
+	# blocked (the limit is worth testing on your own board) but say it up
+	# front, so a failure at the encoder is not a surprise.
+	case "$res" in
+		1440p|2k|2K|2560x1440|2160p|4k|4K|3840x2160)
+			rz_note='Target is %s: this board does encode above 1080p (measured: 3840x2160 H.264 at about 0.5x with cma=512M), so expect a long job - a 97 minute film took 3h21m'
+			rz_args=$(tjoin "$res") ;;
+	esac
+	# 4K sources: the VPU needs ~300 MB of CONTIGUOUS DMA memory for a 4K
+	# stream (each 4K NV12 frame is 12 MB, MPP keeps 20+ of them) while this
+	# board reserves cma=128M -> measured: "cma_alloc: alloc failed for
+	# req-size 4838 pages" (19 MB!) and then SIGSEGV.  Refuse with the real
+	# reason instead of crashing, and re-check the actual CMA size so raising
+	# cma= in the bootargs lifts the limit by itself.
+	if [ "${S_H:-0}" -gt 1080 ] 2>/dev/null; then
+		cma_mb=$(video_pool_mb)
+		# downscaling to 1080p does NOT help: the stream still has to be
+		# decoded at 4K first, which is where the buffers are needed
+		if [ "${cma_mb:-0}" -lt 300 ]; then
+			fail 'This source is %sx%s: decoding it needs about 300 MB of contiguous DMA memory and the video pool is only %s MB, so the VPU never gets its buffers (measured: mpp_dma_heap "alloc failed", then the job sits at 0%% for ever). Downscaling does not help - the source is decoded at full size first. Use a 1080p source, or raise rk_video_cma= (e.g. rk_video_cma=512M) in the bootargs.' \
+				"${S_W:-0}" "${S_H:-0}" "$cma_mb"
+			return 1
+		fi
 	fi
 	codec="$S_CODEC"; pix="$S_PIX"; dur_src="$S_DUR"; acodec="$S_ACODEC"
 	stype="$S_STYPE"; live="$S_LIVE"
@@ -875,9 +947,24 @@ do_run() {
 	case "$container" in mp4|mkv|ts|gif) ;; *) container="mp4" ;; esac
 	# a GIF has no audio track and no bitrate; frame rate comes from --gif-fps
 	if [ "$container" = "gif" ]; then audio="none"; fi
+	rs_aac="0"; rs_note=""
+	if [ "$resync" = "1" ] && [ "$container" != "gif" ]; then
+		# the audio half of a resync needs aresample=async (drift correction);
+		# without that filter only the video timestamps can be rebuilt
+		if "$FFMPEG_HW" -hide_banner -filters 2>/dev/null | grep -q " aresample "; then
+			rs_aac="1"
+			audio="aac"
+			rs_note='Resync: constant frame rate and regenerated timestamps, audio re-encoded and drift-corrected'
+		else
+			rs_note='Resync: this ffmpeg-rkrga has no aresample filter, so only the video timestamps are rebuilt (the audio keeps its own timing)'
+		fi
+	fi
 
 	# audio: auto-fix copy when the container cannot hold the codec
 	notice=""; notice_args=""
+	if [ -n "$rz_note" ]; then notice="$rz_note"; notice_args="$rz_args"
+	elif [ -n "$rs_note" ]; then notice="$rs_note"; notice_args=""
+	fi
 	if [ "$audio" = "copy" ] && [ "$container" = "mp4" ] && [ -n "$acodec" ]; then
 		case "$acodec" in
 			aac|mp3|ac3|eac3|alac|mp2) ;;
@@ -953,7 +1040,8 @@ do_run() {
 	# effects / logo / pip / join: hand them to the worker through a file
 	{
 		printf '%s\n' "$effect" "$logo" "$logopos" "$logosize" "$logoalpha" \
-			"$pip" "$pippos" "$pipscale" "$join2" "$giffps"
+			"$pip" "$pippos" "$pipscale" "$join2" "$giffps" "$resync" "$rs_aac" \
+			"$(fps_snap "${S_FPS:-0}")"
 	} > "$OPTS"
 
 	# the worker inherits the notice (it cannot re-derive it)
@@ -989,12 +1077,16 @@ do_worker() {
 	# effects / logo / pip / join (written by do_run, see $OPTS)
 	FX_EFFECT="none"; FX_LOGO=""; FX_LOGOPOS="tr"; FX_LOGOSIZE=""; FX_LOGOALPHA="200"
 	FX_PIP=""; FX_PIPPOP="br"; FX_PIPSCALE="30"; FX_JOIN=""; FX_GIFFPS="12"
+	FX_RESYNC="0"; FX_RS_AAC="0"; FX_FPS="0"
 	if [ -f "$OPTS" ]; then
 		{ IFS= read -r FX_EFFECT; IFS= read -r FX_LOGO; IFS= read -r FX_LOGOPOS
 		  IFS= read -r FX_LOGOSIZE; IFS= read -r FX_LOGOALPHA; IFS= read -r FX_PIP
 		  IFS= read -r FX_PIPPOP; IFS= read -r FX_PIPSCALE; IFS= read -r FX_JOIN
-		  IFS= read -r FX_GIFFPS; } < "$OPTS" 2>/dev/null
+		  IFS= read -r FX_GIFFPS; IFS= read -r FX_RESYNC; IFS= read -r FX_RS_AAC
+		  IFS= read -r FX_FPS; } < "$OPTS" 2>/dev/null
 	fi
+	[ -n "$FX_RESYNC" ] || FX_RESYNC=0
+	[ -n "$FX_RS_AAC" ] || FX_RS_AAC=0
 	[ -n "$FX_EFFECT" ] || FX_EFFECT="none"
 	[ -n "$FX_GIFFPS" ] || FX_GIFFPS=12
 
@@ -1067,6 +1159,30 @@ do_worker() {
 	fi
 	vopts="$venc"
 
+	# ---- resync: rebuild the video clock from the frame index ----------
+	# "plays fine, then after a few minutes the audio is off, seeking fixes it"
+	# is the timestamp-drift case: the container spreads the same frames over a
+	# slightly wrong timeline, so every player drifts against the audio clock
+	# until it re-anchors on a seek.  setpts=N/(fps*TB) puts frame n back at
+	# n/fps and -fps_mode cfr keeps the output constant; the audio gets
+	# aresample=async so it is glued to that clock instead of its own.
+	RSIN=""; RSOUT=""; RSPS=""
+	if [ "$FX_RESYNC" = "1" ]; then
+		RSIN="-fflags +genpts"
+		RSPS="$fps"
+		if [ "$RSPS" = "source" ] || [ -z "$RSPS" ]; then
+			ff_probe_v "$proto" "$in"
+			RSPS=$(fps_of "$S_FR")
+			# Snap to the nearest standard rate: a source whose timestamps
+			# drifted reports a rate that is off by the same factor (30 fps
+			# stretched by 2% reports 29.41) and keeping the measured value
+			# would reproduce the drift instead of removing it (measured:
+			# 20.400 s stayed 20.400 s).  Only snap within 5%.
+			RSPS=$(fps_snap "$RSPS")
+		fi
+		case "$RSPS" in ""|0) RSOUT="-fps_mode cfr" ;; *) RSOUT="-r $RSPS -fps_mode cfr" ;; esac
+	fi
+
 	# ---- ONE video filter chain: resolution + effect + gif/logo/pip ----
 	# chain_add keeps the commas right; every piece must be space free
 	VCH=""
@@ -1086,10 +1202,24 @@ do_worker() {
 			fi
 			chain_add "format=gray,format=yuv420p" ;;
 	esac
+	if [ -n "$RSPS" ]; then
+		chain_add "setpts=N/($RSPS*TB)"
+	elif [ "$FX_EFFECT" != "none" ] && [ "$(awk -v v="$FX_FPS" 'BEGIN{print (v+0>1)?1:0}')" = "1" ]; then
+		# The RGA / hwdownload stages break the frame timing of a .ts input
+		# (measured: 180 frames of a 6.017 s slice came out as 10.733 s with the
+		# grey chain and 6.183 s with vpp_rkrga).  Re-time by frame index - the
+		# frame count is untouched, only the timestamps are put back.
+		chain_add "setpts=N/($FX_FPS*TB)"
+	fi
 	if [ "$container" = "gif" ]; then
 		if [ "$mode" = "hw" ]; then
-			# RGA does NV12 -> BGRA in hardware, only the gif writer is software
-			chain_add "scale_rkrga=format=bgra"
+			# RGA does the colour conversion in hardware, only the gif writer is
+			# software.  When the scaling pass is already there, ask it for BGRA
+			# directly instead of running the RGA twice per frame.
+			case "$VCH" in
+				scale_rkrga=w=*format=nv12*) VCH=$(printf '%s' "$VCH" | sed 's/format=nv12/format=bgra/') ;;
+				*) chain_add "scale_rkrga=format=bgra" ;;
+			esac
 			chain_add "hwdownload,format=bgra"
 		else
 			chain_add "format=bgra"
@@ -1114,24 +1244,54 @@ do_worker() {
 				*)  lx="W-w-20"; ly="H-h-20" ;;
 			esac
 			lsz=""; [ -n "$FX_LOGOSIZE" ] && lsz="scale=$FX_LOGOSIZE,"
-			FC="$FC;[1:v]${lsz}format=rgba[lg];[v0][lg]overlay=x=$lx:y=$ly:format=yuv420p:eof_action=repeat[v]"
+			# NOTE: overlay's 'format' option takes yuv420/yuv422/yuv444/rgb/
+			# gbrp/auto - NOT the pixel format name yuv420p (measured:
+			# "Undefined constant or missing '(' in 'yuv420p'").  Leave it out
+			# and let it negotiate, the chain above already delivers yuv420p.
+			FC="$FC;[1:v]${lsz}format=rgba[lg];[v0][lg]overlay=x=$lx:y=$ly:eof_action=repeat[v]"
 		else
-			case "$FX_PIPPOS" in
-				side) FC="$FC;[1:v]format=yuv420p[p1];[v0][p1]hstack=inputs=2[v]" ;;
-				top)  FC="$FC;[1:v]format=yuv420p[p1];[v0][p1]vstack=inputs=2[v]" ;;
+			# the stack modes need a matching dimension: hstack wants equal
+			# heights, vstack equal widths, so bring the second input to the
+			# main's geometry before stacking
+			mmh="${srch:-0}"; mmw="${srcw:-0}"
+			case "$res" in
+				""|source|src|srcsize) ;;
+				*x*|*X*) mmw="${res%%[xX]*}"; mmh="${res##*[xX]}" ;;
+				*) mmh="${res%p}"
+				   if [ "${mmw:-0}" -gt 0 ] 2>/dev/null && [ "${mmh:-0}" -gt 0 ] 2>/dev/null; then
+					mmw=$(awk -v w="$mmw" -v h="$mmh" -v sh="$srch" 'BEGIN{ if (sh+0>0) printf "%.0f", w*h/sh; else print w }')
+				   fi ;;
+			esac
+			case "$FX_PIPPOP" in
+				side)
+					FC="$FC;[1:v]scale=w=-2:h=${mmh:-ih},format=yuv420p[p1];[v0][p1]hstack=inputs=2[v]" ;;
+				top)
+					FC="$FC;[1:v]scale=w=${mmw:-iw}:h=-2,format=yuv420p[p1];[v0][p1]vstack=inputs=2[v]" ;;
 				*)
-					case "$FX_PIPPOS" in
+					case "$FX_PIPPOP" in
 						tl) px="20"; py="20" ;;
 						tr) px="W-w-20"; py="20" ;;
 						bl) px="20"; py="H-h-20" ;;
 						*)  px="W-w-20"; py="H-h-20" ;;
 					esac
-					# --pip-scale = percentage of the main width
-					FC="$FC;[1:v]scale=w=iw*$FX_PIPSCALE/100:h=-2,format=yuv420p[p1];[v0][p1]overlay=x=$px:y=$py:format=yuv420p:eof_action=repeat[v]"
+					FC="$FC;[1:v]scale=w=iw*$FX_PIPSCALE/100:h=-2,format=yuv420p[p1];[v0][p1]overlay=x=$px:y=$py:eof_action=repeat[v]"
 					;;
 			esac
 		fi
+		# hstack/vstack deadlock the mp4 muxer on this build (measured: the
+		# picture is written but ffmpeg never exits and the file has no moov),
+		# while matroska and mpegts are fine - so the stack modes mux to mkv
+		# first and are remuxed with -c copy afterwards.
+		case "$FX_PIPPOP" in
+			side|top) [ -n "$FX_PIP" ] && STACK=1 ;;
+		esac
 		vopts="$vopts -pix_fmt yuv420p -filter_complex $FC -map [v]"
+		# hstack/vstack also wreck the output rate on this build (measured:
+		# r_frame_rate 16000/1, ~50 fps of duplicated frames for a 30 fps
+		# source): put it back to the source rate
+		if [ "$STACK" = "1" ] && [ "$(awk -v v="$FX_FPS" 'BEGIN{print (v+0>1)?1:0}')" = "1" ]; then
+			vopts="$vopts -r $FX_FPS -fps_mode cfr"
+		fi
 		[ "$audio" != "none" ] && vopts="$vopts -map 0:a?"
 	else
 		if [ "$mode" = "hw" ] && [ "$container" != "gif" ] && [ "$FX_EFFECT" != "gray" ]; then
@@ -1153,8 +1313,19 @@ do_worker() {
 		none) aopts="-an" ;;
 		aac)  aopts="-c:a aac -b:a 128k" ;;
 	esac
+	if [ "$FX_RESYNC" = "1" ] && [ "$audio" != "none" ]; then
+		# aresample=async rebuilds the audio clock: it inserts/drops samples so
+		# the audio stays glued to the (regenerated) video timestamps, and
+		# first_pts=0 removes a leading offset.  Without that filter only the
+		# re-encode happens (the notice already told the user).
+		if [ "$FX_RS_AAC" = "1" ]; then
+			aopts="-c:a aac -b:a 128k -af aresample=async=1:first_pts=0"
+		else
+			aopts="-c:a aac -b:a 128k"
+		fi
+	fi
 	case "$container" in
-		mp4) copts="-movflags +faststart -f mp4" ;;
+		mp4) [ "$STACK" = "1" ] && copts="-f matroska" || copts="-movflags +faststart -f mp4" ;;
 		mkv) copts="-f matroska" ;;
 		ts)  copts="-f mpegts" ;;
 		gif) copts="-loop 0 -f gif" ;;
@@ -1177,6 +1348,7 @@ do_worker() {
 		-rw_timeout "$NET_TIMEOUT_US"
 	[ -n "$hwopt" ] && set -- "$@" $hwopt
 	[ -n "$extra" ] && set -- "$@" $extra
+	[ -n "$RSIN" ] && set -- "$@" $RSIN
 	[ -n "$ssopt" ] && set -- "$@" $ssopt
 	if [ "$mode" = "hw" ] && [ -n "$dec" ]; then
 		set -- "$@" -c:v "$dec"
@@ -1194,8 +1366,16 @@ do_worker() {
 	# shellcheck disable=SC2086
 	[ "$container" != "gif" ] && set -- "$@" $aopts
 	[ -n "$d_opt" ] && set -- "$@" $d_opt
-	# shellcheck disable=SC2086
-	set -- "$@" $copts "$out"
+	[ -n "$RSOUT" ] && set -- "$@" $RSOUT
+	STACK_MUX=""
+	if [ "$STACK" = "1" ] && [ "$container" = "mp4" ]; then
+		STACK_MUX="$out.stack.mkv"
+		set -- "$@" $copts "$STACK_MUX"
+	else
+		# shellcheck disable=SC2086
+		set -- "$@" $copts "$out"
+	fi
+	STALL_SEC=${VPU_STALL_SEC:-60}
 	"$@" >>"$LOG" 2>&1 &
 	fpid=$!
 	echo "$fpid" > "$PIDF"
@@ -1237,10 +1417,38 @@ do_worker() {
 			last_log=$st_elapsed
 		fi
 		write_status "$st_reason_args"
+		# A stalled VPU produces no frame at all (a 4K stream on a board with a
+		# small CMA, or a source that stops delivering after the header): the
+		# progress would sit at 0.0% for ever.  Fail with the reason instead.
+		if [ "$st_elapsed" -ge "$STALL_SEC" ] && [ "${ot:-0}" -le 0 ] && [ "${st_outsize:-0}" -le 0 ]; then
+			kill -9 "$fpid" 2>/dev/null
+			# do NOT wait: a child stuck inside the kernel never reaps, and a
+			# blocking wait would leave the job "running" for ever
+			sw=0
+			while kill -0 "$fpid" 2>/dev/null && [ "$sw" -lt 5 ]; do
+				sleep 1; sw=$((sw + 1))
+			done
+			cma_kb=$(awk '/^CmaTotal:/{print $2}' /proc/meminfo 2>/dev/null)
+			st_state="error"; st_progress=0; st_speed=""; st_fpsval=""
+			st_error='Nothing was decoded in %ss: the hardware decoder never got a frame. A 4K stream needs about 300 MB of contiguous DMA memory and the video pool is %s MB - if the log shows mpp_dma_heap "alloc failed" the pool was full (another process holding it, or a bigger stream), otherwise the source stopped delivering data. Use a 1080p source, enlarge rk_video_cma= in the bootargs, or check the stream.'
+			st_error_args=$(tjoin "$st_elapsed" "$(video_pool_mb)")
+			st_detail=""; st_detail_args=""
+			add_history "error"
+			log_ev "$st_error" "$st_error_args"
+			write_status "$st_reason_args"
+			rm -f "$PIDF"
+			exit 0
+		fi
 		sleep 2
 	done
 
 	wait "$fpid"; rc=$?
+	if [ -n "$STACK_MUX" ] && [ "$rc" = "0" ] && [ -s "$STACK_MUX" ]; then
+		"$FFMPEG_HW" -y -hide_banner -loglevel warning -i "$STACK_MUX" -c copy \
+			-movflags +faststart -f mp4 "$out" >> "$LOG" 2>&1
+		rc=$?
+		[ "$rc" = "0" ] && rm -f "$STACK_MUX"
+	fi
 	st_elapsed=$(( $(date +%s) - start_ts ))
 
 	stopped=0
@@ -1677,6 +1885,31 @@ clu_okjob() { # job id is generated by us; never let it walk out of the tree
 # node side
 # ---------------------------------------------------------------------------
 
+clu_okaddr() { # ip or host[:port]
+	case "$1" in
+		""|*[!0-9a-zA-Z.:-]*) return 1 ;;
+		*..*) return 1 ;;
+	esac
+	[ "${#1}" -le 64 ]
+}
+
+# fresh announcements = boxes that pinged us within 3 intervals
+roster_ips() {
+	rnow=$(date +%s)
+	riv=$(clu_conf interval); [ -n "$riv" ] || riv=15
+	rfresh=$((riv * 3))
+	rme=$(clu_lan_ip)
+	for rf in "$ROSTER"/*; do
+		[ -f "$rf" ] || continue
+		IFS="$TAB" read -r rts _ _ _ < "$rf" 2>/dev/null
+		[ -n "$rts" ] || continue
+		[ $((rnow - rts)) -le "$rfresh" ] || continue
+		rip=$(basename "$rf")
+		[ "$rip" = "$rme" ] && continue
+		printf '%s ' "$rip"
+	done
+}
+
 clu_node_dir() { printf '%s/%s' "$CLU_NODE_ROOT" "$1"; }
 # one directory per (job, slice): a node may carry several slices of the same
 # job (more segments than workers), and they must not share out.ts
@@ -1716,7 +1949,29 @@ clu_encode() { # <in> <out> <prog> <ss> <dur> <quality> <qp> <br> <enc> <res> <s
 	# hw path = DRM prime zero copy: -pix_fmt must NOT be added (see the notes
 	# at the top of this file - it costs 4x the speed on this SoC)
 	[ "$cmode" = "hw" ] || cvopts="$cvopts -pix_fmt yuv420p"
-	[ -n "$R_VF" ] && cvopts="$cvopts -vf $R_VF"
+	# one chain: scaling + effect (same pieces as do_worker)
+	CVC=""
+	chain_add() { if [ -z "$CVC" ]; then CVC="$1"; else CVC="$CVC,$1"; fi; }
+	[ -n "$R_VF" ] && chain_add "$R_VF"
+	# a .ts slice loses its frame timing through the RGA/hwdownload stages, so
+	# re-time by frame index as soon as an effect is in the chain
+	case "${CLU_EFFECT:-none}" in
+		none|"") ;;
+		*) cefps="${CLU_FPS:-}"
+		   [ -n "$cefps" ] || cefps=$(fps_of "$S_FR")
+		   [ "$(awk -v v="$cefps" 'BEGIN{print (v+0>1)?1:0}')" = "1" ] && chain_add "setpts=N/($cefps*TB)" ;;
+	esac
+	case "${CLU_EFFECT:-none}" in
+		hflip)    chain_add "vpp_rkrga=transpose=hflip:format=nv12" ;;
+		vflip)    chain_add "vpp_rkrga=transpose=vflip:format=nv12" ;;
+		reversal) chain_add "vpp_rkrga=transpose=reversal:format=nv12" ;;
+		rot90)    chain_add "vpp_rkrga=transpose=clock:format=nv12" ;;
+		rot270)   chain_add "vpp_rkrga=transpose=cclock:format=nv12" ;;
+		gray)
+			[ "$cmode" = "hw" ] && chain_add "hwdownload,format=nv12"
+			chain_add "format=gray,format=yuv420p" ;;
+	esac
+	[ -n "$CVC" ] && cvopts="$cvopts -vf $CVC"
 	[ -n "$cfps" ] && [ "$cfps" != "source" ] && cvopts="$cvopts -r $cfps"
 	case "$caudio" in
 		none) caopts="-an" ;;
@@ -1772,6 +2027,8 @@ node_job() { # <job> <i> <src> <ss> <dur> <quality> <qp> <br> <enc> <res> <scale
 	njob="$1"; ni="$2"; nsrc="$3"; nss="$4"; ndur="$5"
 	nq="$6"; nqp="$7"; nbr="$8"; nenc="$9"; nres="${10}"; nsc="${11}"; naudio="${12}"; nfps="${13}"
 	CLU_SEEKMODE="${14:-}"; export CLU_SEEKMODE
+	CLU_EFFECT="${15:-none}"; export CLU_EFFECT
+	CLU_FPS="${16:-}"; export CLU_FPS
 	nd=$(clu_seg_dir "$njob" "$ni")
 	mkdir -p "$nd" || return 1
 	nprog="$nd/prog"
@@ -1845,11 +2102,24 @@ do_node() { # $1 = raw CGI query string -> HTTP response on stdout
 			"$(qs_get "$nq_str" ss)" "$(qs_get "$nq_str" dur)" \
 			"$(qs_get "$nq_str" q)" "$(qs_get "$nq_str" qp)" "$(qs_get "$nq_str" br)" \
 			"$(qs_get "$nq_str" enc)" "$(qs_get "$nq_str" res)" "$(qs_get "$nq_str" scaler)" \
-			"$(qs_get "$nq_str" audio)" "$(qs_get "$nq_str" fps)" "$(qs_get "$nq_str" sm)" ) \
+			"$(qs_get "$nq_str" audio)" "$(qs_get "$nq_str" fps)" "$(qs_get "$nq_str" sm)" \
+			"$(qs_get "$nq_str" fx)" "$(qs_get "$nq_str" srcfps)" ) \
 			</dev/null >/dev/null 2>&1 &
 		node_hdr "application/json"
 		printf '{"ok":true,"job":%s,"i":%s}\n' "$(jstr "$njob")" "$(qs_get "$nq_str" i)"
 		;;
+	announce)
+		# a follower saying "I am here and this busy" - no job involved
+		nme=$(qs_get "$nq_str" me)
+		clu_okaddr "$nme" || node_die "400 Bad Request" "bad node address"
+		node_hdr "application/json"
+		mkdir -p "$ROSTER" 2>/dev/null
+		printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$(qs_get "$nq_str" ver)" \
+			"$(qs_get "$nq_str" cpus)" "$(qs_get "$nq_str" busy)" > "$ROSTER/$nme" 2>/dev/null
+		niv=$(clu_conf interval | tr -cd "0-9")
+		[ -n "$niv" ] || niv=15
+		printf '{"ok":true,"master":"%s","interval":%s}\n' "$(clu_lan_ip)" "$niv"
+		return 0 ;;
 	status)
 		clu_okjob "$njob" || node_die "400 Bad Request" "bad job id"
 		nd=$(clu_seg_dir "$njob" "$(qs_get "$nq_str" i)")
@@ -1923,24 +2193,42 @@ clu_slot_remote() { # <job> <node> <i-list...>
 		slot_fps=$(printf '%s' "$slot_ln" | cut -f12)
 		slot_sm=$(printf '%s' "$slot_ln" | cut -f13)
 		[ -n "$slot_sm" ] || slot_sm="in"
+		slot_fx=$(printf '%s' "$slot_ln" | cut -f14)
+		[ -n "$slot_fx" ] || slot_fx="none"
+		slot_fps_src=$(printf '%s' "$slot_ln" | cut -f15)
 
 		clu_mark "$slot_job" "$slot_i" running 0 "$slot_node"
 		# ONE argument: curl would treat further arguments as extra URLs
 		slot_url="$slot_base?action=start&token=$slot_tok&job=$slot_job&i=$slot_i"
 		slot_url="$slot_url&b64src=$(b64e "$slot_src")&ss=$slot_ss&dur=$slot_du"
 		slot_url="$slot_url&q=$slot_q&qp=$slot_qp&br=$slot_br&enc=$slot_enc"
-		slot_url="$slot_url&res=$slot_res&scaler=$slot_sc&audio=$slot_au&fps=$slot_fps&sm=$slot_sm"
+		slot_url="$slot_url&res=$slot_res&scaler=$slot_sc&audio=$slot_au&fps=$slot_fps&sm=$slot_sm&fx=$slot_fx&srcfps=$slot_fps_src"
 		slot_r=$(curl -s -m 20 "$slot_url" 2>/dev/null)
 		case "$slot_r" in
 			*'"ok":true'*) ;;
 			*) clu_mark "$slot_job" "$slot_i" error 0 "$slot_node"; continue ;;
 		esac
-		# poll until this node reports a terminal state
+		# poll until this node reports a terminal state.  'unknown' means the
+		# node lost the job directory: retry a few times, then fail that slice
+		# instead of polling forever (measured: a stale clean made the whole
+		# job hang at 0% indefinitely).
+		slot_miss=0
 		while :; do
-			[ -f "$STOPFLAG" ] && { CURL_STOP=1; break; }
+			[ -f "$STOPFLAG" ] && break
 			slot_s=$(curl -s -m 10 "$slot_base?action=status&token=$slot_tok&job=$slot_job&i=$slot_i" 2>/dev/null)
 			slot_st=$(printf '%s' "$slot_s" | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p')
 			slot_pc=$(printf '%s' "$slot_s" | sed -n 's/.*"pct":\([0-9.]*\).*/\1/p')
+			case "$slot_st" in
+				unknown|"")
+					slot_miss=$((slot_miss + 1))
+					if [ "$slot_miss" -ge 5 ]; then
+						clu_mark "$slot_job" "$slot_i" error 0 "$slot_node"
+						break
+					fi
+					sleep 2
+					continue ;;
+			esac
+			slot_miss=0
 			clu_mark "$slot_job" "$slot_i" "${slot_st:-running}" "${slot_pc:-0}" "$slot_node"
 			case "$slot_st" in
 				done)  break ;;
@@ -1979,11 +2267,16 @@ clu_slot_local() { # <job> <i-list...>  - this box encodes its own slice
 		slot_fps=$(printf '%s' "$slot_ln" | cut -f12)
 		slot_sm=$(printf '%s' "$slot_ln" | cut -f13)
 		[ -n "$slot_sm" ] || slot_sm="in"
+		slot_fx=$(printf '%s' "$slot_ln" | cut -f14)
+		[ -n "$slot_fx" ] || slot_fx="none"
+		slot_fps_src=$(printf '%s' "$slot_ln" | cut -f15)
 		slot_prog="$CLU_ROOT/$slot_job/prog$slot_i.prog"
 		slot_out="$CLU_ROOT/$slot_job/out/seg$slot_i.ts"
 
 		clu_mark "$slot_job" "$slot_i" running 0 "local"
 		CLU_SEEKMODE="$slot_sm"; export CLU_SEEKMODE
+		CLU_EFFECT="$slot_fx"; export CLU_EFFECT
+		CLU_FPS="$slot_fps_src"; export CLU_FPS
 		clu_encode "$slot_src" "$slot_out" "$slot_prog" "$slot_ss" "$slot_du" \
 			"$slot_q" "$slot_qp" "$slot_br" "$slot_enc" "$slot_res" "$slot_sc" "$slot_au" "$slot_fps" &
 		slot_pid=$!
@@ -2040,6 +2333,52 @@ clu_status_write() { # <job> <i> <n> <state> : aggregate rows for the UI
 	mv "$CLU_STATUS.tmp" "$CLU_STATUS" 2>/dev/null
 }
 
+do_roster() { # JSON: who announced itself recently
+	rnow=$(date +%s)
+	riv=$(clu_conf interval); [ -n "$riv" ] || riv=15
+	rfresh=$((riv * 3))
+	rme=$(clu_lan_ip)
+	first=1
+	printf '{"ok":true,"me":"%s","interval":%s,"nodes":[' "$rme" "$riv"
+	for rf in "$ROSTER"/*; do
+		[ -f "$rf" ] || continue
+		IFS="$TAB" read -r rts rver rcpu rbusy < "$rf" 2>/dev/null
+		[ -n "$rts" ] || continue
+		rage=$((rnow - rts))
+		[ "$rage" -le "$rfresh" ] || continue
+		rip=$(basename "$rf")
+		[ "$rip" = "$rme" ] && continue
+		[ "$first" = "1" ] || printf ','
+		first=0
+		printf '{"node":"%s","age":%s,"ver":"%s","cpus":%s,"busy":%s}' \
+			"$rip" "$rage" "$rver" "${rcpu:-0}" "${rbusy:-0}"
+	done
+	printf ']}\n'
+}
+
+# follower side: tell the master we are here, forever (procd keeps us alive)
+do_beacon() {
+	bmas=$(clu_conf master)
+	btok=$(clu_conf token)
+	biv=$(clu_conf interval); [ -n "$biv" ] || biv=15
+	if [ -z "$bmas" ]; then
+		echo '{"ok":false,"error":"this box has no master configured: it IS the master (or standalone)"}'
+		return 0
+	fi
+	[ -n "$btok" ] || { fail 'Cluster is not configured: set a shared token first'; return 1; }
+	bme=$(clu_lan_ip)
+	bbase=$(clu_url "$bmas")
+	printf 'beacon: announcing %s to %s every %ss\n' "$bme" "$bmas" "$biv"
+	while :; do
+		bbusy=0
+		case "$(cat "$STATE" 2>/dev/null)" in *'"state":"running"'*) bbusy=1 ;; esac
+		curl -s -m 5 -o /dev/null \
+			"$bbase?action=announce&token=$btok&me=$bme&ver=$VERSION&cpus=$(nproc 2>/dev/null || echo 0)&busy=$bbusy" \
+			2>/dev/null
+		sleep "$biv"
+	done
+}
+
 do_cluster_status() {
 	if [ -f "$CLU_STATUS" ]; then
 		cat "$CLU_STATUS" 2>/dev/null
@@ -2076,24 +2415,21 @@ do_clusterlist() {
 
 # cluster settings: the UI cannot write /etc/config itself (rpcd ACL)
 do_cluster_cfg() {
-	cc_tok=$(clu_conf token)
-	cc_seg=$(clu_conf segments)
-	cc_wd=$(clu_conf workdir)
-	cc_loc=$(clu_conf local)
-	printf '{"ok":true,"token":%s,"segments":%s,"workdir":%s,"local":%s,"nodes":[' \
-		"$(jstr "$cc_tok")" "${cc_seg:-0}" "$(jstr "$cc_wd")" "${cc_loc:-1}"
-	cfirst=1
-	for cn in $(clu_conf node); do
-		[ -n "$cn" ] || continue
-		[ "$cfirst" = "1" ] || printf ','
-		cfirst=0
-		printf '%s' "$(jstr "$cn")"
-	done
-	printf ']}\n'
+	printf '{"ok":true,"token": %s,"segments":%s,"workdir":%s,"local":%s,"master":%s,"follow":%s,"interval":%s,"nodes":[%s]}\n' \
+		"$(jstr "$(clu_conf token)")" \
+		"$(clu_conf segments | tr -cd "0-9")" \
+		"$(jstr "$(clu_conf workdir)")" \
+		"$(clu_conf local | tr -cd "0-9")" \
+		"$(jstr "$(clu_conf master)")" \
+		"$(clu_conf follow | tr -cd "0-9")" \
+		"$(clu_conf interval | tr -cd "0-9")" \
+		"$(clu_conf node | awk '$0 != "" {if (o != "") o = o ","; o = o "\"" $0 "\""} END{printf "%s", o}')" 
 }
+
 
 do_cluster_set() {
 	cs_tok=""; cs_seg=""; cs_wd=""; cs_loc=""; cs_nodes=""; cs_have_nodes=0
+	cs_mas=""; cs_mas_set=0; cs_fol=""; cs_iv=""
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			--token)    shift; cs_tok="$1" ;;
@@ -2101,6 +2437,9 @@ do_cluster_set() {
 			--workdir)  shift; cs_wd="$1" ;;
 			--local)    shift; cs_loc="$1" ;;
 			--nodes)    shift; cs_nodes="$1"; cs_have_nodes=1 ;;
+			--master)   shift; cs_mas="$1"; cs_mas_set=1 ;;
+			--follow)   shift; cs_fol="$1" ;;
+			--interval) shift; cs_iv="$1" ;;
 		esac
 		shift
 	done
@@ -2111,6 +2450,9 @@ do_cluster_set() {
 	[ -n "$cs_tok" ] && uci -q set vputrans.cluster.token="$cs_tok"
 	[ -n "$cs_seg" ] && uci -q set vputrans.cluster.segments="$cs_seg"
 	[ -n "$cs_loc" ] && uci -q set vputrans.cluster.local="$cs_loc"
+	[ "$cs_mas_set" = "1" ] && uci -q set vputrans.cluster.master="$cs_mas"
+	[ -n "$cs_fol" ] && uci -q set vputrans.cluster.follow="$cs_fol"
+	case "$cs_iv" in ''|*[!0-9]*) ;; *) uci -q set vputrans.cluster.interval="$cs_iv" ;; esac
 	uci -q set vputrans.cluster.workdir="$cs_wd"
 	if [ "$cs_have_nodes" = "1" ]; then
 		uci -q delete vputrans.cluster.node 2>/dev/null
@@ -2119,6 +2461,11 @@ do_cluster_set() {
 		done
 	fi
 	uci -q commit vputrans 2>/dev/null
+	# the beacon is a procd service: restart it so a changed master/interval
+	# takes effect immediately instead of on the next boot
+	if [ -x /etc/init.d/vputrans ]; then
+		/etc/init.d/vputrans restart >/dev/null 2>&1
+	fi
 	printf '{"ok":true,"token_set":%s}\n' "$([ -n "$(clu_conf token)" ] && printf true || printf false)"
 }
 
@@ -2142,7 +2489,7 @@ do_cluster() {
 	cin=""; cout=""; cquality="cbr"; cbr=""; cqp=""; cenc="h264"; cres="source"
 	cscaler="bicubic"; caudio="copy"; ccontainer="auto"; cfps="source"
 	cnodes=""; cnodes_set=0; csegs=""; clocal=""
-	css_off="0"; cdur_len="0"
+	css_off="0"; cdur_len="0"; ceffect="none"
 
 	while [ $# -gt 0 ]; do
 		case "$1" in
@@ -2157,6 +2504,7 @@ do_cluster() {
 			--audio|-a)   shift; caudio="$1" ;;
 			--container|-f) shift; ccontainer="$1" ;;
 			--ss)         shift; css_off="$1" ;;
+			--effect)     shift; ceffect="$1" ;;
 			--dur|-t)     shift; cdur_len="$1" ;;
 			--nodes)      shift; cnodes="$1"; cnodes_set=1 ;;
 			--segments)   shift; csegs="$1" ;;
@@ -2172,6 +2520,14 @@ do_cluster() {
 	ctok=$(clu_conf token)
 	[ -n "$ctok" ] || { fail 'Cluster is not configured: set a shared token first'; return 1; }
 	[ "$cnodes_set" = "1" ] || cnodes=$(clu_conf node)
+	# nothing configured -> use whoever announced itself to us (a follower with
+	# `option master <this box>` + the beacon running).  This is the "start on
+	# one box, the others follow" path: no node list to maintain anywhere.
+	cwchk=0
+	for cnull in $cnodes; do [ -n "$cnull" ] && cwchk=$((cwchk + 1)); done
+	if [ "$cwchk" = "0" ]; then
+		cnodes=$(roster_ips)
+	fi
 	[ -n "$clocal" ] || clocal=$(clu_conf local)
 	[ -n "$clocal" ] || clocal=1
 	[ -n "$csegs" ] || csegs=$(clu_conf segments)
@@ -2190,6 +2546,51 @@ do_cluster() {
 		return 1
 	fi
 	cdur_src="$S_DUR"; clive="$S_LIVE"; cstype="$S_STYPE"
+
+	# ---- encoding settings: validate, then apply the same defaults as a
+	# normal job.  The form's default bitrate is "follow the source", which
+	# arrives here as an EMPTY --bitrate: without this every worker would run
+	# `-b:v` with no value (measured: the whole job dies on the first slice).
+	case "$cquality" in
+		cbr|crf) ;;
+		*) fail 'Unknown quality mode: %s' "$cquality"; return 1 ;;
+	esac
+	[ -n "$(enc_of "$cenc")" ] || { fail 'Unsupported encoder: %s (this SoC only has H.264/H.265 hardware encoders)' "$cenc"; return 1; }
+	case "$cscaler" in
+		bicubic|bilinear|lanczos) ;;
+		*) fail 'Unknown scaler: %s' "$cscaler"; return 1 ;;
+	esac
+	case "$caudio" in
+		copy|none|aac) ;;
+		*) fail 'Unknown audio mode: %s' "$caudio"; return 1 ;;
+	esac
+	case "$ccontainer" in
+		auto|mp4|mkv|ts) ;;
+		gif) fail 'A GIF is a single-file output, it cannot be split across boxes'; return 1 ;;
+		*) fail 'Unknown container: %s' "$ccontainer"; return 1 ;;
+	esac
+	case "$cfps" in
+		source|"") cfps="source" ;;
+		*[!0-9.]*) fail 'Invalid frame rate: %s (a number or "source")' "$cfps"; return 1 ;;
+	esac
+	if ! res_ok "$cres"; then fail 'Invalid resolution: %s' "$cres"; return 1; fi
+
+	if [ "${S_H:-0}" -gt 1080 ] 2>/dev/null; then
+		cmb=$(video_pool_mb)
+		[ "${cmb:-0}" -lt 300 ] && {
+			fail 'This source is %sx%s: decoding it needs about 300 MB of contiguous DMA memory and the video pool is only %s MB, so the VPU never gets its buffers. Downscaling does not help. Use a 1080p source, or raise rk_video_cma= (e.g. rk_video_cma=512M) in the bootargs.' \
+				"${S_W:-0}" "${S_H:-0}" "$cmb"
+			return 1; }
+	fi
+	[ -n "$cqp" ] || cqp=26
+	if [ "$cquality" = "cbr" ] && [ -z "$cbr" ]; then
+		if [ "$(awk -v v="${S_VBR:-${S_BR:-0}}" 'BEGIN{print (v+0>0)?1:0}')" = "1" ]; then
+			cbr="$(( ${S_VBR:-$S_BR} / 1000 ))k"
+			[ "${cbr%k}" -lt 100 ] 2>/dev/null && cbr="100k"
+		else
+			cbr="2M"
+		fi
+	fi
 	[ "$clive" = "true" ] && { fail 'A live stream cannot be split across boxes'; return 1; }
 
 	cwork=$(clu_conf workdir); [ -n "$cwork" ] || cwork="$CLU_ROOT"
@@ -2217,7 +2618,7 @@ do_cluster() {
 	{
 		printf '%s\n' "$cin" "$cout" "$cquality" "${cqp:-26}" "${cbr:-}" "$cenc" "$cres" \
 			"$cscaler" "$caudio" "$ccontainer" "$cfps" "$csegs" "$clocal" "$cwork" "$cjob" \
-			"${css_off:-0}" "${cdur_len:-0}"
+			"${css_off:-0}" "${cdur_len:-0}" "$ceffect"
 		printf '%s\n' "$cnodes"
 	} > "$cwork/$cjob/meta"
 	( exec "$0" __cluster "$cwork" "$cjob" ) </dev/null >/dev/null 2>&1 &
@@ -2234,16 +2635,22 @@ do_cluster_worker() { # <workdir> <job>
 	  IFS= read -r cbr; IFS= read -r cenc; IFS= read -r cres; IFS= read -r cscaler
 	  IFS= read -r caudio; IFS= read -r ccontainer; IFS= read -r cfps; IFS= read -r csegs
 	  IFS= read -r clocal; IFS= read -r cwork; IFS= read -r cjob2
-	  IFS= read -r css_off; IFS= read -r cdur_len
+	  IFS= read -r css_off; IFS= read -r cdur_len; IFS= read -r ceffect
 	  IFS= read -r cnodes; } < "$cmeta"
 	[ -n "$css_off" ] || css_off=0
 	[ -n "$cdur_len" ] || cdur_len=0
+	[ -n "$ceffect" ] || ceffect=none
 	ctok=$(clu_conf token)
 	start_ts=$(date +%s)
 	# the worker is a fresh process: the meta file carries the options, not the
 	# probed length, so measure it here (the segment plan depends on it)
 	cdur_src=$(ff_duration "$(proto_of "$cin")" "$cin")
 	[ -n "$cdur_src" ] || cdur_src=0
+	# the frame rate must come from the real source: a raw .ts slice has no
+	# trustworthy rate (measured: 6 s slices reported 18 and 8.7 fps, and the
+	# re-time step then stretched them to 10 s and 20.7 s)
+	ff_probe_v "$(proto_of "$cin")" "$cin"
+	csrc_fps=$(fps_snap "$(fps_of "$S_FR")")
 	# trim: the pieces cover [css_off, css_off+cdur_len] of the source
 	ceff=$(awk -v d="$cdur_src" -v o="$css_off" -v l="$cdur_len" 'BEGIN{
 		r = d - o; if (r < 0) r = 0
@@ -2297,9 +2704,9 @@ do_cluster_worker() { # <workdir> <job>
 		ci=0
 		while [ "$ci" -lt "$csegs" ]; do
 			css=$(awk -v l="$cseglen" -v i="$ci" -v o="$css_off" 'BEGIN{ printf "%.3f", o + l*i }')
-			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
 				"$((ci + 1))" "$cin" "$css" "$cseglen" "$cquality" "$cqp" "$cbr" "$cenc" \
-				"$cres" "$cscaler" "$caudio" "$cfps" "in" >> "$cm/plan"
+				"$cres" "$cscaler" "$caudio" "$cfps" "in" "$ceffect" "$csrc_fps" >> "$cm/plan"
 			printf '%s\t%s\n' "$((ci + 1))" "$cseglen" >> "$cm/seglen"
 			ci=$((ci + 1))
 		done
@@ -2377,10 +2784,10 @@ do_cluster_worker() { # <workdir> <job>
 				-f mpegts "$csf" >> "$LOG" 2>&1
 			[ -s "$csf" ] || continue
 			cnsegs=$((cnsegs + 1))
-			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
 				"$cnsegs" "$cbase?action=src&token=$ctok&job=$cjob&f=$(basename "$csf")" \
 				"$css" "$cdur" "$cquality" "$cqp" "$cbr" "$cenc" "$cres" "$cscaler" "$caudio" "$cfps" \
-				"out" >> "$cm/plan"
+				"out" "$ceffect" "$csrc_fps" >> "$cm/plan"
 			cfrom="$cto"
 		done
 	fi
@@ -2551,6 +2958,8 @@ case "$1" in
 	history) do_history ;;
 	__worker) shift; do_worker "$@" ;;
 	__join)   shift; do_join_worker "$@" ;;
+	beacon)   shift; do_beacon "$@" ;;
+	roster)   shift; do_roster "$@" ;;
 	*)
 		fail 'usage: vputrans {version|probe <src>|list|run <src> [opt]|status|stop|history|cluster <src> [opt]}'
 		exit 2

@@ -1,0 +1,41 @@
+From: Panther X2 Project <root@localhost>
+Subject: [PATCH] dma-heap: prefer the dedicated video CMA pool when present
+
+--- a/osal/allocator/allocator_dma_heap.c
++++ b/osal/allocator/allocator_dma_heap.c
+@@ -120,6 +120,35 @@
+ 
+     mpp_env_get_u32("dma_heap_debug", &dma_heap_debug, 0);
+ 
++    /*
++     * A kernel booted with rk_video_cma=<size> provides a dedicated CMA pool
++     * as /dev/dma_heap/{cma-uncached,cma}.  Prefer those for the uncached
++     * (type 0) and cached (type 2) buffers - that is where every VPU frame
++     * comes from - so the video pipeline works out of its own pool and other
++     * processes allocating dma-heap memory can no longer fragment it.  That
++     * fragmentation is what makes a 4K job die with "mpp_dma_heap: ioctl
++     * alloc failed" on a busy box.
++     * Without those heaps nothing changes: system-uncached / system stay the
++     * first choices and the usual flag-remap fallbacks still apply.
++     */
++    if (heap_infos[0].fd <= 0) {
++        int vpu_fd = try_open_path("cma-uncached");
++
++        if (vpu_fd > 0) {
++            heap_infos[0].fd = vpu_fd;
++            heap_infos[0].name = "cma-uncached";
++        }
++    }
++
++    if (heap_infos[2].fd <= 0) {
++        int vpu_fd = try_open_path("cma");
++
++        if (vpu_fd > 0) {
++            heap_infos[2].fd = vpu_fd;
++            heap_infos[2].name = "cma";
++        }
++    }
++
+     /* go through all heap first */
+     for (i = 0; i < MPP_ARRAY_ELEMS(heap_infos); i++) {
+         info = &heap_infos[i];

@@ -219,8 +219,8 @@ return view.extend({
 		var running = (st.state === 'running');
 
 		var el = {};
-		function inputOpts() { return { 'type': 'text', 'style': 'width:100%;box-sizing:border-box;padding:6px' }; }
-		function selectOpts() { return { 'style': 'width:100%;box-sizing:border-box;padding:6px' }; }
+		function inputOpts() { return { 'type': 'text', 'class': 'vpu-in', 'style': 'width:100%;box-sizing:border-box' }; }
+		function selectOpts() { return { 'class': 'vpu-in', 'style': 'width:100%;box-sizing:border-box' }; }
 
 		/* ---- source ----
 		 * Free-form text field: the user may type ANY local path or URL.
@@ -267,9 +267,13 @@ return view.extend({
 			[ _('Sources are hardware-decoded (H.264/HEVC/VP8/VP9) and encoded by the H.264/H.265 hardware encoder - the output codecs are the only two this SoC encodes in hardware') ]);
 		var resSel = E('select', selectOpts(), [
 			E('option', { value: 'source' }, [ _('Source size (no scaling)') ]),
+			E('option', { value: '240p' }, [ '240p' ]),
+			E('option', { value: '360p' }, [ '360p' ]),
 			E('option', { value: '480p' }, [ '480p' ]),
 			E('option', { value: '720p' }, [ '720p' ]),
-			E('option', { value: '1080p' }, [ '1080p' ])
+			E('option', { value: '1080p' }, [ '1080p' ]),
+			E('option', { value: '1440p' }, [ '1440p (2K)' ]),
+			E('option', { value: '2160p' }, [ '2160p (4K)' ])
 		]);
 		var fpsIn = E('input', Object.assign(inputOpts(), { value: 'source', placeholder: _('source or a number, e.g. 25') }));
 		var scalerSel = E('select', selectOpts(), [
@@ -298,11 +302,12 @@ return view.extend({
 		var probBox = E('div', { 'class': 'vpu-probe', id: 'vpu-probe' }, [ E('span', { 'class': 'vpu-dim' }, [ _('Enter a path or URL and the source is probed automatically.') ]) ]);
 		var barFill = E('div', { 'class': 'vpu-bar-fill', 'style': 'width:0%' });
 		var bar = E('div', { 'class': 'vpu-bar' }, [ barFill ]);
-		var statLine = E('div', { 'class': 'vpu-dim', id: 'vpu-stat' }, [ '' ]);
+		var statLine = E('div', { 'class': 'vpu-stats', id: 'vpu-stat' }, []);
+		var statMeta = E('div', { 'class': 'vpu-meta', id: 'vpu-meta' }, [ '' ]);
 		var logPre = E('pre', { 'class': 'vpu-log', id: 'vpu-log' }, [ '' ]);
 		var histBox = E('div', { 'class': 'vpu-hist', id: 'vpu-hist' }, [ E('span', { 'class': 'vpu-dim' }, [ _('No history yet.') ]) ]);
 
-		var btnRun = E('button', { 'class': 'btn cbi-button cbi-button-apply vpu-btn', id: 'vpu-btn-run' }, [ _('Start') ]);
+		var btnRun = E('button', { 'class': 'btn cbi-button vpu-btn vpu-btn-main', id: 'vpu-btn-run' }, [ _('Start transcoding') ]);
 		var btnStop = E('button', { 'class': 'btn cbi-button vpu-btn', id: 'vpu-btn-stop' }, [ _('Stop') ]);
 		var btnProbe = E('button', { 'class': 'btn cbi-button vpu-btn', id: 'vpu-btn-probe' }, [ _('Probe') ]);
 		var btnList = E('button', { 'class': 'cbi-button', id: 'vpu-btn-list' }, [ _('Refresh list') ]);
@@ -315,7 +320,7 @@ return view.extend({
 		var bStat = E('div', { 'class': 'vpu-dim', id: 'vpu-bstat' }, [ _('Idle') ]);
 		var bRes = E('div', { 'class': 'vpu-dim', id: 'vpu-bres' }, [ '' ]);
 		var btnScan = E('button', { 'class': 'btn cbi-button vpu-btn', id: 'vpu-btn-scan' }, [ _('Scan directory') ]);
-		var btnBStart = E('button', { 'class': 'btn cbi-button cbi-button-apply vpu-btn', id: 'vpu-btn-brun' }, [ _('Start batch') ]);
+		var btnBStart = E('button', { 'class': 'btn cbi-button vpu-btn vpu-btn-main', id: 'vpu-btn-brun' }, [ _('Start batch') ]);
 		var btnBStop = E('button', { 'class': 'btn cbi-button vpu-btn', id: 'vpu-btn-bstop' }, [ _('Stop batch') ]);
 
 		function syncQuality() {
@@ -456,26 +461,36 @@ return view.extend({
 			 * 100% for the rest of the job. */
 			var timemode = (j.progmode === 'time') || live;
 			if (isRun && timemode) { barFill.style.width = '100%'; barFill.className = 'vpu-bar-fill vpu-live'; }
-			else { barFill.className = 'vpu-bar-fill'; barFill.style.width = Math.max(0, Math.min(100, pct)) + '%'; }
-
-			var bits = [];
-			if (timemode) {
-				bits.push(_('processed') + ' ' + fmtDur(j.out_time) + ' / ' +
-					(live ? _('live stream') : _('total length unknown')));
-			} else {
-				bits.push(pct.toFixed(1) + '%');
-				if (Number(j.total) > 0)
-					bits.push(_('processed') + ' ' + fmtDur(j.out_time) + ' / ' + fmtDur(j.total));
+			else {
+				barFill.className = 'vpu-bar-fill' + (j.state === 'done' ? ' vpu-done' : '');
+				barFill.style.width = Math.max(0, Math.min(100, pct)) + '%';
 			}
-			if (j.fps) bits.push(j.fps + ' fps');
-			if (j.speed) bits.push(j.speed);
-			bits.push(_('written') + ' ' + fmtSize(j.outsize));
-			if (j.elapsed) bits.push(_('elapsed') + ' ' + j.elapsed + 's');
-			if (j.mode) bits.push(pipeText(j.mode, j.scaleeng, j.encoder));
-			if (j.state === 'done' || j.state === 'stopped')
-				bits.push(_('output file') + ' ' + (j.out || '') + '  ' + fmtSize(j.outsize));
-			if (j.error && j.state !== 'error' && isRun) bits.push(msg(j, 'error'));
-			statLine.textContent = bits.join('   ');
+
+			/* one pill per number: the old single sentence was unreadable */
+			statLine.innerHTML = '';
+			function addStat(lbl, val) {
+				if (val === undefined || val === null || val === '') { return; }
+				statLine.appendChild(E('div', { 'class': 'vpu-stat' }, [
+					E('span', { 'class': 'vpu-stat-l' }, [ lbl ]),
+					E('span', { 'class': 'vpu-stat-v' }, [ String(val) ])
+				]));
+			}
+			if (timemode) {
+				addStat(_('Processed'), fmtDur(j.out_time));
+				addStat(_('Length'), live ? _('live stream') : _('unknown'));
+			} else {
+				addStat(_('Progress'), pct.toFixed(1) + '%');
+				if (Number(j.total) > 0) addStat(_('Time'), fmtDur(j.out_time) + ' / ' + fmtDur(j.total));
+			}
+			addStat(_('Speed'), j.speed);
+			addStat(_('FPS'), j.fps);
+			addStat(_('Written'), fmtSize(j.outsize));
+			addStat(_('Elapsed'), j.elapsed ? fmtDur(j.elapsed) : '');
+			var meta = [];
+			if (j.mode) meta.push(pipeText(j.mode, j.scaleeng, j.encoder));
+			if (j.state === 'done' || j.state === 'stopped') meta.push(_('output file') + ': ' + (j.out || ''));
+			if (j.error && j.state !== 'error' && isRun) meta.push(msg(j, 'error'));
+			statMeta.textContent = meta.join('   ·   ');
 
 			var lines = [];
 			if (Array.isArray(j.log)) {
@@ -489,10 +504,18 @@ return view.extend({
 			logPre.textContent = lines.join('\n');
 		}
 
+		function chipUpdate(state) {
+			if (!stateChip) { return; }
+			var map = { running: 'run', done: 'ok', error: 'bad', stopped: 'stop', idle: '' };
+			var word = { running: _('Running'), done: _('Finished'), error: _('Failed'), stopped: _('Stopped'), idle: _('Idle') };
+			var k = map[state];
+			stateChip.className = 'vpu-chip' + (k ? (' vpu-chip-' + k) : '');
+			stateChip.textContent = word[state] || state || _('Idle');
+		}
 		function refreshStatus() {
 			vexec([ 'status' ]).then(function(r) {
 				var j = parseJSON(r.out, null);
-				if (j) applyStatus(j);
+				if (j) { applyStatus(j); chipUpdate(j.state); }
 			});
 		}
 
@@ -537,7 +560,13 @@ return view.extend({
 		var clLocalIn = E('input', { id: 'vpu-cllocal', type: 'checkbox', checked: true });
 		var btnClSave = E('button', { class: 'cbi-button vpu-btn', id: 'vpu-clsave' }, [ _('Save cluster settings') ]);
 		var btnClCheck = E('button', { class: 'cbi-button vpu-btn', id: 'vpu-clcheck' }, [ _('Check nodes') ]);
-		var btnClRun = E('button', { class: 'cbi-button cbi-button-apply vpu-btn', id: 'vpu-clrun' }, [ _('Cluster transcode') ]);
+		var btnClRun = E('button', { class: 'cbi-button vpu-btn vpu-btn-main', id: 'vpu-clrun' }, [ _('Cluster transcode') ]);
+		var clMasterIn = E('input', Object.assign(inputOpts(), {
+			id: 'vpu-clmaster', placeholder: _('master ip, e.g. 10.80.1.125') }));
+		var clFollowIn = E('input', { id: 'vpu-clfollow', type: 'checkbox' });
+		var clIvIn = E('input', Object.assign(inputOpts(), { id: 'vpu-cliv', value: '15', style: 'width:80px' }));
+		var btnClRoster = E('button', { class: 'cbi-button vpu-btn', id: 'vpu-clroster' }, [ _('Refresh nodes') ]);
+		var rosterBox = E('div', { style: 'margin-top:2px' }, []);
 		var clStat = E('div', { class: 'vpu-dim', style: 'margin-top:6px' }, [ '' ]);
 		var clBox = E('div', { style: 'margin-top:6px' }, []);
 
@@ -552,6 +581,44 @@ return view.extend({
 			clNodesIn.value = (j.nodes || []).join('\n');
 			clSegIn.value = String(j.segments || 0);
 			clLocalIn.checked = (String(j.local) !== '0');
+			clMasterIn.value = j.master || '';
+			clFollowIn.checked = (String(j.follow) === '1');
+			clIvIn.value = String(j.interval || 15);
+		}
+		function renderRoster(j) {
+			rosterBox.innerHTML = '';
+			if (!j || !j.ok) {
+				rosterBox.appendChild(E('div', { class: 'vpu-dim' }, [ _('Cannot read the node list') ]));
+				return;
+			}
+			var tbl = E('table', { class: 'vpu-table' });
+			var hr = E('tr', {});
+			[ _('Node'), _('Seen'), _('Version'), _('CPUs'), _('State') ].forEach(function (h) {
+				hr.appendChild(E('th', {}, [ h ]));
+			});
+			tbl.appendChild(hr);
+			(j.nodes || []).forEach(function (n) {
+				var tr = E('tr', {});
+				tr.appendChild(E('td', { class: 'vpu-clip' }, [ n.node ]));
+				tr.appendChild(E('td', {}, [ n.age + ' s' ]));
+				tr.appendChild(E('td', {}, [ n.ver || '' ]));
+				tr.appendChild(E('td', {}, [ String(n.cpus || '') ]));
+				tr.appendChild(E('td', { class: n.busy ? 'vpu-warn' : 'vpu-ok' },
+					[ n.busy ? _('busy') : _('ready') ]));
+				tbl.appendChild(tr);
+			});
+			if (!(j.nodes || []).length) {
+				tbl.appendChild(E('tr', {}, [ E('td', { colspan: 5, class: 'vpu-dim' },
+					[ _('No node has announced itself yet. On the other boxes set Master to this box\'s address, tick "follow" and save.') ]) ]));
+			}
+			rosterBox.appendChild(tbl);
+			rosterBox.appendChild(E('div', { class: 'vpu-dim', style: 'margin-top:6px' }, [
+				_('This box') + ': ' + (j.me || '?') + '  ·  ' + _('interval') + ' ' + (j.interval || 15) +
+				' s  ·  ' + _('a node counts as present for 3 intervals')
+			]));
+		}
+		function refreshRoster() {
+			vexec([ 'roster' ]).then(function (r) { renderRoster(parseJSON(r.out, null)); });
 		}
 		function renderNodes(j) {
 			clBox.innerHTML = '';
@@ -614,7 +681,10 @@ return view.extend({
 				'--token', clTokenIn.value.trim(),
 				'--nodes', clNodeLines().join(','),
 				'--segments', (clSegIn.value.trim() || '0'),
-				'--local', clLocalIn.checked ? '1' : '0' ]).then(function (r) {
+				'--local', clLocalIn.checked ? '1' : '0',
+				'--master', clMasterIn.value.trim(),
+				'--follow', clFollowIn.checked ? '1' : '0',
+				'--interval', (clIvIn.value.trim() || '15') ]).then(function (r) {
 				btnClSave.disabled = false;
 				var j = parseJSON(r.out, null);
 				if (!j || !j.ok) {
@@ -625,6 +695,7 @@ return view.extend({
 				banner.className = 'vpu-banner';
 				banner.textContent = _('Cluster settings saved');
 				refreshNodes();
+				refreshRoster();
 			});
 		});
 		btnClCheck.addEventListener('click', function () {
@@ -644,6 +715,7 @@ return view.extend({
 				'--segments', (clSegIn.value.trim() || '0') ];
 			var n = clNodeLines();
 			if (n.length) { a.push('--nodes', n.join(',')); }
+			if (fxSel.value !== 'none') { a.push('--effect', fxSel.value); }
 			if (qualitySel.value === 'crf') { a.push('--qp', (qpIn.value.trim() || '26')); }
 			else if (brIn.value.trim()) { a.push('--bitrate', brIn.value.trim()); }
 			if (ssIn.value.trim() && ssIn.value.trim() !== '0') { a.push('--ss', ssIn.value.trim()); }
@@ -714,6 +786,25 @@ return view.extend({
 		var pipScaleIn = E('input', Object.assign(inputOpts(), { value: '30', style: 'width:70px', placeholder: '30' }));
 		var joinIn = E('input', Object.assign(inputOpts(), { placeholder: '/mnt/b.mp4   ' + _('(appended after the source)') }));
 		var gifFpsIn = E('input', Object.assign(inputOpts(), { value: '12', style: 'width:70px' }));
+		/* A/V sync repair: a page of its own, because "the sound drifts after a
+		 * few minutes" has nothing to do with effects */
+		var syncSrcIn = E('input', Object.assign(inputOpts(), {
+			id: 'vpu-sync-src', list: 'vpu-src-list', autocomplete: 'off',
+			placeholder: '/mnt/video/a.mkv   ' + _('or') + '   http://host/a.mkv' }));
+		var syncAudioSel = E('select', selectOpts(), [
+			E('option', { value: 'aac' }, [ _('Rebuild audio clock (AAC)') ]),
+			E('option', { value: 'none' }, [ _('Drop the audio (video only)') ])
+		]);
+		var syncContSel = E('select', selectOpts(), [
+			E('option', { value: 'auto' }, [ _('Auto (file -> mp4)') ]),
+			E('option', { value: 'mp4' }, [ 'mp4' ]),
+			E('option', { value: 'mkv' }, [ 'mkv' ])
+		]);
+		var syncOutIn = E('input', Object.assign(inputOpts(), {
+			id: 'vpu-sync-out', placeholder: _('empty = <name>_sync.mp4 next to the source') }));
+		var btnSyncProbe = E('button', { 'class': 'btn cbi-button vpu-btn', id: 'vpu-sync-probe' }, [ _('Check the track lengths') ]);
+		var btnSyncRun = E('button', { 'class': 'btn cbi-button vpu-btn vpu-btn-main', id: 'vpu-sync-run' }, [ _('Repair and write the output') ]);
+		var syncBox = E('div', { id: 'vpu-sync-box', 'style': 'margin-top:14px' }, []);
 
 		/* ---- events ---- */
 		pathIn.addEventListener('change', doProbe);
@@ -855,6 +946,7 @@ return view.extend({
 					'--pip-scale', (pipScaleIn.value.trim() || '30'));
 			}
 			if (joinIn.value.trim()) args.push('--join', joinIn.value.trim());
+
 			if (contSel.value === 'gif') args.push('--gif-fps', (gifFpsIn.value.trim() || '12'));
 			var o = outIn.value.trim();
 			if (o) args.push('--out', o);
@@ -886,144 +978,368 @@ return view.extend({
 		});
 
 		var style = E('style', {}, [ [
-			'.vpu-wrap{max-width:1040px}',
-			'.vpu-card{border:1px solid #d4d4d4;border-radius:6px;padding:12px;margin:10px 0;background:#fff}',
-			'.vpu-card h3{margin:0 0 8px;font-size:15px}',
-			'.vpu-ver{font-weight:bold;color:#2d70b3}',
-			'.vpu-row{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end}',
+			'.vpu-wrap{max-width:1120px;color:#1f2937;font-size:13px}',
+			/* header */
+			'.vpu-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap}',
+			'.vpu-title{font-size:18px;font-weight:700;color:#0f172a;display:flex;align-items:center;gap:9px}',
+			'.vpu-sub{font-size:12px;color:#94a3b8;margin-top:4px}',
+			'.vpu-badge{background:#eef2ff;color:#3b5bdb;font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px;letter-spacing:.2px}',
+			'.vpu-chip{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:600;padding:5px 13px;border-radius:999px;background:#f1f5f9;color:#64748b}',
+			'.vpu-chip:before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor;opacity:.85}',
+			'.vpu-chip-run{background:#eff6ff;color:#1d4ed8}',
+			'.vpu-chip-ok{background:#ecfdf5;color:#047857}',
+			'.vpu-chip-bad{background:#fef2f2;color:#b91c1c}',
+			'.vpu-chip-stop{background:#fffbeb;color:#b45309}',
+			/* progress + stats */
+			'.vpu-bar{height:6px;background:#eef2f7;border-radius:999px;overflow:hidden;margin-top:16px}',
+			'.vpu-bar-fill{height:100%;width:0;background:linear-gradient(90deg,#60a5fa,#2563eb);border-radius:999px;transition:width .35s}',
+			'.vpu-bar-fill.vpu-done{background:linear-gradient(90deg,#34d399,#059669)}',
+			'.vpu-live{background:repeating-linear-gradient(45deg,#dc2626,#dc2626 8px,#f87171 8px,#f87171 16px)}',
+			'.vpu-stats{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}',
+			'.vpu-stat{background:#f8fafc;border:1px solid #eef2f7;border-radius:10px;padding:7px 13px;min-width:84px}',
+			'.vpu-stat-l{display:block;font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:#9aa5b4}',
+			'.vpu-stat-v{display:block;font-size:14px;font-weight:650;color:#0f172a;margin-top:1px;font-variant-numeric:tabular-nums}',
+			'.vpu-meta{margin-top:9px;font-size:11px;color:#94a3b8;word-break:break-all;line-height:1.5}',
+			/* tabs */
+			'.vpu-tabs{display:inline-flex;gap:4px;background:#f1f5f9;padding:4px;border-radius:12px;margin:16px 0 0}',
+			'.vpu-tab{border:0;background:transparent;padding:8px 16px;border-radius:9px;font-size:13px;font-weight:600;color:#64748b;cursor:pointer}',
+			'.vpu-tab:hover{color:#1d4ed8}',
+			'.vpu-tab-on{background:#fff;color:#1d4ed8;box-shadow:0 1px 2px rgba(16,24,40,.1)}',
+			'.vpu-panel{display:none;padding-top:16px}',
+			/* cards */
+			'.vpu-card{background:#fff;border:1px solid #e8edf3;border-radius:14px;padding:16px 18px;margin:0 0 14px;box-shadow:0 1px 2px rgba(16,24,40,.04)}',
+			'.vpu-card h3{margin:0 0 14px;font-size:13px;font-weight:700;color:#334155;display:flex;align-items:center;gap:8px}',
+			'.vpu-card h3:before{content:"";width:3px;height:14px;border-radius:2px;background:#3b82f6}',
+			'.vpu-sub2{font-size:10px;font-weight:700;color:#a2adbb;letter-spacing:.7px;text-transform:uppercase;margin:18px 0 9px}',
+			'.vpu-sub2:first-of-type{margin-top:0}',
+			/* fields */
+			'.vpu-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px 16px}',
+			'.vpu-grid .vpu-full{grid-column:1/-1}',
+			'.vpu-grid label,.vpu-row label{display:block;font-size:11.5px;font-weight:600;color:#64748b;margin-bottom:5px}',
+			'.vpu-row{display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end}',
 			'.vpu-row>div{flex:1 1 200px;min-width:150px}',
-			'.vpu-row label{display:block;font-size:12px;color:#555;margin-bottom:3px}',
-			'.vpu-btn{margin:2px 4px 2px 0}',
-			'#vpu-blist{width:100%;font-family:monospace;font-size:12px;white-space:pre}',
-			'#vpu-bres{max-height:170px;overflow:auto;font-family:monospace;font-size:12px;white-space:pre;margin-top:6px}',
-			'#vpu-bdir,#vpu-boutdir{width:100%}',
-			'.vpu-banner{border-left:4px solid #999;background:#f6f6f6;padding:8px 12px;border-radius:4px;margin:8px 0;font-size:13px}',
-			'.vpu-banner-ok{border-left-color:#2d9c4f;background:#eef8f0}',
-			'.vpu-banner-bad{border-left-color:#c0392b;background:#fdecea}',
-			'.vpu-banner-warn{border-left-color:#e67e22;background:#fdf3e7}',
-			'.vpu-probe{margin:8px 0;font-size:13px}',
-			'.vpu-bar{height:16px;background:#eee;border-radius:8px;overflow:hidden;margin:6px 0}',
-			'.vpu-bar-fill{height:100%;background:#2d70b3;transition:width .3s}',
-			'.vpu-live{background:repeating-linear-gradient(45deg,#c0392b,#c0392b 10px,#e05545 10px,#e05545 20px)}',
-			'.vpu-dim{color:#888;font-size:12px}',
-			'.vpu-ok{color:#0a0;font-weight:bold}',
-			'.vpu-err{color:#c00;font-weight:bold}',
-			'.vpu-warn{color:#e67e22;font-weight:bold}',
-			'.vpu-log{background:#111;color:#ddd;font-family:monospace;font-size:12px;padding:8px;border-radius:4px;min-height:50px;max-height:200px;overflow:auto;white-space:pre-wrap}',
+			'input.vpu-in,select.vpu-in,textarea.vpu-in{height:34px;padding:0 10px;border:1px solid #d8e0ea;border-radius:9px;background:#fff;color:#0f172a;font-size:13px;line-height:32px}',
+			'select.vpu-in{padding:0 8px}',
+			'input.vpu-in:focus,select.vpu-in:focus,textarea.vpu-in:focus{outline:0;border-color:#93b4f5;box-shadow:0 0 0 3px rgba(59,130,246,.14)}',
+			'textarea.vpu-in{height:auto;padding:8px 10px;line-height:1.5;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}',
+			'.vpu-checks{display:flex;gap:22px;flex-wrap:wrap;margin-top:14px}',
+			'.vpu-checks label{display:inline-flex;align-items:center;gap:7px;font-size:13px;color:#334155;margin:0}',
+			'.vpu-checks input[type=checkbox]{width:16px;height:16px;accent-color:#2563eb;margin:0}',
+			/* buttons */
+			'.vpu-actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:16px;padding-top:14px;border-top:1px solid #f1f5f9}',
+			'.vpu-btn{height:34px;padding:0 16px;border-radius:9px;font-size:13px;font-weight:600;cursor:pointer}',
+			'.vpu-btn-main{background:#2563eb;border:1px solid #2563eb;color:#fff;box-shadow:0 1px 2px rgba(37,99,235,.3)}',
+			'.vpu-btn-main:hover{background:#1d4ed8;border-color:#1d4ed8}',
+			'.vpu-btn-main[disabled]{background:#a9c2f7;border-color:#a9c2f7;box-shadow:none;cursor:default}',
+			/* banner / probe / log / tables */
+			'.vpu-banner{border-left:3px solid #cbd5e1;background:#f8fafc;padding:9px 13px;border-radius:0 9px 9px 0;margin-top:14px;font-size:13px;color:#334155}',
+			'.vpu-banner-ok{border-left-color:#059669;background:#f0fdf4}',
+			'.vpu-banner-bad{border-left-color:#dc2626;background:#fef2f2}',
+			'.vpu-banner-warn{border-left-color:#d97706;background:#fffbeb}',
+			'.vpu-probe{margin-top:14px;padding:11px 13px;background:#f8fafc;border:1px solid #eef2f7;border-radius:10px;font-size:12.5px;color:#3f4b5b}',
+			'.vpu-log{background:#0b1220;color:#cbd5e1;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.6;padding:13px;border-radius:11px;min-height:70px;max-height:280px;overflow:auto;white-space:pre-wrap;margin:0}',
 			'.vpu-table{border-collapse:collapse;width:100%;font-size:12px}',
-			'.vpu-table th,.vpu-table td{border-bottom:1px solid #eee;padding:4px 6px;text-align:left;vertical-align:top}',
-			'.vpu-table th{color:#555;background:#fafafa}',
-			'.vpu-clip{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}'
+			'.vpu-table th,.vpu-table td{border-bottom:1px solid #f1f5f9;padding:7px 9px;text-align:left;vertical-align:top}',
+			'.vpu-table th{color:#7c8794;background:#fafbfc;font-weight:600;font-size:11px;letter-spacing:.3px;text-transform:uppercase}',
+			'.vpu-table tr:last-child td{border-bottom:0}',
+			'.vpu-table tbody tr:hover td{background:#fbfdff}',
+			'.vpu-dim{color:#94a3b8;font-size:12px;line-height:1.6}',
+			'.vpu-ok{color:#047857;font-weight:600}',
+			'.vpu-err{color:#b91c1c;font-weight:600}',
+			'.vpu-warn{color:#b45309;font-weight:600}',
+			'.vpu-clip{max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+			'#vpu-blist{width:100%;box-sizing:border-box;min-height:120px}',
+			'#vpu-bres{max-height:170px;overflow:auto;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;white-space:pre;margin-top:8px}',
+			'#vpu-bdir,#vpu-boutdir{width:100%;box-sizing:border-box}',
+			'#vpu-clnodes{width:100%;box-sizing:border-box;min-height:74px}'
 		].join('') ]);
+
+		/* ---- tabs ---------------------------------------------------------
+		 * Seven stacked cards had turned into a wall of fields; the panels are
+		 * the same widgets, only grouped: what you touch per job (source +
+		 * parameters) stays in the first tab, the exotic parts moved away.
+		 */
+		var stateChip = E('span', { 'class': 'vpu-chip', 'id': 'vpu-chip' }, [ _('Idle') ]);
+		var panels = {}, tabBtns = {};
+
+		function showTab(key) {
+			var k;
+			/* 'block', not '': an empty inline style falls back to the class
+			 * rule (.vpu-panel{display:none}) and the tab stays blank */
+			for (k in panels) { panels[k].style.display = (k === key) ? 'block' : 'none'; }
+			for (k in tabBtns) { tabBtns[k].className = 'vpu-tab' + (k === key ? ' vpu-tab-on' : ''); }
+			if (key === 'cluster') { refreshNodes(); refreshRoster(); }
+			if (key === 'tasks') { renderHistory(); }
+		}
+		function mkTab(key, text) {
+			var b = E('button', { 'class': 'vpu-tab', 'type': 'button' }, [ text ]);
+			b.addEventListener('click', function () { showTab(key); });
+			tabBtns[key] = b;
+			return b;
+		}
+		function mkPanel(key, children) {
+			var p = E('div', { 'class': 'vpu-panel' }, children);
+			panels[key] = p;
+			return p;
+		}
+
+		/* ---- transcode tab ---- */
+		var pTranscode = mkPanel('transcode', [
+			E('div', { 'class': 'vpu-card' }, [
+				E('h3', {}, [ _('Source') ]),
+				E('div', { 'class': 'vpu-grid' }, [
+					E('div', { 'class': 'vpu-full' }, [ E('label', {}, [ _('Input / path / URL') ]), pathIn, srcList, srcHint, listHint ])
+				]),
+				E('div', { 'class': 'vpu-actions' }, [ btnList, btnProbe ]),
+				probBox
+			]),
+			E('div', { 'class': 'vpu-card' }, [
+				E('h3', {}, [ _('Parameters') ]),
+				E('div', { 'class': 'vpu-grid' }, [
+					E('div', {}, [ E('label', {}, [ _('Quality mode') ]), qualitySel ]),
+					E('div', {}, [ E('label', {}, [ _('Bitrate (CBR)') ]), brIn ]),
+					E('div', {}, [ E('label', {}, [ _('QP (CQP)') ]), qpIn ]),
+					E('div', {}, [ E('label', {}, [ _('Output encoder') ]), encSel ]),
+					E('div', {}, [ E('label', {}, [ _('Target resolution') ]), resSel ]),
+					E('div', {}, [ E('label', {}, [ _('Scaler (software-decode path only)') ]), scalerSel ]),
+					E('div', {}, [ E('label', {}, [ _('Output frame rate') ]), fpsIn ]),
+					E('div', {}, [ E('label', {}, [ _('Audio') ]), audioSel ]),
+					E('div', {}, [ E('label', {}, [ _('Trim start -ss (seconds)') ]), ssIn ]),
+					E('div', {}, [ E('label', {}, [ _('Duration -t (seconds)') ]), durIn ]),
+					E('div', {}, [ E('label', {}, [ _('Output container') ]), contSel ]),
+					E('div', { 'class': 'vpu-full' }, [ E('label', {}, [ _('Output file (empty = automatic)') ]), outIn ])
+				]),
+				encHint,
+				E('div', { 'class': 'vpu-actions' }, [ btnRun, btnStop ])
+			])
+		]);
+
+		/* ---- batch tab ---- */
+		var pBatch = mkPanel('batch', [
+			E('div', { 'class': 'vpu-card' }, [
+				E('h3', {}, [ _('Batch (a directory, or a list of files one per line)') ]),
+				E('div', { 'class': 'vpu-grid' }, [
+					E('div', { 'class': 'vpu-full' }, [ E('label', {}, [ _('Directory') ]), bdirIn ]),
+					E('div', {}, [ E('label', {}, [ _('Output directory') ]), boutDirIn ]),
+					E('div', {}, [ E('label', {}, [ ' ' ]), E('label', {}, [ brecIn, ' ' + _('recursive') ]),
+						E('label', {}, [ bskipIn, ' ' + _('skip files that already have an output') ]) ])
+				]),
+				E('div', { 'style': 'margin-top:10px' }, [
+					E('label', {}, [ _('File list (one path per line - Chinese names are fine)') ]),
+					bListArea
+				]),
+				E('div', { 'class': 'vpu-actions' }, [ btnScan, btnBStart, btnBStop ]),
+				bStat, bRes
+			])
+		]);
+
+		/* ---- cluster tab ---- */
+		var pCluster = mkPanel('cluster', [
+			E('div', { 'class': 'vpu-card' }, [
+				E('h3', {}, [ _('Cluster settings') ]),
+				E('div', { 'class': 'vpu-grid' }, [
+					E('div', { 'class': 'vpu-full' }, [ E('label', {}, [ _('Shared token (identical on every node)') ]), clTokenIn ]),
+					E('div', {}, [ E('label', {}, [ _('Master IP') ]), clMasterIn ]),
+					E('div', {}, [ E('label', {}, [ _('Announce interval (s)') ]), clIvIn ]),
+					E('div', {}, [ E('label', {}, [ _('Segments (0 = auto)') ]), clSegIn ])
+				]),
+				E('div', { 'class': 'vpu-checks' }, [
+					E('label', {}, [ clFollowIn, _('follow the master (run the beacon)') ]),
+					E('label', {}, [ clLocalIn, _('this box also encodes') ])
+				]),
+				E('div', { 'style': 'margin-top:12px' }, [
+					E('label', {}, [ _('Manual node list (one per line; leave empty to use the auto-discovered nodes)') ]),
+					clNodesIn
+				]),
+				E('div', { 'class': 'vpu-actions' }, [ btnClSave, btnClCheck, btnClRoster, btnClRun ]),
+				clStat, clBox
+			]),
+			E('div', { 'class': 'vpu-card' }, [
+				E('h3', {}, [ _('Nodes that announced themselves (followers)') ]),
+				rosterBox
+			]),
+			E('div', { 'class': 'vpu-card' }, [
+				E('h3', {}, [ _('How it works') ]),
+				E('div', { 'class': 'vpu-dim' }, [
+					_('Set the same token on every box and put this box\'s IP into Master on the others, tick "follow" there: each follower then announces itself every N seconds and this box lists it above. Start a job here and every announced node joins automatically - the source is cut into keyframe-aligned pieces, every box encodes one, this box joins them. Stop stops all workers.')
+				])
+			])
+		]);
+
+		/* ---- effects tab ---- */
+		var pEffects = mkPanel('effects', [
+			E('div', { 'class': 'vpu-card' }, [
+				E('h3', {}, [ _('Effects, logo, second video and GIF') ]),
+				E('div', { 'class': 'vpu-sub2' }, [ _('Effect') ]),
+				E('div', { 'class': 'vpu-grid' }, [
+					E('div', {}, [ E('label', {}, [ _('Picture effect') ]), fxSel ]),
+					E('div', {}, [ E('label', {}, [ _('GIF frame rate') ]), gifFpsIn ])
+				]),
+				E('div', { 'class': 'vpu-sub2' }, [ _('Logo') ]),
+				E('div', { 'class': 'vpu-grid' }, [
+					E('div', { 'class': 'vpu-full' }, [ E('label', {}, [ _('Logo (png)') ]), logoIn ]),
+					E('div', {}, [ E('label', {}, [ _('Position') ]), logoPosSel ]),
+					E('div', {}, [ E('label', {}, [ _('Logo size') ]), logoSizeIn ])
+				]),
+				E('div', { 'class': 'vpu-sub2' }, [ _('Second video') ]),
+				E('div', { 'class': 'vpu-grid' }, [
+					E('div', { 'class': 'vpu-full' }, [ E('label', {}, [ _('Second video (picture in picture / side by side)') ]), pipIn ]),
+					E('div', {}, [ E('label', {}, [ _('Layout') ]), pipPosSel ]),
+					E('div', {}, [ E('label', {}, [ _('PIP width %') ]), pipScaleIn ])
+				]),
+				E('div', { 'class': 'vpu-sub2' }, [ _('Merge and clock') ]),
+				E('div', { 'class': 'vpu-grid' }, [
+					E('div', { 'class': 'vpu-full' }, [ E('label', {}, [ _('Append a second video (one file after another)') ]), joinIn ])
+				]),
+				E('div', { 'class': 'vpu-dim', 'style': 'margin-top:12px' }, [
+					_('Effect and GIF work with the shipped transcoder (flip/rotate run on the RGA, black and white keeps the hardware encoder). Resync rebuilds the video clock from the frame index and forces a constant frame rate - that is the fix for "plays fine, then the audio drifts, seeking helps"; the audio side needs the aresample filter, the backend says so when it is missing. Logo and picture in picture need the overlay filter as well. Cluster mode uses the effect, the other options are ignored.')
+				])
+			])
+		]);
+
+		/* ---- A/V sync page ---- */
+		function syncVerdict(vd, ad) {
+			syncBox.innerHTML = '';
+			var drift = vd - ad;
+			var tbl = E('table', { 'class': 'vpu-table' });
+			var hr = E('tr', {});
+			[ _('Track'), _('Length'), _('Codec') ].forEach(function (h) { hr.appendChild(E('th', {}, [ h ])); });
+			tbl.appendChild(hr);
+			var r1 = E('tr', {});
+			r1.appendChild(E('td', {}, [ _('Video') ]));
+			r1.appendChild(E('td', {}, [ fmtDur(vd) + '  (' + vd.toFixed(3) + ' s)' ]));
+			r1.appendChild(E('td', {}, [ _('hardware decode') ]));
+			tbl.appendChild(r1);
+			var r2 = E('tr', {});
+			r2.appendChild(E('td', {}, [ _('Audio') ]));
+			r2.appendChild(E('td', {}, [ ad > 0 ? (fmtDur(ad) + '  (' + ad.toFixed(3) + ' s)') : _('no audio track') ]));
+			r2.appendChild(E('td', {}, [ _('re-encoded to AAC') ]));
+			tbl.appendChild(r2);
+			var r3 = E('tr', {});
+			r3.appendChild(E('td', { 'class': 'vpu-warn' }, [ _('Difference') ]));
+			r3.appendChild(E('td', { 'class': 'vpu-warn' }, [ (drift >= 0 ? '+' : '') + drift.toFixed(3) + ' s' ]));
+			r3.appendChild(E('td', {}, [ (Math.abs(drift) < 0.05) ? _('nothing to fix') : _('this is what drifts the sound') ]));
+			tbl.appendChild(r3);
+			syncBox.appendChild(tbl);
+			if (ad <= 0) {
+				syncBox.appendChild(E('div', { 'class': 'vpu-banner vpu-banner-warn' }, [
+					_('This source has no audio track: only the video timeline can be rebuilt.') ]));
+			} else if (Math.abs(drift) < 0.05) {
+				syncBox.appendChild(E('div', { 'class': 'vpu-banner vpu-banner-ok' }, [
+					_('The two tracks are the same length. If the sound still creeps out of step during playback, the drift is inside the audio stream (a broken sample rate) - repair still helps, it glues the audio to the rebuilt video clock.') ]));
+			} else {
+				syncBox.appendChild(E('div', { 'class': 'vpu-banner vpu-banner-warn' }, [
+					_('The tracks differ by %s s: repair rebuilds the video timeline from the frame index and resamples the audio onto it.')
+						.replace('%s', Math.abs(drift).toFixed(3)) ]));
+			}
+		}
+		function syncProbe() {
+			var src = syncSrcIn.value.trim();
+			if (!src) {
+				syncBox.innerHTML = '';
+				syncBox.appendChild(E('div', { 'class': 'vpu-dim' }, [ _('Enter a path or URL first.') ]));
+				return;
+			}
+			syncBox.innerHTML = '';
+			syncBox.appendChild(E('div', { 'class': 'vpu-dim' }, [ _('Reading the source…') ]));
+			vexec([ 'probe', src ]).then(function (r) {
+				var j = parseJSON(r.out, null);
+				if (!j || !j.ok) {
+					syncBox.innerHTML = '';
+					syncBox.appendChild(E('div', { 'class': 'vpu-err' }, [
+						_('Cannot read this source') + ': ' + (msg(j, 'error') || r.err || _('Unknown error')) ]));
+					return;
+				}
+				syncVerdict(Number(j.vdur) || 0, Number(j.adur) || 0);
+			});
+		}
+		btnSyncProbe.addEventListener('click', syncProbe);
+		btnSyncRun.addEventListener('click', function() {
+			var src = syncSrcIn.value.trim();
+			if (!src) { syncProbe(); return; }
+			var a = [ 'run', src, '--resync', '--audio', syncAudioSel.value,
+				'--container', syncContSel.value ];
+			var o = syncOutIn.value.trim();
+			if (!o && !isUrl(src)) {
+				/* never aim at the source file: a repair writes a new file
+				 * called <name>_sync.<ext> next to it */
+				o = dirname(src) + '/' + stripExt(basename(src)) + '_sync.' +
+					(syncContSel.value === 'mkv' ? 'mkv' : 'mp4');
+			}
+			if (o) a.push('--out', o);
+			btnSyncRun.disabled = true;
+			vexec(a).then(function(r) {
+				btnSyncRun.disabled = false;
+				var j = parseJSON(r.out, null);
+				if (!j || !j.ok) {
+					banner.className = 'vpu-banner vpu-banner-bad';
+					banner.textContent = _('Cannot start') + ': ' + (msg(j, 'error') || r.err || _('Unknown error, please check the log'));
+					return;
+				}
+				banner.className = 'vpu-banner';
+				banner.textContent = _('Repair started…');
+				var no = msg(j, 'notice');
+				if (no) banner.appendChild(E('div', { 'class': 'vpu-dim' }, [ no ]));
+				refreshStatus();
+				setTimeout(renderHistory, 1500);
+			});
+		});
+
+		var pSync = mkPanel('sync', [
+			E('div', { 'class': 'vpu-card' }, [
+				E('h3', {}, [ _('Repair audio/video sync') ]),
+				E('div', { 'class': 'vpu-grid' }, [
+					E('div', { 'class': 'vpu-full' }, [ E('label', {}, [ _('Input / path / URL') ]), syncSrcIn ]),
+					E('div', {}, [ E('label', {}, [ _('Audio') ]), syncAudioSel ]),
+					E('div', {}, [ E('label', {}, [ _('Output container') ]), syncContSel ]),
+					E('div', { 'class': 'vpu-full' }, [ E('label', {}, [ _('Output file') ]), syncOutIn ])
+				]),
+				E('div', { 'class': 'vpu-actions' }, [ btnSyncProbe, btnSyncRun ]),
+				syncBox
+			]),
+			E('div', { 'class': 'vpu-card' }, [
+				E('h3', {}, [ _('What it does') ]),
+				E('div', { 'class': 'vpu-dim' }, [
+					_('Audio and video keep separate clocks. If the video clock comes from the timestamps of a damaged source, or the audio arrives at a slightly different rate, the sound slowly creeps out of step - the classic "starts fine, drifts after a few minutes, seeking helps for a moment". Repair rebuilds the video timeline from the frame index (constant frame rate, regenerated timestamps, no re-scaling) and re-encodes the audio with aresample=async so it is glued to that clock. Pixels are not touched and no effect is applied. Measured on this box: a 20.400 s video against 20.000 s of audio comes out as 20.020 s / 20.010 s, 600 frames, 0 decode errors.') ])
+			])
+		]);
+
+		/* ---- tasks tab ---- */
+		var pTasks = mkPanel('tasks', [
+			E('div', { 'class': 'vpu-card' }, [
+				E('h3', {}, [ _('Progress and log') ]),
+				logPre
+			]),
+			E('div', { 'class': 'vpu-card' }, [
+				E('h3', {}, [ _('Recent jobs (newest 5)') ]),
+				histBox
+			])
+		]);
 
 		var wrap = E('div', { 'class': 'vpu-wrap' }, [
 			style,
 			E('div', { 'class': 'vpu-card' }, [
-				E('h3', {}, [ E('span', { 'class': 'vpu-ver' }, [ 'vputrans ' + VPU_VER ]),
-					'  ', E('span', { 'class': 'vpu-dim' }, [ _('RK3566 hardware transcode · local/online source auto-detection') ]) ]),
-				banner, bar, statLine
+				E('div', { 'class': 'vpu-head' }, [
+					E('div', {}, [
+						E('div', { 'class': 'vpu-title' }, [
+							E('span', {}, [ _('Video transcoder') ]),
+							E('span', { 'class': 'vpu-badge' }, [ VPU_VER ])
+						]),
+						E('div', { 'class': 'vpu-sub' }, [ _('RK3566 hardware transcode · local/online source auto-detection') ])
+					]),
+					stateChip
+				]),
+				bar, statLine, statMeta, banner
 			]),
-			E('div', { 'class': 'vpu-card' }, [
-				E('h3', {}, [ _('① Source (type a local path or an online URL - auto-detected)') ]),
-				E('div', { 'class': 'vpu-row' }, [
-					E('div', { 'style': 'flex:3 1 420px' }, [ E('label', {}, [ _('Input / path / URL') ]), pathIn, srcList, srcHint, listHint ]),
-					E('div', { 'style': 'flex:0 0 auto' }, [ btnList, btnProbe ])
-				]),
-				probBox
+			E('div', { 'class': 'vpu-tabs' }, [
+				mkTab('transcode', _('Transcode')),
+				mkTab('batch', _('Batch')),
+				mkTab('cluster', _('Cluster')),
+				mkTab('sync', _('A/V sync')),
+				mkTab('effects', _('Effects & GIF')),
+				mkTab('tasks', _('Tasks'))
 			]),
-			E('div', { 'class': 'vpu-card' }, [
-				E('h3', {}, [ _('② Parameters') ]),
-				E('div', { 'class': 'vpu-row' }, [
-					E('div', {}, [ E('label', {}, [ _('Quality mode') ]), qualitySel ]),
-					E('div', {}, [ E('label', {}, [ _('Bitrate (CBR)') ]), brIn ]),
-					E('div', {}, [ E('label', {}, [ _('QP (CQP)') ]), qpIn ]),
-					E('div', {}, [ E('label', {}, [ _('Output encoder') ]), encSel ])
-				]),
-				encHint,
-				E('div', { 'class': 'vpu-row', 'style': 'margin-top:8px' }, [
-					E('div', {}, [ E('label', {}, [ _('Target resolution') ]), resSel ]),
-					E('div', {}, [ E('label', {}, [ _('Scaler (software-decode path only)') ]), scalerSel ]),
-					E('div', {}, [ E('label', {}, [ _('Output frame rate') ]), fpsIn ]),
-					E('div', {}, [ E('label', {}, [ _('Audio') ]), audioSel ])
-				]),
-				E('div', { 'class': 'vpu-row', 'style': 'margin-top:8px' }, [
-					E('div', {}, [ E('label', {}, [ _('Trim start -ss (seconds)') ]), ssIn ]),
-					E('div', {}, [ E('label', {}, [ _('Duration -t (seconds)') ]), durIn ]),
-					E('div', {}, [ E('label', {}, [ _('Output container') ]), contSel ]),
-					E('div', { 'style': 'flex:2 1 320px' }, [ E('label', {}, [ _('Output file (empty = automatic)') ]), outIn ])
-				]),
-				E('div', { 'style': 'margin-top:10px' }, [ btnRun, btnStop ])
-			]),
-			E('div', { 'class': 'vpu-card' }, [
-				E('h3', {}, [ _('③ Batch (a directory, or a list of files one per line)') ]),
-				E('div', { 'class': 'vpu-row' }, [
-					E('div', { 'style': 'flex:2' }, [ E('label', {}, [ _('Directory') ]), bdirIn ]),
-					E('div', {}, [ E('label', {}, [ ' ' ]), btnScan ]),
-					E('div', {}, [ E('label', {}, [ ' ' ]), E('label', {}, [ brecIn, ' ' + _('recursive') ]) ])
-				]),
-				E('div', { 'style': 'margin-top:8px' }, [
-					E('label', {}, [ _('File list (one path per line - Chinese names are fine)') ]),
-					bListArea
-				]),
-				E('div', { 'class': 'vpu-row', 'style': 'margin-top:8px' }, [
-					E('div', { 'style': 'flex:2' }, [ E('label', {}, [ _('Output directory') ]), boutDirIn ]),
-					E('div', {}, [ E('label', {}, [ ' ' ]), E('label', {}, [ bskipIn, ' ' + _('skip files that already have an output') ]) ]),
-					E('div', { 'style': 'display:flex;gap:8px' }, [ E('label', {}, [ ' ' ]), btnBStart, btnBStop ])
-				]),
-				bStat,
-				bRes
-			]),
-			E('div', { 'class': 'vpu-card' }, [
-				E('h3', {}, [ _('④ Cluster (several boxes transcode one file)') ]),
-				E('div', { 'class': 'vpu-row' }, [
-					E('div', { 'style': 'flex:2 1 320px' }, [ E('label', {}, [ _('Shared token') ]), clTokenIn ]),
-					E('div', { 'style': 'flex:0 0 110px' }, [ E('label', {}, [ _('Segments') ]), clSegIn ]),
-					E('div', { 'style': 'flex:0 0 auto' }, [ E('label', {}, [ ' ' ]),
-						E('label', {}, [ clLocalIn, ' ' + _('this box also encodes') ]) ])
-				]),
-				E('div', { 'style': 'margin-top:8px' }, [
-					E('label', {}, [ _('Nodes (one per line: ip or ip:port, empty = this box only)') ]),
-					clNodesIn
-				]),
-				E('div', { 'class': 'vpu-row', 'style': 'margin-top:8px' }, [
-					E('div', { 'style': 'display:flex;gap:8px;flex-wrap:wrap' }, [ btnClSave, btnClCheck, btnClRun ])
-				]),
-				E('div', { 'class': 'vpu-dim', 'style': 'margin-top:6px' }, [
-					_('The source is cut into keyframe-aligned pieces, every box encodes one piece and the master joins them. Stop stops all workers. The nodes must run this same package with the same token.')
-				]),
-				clStat, clBox
-			]),
-			E('div', { 'class': 'vpu-card' }, [
-				E('h3', {}, [ _('⑤ Effects, logo, second video and GIF') ]),
-				E('div', { 'class': 'vpu-row' }, [
-					E('div', {}, [ E('label', {}, [ _('Effect') ]), fxSel ]),
-					E('div', {}, [ E('label', {}, [ _('GIF frame rate') ]), gifFpsIn ])
-				]),
-				E('div', { 'class': 'vpu-row', 'style': 'margin-top:8px' }, [
-					E('div', { 'style': 'flex:2 1 260px' }, [ E('label', {}, [ _('Logo (png)') ]), logoIn ]),
-					E('div', { 'style': 'flex:0 0 150px' }, [ E('label', {}, [ _('Position') ]), logoPosSel ]),
-					E('div', { 'style': 'flex:1 1 160px' }, [ E('label', {}, [ _('Logo size') ]), logoSizeIn ])
-				]),
-				E('div', { 'class': 'vpu-row', 'style': 'margin-top:8px' }, [
-					E('div', { 'style': 'flex:2 1 260px' }, [ E('label', {}, [ _('Second video (picture in picture / side by side)') ]), pipIn ]),
-					E('div', { 'style': 'flex:0 0 170px' }, [ E('label', {}, [ _('Layout') ]), pipPosSel ]),
-					E('div', { 'style': 'flex:0 0 90px' }, [ E('label', {}, [ _('PIP width %') ]), pipScaleIn ])
-				]),
-				E('div', { 'class': 'vpu-row', 'style': 'margin-top:8px' }, [
-					E('div', { 'style': 'flex:2 1 260px' }, [ E('label', {}, [ _('Append a second video (one file after another)') ]), joinIn ])
-				]),
-				E('div', { 'class': 'vpu-dim', 'style': 'margin-top:6px' }, [
-					_('Effect and GIF work with the shipped transcoder (flip/rotate run on the RGA, black and white keeps the hardware encoder). Logo and picture in picture need the overlay filter: if it is missing the backend says so - rebuild ffmpeg-rkrga once. Cluster mode ignores this card.')
-				])
-			]),
-			E('div', { 'class': 'vpu-card' }, [
-				E('h3', {}, [ _('⑥ Progress and log') ]),
-				logPre
-			]),
-			E('div', { 'class': 'vpu-card' }, [
-			E('h3', {}, [ _('⑦ Recent jobs (newest 5)') ]),
-				histBox
-			])
+			pTranscode, pBatch, pCluster, pSync, pEffects, pTasks
 		]);
 
 		applyStatus(st);
@@ -1032,6 +1348,9 @@ return view.extend({
 		loadFileList();
 		setTimeout(refreshStatus, 400);
 		refreshCluster();
+		refreshRoster();
+		showTab('transcode');
+		chipUpdate(st && st.state);
 
 		this._vpuTimer = setInterval(function() {
 			if (!document.body.contains(wrap)) { clearInterval(self._vpuTimer); return; }

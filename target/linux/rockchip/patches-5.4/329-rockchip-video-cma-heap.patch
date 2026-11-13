@@ -1,0 +1,154 @@
+--- a/kernel/dma/contiguous.c
++++ b/kernel/dma/contiguous.c
+@@ -39,6 +39,35 @@
+ EXPORT_SYMBOL_GPL(dma_contiguous_default_area);
+ 
+ /*
++ * rk_video_cma=<size>: a SECOND CMA area, kept for the video pipeline.
++ * Rockchip MPP allocates its frame buffers through dma-heap, i.e. out of the
++ * shared default area, where any other DMA user can fragment it until a 4K
++ * decode cannot get its ~12 MB contiguous blocks.  This area is reserved here,
++ * in the early path, so that mm/cma.c activates it together with the default
++ * area: an area declared from a later initcall never gets its bitmap and
++ * cma_alloc() then oopses on a NULL pointer.
++ *
++ * system_heap.c exposes it as /dev/dma_heap/{cma,cma-uncached} and libmpp
++ * prefers those heaps; without the parameter nothing changes.
++ */
++struct cma *rk_video_cma_area;
++EXPORT_SYMBOL_GPL(rk_video_cma_area);
++
++static phys_addr_t rk_video_cma_size;
++
++static int __init early_rk_video_cma(char *p)
++{
++	if (!p || !*p) {
++		pr_err("rk_video_cma: no size given\n");
++		return -EINVAL;
++	}
++
++	rk_video_cma_size = memparse(p, &p);
++	return 0;
++}
++early_param("rk_video_cma", early_rk_video_cma);
++
++/*
+  * Default global CMA area size can be defined in kernel's .config.
+  * This is useful mainly for distro maintainers to create a kernel
+  * that works correctly for most supported systems.
+@@ -146,6 +175,17 @@
+ 					    &dma_contiguous_default_area,
+ 					    fixed);
+ 	}
++
++	/* the video pool, declared early so mm/cma.c activates it as well */
++	if (rk_video_cma_size) {
++		if (dma_contiguous_reserve_area(rk_video_cma_size, 0, limit,
++						&rk_video_cma_area, false))
++			pr_err("rk_video_cma: cannot reserve %ld MiB\n",
++			       (unsigned long)rk_video_cma_size / SZ_1M);
++		else
++			pr_info("rk_video_cma: dedicated video pool: %ld MiB\n",
++				(unsigned long)rk_video_cma_size / SZ_1M);
++	}
+ }
+ 
+ /**
+--- a/drivers/dma-buf/heaps/system_heap.c
++++ b/drivers/dma-buf/heaps/system_heap.c
+@@ -99,6 +99,8 @@
+ 
+ static struct dma_heap *sys_heap;
+ static struct dma_heap *sys_uncached_heap;
++static struct dma_heap *video_heap;
++static struct dma_heap *video_cached_heap;
+ 
+ /*
+  * Default CMA area (the one created from the "cma=..." cmdline / DT
+@@ -107,6 +109,27 @@
+  */
+ static struct cma *system_cma;
+ 
++/*
++ * Dedicated video CMA pool, reserved in the early path from the
++ * rk_video_cma=<size> kernel parameter (kernel/dma/contiguous.c).  The heaps
++ * below expose it as /dev/dma_heap/{cma,cma-uncached}; libmpp opens those for
++ * its frame buffers so that other DMA users cannot fragment the video pool.
++ * NULL when the parameter is absent - everything then works as before.
++ */
++extern struct cma *rk_video_cma_area;
++
++/* per-heap CMA area: priv carries an override, NULL means the default area */
++static struct cma *heap_cma(struct dma_heap *heap)
++{
++	struct cma *cma = dma_heap_get_drvdata(heap);
++
++	/* struct cma is opaque here: use the accessor, never the fields */
++	if (cma && !cma_get_size(cma))
++		cma = NULL;
++
++	return cma ? cma : system_cma;
++}
++
+ struct system_heap_buffer {
+ 	struct dma_heap *heap;
+ 	struct list_head attachments;
+@@ -410,6 +433,7 @@
+ 				   CONFIG_CMA_ALIGNMENT);
+ 	struct page *cma_pages;
+ 	struct scatterlist *sg;
++	struct cma *cma = heap_cma(heap);
+ 	int ret = -ENOMEM;
+ 
+ 	buffer = kzalloc(sizeof(*buffer), GFP_KERNEL);
+@@ -421,9 +445,9 @@
+ 	buffer->heap = heap;
+ 	buffer->len = size;
+ 	buffer->uncached = uncached;
+-	buffer->cma = system_cma;
++	buffer->cma = cma;
+ 
+-	cma_pages = cma_alloc(system_cma, pagecount, align, false);
++	cma_pages = cma_alloc(cma, pagecount, align, false);
+ 	if (!cma_pages)
+ 		goto free_buffer;
+ 
+@@ -590,6 +614,38 @@
+ 	mb(); /* make sure we only set allocate after dma_mask is set */
+ 	system_uncached_heap_ops.allocate = system_uncached_heap_allocate;
+ 
++	/*
++	 * The two heaps libmpp opens first for its uncached (type 0) and cached
++	 * (type 2) buffers.  With rk_video_cma= on the command line they are
++	 * backed by the private pool; without it they share the default area,
++	 * which keeps the nodes present and the userspace side unchanged.
++	 */
++	exp_info.name = "cma-uncached";
++	exp_info.ops = &system_uncached_heap_ops;
++	exp_info.priv = rk_video_cma_area;
++
++	video_heap = dma_heap_add(&exp_info);
++	if (IS_ERR(video_heap)) {
++		pr_err("system_heap: cannot register the cma-uncached heap: %ld\n",
++		       PTR_ERR(video_heap));
++		video_heap = NULL;
++	} else {
++		set_heap_dev_dma(dma_heap_get_dev(video_heap));
++	}
++
++	exp_info.name = "cma";
++	exp_info.ops = &system_heap_ops;
++	exp_info.priv = rk_video_cma_area;
++
++	video_cached_heap = dma_heap_add(&exp_info);
++	if (IS_ERR(video_cached_heap)) {
++		pr_err("system_heap: cannot register the cma heap: %ld\n",
++		       PTR_ERR(video_cached_heap));
++		video_cached_heap = NULL;
++	} else {
++		set_heap_dev_dma(dma_heap_get_dev(video_cached_heap));
++	}
++
+ 	return 0;
+ }
+ module_init(system_heap_create);

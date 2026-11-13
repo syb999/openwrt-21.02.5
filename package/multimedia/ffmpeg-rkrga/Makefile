@@ -68,10 +68,22 @@ define Package/ffmpeg-rkrga/description
  (libgnutls is linked dynamically, like librga/mpp/libdrm.)
 endef
 
+# overlay/hstack/vstack are the SOFTWARE compositors: on this firmware
+# /dev/dri/card0 is vgem (the vendor kernel does not bring up rockchip-drm), so
+# hwupload cannot create a DRM_PRIME frame from a PNG and overlay_rkrga only
+# accepts DRM_PRIME inputs - i.e. the RGA mutator cannot do a logo/PiP here.
+# The software filters work after one hwdownload, and the RGA still does the
+# scaling (scale_rkrga) before it.
+#
+# aresample/asetpts/atempo are for the --resync mode: aresample=async=1
+# rebuilds the audio clock (drift correction), asetpts resets audio timestamps,
+# atempo is there for a later "change speed without changing pitch" option.
 FFMPEG_RKRGA_FILTERS:= \
 	scale scale_rkrga vpp_rkrga overlay_rkrga \
 	format null anull fps setpts crop transpose \
-	hwupload hwdownload hwmap aformat split copy select trim vflip hflip pad
+	hwupload hwdownload hwmap aformat split copy select trim vflip hflip pad \
+	overlay hstack vstack \
+	aresample asetpts atempo
 
 FFMPEG_RKRGA_DECODERS:= \
 	png mjpeg rawvideo h264 hevc mpeg1video mpeg2video mpeg4 vp8 vp9 av1 \

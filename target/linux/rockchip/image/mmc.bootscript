@@ -57,7 +57,33 @@ elif test $soc = 'rk3588'; then
 	serial_addr=',0xfeb50000'; serial_port='ttyS2';
 fi
 
-setenv bootargs "console=${serial_port},1500000 earlycon=uart8250,mmio32${serial_addr} root=PARTUUID=${uuid} rw rootwait panic=5 iomem=relaxed cma=128M r8168.aspm=0 r8168.dynamic_aspm=0 r8168.eee_enable=0 pcie_aspm=off"
+# Two contiguous pools on the video boards:
+#
+#   cma=256M         the default CMA area - shared with everything else on the
+#                    box (RGA, network, other programs).  One 4K NV12 frame is
+#                    12.4 MB and MPP keeps 20+ of them, so a 4K stream needs
+#                    ~300 MB and this area alone cannot hold it reliably.
+#   rk_video_cma=512M  a dedicated area (patches-5.4/329) exposed as
+#                    /dev/dma_heap/{cma,cma-uncached}; libmpp prefers those
+#                    heaps, so the VPU works out of its own pool and other
+#                    programs cannot fragment it.  Without the parameter the
+#                    heaps fall back to the default area (old behaviour).
+#
+# Older/smaller SoCs keep the single 128M area.
+if test $soc = 'rk3566'; then
+	setenv cma_size '256M';
+	setenv video_cma 'rk_video_cma=512M';
+elif test $soc = 'rk3568'; then
+	setenv cma_size '256M';
+	setenv video_cma 'rk_video_cma=512M';
+elif test $soc = 'rk3588'; then
+	setenv cma_size '256M';
+	setenv video_cma 'rk_video_cma=512M';
+else
+	setenv cma_size '128M';
+	setenv video_cma '';
+fi
+setenv bootargs "console=${serial_port},1500000 earlycon=uart8250,mmio32${serial_addr} root=PARTUUID=${uuid} rw rootwait panic=5 iomem=relaxed cma=${cma_size} ${video_cma} r8168.aspm=0 r8168.dynamic_aspm=0 r8168.eee_enable=0 pcie_aspm=off"
 
 if test $soc = 'rk3528'; then
 	# Boot-stage breadcrumbs for a board with no exposed UART.

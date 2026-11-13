@@ -466,14 +466,8 @@ msgstr "总长未知"
 msgid "Source codec"
 msgstr "源编码"
 
-
-
-
-
 msgid "H.264/H.265 are encoded by the hardware engine (zero copy, fast)"
 msgstr "H.264/H.265 由硬件编码器完成（零拷贝，速度快）"
-
-
 
 
 msgid "Sources are hardware-decoded (H.264/HEVC/VP8/VP9) and encoded by the H.264/H.265 hardware encoder - the output codecs are the only two this SoC encodes in hardware"
@@ -809,9 +803,6 @@ msgstr "拼接第二个视频（两个文件首尾相接）"
 msgid "(appended after the source)"
 msgstr "（接在源文件后面）"
 
-msgid "Effect and GIF work with the shipped transcoder (flip/rotate run on the RGA, black and white keeps the hardware encoder). Logo and picture in picture need the overlay filter: if it is missing the backend says so - rebuild ffmpeg-rkrga once. Cluster mode ignores this card."
-msgstr "特效和 GIF 现在就能用（翻转/旋转走 RGA 硬件，黑白保留硬件编码器）。LOGO 和画中画需要 overlay 滤镜：没有时后端会直接说明，重编一次 ffmpeg-rkrga 即可。集群模式不使用本卡的选项。"
-
 msgid "Unknown effect: %s"
 msgstr "未知特效：%s"
 
@@ -838,3 +829,296 @@ msgstr "这段范围内只有 %s 个可用关键帧切点：改为 %s 段"
 
 msgid "The selected range has no keyframe to split on - use fewer segments, or drop the duration limit"
 msgstr "选定范围内没有可切的关键帧：减少分段数，或去掉时长限制"
+
+msgid "Fix audio/video sync (resync)"
+msgstr "修复音画不同步（重建时间轴）"
+
+msgid "Resync: constant frame rate and regenerated timestamps, audio re-encoded and drift-corrected"
+msgstr "重建时间轴：固定帧率 + 重生时间戳，音频重编并修正漂移"
+
+msgid "Resync: this ffmpeg-rkrga has no aresample filter, so only the video timestamps are rebuilt (the audio keeps its own timing)"
+msgstr "重建时间轴：这个 ffmpeg-rkrga 没有 aresample 滤镜，只能重建视频时间轴（音频保持原样）"
+
+msgid "Announce interval (seconds)"
+msgstr "心跳间隔（秒）"
+
+msgid "Batch (a directory, or a list of files one per line)"
+msgstr "批量（目录，或每行一个文件）"
+
+msgid "CPUs"
+msgstr "核数"
+
+msgid "Cannot read the node list"
+msgstr "读不到节点列表"
+
+msgid "Cluster"
+msgstr "集群"
+
+msgid "Cluster settings"
+msgstr "集群设置"
+
+msgid "Effects & GIF"
+msgstr "特效与 GIF"
+
+msgid "Effects, logo, second video and GIF"
+msgstr "特效、LOGO、第二个视频与 GIF"
+
+msgid "Failed"
+msgstr "失败"
+
+msgid "Finished"
+msgstr "已完成"
+
+msgid "Hardware video transcoder"
+msgstr "硬件视频转码"
+
+msgid "How it works"
+msgstr "工作方式"
+
+msgid "Manual node list (one per line; leave empty to use the auto-discovered nodes)"
+msgstr "手动节点列表（每行一个；留空则使用自动发现的节点）"
+
+msgid "Master (empty = this box is the master)"
+msgstr "主机（留空 = 本机就是主机）"
+
+msgid "No node has announced itself yet. On the other boxes set Master to this box\'s address, tick "follow" and save."
+msgstr "还没有节点上报。在其他设备上把“主机”填成本机地址，勾上“跟随主机”并保存。"
+
+msgid "Nodes that announced themselves (followers)"
+msgstr "已上报的节点（跟随者）"
+
+msgid "Parameters"
+msgstr "参数"
+
+msgid "Progress and log"
+msgstr "进度与日志"
+
+msgid "Recent jobs (newest 5)"
+msgstr "最近任务（最多 5 条）"
+
+msgid "Refresh nodes"
+msgstr "刷新节点"
+
+msgid "Running"
+msgstr "运行中"
+
+msgid "Seen"
+msgstr "上报于"
+
+msgid "Segments (0 = one per worker)"
+msgstr "分段数（0 = 每个工作节点一段）"
+
+msgid "Shared token (identical on every node)"
+msgstr "共享密钥（每台节点必须一致）"
+
+msgid "Source"
+msgstr "源文件"
+
+msgid "Tasks"
+msgstr "任务"
+
+msgid "This box"
+msgstr "本机"
+
+msgid "Transcode"
+msgstr "转码"
+
+msgid "a node counts as present for 3 intervals"
+msgstr "节点在 3 个间隔内上报过就算在线"
+
+msgid "follow the master (run the beacon)"
+msgstr "跟随主机（运行心跳上报）"
+
+msgid "interval"
+msgstr "间隔"
+
+msgid "master ip, e.g. 10.80.1.125"
+msgstr "主机 IP，例如 10.80.1.125"
+
+msgid "Master IP"
+msgstr "主机 IP"
+
+msgid "Announce interval (s)"
+msgstr "上报间隔（秒）"
+
+msgid "Segments (0 = auto)"
+msgstr "分段数（0 = 自动）"
+
+msgid "Picture effect"
+msgstr "画面特效"
+
+msgid "Merge and clock"
+msgstr "拼接与时钟"
+
+msgid "this box has no master configured: it IS the master (or standalone)"
+msgstr "本机没配主机：它本身就是主机（或单机）"
+
+msgid "bad node address"
+msgstr "节点地址不合法"
+
+msgid "beacon: announcing %s to %s every %ss"
+msgstr "心跳：每 %s 秒向 %s 上报本机地址 %s"
+
+msgid "Logo"
+msgstr "LOGO"
+
+msgid "Second video"
+msgstr "第二个视频"
+
+msgid "Video transcoder"
+msgstr "视频转码"
+
+msgid "Start transcoding"
+msgstr "开始转码"
+
+msgid "Progress"
+msgstr "进度"
+
+msgid "Speed"
+msgstr "速度"
+
+msgid "FPS"
+msgstr "帧率"
+
+msgid "Written"
+msgstr "已写"
+
+msgid "Processed"
+msgstr "已处理"
+
+msgid "Length"
+msgstr "总长"
+
+msgid "unknown"
+msgstr "未知"
+
+msgid "This SoC cannot encode 4K: the hardware encoder stops at 1920x1080. Pick 1080p - and note that a 4K source needs cma>=300M to decode at all on this board."
+msgstr "这个 SoC 编不出 4K：硬件编码器上限 1920x1080。选 1080p——另外注意：这块板子要解 4K 片源，cma 得≥300M。"
+
+msgid "This SoC cannot encode 4K: the hardware encoder stops at 1920x1080"
+msgstr "这个 SoC 编不出 4K：硬件编码器上限 1920x1080"
+
+msgid "Source is %sx%s: the hardware encoder stops at 1920x1080, so the output is scaled down to 1080p"
+msgstr "源是 %sx%s：硬件编码器上限 1920x1080，输出已自动缩到 1080p"
+
+msgid "Set the same token on every box and put this box's IP into Master on the others, tick \"follow\" there: each follower then announces itself every N seconds and this box lists it above. Start a job here and every announced node joins automatically - the source is cut into keyframe-aligned pieces, every box encodes one, this box joins them. Stop stops all workers."
+msgstr "每台设备填相同的密钥，并在其他设备的“主机”里填本机 IP、勾上“跟随主机”：跟随者每 N 秒上报一次，就会出现在上面的列表里。在本机点开始，所有已上报节点自动加入：源按关键帧切段，每台编码一段，本机拼接。点停止会停掉所有工作节点。"
+
+msgid "Effect and GIF work with the shipped transcoder (flip/rotate run on the RGA, black and white keeps the hardware encoder). Resync rebuilds the video clock from the frame index and forces a constant frame rate - that is the fix for \"plays fine, then the audio drifts, seeking helps\"; the audio side needs the aresample filter, the backend says so when it is missing. Logo and picture in picture need the overlay filter as well. Cluster mode uses the effect, the other options are ignored."
+msgstr "特效和 GIF 现在就能用（翻转/旋转走 RGA 硬件，黑白保留硬件编码器）。重定时按帧序号重建视频时间轴并强制恒定帧率——“开头好好的，几分钟后音画不同步、快进一下又好”就是这个。音轨侧需要 aresample 滤镜，缺少时后端会直接说明。LOGO 和画中画同样需要 overlay 滤镜。集群模式只用特效，其余选项忽略。"
+
+msgid "A GIF is a single-file output, it cannot be split across boxes"
+msgstr "GIF 是单文件输出，不能分正到多台设备上"
+
+msgid "Cannot create the work directory: %s"
+msgstr "无法创建工作目录：%s"
+
+msgid "Invalid frame rate: %s (a number or \"source\")"
+msgstr "帧率无效：%s（填数字或 "source"）"
+
+msgid "Unknown audio mode: %s"
+msgstr "未知音频模式：%s"
+
+msgid "Unknown container: %s"
+msgstr "未知容器：%s"
+
+msgid "Unknown quality mode: %s"
+msgstr "未知质量模式：%s"
+
+msgid "Unknown scaler: %s"
+msgstr "未知缩放算法：%s"
+
+msgid "⏹ Cluster job stopped"
+msgstr "⏹ 集群任务已停止"
+
+msgid "✔ All %s segments finished, joining"
+msgstr "✔ %s 段全部完成，正在拼接"
+
+msgid "✘ Cluster job failed, segment(s): %s"
+msgstr "✘ 集群任务失败，分段：%s"
+msgid "usage: vputrans {version|probe <src>|list|run <src> [opt]|status|stop|history|cluster <src> [opt]}"
+msgstr "用法：vputrans {version|probe <src>|list|run <src> [opt]|status|stop|history|cluster <src> [opt]}"
+
+msgid "A/V sync"
+msgstr "音画同步"
+
+msgid "Repair audio/video sync"
+msgstr "修复音画同步"
+
+msgid "Check the track lengths"
+msgstr "检测音视频时长"
+
+msgid "Repair and write the output"
+msgstr "开始修复并输出"
+
+msgid "Rebuild audio clock (AAC)"
+msgstr "重建音轨时钟（AAC）"
+
+msgid "Drop the audio (video only)"
+msgstr "丢弃音轨（只修视频）"
+
+msgid "Auto (file -> mp4)"
+msgstr "自动（文件 → mp4）"
+
+msgid "empty = <name>_sync.mp4 next to the source"
+msgstr "留空 = 源文件旁边生成 <名字>_sync.mp4"
+
+msgid "Track"
+msgstr "轨道"
+
+msgid "Codec"
+msgstr "编码"
+
+msgid "Video"
+msgstr "视频"
+
+msgid "Difference"
+msgstr "差值"
+
+msgid "no audio track"
+msgstr "无音轨"
+
+msgid "re-encoded to AAC"
+msgstr "重编码为 AAC"
+
+msgid "nothing to fix"
+msgstr "无需修复"
+
+msgid "this is what drifts the sound"
+msgstr "这就是声音漂移的原因"
+
+msgid "This source has no audio track: only the video timeline can be rebuilt."
+msgstr "这个源没有音轨：只能重建视频时间轴。"
+
+msgid "The two tracks are the same length. If the sound still creeps out of step during playback, the drift is inside the audio stream (a broken sample rate) - repair still helps, it glues the audio to the rebuilt video clock."
+msgstr "两条轨时长一致。如果播放时声音仍然慢慢跑偏，说明漂移在音频流内部（采样率不对）——修复仍然管用，它会把音频钉到重建后的视频时钟上。"
+
+msgid "The tracks differ by %s s: repair rebuilds the video timeline from the frame index and resamples the audio onto it."
+msgstr "两条轨相差 %s 秒：修复会按帧序号重建视频时间轴，并把音频重采样对齐到它上。"
+
+msgid "Enter a path or URL first."
+msgstr "先填一个路径或 URL。"
+
+msgid "Reading the source…"
+msgstr "正在读取源文件…"
+
+msgid "Cannot read this source"
+msgstr "读不了这个源"
+
+msgid "Repair started…"
+msgstr "修复已开始…"
+
+msgid "What it does"
+msgstr "做什么了"
+
+msgid "Audio and video keep separate clocks. If the video clock comes from the timestamps of a damaged source, or the audio arrives at a slightly different rate, the sound slowly creeps out of step - the classic \"starts fine, drifts after a few minutes, seeking helps for a moment\". Repair rebuilds the video timeline from the frame index (constant frame rate, regenerated timestamps, no re-scaling) and re-encodes the audio with aresample=async so it is glued to that clock. Pixels are not touched and no effect is applied. Measured on this box: a 20.400 s video against 20.000 s of audio comes out as 20.020 s / 20.010 s, 600 frames, 0 decode errors."
+msgstr "音频和视频各自走自己的时钟。如果视频时钟来自损坏源的时间戳，或者音频到达的码率微微不对，声音就会慢慢跑偏——就是那个“开头好好的，几分钟后开始不对，拖一下进度又好一会儿”。修复按帧序号重建视频时间轴（恒定帧率、重生成时间戳、不重新缩放），并用 aresample=async 重编码音轨，把它钉在这个时钟上。像素不动，也不应用特效。本机实测：20.400 秒视频对 20.000 秒音频，修复后 20.020 / 20.010 秒，600 帧，0 解码错误。"
+
+msgid "This source is %sx%s: decoding it needs about 300 MB of contiguous DMA memory and the video pool is only %s MB, so the VPU never gets its buffers (measured: mpp_dma_heap \"alloc failed\", then the job sits at 0% for ever). Downscaling does not help - the source is decoded at full size first. Use a 1080p source, or raise rk_video_cma= (e.g. rk_video_cma=512M) in the bootargs."
+msgstr "这个源是 %sx%s：解码它需要约 300 MB 连续 DMA 内存，而视频专用池只有 %s MB，VPU 拿不到缓存（实测：mpp_dma_heap “alloc failed”，任务就永远停在 0%）。降分辨率没用——源是先按原尺寸解码的。请用 1080p 片源，或把 bootargs 里的 rk_video_cma= 调大（例如 rk_video_cma=512M）。"
+
+msgid "This source is %sx%s: decoding it needs about 300 MB of contiguous DMA memory and the video pool is only %s MB, so the VPU never gets its buffers. Downscaling does not help. Use a 1080p source, or raise rk_video_cma= (e.g. rk_video_cma=512M) in the bootargs."
+msgstr "这个源是 %sx%s：解码需要约 300 MB 连续 DMA 内存，视频专用池只有 %s MB，VPU 拿不到缓存。降分辨率没用。请用 1080p 片源，或把 rk_video_cma= 调大（如 rk_video_cma=512M）。"
+
+msgid "Nothing was decoded in %ss: the hardware decoder never got a frame. A 4K stream needs about 300 MB of contiguous DMA memory and the video pool is %s MB - if the log shows mpp_dma_heap \"alloc failed\" the pool was full (another process holding it, or a bigger stream), otherwise the source stopped delivering data. Use a 1080p source, enlarge rk_video_cma= in the bootargs, or check the stream."
+msgstr "%s 秒内一帧都没解出来：硬件解码器始终没拿到帧。4K 流需要约 300 MB 连续 DMA 内存，而视频专用池是 %s MB——如果日志里是 mpp_dma_heap “alloc failed”，说明池已满（被别的进程占了，或者流更大）；否则就是源中途不发数据了。请用 1080p 源、把 bootargs 里的 rk_video_cma= 调大，或检查流。"
