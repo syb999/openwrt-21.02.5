@@ -123,20 +123,104 @@
 	};
 };
 
+/*
+ * Two problems with the vendor CPU OPP table on mainline 5.4:
+ *
+ *  1. drivers/opp/of.c:_opp_is_supported() returns false for every OPP that
+ *     carries opp-supported-hw when platform code never called
+ *     dev_pm_opp_set_supported_hw().  The vendor table has that property on
+ *     all entries, so every OPP is filtered out ("no supported OPPs") and
+ *     cpufreq-dt gets zero frequencies.
+ *  2. The bin variants (opp-j-*, opp-m-*, opp-j-od-*) repeat the base
+ *     frequencies with different voltages, which _opp_add_static_v2()
+ *     rejects with -EEXIST, rolling back the whole table.
+ *
+ * Redeclare the base table only, without opp-supported-hw and without the
+ * duplicates, keeping the vendor voltages and latencies.
+ */
+&cpu0_opp_table {
+	/delete-node/ opp-408000000;
+	/delete-node/ opp-600000000;
+	/delete-node/ opp-816000000;
+	/delete-node/ opp-1104000000;
+	/delete-node/ opp-1416000000;
+	/delete-node/ opp-1608000000;
+	/delete-node/ opp-1800000000;
+	/delete-node/ opp-j-1008000000;
+	/delete-node/ opp-j-1416000000;
+	/delete-node/ opp-j-od-1608000000;
+	/delete-node/ opp-j-od-1800000000;
+	/delete-node/ opp-m-1608000000;
+
+	opp-408000000 {
+		opp-hz = /bits/ 64 <408000000>;
+		opp-microvolt = <850000 850000 1150000>;
+		clock-latency-ns = <40000>;
+	};
+
+	opp-600000000 {
+		opp-hz = /bits/ 64 <600000000>;
+		opp-microvolt = <850000 850000 1150000>;
+		clock-latency-ns = <40000>;
+	};
+
+	opp-816000000 {
+		opp-hz = /bits/ 64 <816000000>;
+		opp-microvolt = <850000 850000 1150000>;
+		clock-latency-ns = <40000>;
+		opp-suspend;
+	};
+
+	opp-1104000000 {
+		opp-hz = /bits/ 64 <1104000000>;
+		opp-microvolt = <900000 900000 1150000>;
+		clock-latency-ns = <40000>;
+	};
+
+	opp-1416000000 {
+		opp-hz = /bits/ 64 <1416000000>;
+		opp-microvolt = <1025000 1025000 1150000>;
+		clock-latency-ns = <40000>;
+	};
+
+	opp-1608000000 {
+		opp-hz = /bits/ 64 <1608000000>;
+		opp-microvolt = <1100000 1100000 1150000>;
+		clock-latency-ns = <40000>;
+	};
+
+	opp-1800000000 {
+		opp-hz = /bits/ 64 <1800000000>;
+		opp-microvolt = <1150000 1150000 1150000>;
+		clock-latency-ns = <40000>;
+	};
+};
+
+/*
+ * The vendor dtsi wires the CPU clocks to SCMI (<&scmi_clk 0>), but this
+ * kernel has no SCMI clock driver, so clk_get() on cpu0 returns
+ * -EPROBE_DEFER forever and cpufreq-dt can never probe.  Point them at the
+ * CRU's armclk instead, which clk-rk3568.c registers with the full
+ * rk3568_cpuclk_rates table (up to 1800 MHz).
+ */
 &cpu0 {
 	cpu-supply = <&vdd_cpu>;
+	clocks = <&cru ARMCLK>;
 };
 
 &cpu1 {
 	cpu-supply = <&vdd_cpu>;
+	clocks = <&cru ARMCLK>;
 };
 
 &cpu2 {
 	cpu-supply = <&vdd_cpu>;
+	clocks = <&cru ARMCLK>;
 };
 
 &cpu3 {
 	cpu-supply = <&vdd_cpu>;
+	clocks = <&cru ARMCLK>;
 };
 
 &gmac1 {

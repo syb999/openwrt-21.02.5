@@ -1,0 +1,44 @@
+cpufreq: dt-platdev: create the device at late_initcall_sync
+
+On the Panther X2 (rk3566) cpufreq-dt never probed even with the allowlist
+entry (patch 332) and a working cpu-supply regulator (patch 333):
+
+  /sys/kernel/debug/devices_deferred always contains "cpufreq-dt"
+  /sys/devices/system/cpu/cpu0/opp/ does not exist
+  dmesg has no cpufreq/OPP line at all (the deferred path is dev_dbg())
+
+Reason: cpufreq_dt_platdev_init is a device_initcall(), the same level as
+the i2c_add_driver() of the PMIC (fan53555 -> tcs4525) that provides
+cpu-supply.  In that order the platform device is probed before the i2c
+client exists, so regulator_get_optional() returns -EPROBE_DEFER.  Deferred
+probes are only retried when a driver registers, and the PMIC driver has
+already registed by then; the regulator appearing later (when the i2c
+controller probes its children) does not re-trigger the retry.  The device
+therefore stays deferred forever and armclk is pinned at the boot frequency.
+
+Create the platform device from late_initcall_sync() instead: by then
+of_platform population, i2c controller, i2c clients and the PMIC regulator
+are all in place, so the first probe succeeds.  cpufreq is wanted for
+userspace only, so running it after the late initcalls is harmless.
+
+Verified on the board: devices_deferred no longer lists cpufreq-dt,
+cpu0/opp/ appears, and scaling_available_frequencies reports
+408000..1800000.
+
+--- a/drivers/cpufreq/cpufreq-dt-platdev.c
++++ b/drivers/cpufreq/cpufreq-dt-platdev.c
+@@ -184,4 +184,13 @@
+ 			       -1, data,
+ 			       sizeof(struct cpufreq_dt_platform_data)));
+ }
+-device_initcall(cpufreq_dt_platdev_init);
++/*
++ * Create the platform device late: probe needs both the CPU clock and the
++ * cpu-supply regulator.  With device_initcall() the probe runs before the
++ * i2c PMIC driver has created its regulator, returns -EPROBE_DEFER, and is
++ * never retried -- deferred-probe retries are only triggered by
++ * driver_register(), and by then that driver is already registered.  The
++ * regulator appearing later does not re-trigger the retry, so cpufreq-dt
++ * stays deferred forever.
++ */
++late_initcall_sync(cpufreq_dt_platdev_init);

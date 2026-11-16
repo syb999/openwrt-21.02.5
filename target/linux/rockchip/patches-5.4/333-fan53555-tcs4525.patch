@@ -1,0 +1,206 @@
+regulator: fan53555: add TCS4525 support (backport from v5.15)
+
+The Panther X2 (rk3566) feeds the CPU rail from a TCS4525 buck on i2c-0
+address 0x1c, declared in the board DTS as:
+
+    vdd_cpu: regulator@1c {
+        compatible = "tcs,tcs4525";
+        reg = <0x1c>;
+        fcs,suspend-voltage-selector = <1>;
+        regulator-min-microvolt = <800000>;
+        regulator-max-microvolt = <1150000>;
+        ...
+    };
+
+The 5.4 fan53555 driver only matches fcs,fan53526 / fcs,fan53555 /
+silergy,syr827 / silergy,syr828, so nothing binds to that node.  Effect on
+the board (measured):
+
+  * /sys/bus/i2c/devices/0-001c/driver does not exist (no driver bound)
+  * no vdd_cpu in /sys/class/regulator/*/name
+  * cpufreq-dt (see patch 332) is created but stays in
+    /sys/kernel/debug/devices_deferred forever, because cpu-supply cannot
+    resolve
+  * armclk stays at the reset value 816 MHz, /sys/devices/system/cpu/cpu0/
+    cpufreq never appears
+
+Upstream added TCS4525 to this driver in v5.15 (registers 0x11/0x10 for
+VSEL0/VSEL1 and 0x14 for COMMAND, VOUT = 0.60 V + NSEL * 6.25 mV, 128
+steps).  Backport only that, reusing the 5.4 structure which already has
+vendor/vol_reg/sleep_reg/mode_reg fields:
+
+  * TCS4525_VSEL0/VSEL1/COMMAND and TCS_VSEL0/1_MODE defines
+  * FAN53526_VENDOR_TCS vendor and TCS4525_CHIP_ID_12 chip id
+  * fan53526_voltages_setup_tcs() with 600000 uV min, 6250 uV step
+  * vendor branch in fan53555_device_setup() for the voltage/sleep
+    registers and the mode register
+  * of_device_id and i2c_device_id entries for tcs,tcs4525
+
+The 5.4 driver has no slew-rate support (slew_reg/ramp_delay_table came
+later), so those fields are intentionally not backported.
+
+After this the regulator probes and cpufreq-dt can bind; verified on the
+board by vdd_cpu appearing in the regulator list and cpufreq scaling to
+1800 MHz.
+
+--- a/drivers/regulator/fan53555.c
++++ b/drivers/regulator/fan53555.c
+@@ -36,6 +36,13 @@
+ /* VSEL bit definitions */
+ #define VSEL_BUCK_EN	(1 << 7)
+ #define VSEL_MODE		(1 << 6)
++
++/* TCS4525 registers (backport from v5.15 fan53555.c) */
++#define TCS4525_VSEL0		0x11
++#define TCS4525_VSEL1		0x10
++#define TCS4525_COMMAND		0x14
++#define TCS_VSEL0_MODE		(1 << 7)
++#define TCS_VSEL1_MODE		(1 << 6)
+ /* Chip ID and Verison */
+ #define DIE_ID		0x0F	/* ID1 */
+ #define DIE_REV		0x0F	/* ID2 */
+@@ -54,6 +61,7 @@
+ 	FAN53526_VENDOR_FAIRCHILD = 0,
+ 	FAN53555_VENDOR_FAIRCHILD,
+ 	FAN53555_VENDOR_SILERGY,
++	FAN53526_VENDOR_TCS,
+ };
+ 
+ enum {
+@@ -85,6 +93,10 @@
+ 	SILERGY_SYR82X = 8,
+ };
+ 
++enum {
++	TCS4525_CHIP_ID_12 = 12,
++};
++
+ struct fan53555_device_info {
+ 	enum fan53555_vendor vendor;
+ 	struct device *dev;
+@@ -316,6 +328,25 @@
+ 	return 0;
+ }
+ 
++/* TCS4525: VOUT = 0.60V + NSELx * 6.25mV, 128 steps (0.60V - 1.4V) */
++static int fan53526_voltages_setup_tcs(struct fan53555_device_info *di)
++{
++	switch (di->chip_id) {
++	case TCS4525_CHIP_ID_12:
++		di->vsel_min = 600000;
++		di->vsel_step = 6250;
++		break;
++	default:
++		dev_err(di->dev,
++			"Chip ID %d not supported!\n", di->chip_id);
++		return -EINVAL;
++	}
++
++	di->vsel_count = FAN53526_NVOLTAGES;
++
++	return 0;
++}
++
+ /* For 00,01,03,05 options:
+  * VOUT = 0.60V + NSELx * 10mV, from 0.60 to 1.23V.
+  * For 04 option:
+@@ -327,18 +358,37 @@
+ 	int ret = 0;
+ 
+ 	/* Setup voltage control register */
+-	switch (pdata->sleep_vsel_id) {
+-	case FAN53555_VSEL_ID_0:
+-		di->sleep_reg = FAN53555_VSEL0;
+-		di->vol_reg = FAN53555_VSEL1;
+-		break;
+-	case FAN53555_VSEL_ID_1:
+-		di->sleep_reg = FAN53555_VSEL1;
+-		di->vol_reg = FAN53555_VSEL0;
++	switch (di->vendor) {
++	case FAN53526_VENDOR_TCS:
++		switch (pdata->sleep_vsel_id) {
++		case FAN53555_VSEL_ID_0:
++			di->sleep_reg = TCS4525_VSEL0;
++			di->vol_reg = TCS4525_VSEL1;
++			break;
++		case FAN53555_VSEL_ID_1:
++			di->sleep_reg = TCS4525_VSEL1;
++			di->vol_reg = TCS4525_VSEL0;
++			break;
++		default:
++			dev_err(di->dev, "Invalid VSEL ID!\n");
++			return -EINVAL;
++		}
+ 		break;
+ 	default:
+-		dev_err(di->dev, "Invalid VSEL ID!\n");
+-		return -EINVAL;
++		switch (pdata->sleep_vsel_id) {
++		case FAN53555_VSEL_ID_0:
++			di->sleep_reg = FAN53555_VSEL0;
++			di->vol_reg = FAN53555_VSEL1;
++			break;
++		case FAN53555_VSEL_ID_1:
++			di->sleep_reg = FAN53555_VSEL1;
++			di->vol_reg = FAN53555_VSEL0;
++			break;
++		default:
++			dev_err(di->dev, "Invalid VSEL ID!\n");
++			return -EINVAL;
++		}
++		break;
+ 	}
+ 
+ 	/* Setup mode control register */
+@@ -360,6 +410,18 @@
+ 		di->mode_reg = di->vol_reg;
+ 		di->mode_mask = VSEL_MODE;
+ 		break;
++	case FAN53526_VENDOR_TCS:
++		di->mode_reg = TCS4525_COMMAND;
++
++		switch (pdata->sleep_vsel_id) {
++		case FAN53555_VSEL_ID_0:
++			di->mode_mask = TCS_VSEL1_MODE;
++			break;
++		case FAN53555_VSEL_ID_1:
++			di->mode_mask = TCS_VSEL0_MODE;
++			break;
++		}
++		break;
+ 	default:
+ 		dev_err(di->dev, "vendor %d not supported!\n", di->vendor);
+ 		return -EINVAL;
+@@ -376,6 +438,9 @@
+ 	case FAN53555_VENDOR_SILERGY:
+ 		ret = fan53555_voltages_setup_silergy(di);
+ 		break;
++	case FAN53526_VENDOR_TCS:
++		ret = fan53526_voltages_setup_tcs(di);
++		break;
+ 	default:
+ 		dev_err(di->dev, "vendor %d not supported!\n", di->vendor);
+ 		return -EINVAL;
+@@ -447,6 +512,9 @@
+ 	}, {
+ 		.compatible = "silergy,syr828",
+ 		.data = (void *)FAN53555_VENDOR_SILERGY,
++	}, {
++		.compatible = "tcs,tcs4525",
++		.data = (void *)FAN53526_VENDOR_TCS,
+ 	},
+ 	{ }
+ };
+@@ -552,8 +620,11 @@
+ 	}, {
+ 		.name = "syr828",
+ 		.driver_data = FAN53555_VENDOR_SILERGY
++	}, {
++		.name = "tcs4525",
++		.driver_data = FAN53526_VENDOR_TCS
+ 	},
+-	{ },
++	{ }
+ };
+ MODULE_DEVICE_TABLE(i2c, fan53555_id);
+ 

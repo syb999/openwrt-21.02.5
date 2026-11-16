@@ -1,0 +1,33 @@
+cpufreq: dt-platdev: create cpufreq-dt for rockchip rk3566/rk3568
+
+The Panther X2 (rk3566) carries a complete cpu0-opp-table (408 MHz up to
+1800 MHz, tcs4525 vdd_cpu 800-1150 mV, rk3566.dtsi only deletes the
+1992 MHz node) and the kernel already has CONFIG_CPUFREQ_DT,
+CONFIG_CPUFREQ_DT_PLATDEV, CONFIG_PM_OPP and CONFIG_ROCKCHIP_THERMAL.
+
+What is missing is the allowlist entry: cpufreq-dt-platdev.c lists rockchip
+SoCs only up to rk3399, so no "cpufreq-dt" platform device is ever created
+for rk3566.  Consequences on the board:
+
+  * /sys/devices/system/cpu/cpu0/cpufreq does not exist
+  * no cpufreq driver probes (dmesg has no cpufreq/opp line at all)
+  * armclk stays at the reset value CLK_IS_CRITICAL parent gives, i.e.
+    816 MHz (clk_summary: armclk 816000000), 2.2x below the OPP top
+
+Add the rk3566/rk3568 compatibles.  Everything else is already in place:
+clk-rk3568.c registers armclk over mux {apll,gpll} with rk3568_cpuclk_rates
+up to 1800000000 (div 1/7), the APLL is a pll_rk3328 (any VCO rate), and
+fan53555 (tcs,tcs4525) is built in for vdd_cpu.  So the OPP table, not the
+clock driver, is the hardware limit.
+
+--- a/drivers/cpufreq/cpufreq-dt-platdev.c
++++ b/drivers/cpufreq/cpufreq-dt-platdev.c
+@@ -79,6 +79,8 @@
+ 	  .data = &(struct cpufreq_dt_platform_data)
+ 		{ .have_governor_per_policy = true, },
+ 	},
++	{ .compatible = "rockchip,rk3566", },
++	{ .compatible = "rockchip,rk3568", },
+ 
+ 	{ .compatible = "st-ericsson,u8500", },
+ 	{ .compatible = "st-ericsson,u8540", },
