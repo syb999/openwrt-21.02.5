@@ -1,0 +1,58 @@
+ASoC: rockchip: add the I2S/TDM controller driver (rk3568)
+
+The JP TV Box 3566 has an I2S header on the PCB.  Its SoC nodes are
+"rockchip,rk3568-i2s-tdm", but this 5.4 tree only carries the old
+rockchip_i2s.c (rk3066/rk3188/rk3288/rk3399), and the TDM driver only
+reached mainline in 6.1 - so i2s1@fe410000 could never bind.
+
+The driver itself is vendored in the target's files/ overlay
+(sound/soc/rockchip/rockchip_i2s_tdm.{c,h}, taken from v6.1) with only
+mechanical 5.4 adaptations, no behavioural change:
+
+  - SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK -> SND_SOC_DAIFMT_MASTER_MASK
+  - SND_SOC_DAIFMT_BP_FP (codec provides clock/frame) -> SND_SOC_DAIFMT_CBM_CFM
+  - SND_SOC_DAIFMT_BC_FC (codec consumes clock/frame) -> SND_SOC_DAIFMT_CBS_CFS
+  - component driver: 6.1's .legacy_dai_naming = 1 has no 5.4 counterpart,
+    so the field is dropped (5.4 defaults to legacy naming as well)
+  - dai driver: .symmetric_rate -> .symmetric_rates
+  - dev_err_probe() does not exist before 5.9: a local rk_dev_err_probe()
+    wrapper is used instead
+  - devm_platform_get_and_ioremap_resource() does not exist before 5.11:
+    replaced by platform_get_resource() + devm_ioremap_resource()
+
+This patch only adds the Kconfig/Makefile hooks; the module is packaged as
+kmod-rk-i2s and only installed by jp_tv.
+
+--- a/sound/soc/rockchip/Kconfig
++++ b/sound/soc/rockchip/Kconfig
+@@ -34,6 +34,15 @@
+ 	  Say Y or M if you want to add support for SPDIF driver for
+ 	  Rockchip SPDIF transceiver device.
+ 
++config SND_SOC_ROCKCHIP_I2S_TDM
++	tristate "Rockchip I2S/TDM Device Driver"
++	depends on CLKDEV_LOOKUP && SND_SOC_ROCKCHIP
++	select SND_SOC_GENERIC_DMAENGINE_PCM
++	help
++	  Say Y or M if you want to add support for I2S/TDM driver for Rockchip
++	  SoCs. The device supports up to maximum of 8 channels each for play and
++	  capture.
++
+ config SND_SOC_ROCKCHIP_MAX98090
+ 	tristate "ASoC support for Rockchip boards using a MAX98090 codec"
+ 	depends on SND_SOC_ROCKCHIP && I2C && GPIOLIB && CLKDEV_LOOKUP
+--- a/sound/soc/rockchip/Makefile
++++ b/sound/soc/rockchip/Makefile
+@@ -4,10 +4,12 @@
+ snd-soc-rockchip-pcm-objs := rockchip_pcm.o
+ snd-soc-rockchip-pdm-objs := rockchip_pdm.o
+ snd-soc-rockchip-spdif-objs := rockchip_spdif.o
++snd-soc-rockchip-i2s-tdm-objs := rockchip_i2s_tdm.o
+ 
+ obj-$(CONFIG_SND_SOC_ROCKCHIP_I2S) += snd-soc-rockchip-i2s.o snd-soc-rockchip-pcm.o
+ obj-$(CONFIG_SND_SOC_ROCKCHIP_PDM) += snd-soc-rockchip-pdm.o
+ obj-$(CONFIG_SND_SOC_ROCKCHIP_SPDIF) += snd-soc-rockchip-spdif.o
++obj-$(CONFIG_SND_SOC_ROCKCHIP_I2S_TDM) += snd-soc-rockchip-i2s-tdm.o
+ 
+ snd-soc-rockchip-max98090-objs := rockchip_max98090.o
+ snd-soc-rockchip-rt5645-objs := rockchip_rt5645.o

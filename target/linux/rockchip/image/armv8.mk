@@ -57,6 +57,32 @@ define Device/panther_x2
 endef
 TARGET_DEVICES += panther_x2
 
+# RK3566 (JP TV Box 3566): same boot chain as the Panther X2 (TPL/ATF from
+# rkbin + U-Boot generic-rk3568, serial2 at 1500000n8).  The board has no SD
+# slot at all: the eMMC is mmc0 (/dev/mmcblk0) and is the only boot medium.
+# The wifi/bluetooth combo is a BCM43438-class module on SDIO/UART, i.e. the
+# same firmware blobs the Panther X2 vendors.
+define Device/jp_tv
+  DEVICE_VENDOR := JP
+  DEVICE_MODEL := TV Box 3566
+  DEVICE_DTS := rockchip/rk3566-jp-tvbox
+  SUPPORTED_DEVICES := jp-tvbox,rk3566
+  SOC := rk3566
+  UBOOT_DEVICE_NAME := generic-rk3568
+  IMAGE/sysupgrade.img.gz := boot-common | boot-script | pine64-img | gzip | append-metadata
+  DEVICE_PACKAGES := e2fsprogs mkf2fs fdisk cfdisk partx-utils block-mount \
+    parted resize2fs losetup f2fsck \
+    dosfstools kmod-fs-vfat kmod-fs-msdos kmod-fs-ext4 \
+    kmod-nls-cp437 kmod-nls-utf8 \
+    ntfs-3g kmod-fuse \
+    kmod-usb-storage kmod-usb-storage-uas kmod-usb-storage-extras \
+    kmod-brcmfmac brcmfmac-nvram-jp-tv \
+    wpad-basic-wolfssl iw kmod-bluetooth \
+    kmod-rk-vcodec kmod-rk-spdif kmod-rk-simple-card kmod-rk-i2s \
+    kmod-rk-ahci kmod-openvfd openvfd -urngd
+endef
+TARGET_DEVICES += jp_tv
+
 # RK3528 (HINLINK OPC-H28K): boot chain is TPL/ATF from rkbin + U-Boot 2026.07,
 # see package/boot/uboot-rockchip-rk3528 and package/boot/rockchip-rkbin.
 define Device/hinlink_opc-h28k

@@ -49,7 +49,8 @@ define U-Boot/generic-rk3568
   $(U-Boot/rk3566/Default)
   NAME:=GENERIC RK3566
   BUILD_DEVICES:= \
-    panther_x2
+    panther_x2 \
+    jp_tv
 endef
 
 UBOOT_TARGETS := \

@@ -9,10 +9,20 @@ LD_LIBRARY_PATH=$PWD/lib ./rkdeveloptool rci
 LD_LIBRARY_PATH=$PWD/lib ./rkdeveloptool wl 0 panther-x2.img
 LD_LIBRARY_PATH=$PWD/lib ./rkdeveloptool rd
 
+
 H28k
 LD_LIBRARY_PATH=$PWD/lib ./rkdeveloptool ld
 LD_LIBRARY_PATH=$PWD/lib ./rkdeveloptool db rk3528_spl_loader_v1.10.105.bin
 LD_LIBRARY_PATH=$PWD/lib ./rkdeveloptool rci
 LD_LIBRARY_PATH=$PWD/lib ./rkdeveloptool wl 0 h28k.img
 LD_LIBRARY_PATH=$PWD/lib ./rkdeveloptool rd
+
+
+First enter loader mode.
+
+Jp_tv
+LD_LIBRARY_PATH=$PWD/lib ./rkdeveloptool ld
+LD_LIBRARY_PATH=$PWD/lib ./rkdeveloptool wl 0 jp_tv.img
+LD_LIBRARY_PATH=$PWD/lib ./rkdeveloptool rd
+
 

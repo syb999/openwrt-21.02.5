@@ -1,0 +1,30 @@
+misc: add the OpenVFD front panel display driver
+
+The JP TV Box 3566 carries the usual Android-TV-box front panel: a small
+7-segment LED display driven by a clock/data GPIO pair.  The stock firmware
+describes it as "fddis_dev" (driver "digital_dis") with
+fddis_gpio_clk = gpio0 RK_PB3 and fddis_gpio_dat = gpio0 RK_PB4 - read back
+from /proc/device-tree on the running box.
+
+The driver is vendored in the target's files/ overlay
+(drivers/misc/openvfd/, from github.com/arthur-liberman/linux_openvfd,
+GPL-2.0); this patch only hooks it into the kernel's Kconfig/Makefile.
+
+It is a tristate so that only the board that ships the display installs and
+loads it (kmod-openvfd in target/linux/rockchip/modules.mk).
+
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -482,3 +482,5 @@
+ source "drivers/misc/cardreader/Kconfig"
+ source "drivers/misc/habanalabs/Kconfig"
+ endmenu
++
++source "drivers/misc/openvfd/Kconfig"
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -57,3 +57,4 @@
+ obj-$(CONFIG_PVPANIC)   	+= pvpanic.o
+ obj-$(CONFIG_HABANA_AI)		+= habanalabs/
+ obj-$(CONFIG_XILINX_SDFEC)	+= xilinx_sdfec.o
++obj-$(CONFIG_OPENVFD)	+= openvfd/

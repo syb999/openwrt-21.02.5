@@ -1,10 +1,13 @@
 #!/bin/sh
-# panther,x2: 只有一个网口(wan)。wifi AP 需要一个空的 br-lan 当二层落点，
+# panther,x2 / jp-tvbox,rk3566: 只有一个网口(wan)。wifi AP 需要一个空的 br-lan 当二层落点，
 # 而 netifd 只有在 bridge_empty=1 时才会在端口不存在的情况下也把桥建出来。
 
 . /lib/functions.sh
 
-[ "$(board_name)" = "panther,x2" ] || exit 0
+case "$(board_name)" in
+panther,x2|jp-tvbox,rk3566) ;;
+*) exit 0 ;;
+esac
 
 sect=""
 for s in $(uci -q show network 2>/dev/null | sed -n "s/^network\.\([^.=]*\)\.name='br-lan'$/\1/p"); do

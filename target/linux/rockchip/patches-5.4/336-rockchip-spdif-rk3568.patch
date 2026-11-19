@@ -1,0 +1,22 @@
+ASoC: rockchip: spdif: add the rk3568 compatible
+
+The rk3568 SPDIF transmitter is the same rk3366-class block (no GRF
+preratio register, 10 MHz mclk), so it only needs its compatible string
+in the match table - this is exactly what upstream did in v5.10
+(commit "ASoC: rockchip: add support for rk3568").
+
+Needed by the JP TV Box 3566 optical output (spdif@fe460000 in
+rk3568.dtsi, which is already described with compatible
+"rockchip,rk3568-spdif").
+
+--- a/sound/soc/rockchip/rockchip_spdif.c
++++ b/sound/soc/rockchip/rockchip_spdif.c
+@@ -58,6 +58,8 @@
+ 	  .data = (void *)RK_SPDIF_RK3366 },
+ 	{ .compatible = "rockchip,rk3399-spdif",
+ 	  .data = (void *)RK_SPDIF_RK3366 },
++	{ .compatible = "rockchip,rk3568-spdif",
++	  .data = (void *)RK_SPDIF_RK3366 },
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(of, rk_spdif_match);

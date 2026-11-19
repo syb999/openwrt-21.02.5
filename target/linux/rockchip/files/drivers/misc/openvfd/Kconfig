@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# OpenVFD - front-panel display driver for Android TV boxes.
+#
+config OPENVFD
+	tristate "OpenVFD front panel LED/segment display"
+	depends on OF && GPIOLIB
+	help
+	  Driver for the small front-panel displays found on many Android TV
+	  boxes: FD628/FD650 7-segment controllers driven by a clock/data GPIO
+	  pair, plus HD44780, SSD1306, PCD8544 and IL3829 panels.  Exposes
+	  /dev/openvfd; the userspace daemon writes the time/status to it.
+
+	  Say M here. The module is only packaged for the board that has such a
+	  display (JP TV Box 3566); the device tree node is "open,vfd".

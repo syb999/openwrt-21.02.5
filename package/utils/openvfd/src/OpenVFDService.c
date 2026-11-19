@@ -1,0 +1,855 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
+#include <sys/stat.h> 
+#include <unistd.h> 
+#include <fcntl.h>
+#include <errno.h>
+#include <time.h>
+#include <sys/ioctl.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <limits.h>
+#include <signal.h>
+#include "driver/openvfd_drv.h"
+
+#define UNUSED(x)	(void*)(x)
+#define DRV_NAME	"/dev/" DEV_NAME
+#define PIPE_PATH	"/tmp/" DEV_NAME "_service"
+
+void select_display_type(void);
+bool set_display_type(int new_display_type);
+const char *get_user_string(int argc, char *argv[]);
+const char *get_secondary_user_string(int argc, char *argv[]);
+bool is_verbose(int argc, char *argv[]);
+bool is_demo_mode(int argc, char *argv[]);
+bool is_test_mode(int argc, char *argv[]);
+bool is_12h_mode(int argc, char *argv[]);
+bool is_carousel_mode(int argc, char *argv[]);
+int parse_carousel_durations(int argc, char *argv[], int durations[3]);
+bool is_date_mday_first(int argc, char *argv[]);
+int get_cpu_temp(void);
+int get_cmd_display_type(int argc, char *argv[]);
+int get_cmd_chars_order(int argc, char *argv[], u_int8 chars[], const int sz);
+bool print_usage(int argc, char *argv[]);
+
+struct sync_data {
+	volatile sig_atomic_t isActive;
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+	struct timespec abs_time;
+	bool useBuffer;
+	union {
+		struct vfd_display_data display_data;
+		char buffer[sizeof(struct vfd_display_data)];
+	};
+};
+
+struct display_setup {
+	bool is_demo;
+	bool is_12h;
+	bool is_carousel;
+	bool date_mday_first;		/* true: MM.DD, false(default): DD.MM */
+	int carousel_durations[3];	/* durations in 500ms ticks */
+	const char *user_string;
+	const char *secondary_user_string;
+};
+
+typedef struct _DotLedBitMap {
+	uint8_t on;
+	uint8_t bitmap;
+}DotLedBitMap;
+
+#define LED_MASK_VOID	0x00
+static DotLedBitMap dotLeds[LED_DOT_MAX] = {
+	{0, 0x01},
+	{0, 0x02},
+	{0, 0x04},
+	{0, 0x08},
+	{0, 0x10},
+	{0, 0x20},
+	{0, 0x40},
+};
+
+#define LEDCODES_LEN	(sizeof(LED_decode_tab1)/sizeof(LED_decode_tab1[0]))
+static const led_bitmap *ledCodes = LED_decode_tab1;
+static struct vfd_display display_type;
+
+int openvfd_fd;
+bool verbose = false;
+#define VERBOSE_PRINTF(s) if (verbose) printf(s)
+
+uint8_t char_to_mask(uint8_t ch)
+{
+	unsigned int index = 0;
+	if (display_type.controller > CONTROLLER_7S_MAX)
+		return ch;
+	else {
+		for (index = 0; index < LEDCODES_LEN; index++) {
+			if (ledCodes[index].character == ch) {
+				return ledCodes[index].bitmap;
+			}
+		}
+	}
+
+	return LED_MASK_VOID;
+}
+
+void mdelay(int n)
+{
+	unsigned long msec=(n);
+	while (msec--)
+		usleep(1000);
+}
+
+struct sync_data sync_data;
+
+int get_cpu_temp(void)
+{
+	char path[64];
+	int i, t, temp = 0;
+	for (i = 0; i < 8; i++) {
+		FILE *fp;
+		snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", i);
+		fp = fopen(path, "r");
+		if (!fp)
+			continue;
+		if (fscanf(fp, "%d", &t) == 1 && t > temp)
+			temp = t;
+		fclose(fp);
+	}
+	return temp / 1000;
+}
+
+void fill_clock_date(struct vfd_display_data *data, const struct tm *timenow, bool is_12h)
+{
+	if (is_12h) {
+		if (timenow->tm_hour == 0)
+			data->time_date.hours = 12;
+		else if (timenow->tm_hour > 12)
+			data->time_date.hours = timenow->tm_hour - 12;
+		else
+			data->time_date.hours = timenow->tm_hour;
+	} else {
+		data->time_date.hours = timenow->tm_hour;
+	}
+	data->time_date.minutes = timenow->tm_min;
+	data->time_date.seconds = timenow->tm_sec;
+	data->time_date.day_of_week = timenow->tm_wday;
+	data->time_date.day = timenow->tm_mday;
+	data->time_date.month = timenow->tm_mon;
+	data->time_date.year = timenow->tm_year + 1900;
+}
+
+/* CLOCK=0, DATE=1, TEMP=2. Falls back to clock when no duration is active. */
+int carousel_display_mode(const struct display_setup *setup, int *state, int *tick)
+{
+	int active = 0, only = 0, i;
+
+	for (i = 0; i < 3; i++) {
+		if (setup->carousel_durations[i] > 0) {
+			active++;
+			only = i;
+		}
+	}
+	if (active == 0)
+		return DISPLAY_MODE_CLOCK;
+	if (active == 1) {
+		*state = only;
+	} else {
+		int skip;
+
+		(*tick)++;
+		if (*tick >= setup->carousel_durations[*state]) {
+			*tick = 0;
+			for (skip = 0; skip < 3; skip++) {
+				*state = (*state + 1) % 3;
+				if (setup->carousel_durations[*state] > 0)
+					break;
+			}
+		}
+	}
+
+	if (*state == 1)
+		return DISPLAY_MODE_DATE;
+	if (*state == 2)
+		return DISPLAY_MODE_TEMPERATURE;
+	return DISPLAY_MODE_CLOCK;
+}
+
+void led_display_loop(const struct display_setup *setup)
+{
+	static struct vfd_display_data data = { 0 };
+	bool use_user_string = false;
+	int ret = -1;
+
+	time_t now;
+	struct tm *timenow;
+
+	static int carousel_state = 0;
+	static int carousel_tick = 0;
+
+	memset(&data, 0, sizeof(data));
+
+	if (setup->user_string) {
+		use_user_string = true;
+		data.mode = DISPLAY_MODE_TITLE;
+		snprintf(data.string_main, sizeof(data.string_main), "%s", setup->user_string);
+		if (setup->secondary_user_string)
+			snprintf(data.string_secondary, sizeof(data.string_secondary), "%s", setup->secondary_user_string);
+	}
+
+	while(sync_data.isActive) {
+		if (!pthread_mutex_lock(&sync_data.mutex)) {
+			ret = pthread_cond_timedwait(&sync_data.cond, &sync_data.mutex, &sync_data.abs_time);
+			if (!ret || ret == ETIMEDOUT) {
+				clock_gettime(CLOCK_REALTIME, &sync_data.abs_time);
+				sync_data.abs_time.tv_nsec += (long)5E8;
+				if (sync_data.abs_time.tv_nsec >= (long)1E9) {
+					sync_data.abs_time.tv_nsec -= (long)1E9;
+					sync_data.abs_time.tv_sec++;
+				}
+
+				select_display_type();
+				if (sync_data.useBuffer && (sync_data.display_data.mode == DISPLAY_MODE_CLOCK ||
+						sync_data.display_data.mode == DISPLAY_MODE_DATE)) {
+					use_user_string = false;
+					sync_data.useBuffer = false;
+					sync_data.display_data.colon_on = data.colon_on;
+					data = sync_data.display_data;
+				}
+
+				if (sync_data.useBuffer) {
+					use_user_string = false;
+					data = sync_data.display_data;
+				} else {
+					// Get current time
+					time(&now);
+					timenow = localtime(&now);
+
+					if (setup->is_demo) {
+						data.mode = 1 + timenow->tm_sec / 12;
+						data.temperature = timenow->tm_hour + timenow->tm_min + timenow->tm_sec;
+						data.channel_data.channel = (u_int16)10*(timenow->tm_hour + timenow->tm_min + timenow->tm_sec);
+						data.channel_data.channel_count = (u_int16)86400;
+						data.time_date.hours = ((timenow->tm_sec >= 24) && (timenow->tm_sec < 30)) ? 0 : (timenow->tm_hour == 0) ? 24 : timenow->tm_hour;
+						data.time_date.minutes = timenow->tm_min;
+						data.time_date.seconds = timenow->tm_sec;
+						data.time_date.day_of_week = timenow->tm_wday;
+						data.time_date.day = timenow->tm_mday;
+						data.time_date.month = timenow->tm_mon;
+						data.time_date.year = timenow->tm_year + 1900;
+						data.time_secondary.hours = timenow->tm_hour;
+						data.time_secondary.minutes = timenow->tm_min;
+						data.time_secondary.seconds = timenow->tm_sec;
+						data.colon_on = !data.colon_on;
+						// Really long movie title.
+						snprintf(data.string_main, sizeof(data.string_main), "The Saga of the Viking Women and their Voyage to the Waters of the Great Sea Serpent");
+						snprintf(data.string_secondary, sizeof(data.string_secondary), "Now playing:");
+					} else if (!use_user_string) {
+						fill_clock_date(&data, timenow, setup->is_12h);
+						data.colon_on = !data.colon_on;
+						/* _reserved=0: DD.MM (default), _reserved=1: MM.DD (-mdf) */
+						data.time_secondary._reserved = setup->date_mday_first ? 1 : 0;
+						if (setup->is_carousel) {
+							data.mode = carousel_display_mode(setup, &carousel_state, &carousel_tick);
+							if (data.mode == DISPLAY_MODE_TEMPERATURE)
+								data.temperature = get_cpu_temp();
+						} else if (data.mode != DISPLAY_MODE_DATE) {
+							data.mode = DISPLAY_MODE_CLOCK;
+						}
+					}
+				}
+				ret = write(openvfd_fd,&data,sizeof(data));
+			}
+			pthread_mutex_unlock(&sync_data.mutex);
+		} else {
+			mdelay(500);
+		}
+	}
+}
+
+void led_test_codes()
+{
+	unsigned short write_buffer[7];
+	unsigned char val = ':';
+	unsigned int i = 0;
+
+	// Test chart, sequence of numbers.
+	for(i = 0; i < LEDCODES_LEN; i++) {
+		val = ~val;
+		write_buffer[1] = char_to_mask(ledCodes[i].character);
+		write_buffer[2] = char_to_mask(ledCodes[i].character);
+		write_buffer[3] = char_to_mask(ledCodes[i].character);
+		write_buffer[4] = char_to_mask(ledCodes[i].character);
+		write_buffer[0] = val;
+
+		write(openvfd_fd,write_buffer,sizeof(write_buffer[0])*5);
+		mdelay(500);
+	}
+
+	// Test bit sequence.
+	for(i = 0; i < 10; i++) {
+		val = ~val;
+		write_buffer[1] = char_to_mask(1);
+		write_buffer[2] = char_to_mask(2);
+		write_buffer[3] = char_to_mask(3);
+		write_buffer[4] = char_to_mask(4);
+		write_buffer[0] = val;
+
+		write(openvfd_fd,write_buffer,sizeof(write_buffer[0])*5);
+		mdelay(500);
+	}
+
+	// Test sequence 2
+	write_buffer[0] = 0;
+	for(i = 0; i < LED_DOT_MAX; i++){
+		val = ~val;
+		write_buffer[1] = char_to_mask(5);
+		write_buffer[2] = char_to_mask(6);
+		write_buffer[3] = char_to_mask(7);
+		write_buffer[4] = char_to_mask(8);
+		write_buffer[0] &= dotLeds[i%LED_DOT_MAX].bitmap;
+
+		write(openvfd_fd,write_buffer,sizeof(write_buffer[0])*5);
+		mdelay(500);
+	}
+
+	// Test sequence 3
+	write_buffer[0] = 0;
+	for(i = 0; i < LED_DOT_MAX; i++){
+		val = ~val;
+		write_buffer[1] = char_to_mask(6);
+		write_buffer[2] = char_to_mask(7);
+		write_buffer[3] = char_to_mask(8);
+		write_buffer[4] = char_to_mask(9);
+		write_buffer[0] |= dotLeds[i%LED_DOT_MAX].bitmap;
+
+		write(openvfd_fd,write_buffer,sizeof(write_buffer[0])*5);
+		mdelay(500);
+	}
+}
+
+void led_test_loop(bool cycle_display_types)
+{
+	int current_type = DISPLAY_TYPE_5D_7S_NORMAL;
+	int transposed = 0;
+	const pid_t pid = getpid();
+	printf("Initializing...\n");
+	if (!cycle_display_types)
+		printf("Process ID = %d\n", pid);
+	while (sync_data.isActive) {
+		int i;
+		const int len = 7;
+		unsigned short wb[7];
+		const size_t sz = sizeof(wb[0])*len;
+
+		if (cycle_display_types) {
+			printf("Process ID = %d\n", pid);
+			++current_type;
+			current_type %= DISPLAY_TYPE_MAX;
+			if (!current_type)
+				transposed = (~transposed & DISPLAY_FLAG_TRANSPOSED_INT);
+			printf("Set display type to 0x%08X\n", current_type | transposed);
+			set_display_type(current_type | transposed);
+			select_display_type();
+		}
+
+		// Light up all sections and cycle
+		// through display brightness levels.
+		memset(wb, 0xFF, sz);
+		write(openvfd_fd,wb,sz);
+		for (i = FD628_Brightness_1; i <= FD628_Brightness_8; i++) {
+			ioctl(openvfd_fd, VFD_IOC_SBRIGHT, &i);
+			mdelay(1000);
+		}
+
+		// Clear display for a second.
+		memset(wb, 0x00, sz);
+		write(openvfd_fd,wb,sz);
+		mdelay(1000);
+
+		// Run original test codes.
+		led_test_codes();
+
+		// Cycle through fully lit characters.
+		for (i = 0; i < len; i++) {
+			memset(wb, 0x00, sz);
+			wb[i] = 0xFF;
+			write(openvfd_fd,wb,sz);
+			mdelay(1000);
+		}
+
+		// Cycle through bits in each character.
+		for (i = 0; i < len; i++) {
+			memset(wb, (1 << i), sz);
+			write(openvfd_fd,wb,sz);
+			mdelay(1000);
+		}
+	}
+}
+
+void *display_thread_handler(void *arg)
+{
+	struct display_setup *setup = (struct display_setup*)arg;
+	led_display_loop(setup);
+	pthread_exit(NULL);
+}
+
+void *display_test_thread_handler(void *arg)
+{
+	bool cycle_display_types = *(bool*)arg;
+	led_test_loop(cycle_display_types);
+	pthread_exit(NULL);
+}
+
+static int create_control_fifo(void)
+{
+	mode_t oldmask;
+	int fd;
+
+	unlink(PIPE_PATH);
+	oldmask = umask(0077);
+	if (mkfifo(PIPE_PATH, S_IRUSR | S_IWUSR) != 0) {
+		umask(oldmask);
+		printf("Unable to create a fifo; errno=%d\n", errno);
+		return -1;
+	}
+	umask(oldmask);
+	chmod(PIPE_PATH, S_IRUSR | S_IWUSR);
+
+	/* O_RDWR does not block, and keeps a writer open so reads wait for data. */
+	fd = open(PIPE_PATH, O_RDWR);
+	if (fd < 0) {
+		printf("Unable to open fifo; errno=%d\n", errno);
+		unlink(PIPE_PATH);
+		return -1;
+	}
+	return fd;
+}
+
+void *named_pipe_thread_handler(void *arg)
+{
+	int file;
+	char buf[1024];
+	int ret = 0, i;
+	unsigned char skipSignal;
+
+	(void)arg;
+	file = create_control_fifo();
+	if (file < 0)
+		pthread_exit(NULL);
+
+	while (sync_data.isActive) {
+		ret = read(file, buf, sizeof(buf) - 1);
+		if (ret <= 0) {
+			if (!sync_data.isActive)
+				break;
+			if (ret < 0 && (errno == EAGAIN || errno == EINTR))
+				continue;
+			break;
+		}
+		buf[ret] = '\0';
+		if (verbose) {
+			printf("ret = %d, %s\n", ret, buf);
+			for (i = 0; i < ret; i++)
+				printf("0x%02X, ", buf[i]);
+			printf("\n");
+		}
+		if (!pthread_mutex_lock(&sync_data.mutex)) {
+			skipSignal = 0;
+			if (ret == sizeof(sync_data.display_data)) {
+				VERBOSE_PRINTF("Write display data\n");
+				memcpy(&sync_data.display_data, buf, sizeof(sync_data.display_data));
+				sync_data.useBuffer = true;
+			} else {
+				VERBOSE_PRINTF("Write unknown data\n");
+				switch ((unsigned char)buf[0]) {
+				case 0:
+				default:
+					VERBOSE_PRINTF("case 0, default\n");
+					sync_data.useBuffer = true;
+					sync_data.display_data.mode = DISPLAY_MODE_CLOCK;
+					break;
+				case 1:
+					// Refresh display. Will signal the led_loop to update display.
+					break;
+				case 2:
+					if (ret >= 3 && buf[1] == DISPLAY_MODE_DATE)
+					{
+						if (sync_data.display_data.mode == DISPLAY_MODE_DATE)
+							skipSignal = 1;
+						else
+							sync_data.display_data.mode = DISPLAY_MODE_DATE;
+						sync_data.display_data.time_secondary._reserved = buf[2];
+						sync_data.useBuffer = true;
+					}
+					break;
+				}
+			}
+			if (!skipSignal)
+				pthread_cond_signal(&sync_data.cond);
+			pthread_mutex_unlock(&sync_data.mutex);
+		}
+	}
+
+	close(file);
+	unlink(PIPE_PATH);
+	pthread_exit(NULL);
+}
+
+void select_display_type()
+{
+	if (!ioctl(openvfd_fd, VFD_IOC_GDISPLAY_TYPE, &display_type)) {
+		switch(display_type.type) {
+			case DISPLAY_TYPE_5D_7S_T95:
+				ledCodes = LED_decode_tab1;
+				break;
+			case DISPLAY_TYPE_5D_7S_G9SX:
+				ledCodes = LED_decode_tab3;
+				break;
+			case DISPLAY_TYPE_4D_7S_FREESATGTC:
+				ledCodes = LED_decode_tab4;
+				break;
+			case DISPLAY_TYPE_5D_7S_TAP1:
+				ledCodes = LED_decode_tab5;
+				break;
+			default:
+				ledCodes = LED_decode_tab2;
+				break;
+		}
+	} else {
+		memset(&display_type, 0, sizeof(display_type));
+		perror("Failed to read display type, using default.");
+	}
+}
+
+bool set_display_type(int new_display_type)
+{
+	long ret = ioctl(openvfd_fd, VFD_IOC_SDISPLAY_TYPE, &new_display_type);
+	if (ret) {
+		printf("Failed setting a new display type.\n");
+		if (ret == ERANGE)
+			printf("Unsupported display type. (out of range)\n");
+	}
+
+	return ret == 0;
+}
+
+void handle_signal(int signal)
+{
+	int file;
+	char wake = 1;
+
+	(void)signal;
+	sync_data.isActive = 0;
+	file = open(PIPE_PATH, O_WRONLY | O_NONBLOCK);
+	if (file < 0)
+		return;
+	write(file, &wake, 1);
+	close(file);
+}
+
+static void init_sync_data(void)
+{
+	memset(&sync_data, 0, sizeof(sync_data));
+	pthread_mutex_init(&sync_data.mutex, NULL);
+	pthread_cond_init(&sync_data.cond, NULL);
+	sync_data.isActive = 1;
+}
+
+int main(int argc, char *argv[])
+{
+	u_int8 char_indexes[7];
+	int ret, type, char_order_count;
+	bool test_mode = false;
+	bool cycle_display_types = true;
+	pthread_t disp_id, npipe_id = 0;
+
+	if (print_usage(argc, argv))
+		return 0;
+	openvfd_fd = open(DRV_NAME, O_RDWR);
+	if (openvfd_fd < 0) {
+		perror("Open device failed.\n");
+		exit(1);
+	}
+
+	verbose = is_verbose(argc, argv);
+	char_order_count = get_cmd_chars_order(argc, argv, char_indexes, (int)sizeof(char_indexes));
+	if (char_order_count)
+		if (ioctl(openvfd_fd, VFD_IOC_SCHARS_ORDER, char_indexes))
+			printf("Error setting new character order.\n");
+
+	type = get_cmd_display_type(argc, argv);
+	if (type >= 0)
+		cycle_display_types = !set_display_type(type);
+	select_display_type();
+
+	test_mode = is_test_mode(argc, argv);
+	init_sync_data();
+	{
+		struct sigaction sig_handler = {.sa_handler = handle_signal};
+		sigemptyset(&sig_handler.sa_mask);
+		sigaction(SIGTERM, &sig_handler, 0);
+		sigaction(SIGINT, &sig_handler, 0);
+	}
+	if (test_mode)
+		ret = pthread_create(&disp_id, NULL, display_test_thread_handler, &cycle_display_types);
+	else {
+		struct display_setup setup = { 0 };
+		setup.is_demo = is_demo_mode(argc, argv);
+		setup.is_12h = is_12h_mode(argc, argv);
+		setup.is_carousel = is_carousel_mode(argc, argv);
+		setup.date_mday_first = is_date_mday_first(argc, argv);
+		/* default durations: 5s CLOCK, 3s DATE, 3s TEMP */
+		setup.carousel_durations[0] = 10;
+		setup.carousel_durations[1] = 6;
+		setup.carousel_durations[2] = 6;
+		switch (parse_carousel_durations(argc, argv, setup.carousel_durations)) {
+		case 1:
+			setup.is_carousel = true;
+			break;
+		case -1:
+			setup.is_carousel = false;
+			break;
+		}
+		setup.user_string = get_user_string(argc, argv);
+		if (setup.user_string)
+			setup.secondary_user_string = get_secondary_user_string(argc, argv);
+		ret = pthread_create(&disp_id, NULL, display_thread_handler, &setup);
+		if (ret == 0)
+			ret = pthread_create(&npipe_id, NULL, named_pipe_thread_handler, NULL);
+	}
+	if(ret != 0) {
+		perror("Create disp_id or npipe_id thread error\n");
+		return ret;
+	}
+
+	if (npipe_id)
+		pthread_join(npipe_id, NULL);
+	pthread_join(disp_id, NULL);
+	close(openvfd_fd);
+	return 0;
+}
+
+bool is_cmd_option(int argc, char *argv[], const char *str)
+{
+	bool ret = false;
+	int i;
+	for (i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], str)) {
+			ret = true;
+			break;
+		}
+	}
+
+	return ret;
+}
+
+const char *get_user_string(int argc, char *argv[])
+{
+	int i;
+	for (i = 1; i < argc; i++) {
+		if ((!strcmp(argv[i], "-s") || !strcmp(argv[i], "--string")) && ++i < argc) {
+			return argv[i];
+		}
+	}
+	return NULL;
+}
+
+const char *get_secondary_user_string(int argc, char *argv[])
+{
+	int i;
+	for (i = 1; i < argc; i++) {
+		if ((!strcmp(argv[i], "-ss") || !strcmp(argv[i], "--secondary-string")) && ++i < argc) {
+			return argv[i];
+		}
+	}
+	return NULL;
+}
+
+bool is_verbose(int argc, char *argv[])
+{
+	return is_cmd_option(argc, argv, "-v");
+}
+
+bool is_demo_mode(int argc, char *argv[])
+{
+	return is_cmd_option(argc, argv, "-dm");
+}
+
+bool is_test_mode(int argc, char *argv[])
+{
+	return is_cmd_option(argc, argv, "-t");
+}
+
+bool is_12h_mode(int argc, char *argv[])
+{
+	return is_cmd_option(argc, argv, "-12h");
+}
+
+/* -mdf: month-day-first, display date as MM.DD instead of default DD.MM */
+bool is_date_mday_first(int argc, char *argv[])
+{
+	return is_cmd_option(argc, argv, "-mdf");
+}
+
+bool is_carousel_mode(int argc, char *argv[])
+{
+	return is_cmd_option(argc, argv, "--carousel");
+}
+
+static bool parse_duration_field(const char *field, long *out)
+{
+	char *end;
+	long val;
+
+	if (!field || !*field)
+		return false;
+	errno = 0;
+	val = strtol(field, &end, 10);
+	if (end == field || *end != '\0' || errno == ERANGE || val < 0 || val > (INT_MAX / 2))
+		return false;
+	*out = val;
+	return true;
+}
+
+/* 1 = parsed, 0 = option absent, -1 = rejected. Seconds are stored as 500ms ticks. */
+int parse_carousel_durations(int argc, char *argv[], int durations[3])
+{
+	int i;
+
+	for (i = 1; i < argc; i++) {
+		const char *start, *comma;
+		long vals[3];
+		int field;
+
+		if (strcmp(argv[i], "-cd") && strcmp(argv[i], "--carousel-duration"))
+			continue;
+		if (++i >= argc) {
+			printf("Error parsing carousel durations, missing argument.\n");
+			return -1;
+		}
+
+		start = argv[i];
+		for (field = 0; field < 3; field++) {
+			char buf[32];
+			size_t len;
+
+			comma = strchr(start, ',');
+			if (field < 2) {
+				if (!comma) {
+					printf("Error parsing carousel durations, expected CLOCK,DATE,TEMP.\n");
+					return -1;
+				}
+				len = (size_t)(comma - start);
+				if (len == 0 || len >= sizeof(buf)) {
+					printf("Error parsing carousel durations, expected three non-negative integers.\n");
+					return -1;
+				}
+				memcpy(buf, start, len);
+				buf[len] = '\0';
+				if (!parse_duration_field(buf, &vals[field])) {
+					printf("Error parsing carousel durations, expected three non-negative integers.\n");
+					return -1;
+				}
+				start = comma + 1;
+			} else if (comma || !parse_duration_field(start, &vals[field])) {
+				printf("Error parsing carousel durations, expected CLOCK,DATE,TEMP.\n");
+				return -1;
+			}
+		}
+		if (vals[0] == 0 && vals[1] == 0 && vals[2] == 0) {
+			printf("Error parsing carousel durations, at least one duration must be non-zero.\n");
+			return -1;
+		}
+		durations[0] = (int)vals[0] * 2;
+		durations[1] = (int)vals[1] * 2;
+		durations[2] = (int)vals[2] * 2;
+		return 1;
+	}
+	return 0;
+}
+
+int get_cmd_display_type(int argc, char *argv[])
+{
+	int ret = -1, i;
+	for (i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "-dt")) {
+			if (argc >= (i + 2)) {
+				long temp = -1;
+				char *start, *end;
+				start = !strncmp(argv[i+1], "0x", 2) ? argv[i+1] + 2 : argv[i+1];
+				temp = strtol(start, &end, 0x10);
+				if (end == start || *end != '\0' || errno == ERANGE) {
+					printf("Error parsing display type index.\n");
+				} else {
+					ret = (int)temp;
+					printf("Display type 0x%08X\n", ret);
+				}
+			} else {
+				printf("Error parsing display type index, missing argument.\n");
+			}
+			break;
+		}
+	}
+
+	return ret;
+}
+
+int get_cmd_chars_order(int argc, char *argv[], u_int8 chars[], const int sz)
+{
+	int ret = 0, i, j;
+	for (i = 0; i < sz; i++)
+		chars[i] = i;
+	for (i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "-co")) {
+			for (i++, j = 0; i < argc && j < sz; i++) {
+				long temp = -1;
+				char *end;
+				temp = strtol(argv[i], &end, 10);
+				if (end == argv[i] || *end != '\0' || errno == ERANGE)
+					break;
+				else if (temp >= 0 && temp < sz)
+					chars[j++] = temp;
+			}
+
+			ret = j;
+			break;
+		}
+	}
+
+	if (ret) {
+		printf("Got %d char indexes.\n", ret);
+		for (i = 0; i < ret; i++) {
+			printf("index[%d] = %d\n", i, chars[i]);
+		}
+	}
+
+	return ret;
+}
+
+bool print_usage(int argc, char *argv[])
+{
+	bool ret = false;
+	int i;
+	for (i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+			ret = true;
+			printf("\nUsage: OpenVFDService [-t] [-dt TYPE] [-h]\n\n");
+			printf("\t-s USER_STRING\tRun OpenVFDService in custom string mode.\n\t\t\tDisplays the USER_STRING on the screen.");
+			printf("\t-ss SECONDARY_USER_STRING\tDisplay a smaller secondary string\n\t\t\tin addtion to USER_STRING.");
+			printf("\t-t\t\tRun OpenVFDService in display test mode.\n");
+			printf("\t-dm\t\tRun OpenVFDService in display demo mode.\n");
+			printf("\t--carousel\tRun OpenVFDService in carousel mode.\n\t\t\tCycles through CLOCK -> DATE -> TEMPERATURE.\n");
+			printf("\t-cd S,S,S\tCarousel durations in seconds (CLOCK,DATE,TEMP).\n\t\t\tDefault: 5,3,3. Implies --carousel.\n");
+			printf("\t-mdf\t\tDate format: month-day-first (MM.DD). Default is DD.MM.\n");
+			printf("\t-dt N\t\tSpecifies which display type to use.\n");
+			printf("\t-co N...\t< D HH:MM > Order of display chars.\n\t\t\tValid values are 0 - 6.\n\t\t\t(D=dots, represented by a single char)\n");
+			printf("\t-h\t\tThis text.\n\n");
+		}
+	}
+
+	return ret;
+}

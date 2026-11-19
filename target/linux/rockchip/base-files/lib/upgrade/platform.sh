@@ -10,6 +10,7 @@
 # at run time.
 #
 #   panther,x2                    (rk3566) -> rockchip_do_upgrade_panther
+#   jp-tvbox,rk3566               (rk3566) -> rockchip_do_upgrade_panther
 #   hinlink,opc-h28k / hinlink,h28k (rk3528) -> rockchip_do_upgrade_h28k
 #   every other board (rk3328 NanoPi R2S, rk3399 RockPro64 / ROCK Pi 4, ...)
 #                                 -> rockchip_do_upgrade_generic
@@ -177,9 +178,12 @@ rockchip_do_upgrade_generic() {
 }
 
 #
-# Panther X2 path (rk3566).
+# Panther X2 path (rk3566).  Also used by jp-tvbox,rk3566, which has exactly
+# the same image layout and the same "never rewrite the loader area" need.
 #
-# Storage: eMMC only (the SD slot is dead), enumerating as mmcblk2.
+# Storage: eMMC only on both boards - on panther,x2 because its SD slot is dead
+# (eMMC enumerates as mmcblk2), on jp-tvbox because the box has no SD slot at
+# all and the eMMC is the only MMC device (mmcblk0).
 #
 # The disk is *not* derived from the running root filesystem: OpenWrt mounts
 # the rootfs from the literal string /dev/root, which does not exist as a
@@ -209,11 +213,39 @@ rockchip_do_upgrade_panther() {
 	local diskdev part partdev start size dpart dsize
 
 	export_bootdevice && export_partdevice diskdev 0 || {
-		echo "cannot determine the boot disk, refusing to upgrade"
-		return 1
+		# The boot script substitutes a hardcoded PARTUUID when U-Boot's
+		# "part uuid" comes back empty (see image/mmc.bootscript), so
+		# root=PARTUUID in /proc/cmdline can name a UUID that does not
+		# exist on the flashed disk.  export_bootdevice() then finds no
+		# match and sysupgrade would refuse to run on a perfectly
+		# healthy board, so fall back to the disk that hosts "/".
+		diskdev=$(sed -n 's|^/dev/\(mmcblk[0-9]\+\)p[0-9]\+ / .*|\1|p' /proc/mounts | head -n1)
+		[ -n "$diskdev" ] || {
+			echo "cannot determine the boot disk, refusing to upgrade"
+			return 1
+		}
+		BOOTDEV_MAJOR=$(cut -d: -f1 "/sys/class/block/$diskdev/dev" 2>/dev/null)
+		BOOTDEV_MINOR=$(cut -d: -f2 "/sys/class/block/$diskdev/dev" 2>/dev/null)
+		[ -n "$BOOTDEV_MAJOR" ] && [ -n "$BOOTDEV_MINOR" ] || {
+			echo "cannot read major/minor of /dev/$diskdev, refusing to upgrade"
+			return 1
+		}
+		echo "boot PARTUUID not on disk, using /dev/$diskdev (from /)" >&2
 	}
 
 	echo "upgrading /dev/$diskdev from $1"
+
+	# Front panel: the red LED is dark during normal operation (see
+	# /etc/init.d/jp-tv-panel), make it blink while the image is written so
+	# a long upgrade is visibly "in progress" instead of looking hung.
+	if [ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = "jp-tvbox,rk3566" ]; then
+		R=/sys/class/leds/red:status
+		if [ -d "$R" ]; then
+			echo timer > "$R/trigger" 2>/dev/null
+			echo 150 > "$R/delay_on" 2>/dev/null
+			echo 150 > "$R/delay_off" 2>/dev/null
+		fi
+	fi
 
 	# NOTE: do not remount the overlay read-only here to "protect" the write.
 	# It was tried (f2fs lives inside p2 on this board, so the running overlay
@@ -333,7 +365,7 @@ rockchip_do_upgrade_h28k() {
 
 platform_do_upgrade() {
 	case "$(board_name)" in
-	panther,x2)
+	panther,x2|jp-tvbox,rk3566)
 		rockchip_do_upgrade_panther "$@"
 		;;
 	hinlink,opc-h28k|hinlink,h28k)

@@ -60,6 +60,26 @@ rockchip_setup_interfaces()
 		# applied by netifd, so there is no fixed fallback address here; the
 		# port carries the upstream lease only.
 		;;
+	jp-tvbox,rk3566)
+		# Single Gigabit port (SoC GMAC1 with an RGMII PHY, MDIO address
+		# 1).  Same arrangement as panther,x2 and for the same reason: the
+		# port is the uplink and takes a lease, while the wireless AP is
+		# attached to a "lan" bridge that has no physical member (this box
+		# has no second port and no SD slot).  The firewall is opened for
+		# the wan zone as well, so the freshly flashed box is reachable at
+		# the address it leased; the full rationale for each step is in the
+		# panther,x2 block above.
+		ucidef_set_interface_wan 'eth0' 'dhcp'
+		/* no second port: br-lan is the wireless bridge, without members */
+		ucidef_set_interface_lan ''
+
+		uci -q set firewall.@defaults[0].input='ACCEPT'
+		uci -q set firewall.@defaults[0].forward='ACCEPT'
+		uci -q set firewall.@zone[1].input='ACCEPT'
+		uci -q set firewall.@zone[1].forward='ACCEPT'
+		uci -q set firewall.@zone[1].output='ACCEPT'
+		uci -q commit firewall
+		;;
 	*)
 		ucidef_set_interface_lan 'eth0'
 		;;
@@ -75,11 +95,14 @@ nanopi_r2s_generate_mac()
 
 panther_x2_generate_mac()
 {
-	# Stable per-board MAC derived from the onboard eMMC CID (mmc1 in the
-	# DT aliases, i.e. /dev/mmcblk1 on this board), falling back to the SD
-	# card CID and finally to the SoC serial.  The optional tag mixes in a
-	# per-interface string so one board can derive several *distinct*
-	# stable addresses.
+	# Stable per-board MAC derived from the onboard eMMC CID, falling back
+	# to the SD card CID and finally to the SoC serial.  The optional tag
+	# mixes in a per-interface string so one board can derive several
+	# *distinct* stable addresses.
+	#
+	# The CID is looked up in both mmc numbering schemes on purpose: on
+	# panther,x2 the eMMC is mmc1 (/dev/mmcblk1), on jp_tv it is mmc0
+	# (/dev/mmcblk0), and the DT alias decides which one it is.
 	local tag="$1" seed="" f
 	for f in /sys/class/mmc_host/mmc1/mmc1:*/cid \
 		 /sys/block/mmcblk1/device/cid \
@@ -90,7 +113,7 @@ panther_x2_generate_mac()
 		seed=$(cat "$f" 2>/dev/null)
 		[ -n "$seed" ] && break
 	done
-	[ -z "$seed" ] && seed="panther-x2"
+	[ -z "$seed" ] && seed="$(board_name)"
 
 	local hash=$(printf '%s-%s' "$seed" "$tag" | sha256sum | cut -c1-12)
 	local mac_base=$(macaddr_canonicalize "$hash")
@@ -137,6 +160,11 @@ rockchip_setup_macs()
 		# See the note in the h28k case below: a single address must not
 		# be shared between an interface and its members, so set it per
 		# network device.
+		ucidef_set_network_device_mac eth0 "$(panther_x2_generate_mac lan)"
+		;;
+	jp-tvbox,rk3566)
+		# Same eMMC-CID derived address as panther,x2; no vendor
+		# ethernet-MAC is stored anywhere readable on this box.
 		ucidef_set_network_device_mac eth0 "$(panther_x2_generate_mac lan)"
 		;;
 	friendlyarm,nanopi-r2s)

@@ -1,0 +1,13 @@
+arm64: dts: rockchip: build the JP TV Box 3566 dtb
+
+The board file itself is dropped into the kernel tree by the target's
+files/ directory; this only tells the dts Makefile to build it.  It must
+come after 303 (which appends the Panther X2 line to the same file).
+
+--- a/arch/arm64/boot/dts/rockchip/Makefile
++++ b/arch/arm64/boot/dts/rockchip/Makefile
+@@ -35,3 +35,4 @@
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3399-sapphire-excavator.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3528-opc-h28k.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3566-panther-x2.dtb
++dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3566-jp-tvbox.dtb

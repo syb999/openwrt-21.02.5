@@ -408,7 +408,7 @@ CONFIG_RTC_I2C_AND_SPI=y
 CONFIG_RTC_NVMEM=y
 # CONFIG_RUNTIME_TESTING_MENU is not set
 CONFIG_SCHED_MC=y
-CONFIG_SCSI=y
+CONFIG_SCSI=m
 # CONFIG_SCSI_LOWLEVEL is not set
 # CONFIG_SCSI_PROC_FS is not set
 CONFIG_SCSI_SAS_ATTRS=y
@@ -654,3 +654,11 @@ CONFIG_ROCKCHIP_RGA_CMD_BUF_COUNT=32
 # CONFIG_DMABUF_RK_HEAPS_DEBUG_PRINT is not set
 CONFIG_ROCKCHIP_RKNPU_PROC_FS=y
 CONFIG_ROCKCHIP_RKNPU_FENCE=y
+
+# This tree's wireless Kconfig already carries the "Vendor: ..." grouping menus
+# (backported from 5.10), so the Broadcom vendor symbol has to be enabled or
+# drivers/net/wireless/broadcom/* - including brcmfmac - is not even visible
+# and kmod-brcmfmac cannot set CONFIG_BRCMFMAC at all.  It is a visibility bool
+# with no runtime effect: drivers are still only built when their own symbol is
+# selected by a kmod, so the sibling boards are unaffected.
+CONFIG_WLAN_VENDOR_BROADCOM=y

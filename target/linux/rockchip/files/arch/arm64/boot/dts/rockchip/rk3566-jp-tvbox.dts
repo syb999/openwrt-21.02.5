@@ -1,0 +1,976 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * JP TV Box 3566 (Rockchip RK3566)
+ *
+ * Board wiring was taken from the RK3566 vendor device tree that ships as
+ * rk3566-jp-tvbox.dtb in ophub/amlogic-s9xxx-armbian
+ * (build-armbian/armbian-files/platform-files/rockchip/bootfs/dtb/rockchip/),
+ * decompiled and cross-checked against the vendor firmware's own boot
+ * environment (armbianEnv.txt: fdtfile=rk3566-jp-tvbox.dtb, console on
+ * ttyS2 at 1500000, root=/dev/mmcblk0p2).
+ *
+ * The description itself is written against the Rockchip 5.10 BSP SoC
+ * bindings, because that is the source of the drivers backported into this
+ * 5.4 kernel (vendor clock IDs, pinctrl group names, RK3568 GRF offsets).
+ *
+ * What this box has that the Panther X2 does not:
+ *   - no SD card slot at all (the vendor tree leaves sdmmc0 disabled and the
+ *     eMMC is mmc0, i.e. /dev/mmcblk0), so eMMC is the only boot medium,
+ *   - SDIO wifi (brcm,bcm4329-fmac) plus UART bluetooth, both on the same
+ *     module, powered from an out-of-band reset line,
+ *   - one front panel LED, and the RGMII PHY answered on MDIO address 1.
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pinctrl/rockchip.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+
+#include "rk3566.dtsi"
+
+/ {
+	model = "JP TV Box 3566";
+	compatible = "jp-tvbox,rk3566", "rockchip,rk3566";
+
+	aliases {
+		/*
+		 * Vendor mapping: the eMMC (sdhci) is the first MMC device and
+		 * therefore /dev/mmcblk0, exactly as the vendor firmware's
+		 * root=/dev/mmcblk0p2 expects.  The SDIO wifi follows as
+		 * mmc1 - there is no SD slot, so sdmmc0 gets no alias at all.
+		 */
+		mmc0 = &sdhci;
+		mmc1 = &sdmmc0;
+		mmc2 = &sdmmc1;
+		/delete-property/ mmc3;
+
+		serial2 = &uart2;
+		/* uart9 (reserved header) would otherwise register as ttyS0 */
+		serial9 = &uart9;
+
+		/*
+		 * gmac1 keeps the "ethernet1" alias: the dwmac-rk glue
+		 * derives its bus id from it and uses that to select the
+		 * RK3568_GRF_GMAC1_* register set over the GMAC0 one.
+		 */
+		/delete-property/ ethernet0;
+		/delete-property/ ethernet1;
+		ethernet1 = &gmac1;
+
+		led-boot = &led_green;
+		led-failsafe = &led_green;
+		led-running = &led_green;
+		led-upgrade = &led_green;
+	};
+
+	chosen {
+		stdout-path = "serial2:1500000n8";
+	};
+
+	/*
+	 * Both front panel LEDs, taken from the stock firmware's own device
+	 * tree (/proc/device-tree/leds on the running Android): green is
+	 * gpio0 RK_PD3 and active low, red is gpio0 RK_PD4 and active high.
+	 * The stock names are "power-green" / "power-red".
+	 */
+	leds {
+		compatible = "gpio-leds";
+		pinctrl-names = "default";
+		pinctrl-0 = <&led_green_en>, <&led_red_en>;
+
+		led_green: green {
+			label = "green:power";
+			gpios = <&gpio0 RK_PD3 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+
+		led_red: red {
+			label = "red:status";
+			gpios = <&gpio0 RK_PD4 GPIO_ACTIVE_HIGH>;
+			linux,default-trigger = "heartbeat";
+		};
+	};
+
+	vcc12v_dcin: vcc12v-dcin {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc12v_dcin";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <12000000>;
+		regulator-max-microvolt = <12000000>;
+	};
+
+	vcc5v0_sys: vcc5v0-sys-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc5v0_sys";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		vin-supply = <&vcc12v_dcin>;
+	};
+
+	vcc3v3_sys: vcc3v3-sys-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc3v3_sys";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		vin-supply = <&vcc5v0_sys>;
+	};
+
+	vcc5v0_usb_otg: vcc5v0-usb-otg {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc5v0_usb_otg";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		enable-active-high;
+		gpio = <&gpio0 RK_PA5 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&vcc5v0_usb_otg_en>;
+		vin-supply = <&vcc5v0_sys>;
+	};
+
+	sdio_pwrseq: sdio-pwrseq {
+		compatible = "mmc-pwrseq-simple";
+		clocks = <&rk809 1>;
+		clock-names = "ext_clock";
+		pinctrl-names = "default";
+		pinctrl-0 = <&wifi_enable_h>;
+		reset-gpios = <&gpio2 RK_PB1 GPIO_ACTIVE_LOW>;
+		post-power-on-delay-ms = <100>;
+	};
+
+	/*
+	 * Small front panel display that shows the clock.  The stock firmware
+	 * calls the node "fddis_dev" (driver "digital_dis") and drives it with
+	 * two GPIOs, which read back from /proc/device-tree on the running box
+	 * as gpio0 RK_PB3 (clk) and gpio0 RK_PB4 (dat).  The OpenVFD driver
+	 * (kmod-openvfd) + the "openvfd" daemon replace that vendor driver.
+	 */
+	openvfd {
+		compatible = "open,vfd";
+		dev_name = "openvfd";
+		status = "okay";
+		/* the driver looks these up by name, see openvfd_drv.h */
+		openvfd_gpio_clk = <&gpio0 RK_PB3 GPIO_ACTIVE_HIGH>;
+		openvfd_gpio_dat = <&gpio0 RK_PB4 GPIO_ACTIVE_HIGH>;
+		/*
+		 * Packed vfd_display { type, reserved, flags, controller } as one
+		 * little-endian cell: type=5 (DISPLAY_TYPE_4D_7S_COL),
+		 * flags=0, controller=6 (CONTROLLER_FD6551).
+		 *
+		 * The panel chip is an FD6551 on PB3/PB4 (two-wire); the driver's
+		 * default controller is FD628 (three-wire, needs an STB line this
+		 * board does not have), which only ever ends in the dummy
+		 * controller.  Setting the type here makes the driver initialise
+		 * FD6551 at probe time; the runtime "-dt" ioctl does not take
+		 * effect on this tree.
+		 */
+		openvfd_display_type = <0x06000005>;
+		/*
+		 * Register order, measured on the panel one register at a time
+		 * (0xFF to a single grid): 0x68=digit4, 0x6A=digit3, 0x6C=digit2,
+		 * 0x6E=digit1, 0x66=icons.  The driver maps character position ->
+		 * wbuf[] slot and writes slots as 0x66 + 2*slot, so character 0
+		 * (hour tens) has to land in slot 4.  Read as a raw byte array by
+		 * the driver, hence the [..] syntax and not <..>.
+		 */
+		openvfd_chars = [04 03 02 01 00];
+		/*
+		 * Icon bits, in LED_DOT order (ALARM, USB, PLAY, PAUSE, SEC, ETH,
+		 * WIFI).  Measured on the panel: the colon sits on bit 4 of the
+		 * icon register 0x66 (0x10).  The remaining icons are left at 0
+		 * until their bits are identified.
+		 */
+		openvfd_dot_bits = [01 02 08 04 10 20 80];
+	};
+};
+
+/*
+ * Same two problems with the vendor CPU OPP table as on the Panther X2, for
+ * the same reason (this SoC dtsi is shared): every OPP carries
+ * opp-supported-hw, which _opp_is_supported() rejects because platform code
+ * never calls dev_pm_opp_set_supported_hw(), and the bin variants repeat the
+ * base frequencies with different voltages so -EEXIST rolls back the whole
+ * table.  Redeclare the base table only, keeping the vendor voltages and
+ * latencies.
+ */
+&cpu0_opp_table {
+	/delete-node/ opp-408000000;
+	/delete-node/ opp-600000000;
+	/delete-node/ opp-816000000;
+	/delete-node/ opp-1104000000;
+	/delete-node/ opp-1416000000;
+	/delete-node/ opp-1608000000;
+	/delete-node/ opp-1800000000;
+	/delete-node/ opp-j-1008000000;
+	/delete-node/ opp-j-1416000000;
+	/delete-node/ opp-j-od-1608000000;
+	/delete-node/ opp-j-od-1800000000;
+	/delete-node/ opp-m-1608000000;
+
+	opp-408000000 {
+		opp-hz = /bits/ 64 <408000000>;
+		opp-microvolt = <850000 850000 1150000>;
+		clock-latency-ns = <40000>;
+	};
+
+	opp-600000000 {
+		opp-hz = /bits/ 64 <600000000>;
+		opp-microvolt = <850000 850000 1150000>;
+		clock-latency-ns = <40000>;
+	};
+
+	opp-816000000 {
+		opp-hz = /bits/ 64 <816000000>;
+		opp-microvolt = <850000 850000 1150000>;
+		clock-latency-ns = <40000>;
+		opp-suspend;
+	};
+
+	opp-1104000000 {
+		opp-hz = /bits/ 64 <1104000000>;
+		opp-microvolt = <900000 900000 1150000>;
+		clock-latency-ns = <40000>;
+	};
+
+	opp-1416000000 {
+		opp-hz = /bits/ 64 <1416000000>;
+		opp-microvolt = <1025000 1025000 1150000>;
+		clock-latency-ns = <40000>;
+	};
+
+	opp-1608000000 {
+		opp-hz = /bits/ 64 <1608000000>;
+		opp-microvolt = <1100000 1100000 1150000>;
+		clock-latency-ns = <40000>;
+	};
+
+	opp-1800000000 {
+		opp-hz = /bits/ 64 <1800000000>;
+		opp-microvolt = <1150000 1150000 1150000>;
+		clock-latency-ns = <40000>;
+	};
+};
+
+/*
+ * The vendor dtsi wires the CPU clocks to SCMI (<&scmi_clk 0>), which this
+ * kernel has no driver for, so clk_get() on cpu0 would defer forever and
+ * cpufreq-dt could never probe.  Point them at the CRU's armclk instead,
+ * which clk-rk3568.c registers with the full rk3568_cpuclk_rates table.
+ */
+&cpu0 {
+	cpu-supply = <&vdd_cpu>;
+	clocks = <&cru ARMCLK>;
+};
+
+&cpu1 {
+	cpu-supply = <&vdd_cpu>;
+	clocks = <&cru ARMCLK>;
+};
+
+&cpu2 {
+	cpu-supply = <&vdd_cpu>;
+	clocks = <&cru ARMCLK>;
+};
+
+&cpu3 {
+	cpu-supply = <&vdd_cpu>;
+	clocks = <&cru ARMCLK>;
+};
+
+&gmac1 {
+	/*
+	 * Vendor firmware combination: RGMII with both delays applied by the
+	 * SoC (phy-mode "rgmii" keeps the PHY's own delay programming out of
+	 * the picture), 125 MHz clock fed in from the board, PHY on MDIO
+	 * address 1 behind gpio3 RK_PA1 as reset.
+	 */
+	phy-mode = "rgmii";
+	clock_in_out = "input";
+	assigned-clocks = <&cru SCLK_GMAC1_RX_TX>, <&cru SCLK_GMAC1_RGMII_SPEED>, <&cru SCLK_GMAC1>;
+	assigned-clock-parents = <&cru SCLK_GMAC1_RGMII_SPEED>, <&cru SCLK_GMAC1>, <&gmac1_clkin>;
+	phy-supply = <&vcc_3v3>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&gmac1m0_miim
+		     &gmac1m0_tx_bus2
+		     &gmac1m0_rx_bus2
+		     &gmac1m0_rgmii_clk
+		     &gmac1m0_clkinout
+		     &gmac1m0_rgmii_bus>;
+	snps,reset-gpio = <&gpio3 RK_PA1 GPIO_ACTIVE_LOW>;
+	snps,reset-active-low;
+	snps,reset-delays-us = <0 20000 100000>;
+	tx_delay = <0x3f>;
+	rx_delay = <0x3f>;
+	phy-handle = <&rgmii_phy1>;
+	status = "okay";
+};
+
+&mdio1 {
+	rgmii_phy1: ethernet-phy@1 {
+		compatible = "ethernet-phy-ieee802.3-c22";
+		reg = <1>;
+	};
+};
+
+&i2c0 {
+	status = "okay";
+
+	/* fan53555-compatible buck feeding the CPU cluster (armclk) */
+	vdd_cpu: regulator@1c {
+		compatible = "tcs,tcs4525";
+		reg = <0x1c>;
+		fcs,suspend-voltage-selector = <1>;
+		regulator-name = "vdd_cpu";
+		regulator-min-microvolt = <800000>;
+		regulator-max-microvolt = <1150000>;
+		regulator-ramp-delay = <2300>;
+		regulator-always-on;
+		regulator-boot-on;
+		vin-supply = <&vcc5v0_sys>;
+
+		regulator-state-mem {
+			regulator-off-in-suspend;
+		};
+	};
+
+	rk809: pmic@20 {
+		compatible = "rockchip,rk809";
+		reg = <0x20>;
+		interrupt-parent = <&gpio0>;
+		interrupts = <RK_PA3 IRQ_TYPE_LEVEL_LOW>;
+		#clock-cells = <1>;
+		clock-output-names = "rk808-clkout1", "rk808-clkout2";
+		pinctrl-names = "default";
+		pinctrl-0 = <&pmic_int_l>;
+		rockchip,system-power-controller;
+		wakeup-source;
+
+		vcc1-supply = <&vcc3v3_sys>;
+		vcc2-supply = <&vcc3v3_sys>;
+		vcc3-supply = <&vcc3v3_sys>;
+		vcc4-supply = <&vcc3v3_sys>;
+		vcc5-supply = <&vcc3v3_sys>;
+		vcc6-supply = <&vcc3v3_sys>;
+		vcc7-supply = <&vcc3v3_sys>;
+		vcc8-supply = <&vcc3v3_sys>;
+		vcc9-supply = <&vcc3v3_sys>;
+
+		regulators {
+			vdd_logic: DCDC_REG1 {
+				regulator-name = "vdd_logic";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <1350000>;
+				regulator-init-microvolt = <900000>;
+				regulator-ramp-delay = <6001>;
+				regulator-initial-mode = <0x2>;
+
+				regulator-state-mem {
+					regulator-on-in-suspend;
+					regulator-suspend-microvolt = <900000>;
+				};
+			};
+
+			vdd_gpu: DCDC_REG2 {
+				regulator-name = "vdd_gpu";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <1350000>;
+				regulator-init-microvolt = <900000>;
+				regulator-ramp-delay = <6001>;
+				regulator-initial-mode = <0x2>;
+
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcc_ddr: DCDC_REG3 {
+				regulator-name = "vcc_ddr";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-initial-mode = <0x2>;
+
+				regulator-state-mem {
+					regulator-on-in-suspend;
+				};
+			};
+
+			vdd_npu: DCDC_REG4 {
+				regulator-name = "vdd_npu";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <1350000>;
+				regulator-init-microvolt = <900000>;
+				regulator-initial-mode = <0x2>;
+
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcc_1v8: DCDC_REG5 {
+				regulator-name = "vcc_1v8";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+
+				regulator-state-mem {
+					regulator-on-in-suspend;
+					regulator-suspend-microvolt = <1800000>;
+				};
+			};
+
+			vdda0v9_image: LDO_REG1 {
+				regulator-name = "vdda0v9_image";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <900000>;
+				regulator-max-microvolt = <900000>;
+
+				regulator-state-mem {
+					regulator-on-in-suspend;
+					regulator-suspend-microvolt = <900000>;
+				};
+			};
+
+			vdda_0v9: LDO_REG2 {
+				regulator-name = "vdda_0v9";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <900000>;
+				regulator-max-microvolt = <900000>;
+
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vdda0v9_pmu: LDO_REG3 {
+				regulator-name = "vdda0v9_pmu";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <900000>;
+				regulator-max-microvolt = <900000>;
+
+				regulator-state-mem {
+					regulator-on-in-suspend;
+					regulator-suspend-microvolt = <900000>;
+				};
+			};
+
+			vccio_acodec: LDO_REG4 {
+				regulator-name = "vccio_acodec";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vccio_sd: LDO_REG5 {
+				regulator-name = "vccio_sd";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <3300000>;
+
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcc3v3_pmu: LDO_REG6 {
+				regulator-name = "vcc3v3_pmu";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+
+				regulator-state-mem {
+					regulator-on-in-suspend;
+					regulator-suspend-microvolt = <3300000>;
+				};
+			};
+
+			vcca_1v8: LDO_REG7 {
+				regulator-name = "vcca_1v8";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcca1v8_pmu: LDO_REG8 {
+				regulator-name = "vcca1v8_pmu";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcca1v8_image: LDO_REG9 {
+				regulator-name = "vcca1v8_image";
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcc_3v3: SWITCH_REG1 {
+				regulator-name = "vcc_3v3";
+				regulator-always-on;
+				regulator-boot-on;
+
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcc3v3_sd: SWITCH_REG2 {
+				/* no SD slot on this board */
+				regulator-name = "vcc3v3_sd";
+				status = "disabled";
+
+				regulator-state-mem {
+					regulator-on-in-suspend;
+				};
+			};
+		};
+	};
+};
+
+&pinctrl {
+	sdio-pwrseq {
+		wifi_enable_h: wifi-enable-h {
+			rockchip,pins = <2 RK_PB1 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	wireless-wlan {
+		wifi_host_wake_irq: wifi-host-wake-irq {
+			rockchip,pins = <2 RK_PB2 RK_FUNC_GPIO &pcfg_pull_down>;
+		};
+	};
+
+	leds {
+		led_green_en: led-green-enable-h {
+			rockchip,pins = <0 RK_PD3 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		led_red_en: led-red-enable-h {
+			rockchip,pins = <0 RK_PD4 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	usb {
+		vcc5v0_usb_otg_en: vcc5v0-usb-otg-en {
+			rockchip,pins = <0 RK_PA5 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	pmic {
+		pmic_int_l: pmic-int-l {
+			rockchip,pins = <0 RK_PA3 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
+
+	bt {
+		bt_enable_h: bt-enable-h {
+			rockchip,pins = <2 RK_PB7 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		bt_host_wake_l: bt-host-wake-l {
+			rockchip,pins = <2 RK_PC0 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		bt_wake_l: bt-wake-l {
+			rockchip,pins = <2 RK_PC1 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+};
+
+/*
+ * Supply split copied from the vendor tree, which differs from the Panther X2:
+ * vccio1 is the acodec rail and vccio6 is 1.8 V here, and the vendor tree does
+ * not describe vccio2 at all.
+ */
+&pmu_io_domains {
+	status = "okay";
+	pmuio1-supply = <&vcc3v3_pmu>;
+	pmuio2-supply = <&vcc3v3_pmu>;
+	vccio1-supply = <&vccio_acodec>;
+	vccio3-supply = <&vccio_sd>;
+	vccio4-supply = <&vcc_1v8>;
+	vccio5-supply = <&vcc_3v3>;
+	vccio6-supply = <&vcc_1v8>;
+	vccio7-supply = <&vcc_3v3>;
+};
+
+/* eMMC: 8 bit, HS200, and the only boot medium (mmc0 -> /dev/mmcblk0). */
+&sdhci {
+	bus-width = <8>;
+	no-sd;
+	no-sdio;
+	non-removable;
+	mmc-hs200-1_8v;
+	vmmc-supply = <&vcc_3v3>;
+	vqmmc-supply = <&vcc_1v8>;
+	status = "okay";
+};
+
+/*
+ * microSD slot on sdmmc0.  The stock firmware's device tree keeps this
+ * controller enabled ("okay"), so it is described here as well; the card
+ * detect line is not wired up in the vendor tree, hence broken-cd (polling).
+ */
+&sdmmc0 {
+	broken-cd;
+	bus-width = <4>;
+	cap-sd-highspeed;
+	disable-wp;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sdmmc0_bus4 &sdmmc0_clk &sdmmc0_cmd>;
+	vqmmc-supply = <&vccio_sd>;
+	status = "okay";
+};
+
+/* SDIO wifi on sdmmc1 (non-removable, powered through sdio_pwrseq). */
+&sdmmc1 {
+	bus-width = <4>;
+	/*
+	 * Matched to the vendor tree: the wifi half of the AP6335 combo only
+	 * attaches when the host advertises SDIO support and the UHS modes it
+	 * actually negotiates (SDR104 at 148.5 MHz).  Without "supports-sdio"
+	 * the SDPCM control channel times out after the firmware download
+	 * ("dongle is not responding: err=-110").
+	 */
+	supports-sdio;
+	cap-sd-highspeed;
+	/*
+	 * 25 MHz, not the vendor's 200 MHz.  At 200 MHz the host negotiates
+	 * high-speed (50 MHz) and brcmfmac's control transfers then fail (-52
+	 * on event_msgs, -84 on cur_etheraddr) even though the bulk firmware
+	 * download itself goes through.  At 25 MHz wlan0 comes up.  The UHS
+	 * modes are not advertised either: sd-uhs-sdr104 makes the dw_mmc
+	 * tuning loop give up with "All phases bad!" on this board.
+	 */
+	max-frequency = <25000000>;
+	cap-sdio-irq;
+	keep-power-in-suspend;
+	disable-wp;
+	non-removable;
+	mmc-pwrseq = <&sdio_pwrseq>;
+	rockchip,default-sample-phase = <90>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sdmmc1_bus4 &sdmmc1_clk &sdmmc1_cmd>;
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	wifi@1 {
+		compatible = "brcm,bcm4329-fmac";
+		reg = <1>;
+		/*
+		 * BCM4339 (AP6335 combo, the BT half reports itself as BCM4335).
+		 * brcmfmac takes the board type from the machine compatible, so
+		 * the nvram has to be installed as
+		 * brcmfmac4339-sdio.jp-tvbox,rk3566.txt.
+		 */
+		/*
+		 * Deliberately no OOB interrupt here.  With interrupt-parent =
+		 * &gpio2 / interrupts = <RK_PB2 ...> brcmfmac registered no IRQ
+		 * at all (nothing shows up in /proc/interrupts) and then timed
+		 * out waiting for the SDPCM control response after downloading
+		 * the firmware ("dongle is not responding: err=-110").  Without
+		 * the interrupt the driver uses the in-band SDIO interrupt path,
+		 * which cap-sdio-irq above supports.
+		 */
+		pinctrl-names = "default";
+		pinctrl-0 = <&wifi_host_wake_irq>;
+	};
+};
+
+&uart1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart1m0_xfer &uart1m0_ctsn &uart1m0_rtsn>;
+	status = "okay";
+
+	/*
+	 * The BT half of the AP6335 combo is a BCM4335, and the stock firmware
+	 * ships no BCM4335C0.hcd and disables BT outright
+	 * (config.disable_bluetooth=true).  Keep the node out of the way until
+	 * a matching HCD is available, otherwise every boot logs a failing
+	 * firmware request.
+	 */
+	bluetooth {
+		compatible = "brcm,bcm43438-bt";
+		status = "disabled";
+		clocks = <&rk809 1>;
+		clock-names = "lpo";
+		device-wakeup-gpios = <&gpio2 RK_PC1 GPIO_ACTIVE_HIGH>;
+		host-wakeup-gpios = <&gpio2 RK_PC0 GPIO_ACTIVE_HIGH>;
+		shutdown-gpios = <&gpio2 RK_PB7 GPIO_ACTIVE_HIGH>;
+		max-speed = <1500000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&bt_host_wake_l &bt_wake_l &bt_enable_h>;
+		vbat-supply = <&vcc3v3_sys>;
+		vddio-supply = <&vcca1v8_pmu>;
+	};
+};
+
+&uart2 {
+	status = "okay";
+};
+
+/*
+ * USB: the vendor tree enables only PHY0 (both its ports) plus the two XHCI
+ * controllers behind it, and leaves PHY1 as well as all EHCI/OHCI controllers
+ * disabled.  This kernel's phy-rockchip-inno-usb2 learned RK3568 in
+ * patches-5.4/313.
+ */
+&usb2phy0 {
+	status = "okay";
+};
+
+&u2phy0_otg {
+	status = "okay";
+};
+
+&u2phy0_host {
+	status = "okay";
+};
+
+&usbhost30 {
+	status = "okay";
+};
+
+/* combphy1 (usb3 pipe phy) and its GRF must be up for usbhost30 to bind */
+&{/syscon@fdc80000} {
+	status = "okay";
+};
+
+&{/phy@fe830000} {
+	status = "okay";
+};
+
+&usbhost_dwc3 {
+	/*
+	 * Keep the dtsi's power-domains = <&power RK3568_PD_PIPE>.  PD_PIPE is
+	 * enabled here (the SATA controller lives in it), so both DWC3 cores
+	 * have to reference it as well - without the link nothing powers the
+	 * pipe domain before the first register access and the xHCI port
+	 * status read faults with a synchronous external abort.
+	 */
+	status = "okay";
+};
+
+&usbdrd30 {
+	status = "okay";
+};
+
+&usbdrd_dwc3 {
+	dr_mode = "host";
+	snps,dis_u2_susphy_quirk;
+	maximum-speed = "high-speed";
+	quirk-skip-phy-init;
+	phys = <&u2phy0_otg>;
+	phy-names = "usb2-phy";
+	status = "okay";
+};
+
+/*
+ * SATA: the box exposes one SATA port, wired to the SoC's second AHCI
+ * controller (sata2 @ 0xfc800000) through combphy2.  The vendor tree leaves
+ * sata1 disabled on purpose: sata1 shares combphy1 with the USB3 host port,
+ * and this board needs that PHY in USB3 mode instead.
+ *
+ * The controller sits in PD_PIPE, which rk3568.dtsi keeps disabled.  Without
+ * that domain the genpd lookup fails (-ENODEV) and the AHCI driver never
+ * probes, so it has to be enabled here.  PD_PIPE only gates the pipe
+ * interface shared by the SATA/PCIe/USB3 PHYs; the two DWC3 cores stay
+ * detached from it exactly as validated on the Panther X2, so the only
+ * consumer here is the SATA controller.
+ */
+&sata2 {
+	status = "okay";
+};
+
+&combphy2_psq {
+	status = "okay";
+};
+
+&power {
+	pd_pipe@RK3568_PD_PIPE {
+		status = "okay";
+	};
+};
+
+/*
+ * SPDIF: optical output on the spdifm0 pin group (gpio1 RK_PA4).  The SoC
+ * transmitter is the CPU DAI, "linux,spdif-dit" is the standard dummy codec,
+ * and simple-audio-card ties them together into one ALSA card named "SPDIF"
+ * with a single playback PCM.  All three pieces are modules: kmod-rk-spdif,
+ * kmod-sound-soc-spdif and kmod-sound-simple-card.
+ */
+&spdif_8ch {
+	status = "okay";
+};
+
+&{/} {
+	spdif_dit: spdif-dit {
+		compatible = "linux,spdif-dit";
+		#sound-dai-cells = <0>;
+		status = "okay";
+	};
+
+	spdif_sound: spdif-sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "SPDIF";
+
+		simple-audio-card,cpu {
+			sound-dai = <&spdif_8ch>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&spdif_dit>;
+		};
+	};
+};
+
+/*
+ * Headers reserved on the PCB.  Pin groups are exactly the ones the stock
+ * firmware's device tree uses for these controllers (read back from
+ * /proc/device-tree on the running Android), and every pin below was checked
+ * against the functions this board already uses:
+ *
+ *   uart9 (m0)  TX/RX      gpio2_PA7 / gpio2_PB0
+ *   spi3  (m0)  CLK/MOSI/MISO/CS0/CS1  gpio4_PB3 / gpio4_PB0 / gpio4_PB2 /
+ *               gpio4_PA6 / gpio4_PA7
+ *   i2c3  (m0)  SCL/SDA    gpio1_PA1 / gpio1_PA0
+ *   i2s1  (m0)  SCLK/LRCK/SDO0/SDI0    gpio1_PA3 / gpio1_PA5 /
+ *               gpio1_PA7 / gpio1_PB3
+ *
+ * Three of the six i2c buses are unusable on this board: i2c1 (gpio0_PB3/PB4)
+ * is the front panel display, i2c4 (gpio4_B2/B3) collides with spi3, and i2c5
+ * (gpio3_PB3/PB4) collides with gmac1 - the stock kernel itself fails to probe
+ * it with "pin gpio3-11 already requested by fe010000.ethernet".  i2c0/i2c2
+ * are the PMIC and the camera bus.
+ */
+/*
+ * uart9 m0 (gpio2_PA7 / gpio2_PB0) is impossible on this board: those are
+ * exactly sdmmc1's CMD and CLK, i.e. the SDIO wifi data path - the stock
+ * firmware keeps uart9 disabled for that reason.  The header is wired to the
+ * m1 pins instead: TX gpio4_PC6, RX gpio4_PC5 (spi3 sits on gpio4_PB0/B2/B3,
+ * CS0 gpio4_PA6, CS1 gpio4_PA7 - no overlap).
+ * If the PCB silkscreen says the uart9 header is on gpio4_PA4/PA5, switch to
+ * &uart9m2_xfer here.
+ */
+&uart9 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart9m1_xfer>;
+	status = "okay";
+};
+
+&i2c3 {
+	status = "okay";
+};
+
+&spi3 {
+	status = "okay";
+
+	/* the header is a bare pin row: expose it to userspace as spidev */
+	spidev@0 {
+		compatible = "rohm,dh2228fv";
+		reg = <0>;
+		spi-max-frequency = <10000000>;
+	};
+};
+
+/*
+ * I2S1 on the reserved header.  The vendor tree drives only the four pins it
+ * routed (SCLK_TX, LRCK_TX, SDO0, SDI0) and makes the codec the bit-clock
+ * slave (rockchip,clk-trcm = 1), so the pin list is overridden here instead of
+ * taking the SoC dtsi default, which also claims SDI1-3/SDO1-3 and would mux
+ * pins this board uses elsewhere (gpio1_PA4 is the SPDIF output).
+ * MCLK is not routed on this header.
+ */
+&i2s1_8ch {
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2s1m0_sclktx &i2s1m0_lrcktx &i2s1m0_sdi0 &i2s1m0_sdo0>;
+	rockchip,clk-trcm = <1>;
+	status = "okay";
+};
+
+&tsadc {
+	status = "okay";
+};
+&rk_rga {
+	status = "okay";
+};
+
+&mpp_srv {
+	status = "okay";
+};
+
+&rkvdec {
+	status = "okay";
+};
+
+&rkvdec_mmu {
+	status = "okay";
+};
+
+&rkvenc {
+	/delete-property/ iommus;
+	status = "okay";
+};
+
+&vdpu {
+	status = "okay";
+};
+
+&vdpu_mmu {
+	status = "okay";
+};
+
+/*
+ * NPU: no IOMMU and no DVFS in this backport, exactly like the Panther X2 -
+ * see the long explanation in rk3566-panther-x2.dts for why the iommus and
+ * operating-points-v2 properties are dropped and why the domain is kept.
+ */
+&rknpu {
+	/delete-property/ iommus;
+	/delete-property/ operating-points-v2;
+	power-domains = <&power RK3568_PD_NPU>;
+	clocks = <&cru CLK_NPU>, <&cru ACLK_NPU>, <&cru HCLK_NPU>;
+	clock-names = "clk", "aclk", "hclk";
+	rknpu-supply = <&vdd_npu>;
+	status = "okay";
+};

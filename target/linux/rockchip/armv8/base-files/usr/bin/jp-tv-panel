@@ -1,0 +1,75 @@
+#!/bin/sh
+#
+# Front panel status icons for the JP TV Box 3566 (FD6551, OpenVFD sysfs).
+# Lights exactly three icons and nothing else:
+#   eth   - some eth* port has carrier
+#   wifi  - some wlan* interface is up
+#   usb   - a USB device is attached (root hubs excluded)
+#
+# The panel is polled instead of using hotplug handlers: the states involved
+# (carrier / operstate / usb device list) are all plain sysfs reads, and a
+# 4 second poll costs nothing while avoiding races at boot when the drivers
+# come up in an arbitrary order.
+
+P=/sys/devices/platform/openvfd/leds/openvfd
+[ -d "$P" ] || exit 0
+
+ICONS="eth wifi usb"
+cur_eth=-1
+cur_wifi=-1
+cur_usb=-1
+
+icon()
+{
+	if [ "$2" = 1 ]; then
+		echo "$1" > "$P/led_on" 2>/dev/null
+	else
+		echo "$1" > "$P/led_off" 2>/dev/null
+	fi
+}
+
+state_eth()
+{
+	for c in /sys/class/net/eth*/carrier; do
+		[ -r "$c" ] || continue
+		[ "$(cat "$c" 2>/dev/null)" = 1 ] && { echo 1; return; }
+	done
+	echo 0
+}
+
+state_wifi()
+{
+	for s in /sys/class/net/wlan*/operstate; do
+		[ -r "$s" ] || continue
+		case "$(cat "$s" 2>/dev/null)" in
+		up|unknown) echo 1; return ;;
+		esac
+	done
+	echo 0
+}
+
+state_usb()
+{
+	for f in /sys/bus/usb/devices/*/bDeviceClass; do
+		[ -r "$f" ] || continue
+		# 09 = hub, those are the on-SoC root hubs, not a plugged device
+		[ "$(cat "$f" 2>/dev/null)" = 09 ] && continue
+		echo 1
+		return
+	done
+	echo 0
+}
+
+trap 'for i in $ICONS; do icon $i 0; done; exit 0' TERM INT
+
+while :; do
+	e=$(state_eth)
+	w=$(state_wifi)
+	u=$(state_usb)
+
+	[ "$e" != "$cur_eth" ] && { icon eth "$e"; cur_eth=$e; }
+	[ "$w" != "$cur_wifi" ] && { icon wifi "$w"; cur_wifi=$w; }
+	[ "$u" != "$cur_usb" ] && { icon usb "$u"; cur_usb=$u; }
+
+	sleep 4
+done

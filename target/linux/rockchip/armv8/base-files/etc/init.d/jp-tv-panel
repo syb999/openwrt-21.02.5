@@ -1,0 +1,44 @@
+#!/bin/sh /etc/rc.common
+#
+# JP TV Box 3566 front panel service.
+#
+# Boot: 01_leds gives red:status a heartbeat trigger, so the board blinks red
+# while it is coming up.  Once userspace has reached this point (START=99, so
+# after the network and wifi have been configured) the heartbeat is disabled
+# and the red LED is turned off - green:power (default-state = on in the DTS)
+# is what shows that the box is running.  lib/upgrade/platform.sh turns the
+# red LED into a blinking "upgrade in progress" light again.
+#
+# Then the icon daemon keeps eth/wifi/usb on the FD6551 panel in sync.
+
+START=99
+STOP=10
+
+BOARD=$(cat /tmp/sysinfo/board_name 2>/dev/null)
+
+start()
+{
+	[ "$BOARD" = "jp-tvbox,rk3566" ] || return 0
+
+	R=/sys/class/leds/red:status
+	if [ -d "$R" ]; then
+		echo none > "$R/trigger" 2>/dev/null
+		echo 0 > "$R/brightness" 2>/dev/null
+	fi
+
+	if [ -x /usr/bin/jp-tv-panel ]; then
+		/usr/bin/jp-tv-panel >/dev/null 2>&1 &
+	fi
+}
+
+stop()
+{
+	[ "$BOARD" = "jp-tvbox,rk3566" ] || return 0
+
+	killall jp-tv-panel >/dev/null 2>&1
+
+	P=/sys/devices/platform/openvfd/leds/openvfd
+	for i in eth wifi usb; do
+		echo "$i" > "$P/led_off" 2>/dev/null
+	done
+}
