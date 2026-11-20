@@ -175,12 +175,23 @@
 		/*
 		 * Register order, measured on the panel one register at a time
 		 * (0xFF to a single grid): 0x68=digit4, 0x6A=digit3, 0x6C=digit2,
-		 * 0x6E=digit1, 0x66=icons.  The driver maps character position ->
-		 * wbuf[] slot and writes slots as 0x66 + 2*slot, so character 0
-		 * (hour tens) has to land in slot 4.  Read as a raw byte array by
-		 * the driver, hence the [..] syntax and not <..>.
+		 * 0x6E=digit1, 0x66=icons.
+		 *
+		 * The driver's data cells are NOT four digits: seg7_write_display_data
+		 * fills raw_wdata[0] with the colon/dot flags and raw_wdata[1..4] with
+		 * the four digits, and fd650_write_data then stores cell i at
+		 * wbuf[dat_index[i]] (= register 0x66 + 2*slot).  So the flags cell has
+		 * to land on the icon register and the digits one slot lower:
+		 *   cell0 (flags)  -> slot 0 -> 0x66
+		 *   cell1 (digit1) -> slot 4 -> 0x6E
+		 *   cell2 (digit2) -> slot 3 -> 0x6C
+		 *   cell3 (digit3) -> slot 2 -> 0x6A
+		 *   cell4 (digit4) -> slot 1 -> 0x68
+		 * Getting this wrong shifts every digit by one and writes the icon
+		 * mask into a digit register (or a digit into the icon register, which
+		 * lights random icons).  Read as a raw byte array, hence [..].
 		 */
-		openvfd_chars = [04 03 02 01 00];
+		openvfd_chars = [00 04 03 02 01];
 		/*
 		 * Icon bits, in LED_DOT order (ALARM, USB, PLAY, PAUSE, SEC, ETH,
 		 * WIFI).  Measured on the panel: the colon sits on bit 4 of the
@@ -829,6 +840,17 @@
 &power {
 	pd_pipe@RK3568_PD_PIPE {
 		status = "okay";
+		/*
+		 * With a SATA disk attached U-Boot has already brought the combo
+		 * PHY and the link up, while the kernel's ATA driver is a module
+		 * that only loads from the rootfs.  Nothing claims PD_PIPE at
+		 * initcall time, genpd tries to power the domain off, the
+		 * power-off handshake never gets its ACK and the CPU spins
+		 * forever in rockchip_pmu_set_idle_request(): the board hangs
+		 * right after "calling rtc_hctosys" with only an RCU stall on
+		 * genpd_power_off_work_fn.  Pin the domain on instead.
+		 */
+		rockchip,always-on;
 	};
 };
 

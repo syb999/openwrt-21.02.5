@@ -1,0 +1,68 @@
+From: local
+Subject: [PATCH] soc: rockchip: pm_domains: do not touch QoS on power transitions
+
+On the RK3566 in the JP TV Box 3566 the power-down path of the npu domain
+hangs the machine: rockchip_pmu_save_qos() reads five QoS registers with
+plain regmap_read()s, the read never returns on the AXI bus, and the CPU
+ends up spinning with interrupts disabled inside genpd_power_off_work_fn.
+The kernel then dies right after "calling rtc_hctosys", where
+clock_was_set() -> smp_call_function() waits forever for that CPU:
+
+  rcu: INFO: rcu_preempt self-detected stall on CPU
+  Workqueue: pm genpd_power_off_work_fn
+
+A trace of the power-down steps showed rga and rkvenc completing normally
+and the boot stopping right at:
+
+  pm: 'npu' save_qos
+
+An MMIO access that stalls on the interconnect cannot be given a timeout,
+so the only safe fix is not to access the QoS block around a power
+transition at all.  The QoS values are a bus-priority tuning hint: not
+saving/restoring them costs a little performance after a power cycle and
+nothing else.
+
+Also add rockchip,always-on so a board can pin a domain up (the pipe domain
+is shared with the SATA combo PHY, and powering it down while a disk keeps
+the PHY alive is not something this SoC handles gracefully).
+
+--- a/drivers/soc/rockchip/pm_domains.c
++++ b/drivers/soc/rockchip/pm_domains.c
+@@ -319,9 +319,19 @@
+ 		if (!power_on) {
+-			rockchip_pmu_save_qos(pd);
+-			pd->qos_saved = true;
++			/*
++			 * Do not read the QoS block here.  On RK3566 that read
++			 * can stall on the AXI bus for the npu domain, and a
++			 * stalled MMIO access cannot be timed out - the CPU
++			 * spins forever with interrupts disabled and the board
++			 * never finishes booting.  Skipping the save/restore
++			 * only loses a bus-priority tuning.
++			 */
++			pd->qos_saved = false;
+ 
+ 			/* if powering down, idle request to NIU first */
++			dev_info(pmu->dev, "pm: '%s' idle_req\n", pd->genpd.name);
+ 			rockchip_pmu_set_idle_request(pd, true);
++			dev_info(pmu->dev, "pm: '%s' idle_req done\n", pd->genpd.name);
+ 		}
+ 
++		dev_info(pmu->dev, "pm: '%s' set_pd %d\n", pd->genpd.name, power_on);
+ 		rockchip_do_pmu_set_power_domain(pd, power_on);
++		dev_info(pmu->dev, "pm: '%s' set_pd done\n", pd->genpd.name);
+@@ -545,6 +555,15 @@
+ 	pd->genpd.flags = GENPD_FLAG_PM_CLK;
+ 	if (pd_info->active_wakeup)
+ 		pd->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
++	/*
++	 * Some domains must never be powered off.  The pipe domain is the
++	 * case in point: the SATA combo PHY is alive while a disk is
++	 * attached and the power-off sequence does not complete.  Boards
++	 * that need this set "rockchip,always-on" in the DT node.
++	 */
++	if (of_property_read_bool(node, "rockchip,always-on"))
++		pd->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
+ 	pm_genpd_init(&pd->genpd, NULL, false);
+ 
+ 	pmu->genpd_data.domains[id] = &pd->genpd;

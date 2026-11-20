@@ -1,6 +1,23 @@
 #!/bin/sh
-# panther,x2 / jp-tvbox,rk3566: 只有一个网口(wan)。wifi AP 需要一个空的 br-lan 当二层落点，
-# 而 netifd 只有在 bridge_empty=1 时才会在端口不存在的情况下也把桥建出来。
+# panther,x2 / jp-tvbox,rk3566: 只有一个网口(wan，裸 eth0，直接从上游拿地址)。
+# 无线 AP 需要一个二层落点，这个落点必须是一个"桥设备"，netifd 才会把
+# hostapd 报上来的无线接口挂进去：
+#
+#   interface.c: interface_add_link()
+#       if (mdev) {
+#               if (mdev->hotplug_ops)
+#                       return mdev->hotplug_ops->add(mdev, dev, vlan);
+#               else
+#                       return UBUS_STATUS_NOT_SUPPORTED;
+#       }
+#
+# 桥设备有 hotplug_ops，普通网卡没有。所以 br-lan 必须是桥。
+# config_generate 只有在 lan 带 device 时才会为它生成 br-lan 设备和地址
+# （board.d 里用 eth1 这种不存在的端口名占位），这里再把那个占位端口清掉，
+# 用 bridge_empty=1 让 netifd 在没有端口时也把桥建出来。
+#
+# 本脚本在 config_generate 之后执行（uci-defaults）——board.d 里的 uci 写操作
+# 会被 config_generate 随后的重写覆盖掉，所以必须放在这里。
 
 . /lib/functions.sh
 
@@ -25,6 +42,7 @@ uci set network.$sect.type='bridge'
 uci set network.$sect.bridge_empty='1'
 uci -q delete network.$sect.ports 2>/dev/null
 uci set network.lan.device='br-lan'
+
 uci commit network
 
 exit 0

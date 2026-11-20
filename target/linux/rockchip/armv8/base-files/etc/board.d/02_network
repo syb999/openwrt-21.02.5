@@ -27,21 +27,27 @@ rockchip_setup_interfaces()
 		# below so that a freshly flashed headless box stays reachable.)
 		ucidef_set_interface_wan 'eth0' 'dhcp'
 
-		# The wifi AP in the generated wireless config points at the "lan"
-		# network, but a single-port box has no lan interface, so the AP ends
-		# up attached to nothing (no br-lan, no address, no traffic).  Create
-		# the lan bridge on a *non-existent* eth1 purely as a home for the
-		# wireless interface; the physical port stays the wan.
-		#
-		# No address is passed on purpose.  ucidef_set_interface_lan() only
-		# takes the device and the protocol; generate_network() in
-		# bin/config_generate supplies the standard static default and the
-		# user can change it from LuCI/uci.  The old
-		#   'eth1' 'static' '192.168.9.1' '255.255.255.0'
-		# form looked like a hard-coded LAN address, but the ipaddr/netmask
-		# arguments were silently dropped (they are not part of the helper's
-		# signature), so the address never took effect - it is removed here so
-		# the generated config is not misleading.
+		# The wan stays a plain device on purpose.  It was tried as a
+		# bridge over eth0 (so the wireless could be bridged onto the
+		# uplink), and on this board netifd never puts eth0 into it:
+		# bridge_add_member() -> device_get("eth0", true) yields nothing,
+		# a freshly created test bridge stays empty as well, while the same
+		# thing done with "ip link set eth0 master ..." works instantly.
+		# With the wan unusable the box boots with no address at all, so
+		# the wan is left as the bare port (proven reliable) and the
+		# wireless AP lives on the lan bridge instead.
+
+		# NOTE: pass a *placeholder* port here, never "br-lan".  The lan
+		# entry is special-cased in bin/config_generate:
+		#   [ "$1" = "lan" -a -z "$ports" ] && ports="$device"
+		# so it builds "config device br-lan { ports <device> }".  Passing
+		# br-lan itself yields a bridge whose only port is br-lan, netifd
+		# cannot bring it up, and the wireless (which hostapd attaches to
+		# br-lan) comes up nowhere either - the box then boots with no
+		# ethernet, no address and no SSID.  eth1 does not exist on this
+		# board; 95-panther-brlan turns the generated br-lan into an empty
+		# bridge (bridge_empty=1, ports removed) right afterwards, which is
+		# what the wireless AP needs as its L2 home.
 		ucidef_set_interface_lan 'eth1'
 
 		# Open the wan zone, because this script is the only place that is
@@ -70,8 +76,13 @@ rockchip_setup_interfaces()
 		# the address it leased; the full rationale for each step is in the
 		# panther,x2 block above.
 		ucidef_set_interface_wan 'eth0' 'dhcp'
-		/* no second port: br-lan is the wireless bridge, without members */
-		ucidef_set_interface_lan ''
+		# Placeholder port (see the long note in the panther,x2 block):
+		# config_generate turns "lan" + device into "config device br-lan
+		# { ports <device> }", so it must not be "br-lan" itself, and it
+		# must not be empty either - with no device the lan interface is
+		# not generated at all, dnsmasq then has no dhcp-range and every
+		# wireless client is left without an address.
+		ucidef_set_interface_lan 'eth1'
 
 		uci -q set firewall.@defaults[0].input='ACCEPT'
 		uci -q set firewall.@defaults[0].forward='ACCEPT'
