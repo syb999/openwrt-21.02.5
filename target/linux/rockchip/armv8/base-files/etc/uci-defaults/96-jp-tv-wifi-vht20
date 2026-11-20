@@ -1,0 +1,21 @@
+#!/bin/sh
+#
+# jp-tvbox,rk3566: the wifi is a BCM4339 (AP6335) behind a 25 MHz SDIO bus.
+# 25 MHz is a hard requirement for this card (at the 200 MHz default the SDIO
+# link negotiates 50 MHz high-speed and every control transfer fails with
+# -52/-84), and it caps real throughput at roughly 96 Mbit/s.  Running the AP
+# at VHT80 therefore buys nothing while occupying four times the spectrum and
+# making the link much more sensitive to interference, so pin the channel
+# width to 20 MHz.  Users can still change it from LuCI if they want.
+
+. /lib/functions.sh
+
+case "$(board_name)" in
+jp-tvbox,rk3566) ;;
+*) exit 0 ;;
+esac
+
+uci -q set wireless.radio0.htmode='VHT20'
+uci commit wireless
+
+exit 0

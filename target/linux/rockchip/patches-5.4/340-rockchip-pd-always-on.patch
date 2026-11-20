@@ -11,10 +11,9 @@ clock_was_set() -> smp_call_function() waits forever for that CPU:
   rcu: INFO: rcu_preempt self-detected stall on CPU
   Workqueue: pm genpd_power_off_work_fn
 
-A trace of the power-down steps showed rga and rkvenc completing normally
-and the boot stopping right at:
-
-  pm: 'npu' save_qos
+A trace of the power-down steps (added temporarily with dev_info() prints,
+dropped again once the culprit was known) showed rga and rkvenc completing
+normally and the boot stopping right at "pm: 'npu' save_qos".
 
 An MMIO access that stalls on the interconnect cannot be given a timeout,
 so the only safe fix is not to access the QoS block around a power
@@ -28,7 +27,7 @@ the PHY alive is not something this SoC handles gracefully).
 
 --- a/drivers/soc/rockchip/pm_domains.c
 +++ b/drivers/soc/rockchip/pm_domains.c
-@@ -319,9 +319,19 @@
+@@ -319,9 +319,16 @@
  		if (!power_on) {
 -			rockchip_pmu_save_qos(pd);
 -			pd->qos_saved = true;
@@ -36,22 +35,18 @@ the PHY alive is not something this SoC handles gracefully).
 +			 * Do not read the QoS block here.  On RK3566 that read
 +			 * can stall on the AXI bus for the npu domain, and a
 +			 * stalled MMIO access cannot be timed out - the CPU
-+			 * spins forever with interrupts disabled and the board
++			 * then spins with interrupts disabled and the board
 +			 * never finishes booting.  Skipping the save/restore
 +			 * only loses a bus-priority tuning.
 +			 */
 +			pd->qos_saved = false;
  
  			/* if powering down, idle request to NIU first */
-+			dev_info(pmu->dev, "pm: '%s' idle_req\n", pd->genpd.name);
  			rockchip_pmu_set_idle_request(pd, true);
-+			dev_info(pmu->dev, "pm: '%s' idle_req done\n", pd->genpd.name);
  		}
  
-+		dev_info(pmu->dev, "pm: '%s' set_pd %d\n", pd->genpd.name, power_on);
  		rockchip_do_pmu_set_power_domain(pd, power_on);
-+		dev_info(pmu->dev, "pm: '%s' set_pd done\n", pd->genpd.name);
-@@ -545,6 +555,15 @@
+@@ -545,6 +552,14 @@
  	pd->genpd.flags = GENPD_FLAG_PM_CLK;
  	if (pd_info->active_wakeup)
  		pd->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
