@@ -983,9 +983,17 @@
 };
 
 /*
- * NPU: no IOMMU and no DVFS in this backport, exactly like the Panther X2 -
- * see the long explanation in rk3566-panther-x2.dts for why the iommus and
- * operating-points-v2 properties are dropped and why the domain is kept.
+ * NPU: 不开 IOMMU。实测打开后 NPU 作业提交后无人应答（job timeout + soft
+ * reset），因为本树没有厂商的 rknpu_iommu.c —— 它需要 Rockchip 在 5.10 给
+ * struct iommu_domain 挂 iova 域并自己写 NPU 的地址寄存器，仅靠 DMA 层的
+ * IOMMU 映射不够。所以继续删掉 iommus，NPU 走 CMA。
+ *
+ * CMA 被普通进程抢走的问题改用另一个办法解决：关掉 THP（见 config-5.4 的
+ * CONFIG_TRANSPARENT_HUGEPAGE_*）。llama 之类的大块匿名内存一旦变成 2M 大页，
+ * arm64 的 5.4 内核无法迁移它们，CMA 申请就会 -EBUSY；用 4K 页时 CMA 可以
+ * 正常迁移回收，实测占满 4G 内存后 CmaFree 基本不掉。
+ *
+ * DVFS 仍然不做（本内核没有 vendor 的 OPP/leakage/pvtpll 框架）。
  */
 &rknpu {
 	/delete-property/ iommus;

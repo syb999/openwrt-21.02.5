@@ -71,10 +71,10 @@ fi
 #
 # Older/smaller SoCs keep the single 128M area.
 if test $soc = 'rk3566'; then
-	setenv cma_size '256M';
+	setenv cma_size '512M';
 	setenv video_cma 'rk_video_cma=512M';
 elif test $soc = 'rk3568'; then
-	setenv cma_size '256M';
+	setenv cma_size '512M';
 	setenv video_cma 'rk_video_cma=512M';
 elif test $soc = 'rk3588'; then
 	setenv cma_size '256M';

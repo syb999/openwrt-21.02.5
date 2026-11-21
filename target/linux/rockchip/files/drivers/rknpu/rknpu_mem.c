@@ -7,6 +7,10 @@
 #include <linux/version.h>
 #include <linux/uaccess.h>   /* copy_from_user/copy_to_user: only reached when the DMA-HEAP backend is selected */
 #include <linux/rk-dma-heap.h>
+#include <linux/iommu.h>
+#ifdef CONFIG_DMABUF_HEAPS
+#include <linux/dma-heap.h>
+#endif
 
 #if KERNEL_VERSION(5, 10, 0) <= LINUX_VERSION_CODE
 #include <linux/dma-map-ops.h>
@@ -48,12 +52,13 @@ int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 	if (k_size > in_size)
 		memset(k_data + in_size, 0, k_size - in_size);
 
-	if (args.flags & RKNPU_MEM_NON_CONTIGUOUS) {
-		LOG_ERROR("%s: malloc iommu memory unsupported in current!\n",
-			  __func__);
-		ret = -EINVAL;
-		return ret;
-	}
+	/*
+	 * IOMMU 模式下 librknnrt 会用 RKNPU_MEM_NON_CONTIGUOUS 申请"非连续"内存。
+	 * 厂商驱动用 rknpu_iommu_dma_alloc_iova() 自己建 IOVA 映射，本树没有那份
+	 * 实现；但下面走 dma-heap + dma_buf_map_attachment() 的路径，在设备已经
+	 * 挂到 IOMMU 域上时同样会拿到合法的 IOVA，所以这里不再拒绝这个标志，
+	 * 直接按普通路径分配即可（缓冲区来自 system heap，不占 CMA）。
+	 */
 
 	rknpu_obj = kzalloc(sizeof(*rknpu_obj), GFP_KERNEL);
 	if (!rknpu_obj)
@@ -72,9 +77,20 @@ int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 		rknpu_obj->owner = 0;
 	} else {
 		/* Start test kernel alloc/free dma buf */
-		dmabuf = rk_dma_heap_buffer_alloc(rknpu_dev->heap, args.size,
-						  O_CLOEXEC | O_RDWR, 0x0,
-						  dev_name(rknpu_dev->dev));
+		dmabuf = NULL;
+#ifdef CONFIG_DMABUF_HEAPS
+		/*
+		 * 设备挂在 IOMMU 上时用 system 堆（普通内存 + IOMMU 翻译），
+		 * 不占 CMA；否则回退到 Rockchip 的 CMA 堆。
+		 */
+		if (rknpu_dev->sys_heap && iommu_get_domain_for_dev(rknpu_dev->dev))
+			dmabuf = dma_heap_buffer_alloc(rknpu_dev->sys_heap, args.size,
+						       O_CLOEXEC | O_RDWR, 0);
+#endif
+		if (!dmabuf)
+			dmabuf = rk_dma_heap_buffer_alloc(rknpu_dev->heap, args.size,
+							  O_CLOEXEC | O_RDWR, 0x0,
+							  dev_name(rknpu_dev->dev));
 		if (IS_ERR(dmabuf)) {
 			LOG_ERROR("dmabuf alloc failed, args.size = %llu\n",
 				  args.size);

@@ -1,0 +1,18 @@
+# Transparent Huge Pages 模式，开机由 /etc/init.d/thp 应用。
+#
+# 为什么要关：CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS 会让 llama.cpp 这类大块
+# 匿名内存在本 5.4 arm64 内核上变成 2MiB 大页，而本内核不支持大页迁移，
+# CMA 池于是无法被回收 —— NPU 要一块连续内存时 cma_alloc() 直接 -EBUSY，
+# 表现为 "DMA Heap allocation failed / failed to malloc npu memory"，
+# 也就是 llama 一加载 RKNPU 就不能用了。
+#
+# 用 4KiB 页时 CMA 可以正常迁移回收：实测常驻 4GiB 匿名内存，CmaFree 不掉，
+# NPU 推理仍是 1 秒。
+#
+# 可选值：
+#   never    关闭透明大页（推荐，NPU 与 llama 共存）
+#   madvise  只对显式 madvise(MADV_HUGEPAGE) 的进程生效
+#   always   内核默认，大页全局启用
+
+config thp 'global'
+	option mode 'never'

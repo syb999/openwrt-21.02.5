@@ -110,6 +110,12 @@ struct rknpu_subcore_data {
  * @dev: Device instance
  * @drm_dev: DRM device instance
  */
+#ifdef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
+#ifdef CONFIG_DMABUF_HEAPS
+struct dma_heap;
+#endif
+#endif
+
 struct rknpu_device {
 	void __iomem *base[RKNPU_MAX_CORES];
 	struct device *dev;
@@ -120,6 +126,10 @@ struct rknpu_device {
 #ifdef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
 	struct miscdevice miscdev;
 	struct rk_dma_heap *heap;
+#ifdef CONFIG_DMABUF_HEAPS
+	/* 主线 dma-heap 的 "system" 堆：走 IOMMU 时用它分配，避免依赖 CMA */
+	struct dma_heap *sys_heap;
+#endif
 #endif
 	atomic_t sequence;
 	spinlock_t lock;

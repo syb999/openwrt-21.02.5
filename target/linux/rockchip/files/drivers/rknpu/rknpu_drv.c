@@ -55,6 +55,9 @@
 
 #ifdef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
 #include <linux/rk-dma-heap.h>
+#ifdef CONFIG_DMABUF_HEAPS
+#include <linux/dma-heap.h>
+#endif
 #include "rknpu_mem.h"
 #endif
 
@@ -850,6 +853,11 @@ static bool rknpu_is_iommu_enable(struct device *dev)
 	}
 	of_node_put(iommu);
 
+	/*
+	 * 设备挂在 IOMMU 域上，驱动按 IOMMU 模式运行。
+	 * 本树没有厂商的 rknpu_iommu.c，因此 rknpu_mem.c 里"非连续内存"那条
+	 * 路径改用 dma-heap + dma_buf_map_attachment() 拿 IOVA，效果等价。
+	 */
 	LOG_DEV_INFO(dev, "rknpu iommu is enabled, using iommu mode\n");
 
 	return true;
@@ -1460,6 +1468,16 @@ static int rknpu_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 	rk_dma_heap_set_dev(dev);
+#ifdef CONFIG_DMABUF_HEAPS
+	/*
+	 * NPU 走 IOMMU 时缓冲区不需要物理连续，用主线 dma-heap 的 system 堆分配，
+	 * 这样就不再占用 CMA（llama 之类的普通进程会把 CMA 页借走导致 NPU 分配失败）。
+	 * 找不到就保持 CMA 行为，不影响原有功能。
+	 */
+	rknpu_dev->sys_heap = dma_heap_find("system");
+	if (!rknpu_dev->sys_heap)
+		LOG_DEV_INFO(dev, "system dma-heap not available, keeping cma heap\n");
+#endif
 	LOG_DEV_INFO(dev, "Initialized %s: v%d.%d.%d for %s\n", DRIVER_DESC,
 		     DRIVER_MAJOR, DRIVER_MINOR, DRIVER_PATCHLEVEL,
 		     DRIVER_DATE);

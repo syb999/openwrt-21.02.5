@@ -1,0 +1,45 @@
+#!/bin/sh /etc/rc.common
+# 按 /etc/config/thp 的 mode 设置内核的 transparent_hugepage 模式。
+# 改完执行 /etc/init.d/thp restart 即可生效，不需要重启。
+
+START=19
+
+apply_mode() {
+	local mode
+
+	config_load thp
+	config_get mode global mode 'never'
+
+	case "$mode" in
+	never|madvise|always) ;;
+	*)
+		logger -t thp "invalid mode '$mode' in /etc/config/thp, skipped"
+		return 1
+		;;
+	esac
+
+	[ -w /sys/kernel/mm/transparent_hugepage/enabled ] || {
+		logger -t thp "transparent_hugepage knob not present"
+		return 1
+	}
+
+	echo "$mode" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || {
+		logger -t thp "failed to set transparent_hugepage=$mode"
+		return 1
+	}
+	logger -t thp "transparent_hugepage=$mode"
+	return 0
+}
+
+start() {
+	apply_mode
+}
+
+stop() {
+	# 没有真正要停的东西，恢复内核默认即可
+	echo always > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null
+}
+
+reload() {
+	apply_mode
+}
