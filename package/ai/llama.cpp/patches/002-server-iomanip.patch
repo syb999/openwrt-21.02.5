@@ -1,0 +1,9 @@
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1,5 +1,6 @@
+ #include "server-context.h"
+ #include <atomic>
++#include <iomanip>   // std::setw: GCC 8 does not pull <iomanip> in transitively
+ #include <thread>
+ #include "base64.hpp"
+ #include "server-chat.h"
