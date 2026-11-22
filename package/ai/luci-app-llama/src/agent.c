@@ -95,6 +95,7 @@ static int g_memcheck = 0;
 /* llama-server 响应的 content：走正规解析 choices[0].message.content，
  * 取不到再退回顶层 content。不再用 strstr 找 key（字符串里出现
  * "content" 字样会取错位置）。 */
+
 static char *extract_content(const char *resp) {
     char err[128];
     jval *v = json_parse(resp, err, sizeof(err));
@@ -360,6 +361,26 @@ static int utf8_emit(char *out, unsigned cp) {
  *   data: [DONE]
  * 返回累积的完整文本（malloc），失败 NULL。
  */
+/* 调用 /v1/chat/completions 并在模型"还在加载"时自动等一会儿重试。
+ * 装完包/重启后 llama-server 要 10~30 秒才 ready，以前这里直接判失败，
+ * 整个任务白跑（用户看到的就是"模型服务没响应"）。 */
+static char *http_post_chat(const char *host, int port, const char *body, int timeout) {
+    for (int att = 1; att <= 6; att++) {
+        char *r = http_post(host, port, "/v1/chat/completions", body, timeout);
+        int retry = 0;
+        if (!r) retry = 1;
+        else if (strstr(r, "Loading model") || strstr(r, "\"code\":503")
+                 || strstr(r, "unavailable_error")) retry = 1;
+        if (!retry) return r;
+        if (att == 6) return r;
+        printf("（模型正在加载，%d 秒后重试 %d/6…）\n", 6, att + 1);
+        fflush(stdout);
+        free(r);
+        sleep(6);
+    }
+    return NULL;
+}
+
 static char *http_post_sse(const char *host, int port, const char *path,
                            const char *body, int timeout_s,
                            int emit_stdout) {
@@ -998,8 +1019,6 @@ static const route_t ROUTES[] = {
     {"table", "排序|排行|top|TOP|筛选|名次|前.*名"},
     /* JSON 类：探结构 / 取字段 / 导 CSV。以前表里没有 jq，只有"全都不命中
      * 才全列兜底"时它才进 prompt —— 问"这个 json 有哪些字段"基本选不到它。 */
-    {"jq",    "json|JSON|字段|键值|导出.*csv|转.*csv|翻页|jq|结构.*(多少|有哪些)|"
-              "多少条|有几条"},
     {"batch", "分批|大量|很多(页|章|节)|长文档|多章节|整套"},
     {"sysmon","监控|巡检|告警|阈值|采样"},
     /* 抓包类：必须单独一项，否则这句话在 3B 眼里就是个知识问答
@@ -1012,6 +1031,11 @@ static const route_t ROUTES[] = {
     {"netcap", "抓包|tcpdump|pcap|sniff|"
                "抓.{0,4}秒|抓.{0,6}流量|流量.{0,8}(访问|看看|哪些)|"
                "访问了什么|访问了哪些|访问哪些网站|谁在占带宽|带宽占用"},
+    /* 路由表是按 '|' 切成子串、用 strstr 逐个子串匹配的 —— 这里写 ".*"
+     * 没用（会被当字面量），写「字段 / 多少条 / 有几条」又会把表格类问题
+     * （"这个表有多少条记录""这列字段"）也拉进 jq，3B 于是改挑 jq，识别就乱了。
+     * 现在只留"明确在说 JSON"的字面子串。 */
+    {"jq",    "jq|JSON|json|键值|导出csv|导出 csv|转csv|转 csv|翻页"},
 };
 
 /* 返回选中插件的下标数组，返回个数；0 = 没命中（调用方应该全列） */
@@ -1147,16 +1171,43 @@ static const char *intent_text(const char *task) {
 
 /* 认出是插件命令就直接执行，返回 1（结果已打到 stdout） */
 static int try_direct_plugin(const char *task) {
-    if (!task || task[0] != '{') return 0;
+    if (!task || !task[0]) return 0;
+    /* 命令不一定在第一个字节：页面在上传过文件后会在任务前面拼一段
+     * "【用户已上传的文件…】
+<路径>
+
+"，原来 task[0] != '{' 就直接放弃，
+     * 于是 {"op":"sr",...} 被丢给模型猜（160 秒）。这里跳到第一个 '{'，
+     * 并要求整段确实是一个完整的 JSON 对象才认。 */
+    const char *js = strchr(task, '{');
+    if (!js) return 0;
+    {
+        const char *tail = js + strlen(js);
+        while (tail > js && (tail[-1] == ' ' || tail[-1] == '\n' ||
+                             tail[-1] == '\r' || tail[-1] == '\t')) tail--;
+        if (tail <= js + 1 || tail[-1] != '}') return 0;
+    }
     char op[48] = {0};
-    if (json_str_field(task, "op", op, sizeof(op)) != 0 || !op[0]) return 0;
-    const char *pw = op_to_plugin(task, op);
+    json_str_field(js, "op", op, sizeof(op));
+    const char *pw = NULL;
+    if (op[0]) {
+        pw = op_to_plugin(js, op);
+    } else {
+        /* 没写 op 的命令：按内容形状归到 doc（生成类），或按扩展名归到 doc（读文档）。
+         * 别的插件都要 op 才能确定动作，不猜。 */
+        if (strstr(js, "\"markdown\"") || strstr(js, "\"sheets\"") || strstr(js, "\"pages\"")
+            || strstr(js, "\"csv_files\"") || strstr(js, "\"csv\"") || strstr(js, "\"slides\""))
+            pw = "doc";
+        else if (strstr(js, ".pdf") || strstr(js, ".docx") || strstr(js, ".xlsx")
+                 || strstr(js, ".xlsm") || strstr(js, ".pptx"))
+            pw = "doc";
+    }
     if (!pw) return 0;
     plugin_desc_t *pl = find_plugin(pw);
     if (!pl) return 0;
     printf("【插件 %s 开始工作】\n", pw);
     fflush(stdout);
-    char *res = pl->run(task);
+    char *res = pl->run(js);
     if (res) {
         printf("%s\n", res);
         free(res);
@@ -1204,6 +1255,16 @@ static int route_plugins(const char *task, int *idx, int maxn) {
         for (int k = 0; k < g_n; k++)
             if (!strcmp(g_plug[k]->name, ROUTES[i].plugin)) { pk = k; break; }
         if (pk < 0) continue;                     /* 这个插件没装，跳过 */
+
+        /* jq 只该在"明确在说 JSON"时出现。表格类任务（表格/表里/csv/xlsx/excel）
+         * 且没提 json 时直接不给 —— 3B 看到候选里有 jq 就会去挑，识别就乱。 */
+        if (!strcmp(ROUTES[i].plugin, "jq")) {
+            int jsony = strstr(task, "json") || strstr(task, "JSON") || strstr(task, "Json");
+            int datat = strstr(task, "表格") || strstr(task, "表里") || strstr(task, "csv")
+                     || strstr(task, "CSV") || strstr(task, "xlsx") || strstr(task, "xls")
+                     || strstr(task, "Excel") || strstr(task, "excel");
+            if (datat && !jsony) continue;
+        }
 
         char keys[2048];
         snprintf(keys, sizeof(keys), "%s", ROUTES[i].keys);
@@ -1659,6 +1720,94 @@ static int try_math_direct(const char *task) {
     size_t L = strlen(task);
     if (L < 8 || L > 320) return 0;
 
+    /* 中文算式（根号 / √ / 平方 / 立方 + 加减乘除）：求值器本来就认这些记号，
+     * 直接算，不用等模型翻译 —— 3B 一步 170 秒，而且它经常把算式发成
+     * op=solve，被"方程里没有等号"挡回来，重试两次整个任务就废了。
+     * 算不出来（含应用题那种叙述）就 return 0 退回模型，不硬猜。 */
+    int plain_arith = (strstr(task, "计算") || strstr(task, "算一下") || strstr(task, "算算"))
+                    && (strstr(task, "加") || strstr(task, "减") || strstr(task, "乘")
+                        || strstr(task, "除"));
+    if (strstr(task, "根号") || strstr(task, "√") || strstr(task, "平方")
+        || strstr(task, "立方") || strstr(task, "分之") || strstr(task, "次方")
+        || strstr(task, "正弦") || strstr(task, "余弦") || strstr(task, "正切")
+        || strstr(task, "加到") || plain_arith) {
+        plugin_desc_t *mp = find_plugin("math");
+        if (mp) {
+            char *esc = malloc(L * 6 + 64);
+            if (esc) {
+                json_escape(task, esc, L * 6 + 64);
+                char *call = malloc(L * 6 + 128);
+                if (call) {
+                    snprintf(call, L * 6 + 128, "{\"op\":\"calc\",\"expr\":\"%s\"}", esc);
+                    char *r = mp->run(call);
+                    free(call);
+                    if (r && strstr(r, "\"value\"") && !strstr(r, "\"error\"")) {
+                        /* 必须是 "[math] {json}" 这种格式：前端的步骤卡片
+                         * 只认 `  [名字] {`，不打前缀这行会被当成噪音丢掉，
+                         * 用户就只看到一个数字、既没有过程也没有插件名。 */
+                        printf("【插件 math 开始工作】\n  [math] %s\n", r);
+                        char ans[200] = {0};
+                        json_str_field(r, "answer", ans, sizeof(ans));
+                        if (ans[0]) printf("\n最终回答: %s\n", ans);
+                        free(r);
+                        free(esc);
+                        return 1;
+                    }
+                    free(r);
+                }
+                free(esc);
+            }
+        }
+    }
+
+    /* "解方程 3x+5=20" / "求 2x=8 的解"：方程就在文字里，没必要让模型
+     * 再翻译一遍（3B 一步 170 秒，还经常漏掉等号被拒）。 */
+    if (strstr(task, "方程") || strstr(task, "求解") || strstr(task, "解一下")) {
+        char eq[256] = {0};
+        size_t el = 0;
+        int have_eq_sign = 0, have_var = 0;
+        for (const char *p = task; *p && el + 1 < sizeof(eq); ) {
+            unsigned char c = (unsigned char)*p;
+            if ((c >= '0' && c <= '9') || c == '.' || c == '(' || c == ')' ||
+                c == '+' || c == '-' || c == '*' || c == '/' || c == '^' ||
+                c == '=' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+                eq[el++] = (char)c;
+                if (c == '=') have_eq_sign = 1;
+                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) have_var = 1;
+                p++;
+                continue;
+            }
+            if (el > 0) break;          /* 算式片段结束 */
+            p++;
+        }
+        eq[el] = 0;
+        if (have_eq_sign && have_var && el >= 3) {
+            plugin_desc_t *mp = find_plugin("math");
+            if (mp) {
+                char *esc = malloc(el * 2 + 64);
+                if (esc) {
+                    json_escape(eq, esc, el * 2 + 64);
+                    char *call = malloc(el * 2 + 128);
+                    if (call) {
+                        snprintf(call, el * 2 + 128, "{\"op\":\"solve\",\"equation\":\"%s\"}", esc);
+                        char *r = mp->run(call);
+                        free(call);
+                        if (r && strstr(r, "\"value\"") && !strstr(r, "\"error\"")) {
+                            printf("【插件 math 开始工作】\n  [math] %s\n", r);
+                            char ans[200] = {0};
+                            json_str_field(r, "answer", ans, sizeof(ans));
+                            if (ans[0]) printf("\n最终回答: %s\n", ans);
+                            free(r); free(esc);
+                            return 1;
+                        }
+                        free(r);
+                    }
+                    free(esc);
+                }
+            }
+        }
+    }
+
     static const char *K[] = {
         "工程", "合作", "合做", "相遇", "追及", "环形跑道", "火车", "过桥",
         "鸡兔", "多少次", "平均值", "平均数", "中位数", "方差", "标准差",
@@ -1680,15 +1829,18 @@ static int try_math_direct(const char *task) {
     char *call = malloc(strlen(esc) + 64);
     if (!call) { free(esc); return 0; }
     snprintf(call, strlen(esc) + 64, "{\"op\":\"plan\",\"task\":\"%s\"}", esc);
-    printf("【插件 math 开始工作】\n");
-    fflush(stdout);
     char *res = pl->run(call);
     free(call);
     free(esc);
     if (!res) return 0;
+    /* 先判成功再打"开始工作"：失败会退回模型，日志里留一行孤零零的
+     * 【插件 math 开始工作】会让人以为插件跑过了。 */
     if (strstr(res, "\"error\"")) { free(res); return 0; }
 
-    printf("%s\n", res);
+    printf("【插件 math 开始工作】\n  [math] %s\n", res);
+    char ans[200] = {0};
+    json_str_field(res, "answer", ans, sizeof(ans));
+    if (ans[0]) printf("\n最终回答: %s\n", ans);
     free(res);
     return 1;
 }
@@ -1985,7 +2137,7 @@ static char *write_by_sections(const char *task, int target, const char *host,
             "{\"role\":\"user\",\"content\":\"%s\"}],"
             "\"max_tokens\":220,\"temperature\":0.5,\"stream\":false}",
             model, nsec, te);
-        char *r = http_post(host, port, "/v1/chat/completions", body, 300);
+        char *r = http_post_chat(host, port, body, 300);
         if (r) {
             char *c = extract_content(r);
             free(r);
@@ -2081,7 +2233,7 @@ static char *write_by_sections(const char *task, int target, const char *host,
         int to = each * 3 + 300;
         if (to < 240) to = 240;
         if (to > 900) to = 900;
-        char *resp = http_post(host, port, "/v1/chat/completions", body, to);
+        char *resp = http_post_chat(host, port, body, to);
         if (!resp) { printf("（第 %d 段超时/断连，跳过）\n", i); continue; }
         char *c = extract_content(resp);
         free(resp);
@@ -2127,7 +2279,7 @@ static char *write_by_sections(const char *task, int target, const char *host,
             "直接输出压缩后的完整正文：\\n\\n%s\"}],"
             "\"max_tokens\":%d,\"temperature\":0.3,\"stream\":false}",
             model, target, target + target / 10, ae, target * 3 + 200);
-        char *r = http_post(host, port, "/v1/chat/completions", body, target * 2 + 300);
+        char *r = http_post_chat(host, port, body, target * 2 + 300);
         if (r) {
             char *c = extract_content(r);
             free(r);
@@ -2164,7 +2316,7 @@ static char *write_by_sections(const char *task, int target, const char *host,
             model, te, tl, te, want, want * 8 / 10, want * 3 + 150);
         int to = want * 3 + 200;
         if (to > 900) to = 900;
-        char *r = http_post(host, port, "/v1/chat/completions", body, to);
+        char *r = http_post_chat(host, port, body, to);
         if (r) {
             char *c = extract_content(r);
             free(r);
@@ -2246,6 +2398,202 @@ static int direct_answer_of(const char *tool, const char *out, int step,
     return 1;
 }
 
+/* ---------- JSON → 多 sheet xlsx 直连 ----------
+ * jq 的 table op 会把 JSON 里每个子数组导成一份 *_sub_*.csv（article_brand、
+ * statistics_data…），doc 的 xlsx 支持 csv_files 一个文件一个 sheet。
+ * 但让 3B 自己串这两步基本串不对，所以这里直连：
+ *   任务里同时提到 xlsx/Excel 和 json/子表/sheet，且 downloads 里有子表 CSV，
+ *   就直接把它们合成一个多 sheet 的 xlsx。 */
+static int try_json_xlsx_direct(const char *task) {
+    if (!task || !task[0]) return 0;
+    int want_xlsx = strstr(task, "xlsx") || strstr(task, "XLSX") || strstr(task, "Excel")
+                 || strstr(task, "excel") || strstr(task, "工作表文件");
+    int want_json = strstr(task, "json") || strstr(task, "JSON") || strstr(task, "子表")
+                 || strstr(task, "sheet") || strstr(task, "Sheet") || strstr(task, "工作表");
+    int act = strstr(task, "导出") || strstr(task, "生成") || strstr(task, "另存")
+           || strstr(task, "转成") || strstr(task, "做成") || strstr(task, "保存");
+    if (!(want_xlsx && want_json && act)) return 0;
+
+    DIR *dp = opendir("/tmp/llama_agent/downloads");
+    if (!dp) return 0;
+    typedef struct { char path[900]; char name[64]; time_t mt; } cf_t;
+    cf_t cf[16];
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(dp)) != NULL && n < 15) {
+        const char *base = e->d_name;
+        if (strncmp(base, "resp_", 5) && strncmp(base, "jq_", 3)) continue;
+        size_t L = strlen(base);
+        if (L < 5 || strcasecmp(base + L - 4, ".csv")) continue;
+        char full[900];
+        snprintf(full, sizeof(full), "/tmp/llama_agent/downloads/%s", base);
+        struct stat st;
+        if (stat(full, &st) != 0) continue;
+        /* 只要最近 2 小时内导出的，避免拿上一次的旧数据 */
+        if (time(NULL) - st.st_mtime > 7200) continue;
+        snprintf(cf[n].path, sizeof(cf[n].path), "%s", full);
+        const char *sub = strstr(base, "_sub_");
+        if (sub) snprintf(cf[n].name, sizeof(cf[n].name), "%.*s", 31, sub + 5);
+        else snprintf(cf[n].name, sizeof(cf[n].name), "主表");
+        char *dot = strrchr(cf[n].name, '.');
+        if (dot) *dot = 0;
+        cf[n].mt = st.st_mtime;
+        n++;
+    }
+    closedir(dp);
+    if (n == 0) return 0;
+
+    plugin_desc_t *dpl = find_plugin("doc");
+    if (!dpl) return 0;
+
+    char out[512];
+    snprintf(out, sizeof(out), "/tmp/llama_agent/gen/json_%ld.xlsx", (long)time(NULL));
+    size_t cap = 2048 + (size_t)n * 1100;
+    char *call = malloc(cap);
+    if (!call) return 0;
+    size_t o = (size_t)snprintf(call, cap, "{\"op\":\"xlsx\",\"path\":\"%s\",\"csv_files\":[", out);
+    for (int i = 0; i < n && o + 1200 < cap; i++)
+        o += (size_t)snprintf(call + o, cap - o, "%s{\"path\":\"%s\",\"name\":\"%s\"}",
+                              i ? "," : "", cf[i].path, cf[i].name);
+    snprintf(call + o, cap - o, "]}");
+
+    char *r = dpl->run(call);
+    free(call);
+    if (!r) return 0;
+    if (strstr(r, "\"error\"")) { free(r); return 0; }
+    printf("【插件 doc 开始工作】\n  [doc] %s\n", r);
+    char ans[200] = {0};
+    json_str_field(r, "answer", ans, sizeof(ans));
+    if (ans[0]) printf("\n最终回答: %s\n", ans);
+    free(r);
+    return 1;
+}
+
+/* ---------- 表格 TOP-N 直连 ----------
+ *
+ * "展示表格内 播放量 top10" 让模型去做，3B 只会回一句"直接转"或者干脆
+ * 调 doc 把 xlsx 又打包一遍。这类请求的要素只有两个：按哪一列、取前几条 ——
+ * 列名在任务里写着，条数也在任务里写着，不需要模型判断。
+ */
+static int top_n(const char *t) {
+    /* top10 / TOP 10 / 前10 / 前 10 名 / 最高的 10 条 */
+    for (const char *p = t; *p; p++) {
+        const char *q = NULL;
+        if (!strncasecmp(p, "top", 3)) q = p + 3;      /* top10 / TOP 10 */
+        else if (!strncmp(p, "前", 3)) q = p + 3;      /* 前10 / 前 10 名 */
+        if (!q) continue;
+        while (*q == ' ') q++;
+        if (*q < '0' || *q > '9') continue;
+        int v = atoi(q);
+        if (v >= 1 && v <= 200) return v;
+    }
+    return 0;
+}
+
+static int bottom_n(const char *t) {
+    /* 倒数10 / 最低 10 / 最少5 / bottom 10 */
+    for (const char *p = t; *p; p++) {
+        const char *q = NULL;
+        if (!strncmp(p, "倒数", 6)) q = p + 6;
+        else if (!strncmp(p, "最低", 6) || !strncmp(p, "最少", 6)) q = p + 6;
+        else if (!strncasecmp(p, "bottom", 6)) q = p + 6;
+        else continue;
+        while (*q == ' ' || !strncmp(q, "的", 3)) q += (*q == ' ') ? 1 : 3;
+        if (*q < '0' || *q > '9') {
+            /* "最低的" 后面没数字：当成取 10 条 */
+            return 10;
+        }
+        int v = atoi(q);
+        if (v >= 1 && v <= 200) return v;
+    }
+    return 0;
+}
+
+static int try_table_direct(const char *task) {
+    if (!task || !task[0] || task[0] == '{') return 0;
+    int n = top_n(task);
+    int asc = 0;
+    /* top/bottom 路径必须认到列才算表格任务：任务里写着列名（"播放量 top10"）
+     * 才走 table，认不到列让 table 自己报错退回模型 —— 否则"中国前10大城市"
+     * 也会被当成表格请求，随便拿一份表排一遍。 */
+    int need_col = 1;
+    if (n <= 0) {
+        int b = bottom_n(task);
+        if (b > 0) { n = b; asc = 1; }
+    }
+    if (n <= 0) {
+        /* 没有 top/bottom：要么带筛选词，要么明确"展示表格"才接 */
+        int tab_hint = strstr(task, "表格") || strstr(task, "表里") || strstr(task, "csv")
+                    || strstr(task, "CSV") || strstr(task, "xlsx") || strstr(task, "excel")
+                    || strstr(task, "Excel")
+                    || strstr(task, "这个表") || strstr(task, "这张表")
+                    || strstr(task, "该表") || strstr(task, "表中")
+                    || strstr(task, "表有") || strstr(task, "表共");
+        int filt = strstr(task, "筛选") || strstr(task, "满足") || strstr(task, "条件")
+                || strstr(task, "大于") || strstr(task, "小于") || strstr(task, "包含")
+                || strstr(task, "等于") || strstr(task, "不含") || strstr(task, "低于")
+                || strstr(task, "高于");
+        int show_hint = strstr(task, "展示") || strstr(task, "显示") || strstr(task, "列出")
+                     || strstr(task, "看看") || strstr(task, "看下") || strstr(task, "读取")
+                     || strstr(task, "内容") || strstr(task, "前几行") || strstr(task, "预览")
+                     /* "这个表有多少条记录/多少行" 也是看表，别让它掉进纯对话 */
+                     || strstr(task, "多少条") || strstr(task, "多少行")
+                     || strstr(task, "几条") || strstr(task, "几行")
+                     || strstr(task, "行数") || strstr(task, "记录数")
+                     || strstr(task, "哪些字段") || strstr(task, "什么字段")
+                     || strstr(task, "哪些列") || strstr(task, "什么列")
+                     || strstr(task, "列名");
+        /* 光有"等于/大于/包含"不算表格任务 —— "1加1等于几"里也有"等于"。
+         * 必须同时带表格语境（表格/表里/csv/xlsx），或者明确说"筛选/满足条件"。 */
+        if ((filt && tab_hint) || strstr(task, "筛选") || strstr(task, "满足条件")
+            || (tab_hint && show_hint)) { n = 20; need_col = 0; }
+    }
+    if (n <= 0) return 0;
+
+    plugin_desc_t *tp = find_plugin("table");
+    if (!tp) return 0;
+
+    size_t L = strlen(task);
+    char *esc = malloc(L * 6 + 64);
+    if (!esc) return 0;
+    json_escape(task, esc, L * 6 + 64);
+    char *call = malloc(L * 6 + 320);
+    if (!call) { free(esc); return 0; }
+    snprintf(call, L * 6 + 300,
+             "{\"op\":\"top\",\"limit\":%d,\"order\":\"%s\",\"need_col\":%d,\"_task\":\"%s\"}",
+             n, asc ? "asc" : "desc", need_col, esc);
+    char *r = tp->run(call);
+    free(call);
+    free(esc);
+    if (!r) return 0;
+
+    if (strstr(r, "\"error\"")) {
+        /* 数据/列名层面的问题（"没认出要按哪一列排""表里没有这一列"）不适合
+         * 再丢给模型 —— 3B 只会重新推理几分钟然后给个错答案。直接把原因
+         * 摆在气泡里，用户照着改一句话就行。 */
+        int datamsg = strstr(r, "没认出要按哪一列") || strstr(r, "里没有「")
+                   || strstr(r, "没有可用的表格数据") || strstr(r, "只有表头");
+        if (datamsg) {
+            printf("【插件 table 开始工作】\n  [table] %s\n", r);
+            char m[400] = {0};
+            json_str_field(r, "error", m, sizeof(m));
+            if (m[0]) printf("\n最终回答: %s\n", m);
+            free(r);
+            return 1;
+        }
+        free(r);
+        return 0;
+    }
+    if (!strstr(r, "\"value\"")) { free(r); return 0; }
+
+    printf("【插件 table 开始工作】\n  [table] %s\n", r);
+    char ans[200] = {0};
+    json_str_field(r, "answer", ans, sizeof(ans));
+    if (ans[0]) printf("\n最终回答: %s\n", ans);
+    free(r);
+    return 1;
+}
+
 /* ---------- 生成文档（PPT / Word / PDF）直连 ----------
  *
  * "根据 wireguard 技术写一个 10 页 PPT" 交给主循环必挂：模型要在一次
@@ -2296,35 +2644,37 @@ static char *gen_doc_md(const char *topic, int parts, int ppt, int per_part,
         /* 系统提示里不放引号：这段是直接拼进 JSON 字符串的，少一层转义少一个坑 */
         const char *sysp = ppt
             ? "你是文档撰写助手。只输出 Markdown：每页以一行「# 标题」开始，"
-              "下面列 3 到 5 条「- 要点」，要点必须具体（术语、数字、步骤、配置项），"
+              "标题写实质内容，绝对不要写「第1页」这种占位标题；"
+              "标题下面列 3 到 5 条「- 要点」，要点必须具体（术语、数字、步骤、配置项）。"
+              "第 1 页是封面，标题就是主题本身。"
               "不要目录、不要解释、不要任何前后缀。"
             : "你是文档撰写助手。只输出 Markdown 正文：用「## 小标题」分节，"
-              "每节一个完整段落，不要目录、不要解释、不要标注字数。";
+              "小标题写实质内容，每节一个完整段落，不要目录、不要解释、不要标注字数。";
 
         if (all[0])
             snprintf(body, BIG,
                 "{\"model\":\"%s\",\"messages\":["
                 "{\"role\":\"system\",\"content\":\"%s\"},"
-                "{\"role\":\"user\",\"content\":\"主题：%s。只写第 %d-%d 个%s（共 %d 个）。\"},"
+                "{\"role\":\"user\",\"content\":\"主题：%s。共 %d %s，接着写第 %d-%d %s。\"},"
                 "{\"role\":\"assistant\",\"content\":\"%s\"},"
-                "{\"role\":\"user\",\"content\":\"接着往下写第 %d-%d 个，格式完全一致，"
+                "{\"role\":\"user\",\"content\":\"继续写第 %d-%d %s，格式完全一致，"
                 "不要重复前面写过的内容。\"}],"
                 "\"max_tokens\":%d,\"temperature\":0.6,\"stream\":false}",
-                model, sysp, te, from - per_part, from - 1,
-                ppt ? "页" : "节", parts, tv, from, to,
+                model, sysp, te, parts, ppt ? "页" : "节", from - per_part, from - 1,
+                ppt ? "页" : "节", tv, from, to, ppt ? "页" : "节",
                 n * (ppt ? 110 : chars_each) + 160);
         else
             snprintf(body, BIG,
                 "{\"model\":\"%s\",\"messages\":["
                 "{\"role\":\"system\",\"content\":\"%s\"},"
-                "{\"role\":\"user\",\"content\":\"主题：%s。共 %d 个%s，先写第 %d-%d 个。\"}],"
+                "{\"role\":\"user\",\"content\":\"主题：%s。共 %d %s，先写第 %d-%d %s。\"}],"
                 "\"max_tokens\":%d,\"temperature\":0.6,\"stream\":false}",
                 model, sysp, te, parts, ppt ? "页" : "节", from, to,
-                n * (ppt ? 110 : chars_each) + 160);
+                ppt ? "页" : "节", n * (ppt ? 110 : chars_each) + 160);
 
         printf("（生成第 %d-%d/%d 个…）\n", from, to, parts);
         fflush(stdout);
-        char *resp = http_post(host, port, "/v1/chat/completions", body, 420);
+        char *resp = http_post_chat(host, port, body, 420);
         if (!resp) { printf("（这一段超时/断连，跳过）\n"); continue; }
         char *c = extract_content(resp);
         free(resp);
@@ -2581,6 +2931,8 @@ int main(int argc, char **argv) {
      * 文件名里的 .xlsx 之类，会把下面这些直连通道误触发）。 */
     const char *itask = intent_text(task);
     if (itask && try_math_direct(itask)) return 0;
+    if (itask && try_table_direct(itask)) return 0;
+    if (itask && try_json_xlsx_direct(itask)) return 0;
     if (itask && try_music_direct(itask)) return 0;
     /* 文档生成要早于"写文章"：写 word/ppt 的诉求是拿到文件，不是一段正文 */
     if (itask && try_write_doc(itask, host, port, model)) return 0;
@@ -2878,7 +3230,7 @@ int main(int argc, char **argv) {
         inject_recent_files(log, BIG);
     /* task_esc 不在这里释放：下面调 math 时要用它补 task 字段 */
 
-    printf("任务: %s\n插件: %d 个\n", task, g_n);
+    printf("任务: %s\n插件: %d 个\n", intent_text(task), g_n);
 
     int rc = 2;
     /* 插件返回的数值：模型 final 时如果没体现出来，由框架补一行。
@@ -2886,6 +3238,7 @@ int main(int argc, char **argv) {
      * 插件明明算出了 3.732 却不展示，用户会以为算错了。 */
     char last_val[64] = {0};
     char *last_result = last_result_init;   /* 最后一次插件返回的 JSON，兜底收尾用 */
+    char last_ok_tool[64] = {0};            /* 产出 last_result 的那个插件 */
     /* 任务里出现网址 + "抓/看/404/状态码" 时，直接把该调的 JSON 贴给模型抄。
      * 0.5B/3B 自己选 op 很不可靠：实测会去调 curl（要整段 cURL，不是网址）
      * 或者 sys 的 list（列出 /tmp 目录），最后胡答一通。给它一条现成的调用
@@ -2977,7 +3330,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  [body] %.400s\n", body);
                 fflush(stderr);
             }
-            char *resp = http_post(host, port, "/v1/chat/completions", body, 300);
+            char *resp = http_post_chat(host, port, body, 300);
             free(body);
             fin[0] = 0;
             content = resp ? extract_content(resp) : NULL;
@@ -3195,7 +3548,7 @@ int main(int argc, char **argv) {
              * 反过来的话原始 JSON 会被并进答案气泡。 */
             char cutd[BIG];
             snprintf(cutd, sizeof(cutd), "%s", out);
-            utf8_cut(cutd, 4000);
+            utf8_cut(cutd, 20000);
             printf("  [%s] %s\n", p->name, cutd);
             printf("\n最终回答: %s\n", dans);
             free(out);
@@ -3216,6 +3569,26 @@ int main(int argc, char **argv) {
             static char fail_tool[64];
             static int fail_cnt;
             if (strstr(out, "\"error\"")) {
+                /* 前一步已经成功出过结果（比如 curl→jq 已经拿到 30 条 + CSV），
+                 * 这一步模型又拿错文件/拿文本列去排序 —— 这是它在瞎试。
+                 * 以前会再失败一次才停，最后给用户一串"没能完成"，把已经
+                 * 拿到手的结果埋了。这里直接用上一步的结果收尾。 */
+                int data_err = strstr(out, "不是 JSON") || strstr(out, "不是数字列")
+                            || strstr(out, "没认出要按哪一列") || strstr(out, "里没有「");
+                int same_tool = last_ok_tool[0] && !strcmp(last_ok_tool, tool);
+                if (last_result && last_result[0] && (data_err || same_tool)) {
+                    char ans[400] = {0};
+                    json_str_field(last_result, "answer", ans, sizeof(ans));
+                    char why[300];
+                    snprintf(why, sizeof(why), "%s", out);
+                    utf8_cut(why, 160);
+                    printf("  ! 这一步没成（%s），但前面 %s 已经出结果了，按那个收尾\n",
+                           why, last_ok_tool);
+                    printf("\n最终回答: %s\n", ans[0] ? ans : "见上一步的结果");
+                    free(out);
+                    rc = 0;
+                    break;
+                }
                 char sig[700];
                 snprintf(sig, sizeof(sig), "%s|%.500s", tool, enr);
                 /* 同一插件连续失败 2 次就停。小模型不只原样重发，还会换着
@@ -3245,6 +3618,7 @@ int main(int argc, char **argv) {
         /* 记下完整结果：模型没给 final 时拿它收尾，别白算一场 */
         free(last_result);
         last_result = strdup(out);
+        snprintf(last_ok_tool, sizeof(last_ok_tool), "%s", tool);
         /* 记下这一轮插件算出的数值：模型 final 时若没体现，由框架补一行。
          * 3B 常把表达式原样当答案（问"根号3加2"就答 "sqrt(3)+2"），
          * 插件明明算了 3.732 却不展示，用户会以为算错了。 */
@@ -3267,7 +3641,7 @@ int main(int argc, char **argv) {
             /* 不能截太短：math 的解题过程是 markdown 表格，1000+ 字节很正常。
              * 截断会把 JSON 砍坏，前端 JSON.parse 失败就只能显示原始文本，
              * 用户看到的就是"只有结果没有过程"。 */
-            utf8_cut(cut, 4000);
+            utf8_cut(cut, 20000);
             printf("  [%s] %s\n", p->name, cut);
             MEMCHK("after-plugin");
         }

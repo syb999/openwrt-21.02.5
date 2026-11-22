@@ -179,14 +179,35 @@ static char *run(const char *json_in) {
     char path[512] = {0};
     jget(json_in, "op", op, sizeof(op));
     jget(json_in, "path", path, sizeof(path));
+    /* 模型常把路径写成 file / target / output / filename 而不是 path */
+    if (!path[0]) {
+        static const char *PK[] = {"file", "target", "output", "out_path", "filename", NULL};
+        for (int i = 0; PK[i] && !path[0]; i++) jget(json_in, PK[i], path, sizeof(path));
+    }
+    /* op 为空但明显是在"生成"（带了正文/表格/页）：按内容形状推断写操作，
+     * 别落到下面报"缺少 path"。纯 {"path":...} 仍然是读（见下面注释）。 */
+    if (!op[0] && !path[0]) {
+        if (strstr(json_in, "\"pages\"") || strstr(json_in, "\"slides\""))
+            snprintf(op, sizeof(op), "pptx");
+        else if (strstr(json_in, "\"sheets\"") || strstr(json_in, "\"csv_files\"")
+                 || strstr(json_in, "\"csv\""))
+            snprintf(op, sizeof(op), "xlsx");
+        else if (strstr(json_in, "\"markdown\"") || strstr(json_in, "\"content\"")
+                 || strstr(json_in, "\"text\""))
+            snprintf(op, sizeof(op), "docx");
+    }
 
     /* 模型常把"写一个 ppt"发成 op=write / create / new / 生成，或者给了
      * path=xxx.pptx 却不给 op。这些都不是读操作 —— 按扩展名/format 归到
      * 对应的写操作。以前它们全落到下面的读分支，统一报"缺少 path"，
      * 模型看不懂，原样重发两次就被框架判"连续失败"停了。 */
-    if (!op[0] || !strcmp(op, "write") || !strcmp(op, "create") || !strcmp(op, "new")
+    /* 注意：op 为空表示"读这个文件"（插件文档里的读法就是 {"path":...}），
+     * 不能按扩展名猜成写操作 —— 那样上传 xlsx 会被当成"新建 xlsx"，
+     * 把刚存好的上传文件覆盖成一张空表（表现：上传成功但 chars=15、
+     * 伴生 .txt 没生成）。只有明确写了 write/create/… 才按扩展名归到写。 */
+    if (op[0] && (!strcmp(op, "write") || !strcmp(op, "create") || !strcmp(op, "new")
         || !strcmp(op, "gen") || !strcmp(op, "生成") || !strcmp(op, "输出")
-        || !strcmp(op, "out")) {
+        || !strcmp(op, "out"))) {
         char fmt[16] = {0};
         jget(json_in, "format", fmt, sizeof(fmt));
         const char *e = path[0] ? strrchr(path, '.') : NULL;

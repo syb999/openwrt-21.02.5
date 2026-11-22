@@ -304,7 +304,13 @@ static int resolve_file(const char *in, char *out, size_t cap) {
         if (in[0] == '/') snprintf(out, cap, "%s", in);
         else snprintf(out, cap, "%s/downloads/%s", WORK_DIR, in);
         struct stat st;
-        return stat(out, &st) == 0 ? 0 : -1;
+        if (stat(out, &st) == 0) return 0;
+        /* 模型常把绝对路径写成 "./tmp/..."：去掉那个点再试一次 */
+        if (in[0] == '.' && in[1] == '/') {
+            snprintf(out, cap, "%s", in + 1);
+            if (stat(out, &st) == 0) return 0;
+        }
+        return -1;
     }
     DIR *d = opendir(WORK_DIR "/downloads");
     if (!d) return -1;
@@ -347,28 +353,62 @@ static char *op_probe(const char *json) {
     jget(json, "file", fname, sizeof(fname));
     jget(json, "path", qpath, sizeof(qpath));
 
+    /* 模型经常把**文件名**塞进 path（path 本来是 jq 路径表达式，如 .data.list）。
+     * 以前直接把 path 拼进 jq 程序，于是 jq 收到
+     *   "./tmp/xx.txt | if type==\"array\" …"  →  syntax error。
+     * 看到像路径的（带 / 且以 / . ~ 开头）就当 file 用，jq 路径退回默认。 */
+    /* 只接受真正的 jq 路径（以 . 开头，如 .data.rows）。模型有时会把
+     * "200 OK · text/html · 102 KB · rows" 这种摘要塞进 path，以前直接拼进
+     * jq 程序 → syntax error。不认识的就不当路径用，交给自动探测。 */
+    if (qpath[0] && qpath[0] != '.') {
+        if ((qpath[0] == '/' || qpath[0] == '~') && strchr(qpath, '/')) {
+            if (!fname[0]) snprintf(fname, sizeof(fname), "%s", qpath);
+        }
+        qpath[0] = 0;
+    }
+    if (qpath[0] == '.' && !strchr(qpath, '/')) {
+        /* 真正的 jq 路径，保留 */
+    } else if (qpath[0] == '.' && strchr(qpath, '/')) {
+        if (!fname[0]) snprintf(fname, sizeof(fname), "%s", qpath);
+        qpath[0] = 0;
+    }
+
     char path[900];
     if (resolve_file(fname, path, sizeof(path)) != 0)
         return jerr("没有可用的 json 文件（先抓数据，或给 file 参数）");
     if (auto_too_old(path, sizeof(path))) return jerr(auto_too_old_msg());
-    if (!looks_json(path)) return jerr("这个文件不是 JSON");
+    /* 指到非 JSON 文件上（最常见：模型拿了上传的 xlsx.txt 来 jq）时，
+     * 直接改用本次会话最近的 JSON —— 那通常就是刚才 curl 抓回来的响应。
+     * 以前这里报"不是 JSON，请走 table"，模型照着去调 table，
+     * 又拿 JSON 的字段名去排一张 xlsx 表，越跑越离谱。 */
+    char cnote[400] = {0};
+    if (!looks_json(path)) {
+        char recent[900] = {0};
+        resolve_file("", recent, sizeof(recent));
+        if (recent[0] && looks_json(recent)) {
+            const char *bn1 = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+            const char *bn2 = strrchr(recent, '/') ? strrchr(recent, '/') + 1 : recent;
+            snprintf(cnote, sizeof(cnote), "（%s 不是 JSON，已改用最近的 JSON `%s`）\n\n", bn1, bn2);
+            snprintf(path, sizeof(path), "%s", recent);
+        } else {
+            return jerr("这个文件不是 JSON，也没有别的 JSON 可用：先把 JSON 抓下来（curl 一个接口）"
+                        "或给我一个 .json 文件的路径。jq 只处理 JSON。");
+        }
+    }
 
     char *out = malloc(OUTMAX);
     if (!out) return NULL;
     char expr[1024];
+    char root[512] = {0};          /* 选定的数组路径，导出 CSV 时用 */
+    char dl[900] = {0};            /* 导出的 CSV 路径（给页面下载按钮） */
+    long cnt = 0;
 
     if (qpath[0]) {
-        snprintf(expr, sizeof(expr),
-            "%s | if type==\"array\" then \"array|长度=\" + (length|tostring) + "
-            "((if length>0 then \"|字段=\" + (.[0]|if type==\"object\" then (keys_unsorted|join(\",\")) else tostring end) else \"\" end)) "
-            "elif type==\"object\" then \"object|字段=\" + (keys_unsorted|join(\",\")) "
-            "else type end", qpath);
-        if (run_jq_raw(expr, path, out, OUTMAX) != 0) {
-            char m[600];
-            snprintf(m, sizeof(m), "jq 失败：%.400s", out);
-            free(out);
-            return jerr(m);
-        }
+        snprintf(root, sizeof(root), "%s", qpath);
+        /* 先把长度算出来：输出要写成列表，不是一行挤在一起 */
+        snprintf(expr, sizeof(expr), "%s | if type==\"array\" then length else 0 end", qpath);
+        char tmp[128] = {0};
+        if (run_jq_raw(expr, path, tmp, sizeof(tmp)) == 0) cnt = atol(tmp);
     } else {
         /* 没给 path：自动找最长的数组 */
         static const char *cands[] = {"rows", "list", "items", "records", "feeds", "data", NULL};
@@ -389,29 +429,108 @@ static char *op_probe(const char *json) {
                 }
             }
         }
-        if (best[0]) {
-            snprintf(expr, sizeof(expr),
-                "[%s[] | keys_unsorted[]] | unique | join(\",\")", best);
-            char fields[4096] = {0};
-            run_jq_raw(expr, path, fields, sizeof(fields));
-            snprintf(out, OUTMAX,
-                "**主数组** `%s` · %ld 条\n\n**全部字段**（%s）\n", best, blen, fields);
-        } else {
-            snprintf(expr, sizeof(expr), "if type==\"array\" then \"array|\"+(length|tostring) "
-                     "elif type==\"object\" then \"object|\"+(keys_unsorted|join(\",\")) "
-                     "else type end");
-            if (run_jq_raw(expr, path, out, OUTMAX) != 0) {
-                free(out);
-                return jerr("jq 执行失败");
-            }
-            snprintf(out + strlen(out), OUTMAX - strlen(out), "\n");
+        if (best[0]) { snprintf(root, sizeof(root), "%s", best); cnt = blen; }
+    }
+
+    if (!root[0]) {
+        /* 连数组都没找到：给个总体类型 + 顶层字段 */
+        snprintf(expr, sizeof(expr), "if type==\"array\" then \"数组 / \"+(length|tostring)+\" 条\" "
+                 "elif type==\"object\" then \"对象 / 顶层字段：\"+(keys_unsorted|join(\", \")) "
+                 "else type end");
+        if (run_jq_raw(expr, path, out, OUTMAX) != 0) {
+            char m[600];
+            snprintf(m, sizeof(m), "jq 失败：%.400s", out);
+            free(out);
+            return jerr(m);
         }
+        char extra2[1300];
+        snprintf(extra2, sizeof(extra2), "\"file\":\"%s\"", path);
+        char *r2 = jpair(out, strrchr(path, '/') ? strrchr(path, '/') + 1 : path, extra2);
+        free(out);
+        return r2;
+    }
+
+    /* ---- 统一格式化：主数组 + 条数 + 字段列表（按 JSON 里的原始顺序） ---- */
+    char fields[16384] = {0};
+    /* 关键：不能用 `unique`（会按字母排序），要用 reduce 保序去重 ——
+     * 用户看到的就是 JSON 响应里的字段顺序。 */
+    snprintf(expr, sizeof(expr),
+        "[%s[] | keys_unsorted[]] | reduce .[] as $k ([]; if (index($k) != null) then . else . + [$k] end)"
+        " | join(\"\\n\")", root);
+    run_jq_raw(expr, path, fields, sizeof(fields));
+
+    char keys[160][96];
+    int nk = 0;
+    {
+        char tmpk[16384];
+        snprintf(tmpk, sizeof(tmpk), "%s", fields);
+        char *sv = NULL;
+        for (char *ln = strtok_r(tmpk, "\n", &sv); ln && nk < 160; ln = strtok_r(NULL, "\n", &sv))
+            snprintf(keys[nk++], sizeof(keys[0]), "%s", ln);
+    }
+
+    size_t off = 0;
+    if (cnote[0]) off += (size_t)snprintf(out + off, OUTMAX - off, "%s", cnote);
+    off += (size_t)snprintf(out + off, OUTMAX - off,
+        "**主数组** `%s` · %ld 条 · %d 个字段\n\n", root, cnt, nk);
+    if (nk > 0) {
+        off += (size_t)snprintf(out + off, OUTMAX - off, "**字段**（按 JSON 里的顺序）\n\n");
+        for (int i = 0; i < nk && i < 40 && off < OUTMAX - 200; i++)
+            off += (size_t)snprintf(out + off, OUTMAX - off, "- `%s`\n", keys[i]);
+        if (nk > 40)
+            off += (size_t)snprintf(out + off, OUTMAX - off, "- …共 %d 个字段（完整列表看导出的 CSV 表头）\n", nk);
+        off += (size_t)snprintf(out + off, OUTMAX - off, "\n");
+    }
+
+    /* ---- 导出 CSV：表头 + 每行都按同一个键顺序取值，列绝不会错位 ---- */
+    if (nk > 0) {
+        char dir[600];
+        snprintf(dir, sizeof(dir), "/tmp/llama_agent/downloads");
+        mkdir(dir, 0755);
+        snprintf(dl, sizeof(dl), "%s/jq_%ld.csv", dir, (long)time(NULL));
+
+        char prog[32768];
+        size_t po = (size_t)snprintf(prog, sizeof(prog), "(%s[] | [", root);
+        for (int i = 0; i < nk && po + 120 < sizeof(prog); i++) {
+            char kk[160];
+            size_t ko = 0;
+            for (const char *q = keys[i]; *q && ko + 4 < sizeof(kk); q++) {
+                if (*q == '"' || *q == '\\') kk[ko++] = '\\';
+                kk[ko++] = *q;
+            }
+            kk[ko] = 0;
+            /* 每个元素必须自带括号：不然 "|" 会把后一个 .["k"] 作用到前一个的结果上 */
+            /* 缺字段 → 空单元格。以前 tostring 会把 null 写成字符串 "null"，
+             * 30 行 × 90 列里有 1254 格是 "null"，导出的 xlsx 看着就是一坨乱码。 */
+            po += (size_t)snprintf(prog + po, sizeof(prog) - po,
+                                   "%s(.[\"%s\"] | if . == null then \"\" "
+                                   "elif type==\"string\" then . else tostring end)",
+                                   i ? ", " : "", kk);
+        }
+        snprintf(prog + po, sizeof(prog) - po, "] | @csv)");
+
+        static char buf[1 << 20];
+        if (run_jq_raw(prog, path, buf, sizeof(buf)) == 0) {
+            FILE *fp = fopen(dl, "w");
+            if (fp) {
+                for (int i = 0; i < nk; i++)          /* 表头顺序 = JSON 顺序 */
+                    fprintf(fp, "%s\"%s\"", i ? "," : "", keys[i]);
+                fputc('\n', fp);
+                fwrite(buf, 1, strlen(buf), fp);
+                fclose(fp);
+                off += (size_t)snprintf(out + off, OUTMAX - off,
+                    "已导出 CSV（%ld 行 × %d 列，列序与 JSON 一致），点下面的「下载文件」拿走。\n", cnt, nk);
+            } else dl[0] = 0;
+        } else dl[0] = 0;
     }
 
     char ans[300];
     snprintf(ans, sizeof(ans), "%s", strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
-    char extra[1200];
-    snprintf(extra, sizeof(extra), "\"file\":\"%s\"", path);
+    char extra[1600];
+    if (dl[0])
+        snprintf(extra, sizeof(extra), "\"file\":\"%s\",\"path\":\"%s\"", path, dl);
+    else
+        snprintf(extra, sizeof(extra), "\"file\":\"%s\"", path);
     char *r = jpair(out, ans, extra);
     free(out);
     return r;
@@ -432,7 +551,9 @@ static char *op_get(const char *json) {
     char path[900];
     if (resolve_file(fname, path, sizeof(path)) != 0)
         return jerr("没有可用的 json 文件");
-    if (!looks_json(path)) return jerr("这个文件不是 JSON");
+    if (!looks_json(path))
+        return jerr("这个文件不是 JSON（多半是 xlsx/doc 转出来的纯文本或 TSV）。"
+                    "要看它的内容/排序/统计，直接说「展示表格…」走 table 插件；jq 只处理 JSON。");
 
     char expr[2600];
     if (query[0]) snprintf(expr, sizeof(expr), "%s", query);

@@ -515,6 +515,545 @@ static char *err_json(const char *msg) {
 }
 
 /* ============ calc ============ */
+/* 中文算式归一化 + LaTeX 输出。
+ *
+ * 目标：用户写"根号2加根号3后 再开根号"、"3次根号8"、"三分之二加四分之一"、
+ * "sin30度"，插件要算对、并且把式子按数学公式显示（页面自带 LaTeX 渲染）。
+ *
+ * 只认白名单里的记号；出现别的字（"小明有3个苹果"）就整体拒绝，返回空串让
+ * 调用方退回模型 —— 不然会把 3 和 5 拼成 35 当答案。
+ */
+static const char *ZH_WORDS[] = {
+    "根号", "平方根", "立方根", "开根号", "开平方", "开立方", "开", "次根号", "次方根",
+    "的平方", "的立方", "平方", "立方", "次方", "加到",
+    "加上", "减去", "乘以", "乘上", "除以", "加", "减", "乘",
+    "然后再", "然后", "之后", "接着", "再", "后",
+    "算一下", "算算", "先算", "再算", "计算", "先", "等于多少", "等于", "是多少", "多少",
+    "结果", "请", "帮我", "求", "帮", "值",
+    "分之", "正弦", "余弦", "正切", "度", "的",
+    "一", "二", "三", "四", "五", "六", "七", "八", "九", "十",
+    "：", "，", "。", "？", "、", NULL
+};
+
+static size_t zh_match(const char *p) {
+    size_t best = 0;
+    for (int i = 0; ZH_WORDS[i]; i++) {
+        size_t wl = strlen(ZH_WORDS[i]);
+        if (wl > best && !strncmp(p, ZH_WORDS[i], wl)) best = wl;
+    }
+    return best;
+}
+
+static void zh_trim(char *s) {
+    char *q = s;
+    while (*q == ' ') q++;
+    if (q != s) memmove(s, q, strlen(q) + 1);
+    for (size_t i = strlen(s); i > 0 && s[i - 1] == ' '; i--) s[i - 1] = 0;
+}
+
+/* 中文数字 1..99（一、十二、二十三、十） */
+static int zh_cnnum(const char **pp) {
+    const char *p = *pp;
+    static const char *D[] = {"零","一","二","三","四","五","六","七","八","九",NULL};
+    int v = 0, got = 0;
+    if (!strncmp(p, "十", 3)) { v = 10; p += 3; got = 1; }
+    else if (!strncmp(p, "二十", 6)) { v = 20; p += 6; got = 1; }
+    for (int i = 1; D[i] && !got; i++) {
+        if (!strncmp(p, D[i], 3)) { v = i; p += 3; got = 1; }
+    }
+    if (got && *p && !strncmp(p, "十", 3) && v < 10) {     /* 三十五 */
+        p += 3;
+        for (int i = 1; D[i]; i++)
+            if (!strncmp(p, D[i], 3)) { v = v * 10 + i; p += 3; break; }
+    }
+    if (got) *pp = p;
+    return got ? v : -1;
+}
+
+/* 取一个操作数（数字/字母/括号组）的结束位置 */
+static const char *operand_end(const char *p) {
+    if (*p == '(') {
+        int d = 1;
+        p++;
+        while (*p && d) { if (*p == '(') d++; else if (*p == ')') d--; if (d) p++; }
+        return (*p == ')') ? p + 1 : p;
+    }
+    while (*p && ((*p >= '0' && *p <= '9') || *p == '.' ||
+                  (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || *p == '^'))
+        p++;
+    return p;
+}
+
+/* 中文特有写法先改写成 ASCII：
+ *   立方根X / 3次根号X → pow(X,1/3)
+ *   三分之二           → (2)/(3)
+ *   正弦/余弦/正切      → sin/cos/tan
+ *   N度                → (N*pi/180)
+ *   A加到B             → ((A+B)*(B-A+1)/2)
+ */
+static void zh_pre(const char *in, char *out, size_t cap) {
+    size_t o = 0;
+    for (const char *p = in; *p && o + 64 < cap; ) {
+        /* 立方根 */
+        if (!strncmp(p, "立方根", 9)) {
+            const char *op = p + 9;
+            const char *e = operand_end(op);
+            o += (size_t)snprintf(out + o, cap - o, "pow(%.*s,1/3)", (int)(e - op), op);
+            p = e;
+            continue;
+        }
+        /* 平方根 → sqrt */
+        if (!strncmp(p, "平方根", 9)) {
+            const char *op = p + 9;
+            const char *e = operand_end(op);
+            o += (size_t)snprintf(out + o, cap - o, "sqrt(%.*s)", (int)(e - op), op);
+            p = e;
+            continue;
+        }
+        /* N次根号 / N次方根（N 可以是阿拉伯数字或中文数字） */
+        if (!strncmp(p, "次根号", 9) || !strncmp(p, "次方根", 9)) {
+            /* 往回退，把已经写进去的 N 拿出来 */
+            size_t wl = (!strncmp(p, "次根号", 9)) ? 9 : 9;
+            int n = 2;
+            size_t back = 0;
+            while (back < o && out[o - back - 1] >= '0' && out[o - back - 1] <= '9') back++;
+            if (back) { char tmp[8] = {0}; memcpy(tmp, out + o - back, back); n = atoi(tmp); o -= back; }
+            const char *op = p + wl;
+            const char *e = operand_end(op);
+            o += (size_t)snprintf(out + o, cap - o, "pow(%.*s,1/%d)", (int)(e - op), op, n);
+            p = e;
+            continue;
+        }
+        /* N分之M：分母在前、分子在后（三分之二=2/3），两段都可以是
+         * 中文数字或阿拉伯数字。向前扫描识别，不依赖已输出的缓冲。 */
+        {
+            const char *q = p;
+            int den = -1, num = -1;
+            if (*q >= '0' && *q <= '9') { den = atoi(q); while (*q >= '0' && *q <= '9') q++; }
+            else den = zh_cnnum(&q);
+            if (den > 0 && !strncmp(q, "分之", 6)) {
+                q += 6;
+                if (*q >= '0' && *q <= '9') { num = atoi(q); while (*q >= '0' && *q <= '9') q++; }
+                else num = zh_cnnum(&q);
+                if (num > 0) {
+                    o += (size_t)snprintf(out + o, cap - o, "(%d)/(%d)", num, den);
+                    p = q;
+                    continue;
+                }
+            }
+        }
+        /* X的N次方 → X^(N)（必须在这里认，否则 2 和 10 会被拼成 210） */
+        if (!strncmp(p, "的", 3)) {
+            const char *q = p + 3;
+            int n2 = -1;
+            if (*q >= '0' && *q <= '9') { n2 = atoi(q); while (*q >= '0' && *q <= '9') q++; }
+            else n2 = zh_cnnum(&q);
+            if (n2 > 0 && (!strncmp(q, "次方", 6) || !strncmp(q, "次幂", 6))) {
+                o += (size_t)snprintf(out + o, cap - o, "^(%d)", n2);
+                p = q + 6;
+                continue;
+            }
+        }
+        if (!strncmp(p, "正弦", 6)) { o += (size_t)snprintf(out + o, cap - o, "sin"); p += 6; continue; }
+        if (!strncmp(p, "余弦", 6)) { o += (size_t)snprintf(out + o, cap - o, "cos"); p += 6; continue; }
+        if (!strncmp(p, "正切", 6)) { o += (size_t)snprintf(out + o, cap - o, "tan"); p += 6; continue; }
+        out[o++] = *p++;
+    }
+    out[o] = 0;
+
+    /* N度 → (N*pi/180)：先把 "N度" 找出来替换（式子里的 N 一定是刚写完的数字） */
+    char tmp[600];
+    snprintf(tmp, sizeof(tmp), "%s", out);
+    o = 0;
+    for (const char *p = tmp; *p && o + 32 < cap; ) {
+        if (!strncmp(p, "度", 3)) {
+            /* 回退到数字起点，把它包起来 */
+            size_t back = 0;
+            while (back < o && ((out[o - back - 1] >= '0' && out[o - back - 1] <= '9') ||
+                                out[o - back - 1] == '.')) back++;
+            if (back) {
+                char num[32] = {0};
+                memcpy(num, out + o - back, back);
+                o -= back;
+                o += (size_t)snprintf(out + o, cap - o, "(%s*pi/180)", num);
+            }
+            p += 3;
+            continue;
+        }
+        out[o++] = *p++;
+    }
+    out[o] = 0;
+}
+
+static void zh_norm(const char *in, char *out, size_t cap) {
+    out[0] = 0;
+    for (const char *p = in; *p; ) {          /* 词汇白名单 */
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x80) { p++; continue; }
+        size_t wl = zh_match(p);
+        if (!wl) return;
+        p += wl;
+    }
+
+    /* 先做中文特写法的改写，再跑"记号 → 符号" */
+    char pre[600] = {0};
+    zh_pre(in, pre, sizeof(pre));
+
+    /* 后缀形式："A 后 再开三次根号"、"A开平方"、"A的立方根"。
+     * 把"开[N]次根号/开根号/开平方/开立方"前面的整个式子当被开方数，
+     * N 可以是中文数字（三次）或阿拉伯数字（3次）。 */
+    const char *open_pos = NULL;
+    int open_n = 2;
+    for (const char *p = in; *p; p++) {
+        if (strncmp(p, "开", 3)) continue;
+        const char *q = p + 3;
+        int n = 2, got_n = 0;
+        if (*q >= '0' && *q <= '9') { n = atoi(q); while (*q >= '0' && *q <= '9') q++; got_n = 1; }
+        else { const char *qq = q; int cn = zh_cnnum(&qq); if (cn > 0) { n = cn; q = qq; got_n = 1; } }
+        if (!strncmp(q, "次根号", 9) || !strncmp(q, "次方根", 9)) { open_pos = p; open_n = got_n ? n : 3; }
+        else if (!strncmp(q, "根号", 6) || !strncmp(q, "平方根", 9)) { open_pos = p; open_n = 2; }
+        else if (!strncmp(q, "平方", 6)) { open_pos = p; open_n = 2; }
+        else if (!strncmp(q, "立方", 6)) { open_pos = p; open_n = 3; }
+    }
+
+    /* 顺序叙述："根号2 加 根号3 之后，乘以根号5"。
+     * 中文里"之后/然后/再/接着"表示"把前面算出来的结果继续算"，
+     * 这时不能用数学优先级（否则会先算 √3×√5 再和 √2 相加）。 */
+    {
+        static const char *CONNS[] = {"之后再", "之后", "以后再", "以后", "然后再",
+                                      "然后", "接着", "再", "后", "，", ",", NULL};
+        const char *conn = NULL;
+        size_t cl = 0;
+        for (const char *p = in; *p && !conn; p++)
+            for (int i = 0; CONNS[i]; i++) {
+                size_t L = strlen(CONNS[i]);
+                if (!strncmp(p, CONNS[i], L)) { conn = p; cl = L; break; }
+            }
+        if (conn && conn > in) {
+            char left[512] = {0}, right[512] = {0}, l[512] = {0}, r[512] = {0};
+            size_t L = (size_t)(conn - in);
+            if (L >= sizeof(left)) L = sizeof(left) - 1;
+            memcpy(left, in, L);
+            snprintf(right, sizeof(right), "%s", conn + cl);
+            /* 左边可能以"开…根号"结尾（那属于上一条规则），这里剥掉连接词 */
+            zh_norm(left, l, sizeof(l));
+            zh_trim(l);
+            if (l[0]) {
+                int op = 0;
+                const char *rp = right;
+                for (;;) {
+                    if (*rp == ' ' || *rp == ',') { rp++; continue; }
+                    if (!strncmp(rp, "，", 3)) { rp += 3; continue; }
+                    break;
+                }
+                if (!strncmp(rp, "乘以", 6) || !strncmp(rp, "乘上", 6)) { op = '*'; rp += 6; }
+                else if (!strncmp(rp, "乘", 3)) { op = '*'; rp += 3; }
+                else if (!strncmp(rp, "加上", 6)) { op = '+'; rp += 6; }
+                else if (!strncmp(rp, "加", 3)) { op = '+'; rp += 3; }
+                else if (!strncmp(rp, "减去", 6)) { op = '-'; rp += 6; }
+                else if (!strncmp(rp, "减", 3)) { op = '-'; rp += 3; }
+                else if (!strncmp(rp, "除以", 6)) { op = '/'; rp += 6; }
+                else if (!strncmp(rp, "开", 3) || !*rp) { op = 0; }   /* 开根号交给别的规则 */
+                else op = '*';                       /* "再乘 / 再算" 默认乘法 */
+                if (op) {
+                    zh_norm(rp, r, sizeof(r));
+                    zh_trim(r);
+                    if (r[0]) {
+                        /* 右侧自己带着运算符（"再 除以 2" → "/2"）就直接接上，
+                         * 否则用认出来的 op 拼 */
+                        if (r[0] == '*' || r[0] == '/' || r[0] == '+' || r[0] == '-')
+                            snprintf(out, cap, "((%s)%s)", l, r);
+                        else
+                            snprintf(out, cap, "((%s)%c(%s))", l, op, r);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    if (open_pos) {
+        char head[512] = {0};
+        size_t L = (size_t)(open_pos - in);
+        if (L >= sizeof(head)) L = sizeof(head) - 1;
+        memcpy(head, in, L);
+        head[L] = 0;
+        static const char *tail_words[] = {"然后再", "接着再", "然后", "之后", "接着",
+                                           "再", "后", "，", ",", " ", "：", "的", NULL};
+        for (int again = 1; again;) {
+            again = 0;
+            for (int i = 0; tail_words[i]; i++) {
+                size_t wl = strlen(tail_words[i]), hl = strlen(head);
+                if (hl >= wl && !strcmp(head + hl - wl, tail_words[i])) {
+                    head[hl - wl] = 0; again = 1; break;
+                }
+            }
+        }
+        char inner[512] = {0};
+        zh_norm(head, inner, sizeof(inner));
+        zh_trim(inner);
+        if (!inner[0]) return;
+        if (open_n == 2) snprintf(out, cap, "sqrt(%s)", inner);
+        else snprintf(out, cap, "pow(%s,1/%d)", inner, open_n);
+        return;
+    }
+
+    size_t o = 0;
+    for (const char *p = pre; *p && o + 12 < cap; ) {
+        if (!strncmp(p, "根号", 6)) { memcpy(out + o, "根号", 6); o += 6; p += 6; continue; }
+        if (!strncmp(p, "加到", 6)) {           /* 1加到100 → 等差数列求和 */
+            /* 前面已经写进 out 的是起点 a，后面读终点 b */
+            const char *q = p + 6;
+            int b = 0;
+            if (*q >= '0' && *q <= '9') { b = atoi(q); while (*q >= '0' && *q <= '9') q++; }
+            size_t back = 0;
+            while (back < o && out[o - back - 1] >= '0' && out[o - back - 1] <= '9') back++;
+            if (back && b) {
+                char as[16] = {0};
+                memcpy(as, out + o - back, back);
+                o -= back;
+                o += (size_t)snprintf(out + o, cap - o, "((%s+%d)*(%d-(%s)+1)/2)", as, b, b, as);
+                p = q;
+                continue;
+            }
+            p += 6;
+            continue;
+        }
+        if (!strncmp(p, "加上", 6) || !strncmp(p, "加", 3)) {
+            out[o++] = '+'; p += (!strncmp(p, "加上", 6)) ? 6 : 3; continue;
+        }
+        if (!strncmp(p, "次方", 6)) {           /* 10次方 → ^(10) */
+            size_t back = 0;
+            while (back < o && out[o - back - 1] >= '0' && out[o - back - 1] <= '9') back++;
+            if (back) {
+                char e2[16] = {0};
+                memcpy(e2, out + o - back, back);
+                o -= back;
+                o += (size_t)snprintf(out + o, cap - o, "^(%s)", e2);
+            }
+            p += 6;
+            continue;
+        }
+        if (!strncmp(p, "减去", 6) || !strncmp(p, "减", 3)) {
+            out[o++] = '-'; p += (!strncmp(p, "减去", 6)) ? 6 : 3; continue;
+        }
+        if (!strncmp(p, "乘以", 6) || !strncmp(p, "乘上", 6)) { out[o++] = '*'; p += 6; continue; }
+        if (!strncmp(p, "乘", 3)) { out[o++] = '*'; p += 3; continue; }
+        if (!strncmp(p, "除以", 6)) { out[o++] = '/'; p += 6; continue; }
+        if (!strncmp(p, "的平方", 9) || !strncmp(p, "平方", 6)) {
+            out[o++] = '^'; out[o++] = '2';
+            p += (!strncmp(p, "的平方", 9)) ? 9 : 6;
+            continue;
+        }
+        if (!strncmp(p, "的立方", 9) || !strncmp(p, "立方", 6)) {
+            out[o++] = '^'; out[o++] = '3';
+            p += (!strncmp(p, "的立方", 9)) ? 9 : 6;
+            continue;
+        }
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x80) {
+            if ((c >= '0' && c <= '9') || c == '.' || c == '(' || c == ')' ||
+                c == '+' || c == '-' || c == '*' || c == '/' || c == '^' || c == ',' ||
+                (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == ' ')
+                out[o++] = (char)c;
+            p++;
+            continue;
+        }
+        size_t wl = zh_match(p);
+        if (!wl) return;
+        p += wl;
+    }
+    out[o] = 0;
+}
+
+/* ---------- ASCII 算式 → LaTeX ----------
+ * 页面自带轻量 LaTeX 渲染（$...$），这样公式才是真正的数学写法，
+ * 而不是"根号2加根号3"这种中文。 */
+static void a2t(const char *s, char *out, size_t cap, size_t *po) {
+    while (*s && *po + 8 < cap) {
+        if (!strncmp(s, "sqrt(", 5)) {
+            const char *q = s + 5;
+            int d = 1;
+            const char *p = q;
+            while (*p && d) { if (*p == '(') d++; else if (*p == ')') d--; if (d) p++; }
+            char inner[256] = {0};
+            size_t L = (size_t)(p - q);
+            if (L >= sizeof(inner)) L = sizeof(inner) - 1;
+            memcpy(inner, q, L);
+            char chk[512] = {0};
+            size_t co = 0;
+            a2t(inner, chk, sizeof(chk), &co);
+            if (strchr(chk, '{') || strchr(chk, '\\') || strchr(chk, '+') ||
+                strchr(chk, '-') || strchr(chk, ' ')) {
+                /* 复合式：写成 (\sqrt{2}+\sqrt{3})^{1/2}，页面的轻量 LaTeX
+                 * 渲染器不支持嵌套花括号，\sqrt{…{…}…} 会退化成裸 √ */
+                *po += (size_t)snprintf(out + *po, cap - *po, "(");
+                a2t(inner, out, cap, po);
+                *po += (size_t)snprintf(out + *po, cap - *po, ")^{1/2}");
+            } else {
+                *po += (size_t)snprintf(out + *po, cap - *po, "\\sqrt{");
+                a2t(inner, out, cap, po);
+                *po += (size_t)snprintf(out + *po, cap - *po, "}");
+            }
+            s = (*p == ')') ? p + 1 : p;
+            continue;
+        }
+        if (!strncmp(s, "根号", 6)) {
+            s += 6;
+            const char *e = operand_end(s);
+            char op[128] = {0};
+            size_t L = (size_t)(e - s);
+            if (L >= sizeof(op)) L = sizeof(op) - 1;
+            memcpy(op, s, L);
+            *po += (size_t)snprintf(out + *po, cap - *po, "\\sqrt{");
+            a2t(op, out, cap, po);
+            *po += (size_t)snprintf(out + *po, cap - *po, "}");
+            s = e;
+            continue;
+        }
+        if (!strncmp(s, "pow(", 4)) {          /* pow(X,1/3) → \sqrt[3]{X} */
+            const char *p = s + 4;
+            int d = 1;
+            const char *q = p;
+            while (*q && d) { if (*q == '(') d++; else if (*q == ')') d--; if (d) q++; }
+            char body[256] = {0};
+            size_t L = (size_t)(q - p);
+            if (L >= sizeof(body)) L = sizeof(body) - 1;
+            memcpy(body, p, L);
+            char *comma = strrchr(body, ',');
+            if (comma) {
+                *comma = 0;
+                const char *ex = comma + 1;
+                char chk2[512] = {0};
+                size_t co2 = 0;
+                a2t(body, chk2, sizeof(chk2), &co2);
+                int compound = strchr(chk2, '{') || strchr(chk2, '\\') ||
+                               strchr(chk2, '+') || strchr(chk2, ' ');
+                if (!strncmp(ex, "1/", 2) && !compound) {
+                    *po += (size_t)snprintf(out + *po, cap - *po, "\\sqrt[%s]{", ex + 2);
+                } else if (compound) {
+                    /* 立方根套根号这种：写成 (√2+√3)^{1/3}，避免嵌套 */
+                    *po += (size_t)snprintf(out + *po, cap - *po, "(");
+                } else {
+                    *po += (size_t)snprintf(out + *po, cap - *po, "(");
+                }
+                a2t(body, out, cap, po);
+                if (!strncmp(ex, "1/", 2) && !compound)
+                    *po += (size_t)snprintf(out + *po, cap - *po, "}");
+                else if (compound) {
+                    *po += (size_t)snprintf(out + *po, cap - *po, ")^{");
+                    a2t(ex, out, cap, po);
+                    *po += (size_t)snprintf(out + *po, cap - *po, "}");
+                } else {
+                    *po += (size_t)snprintf(out + *po, cap - *po, ")^{");
+                    a2t(ex, out, cap, po);
+                    *po += (size_t)snprintf(out + *po, cap - *po, "}");
+                }
+            }
+            s = (*q == ')') ? q + 1 : q;
+            continue;
+        }
+        if (*s == '^') {
+            s++;
+            *po += (size_t)snprintf(out + *po, cap - *po, "^{");
+            if (*s == '(' || *s == '-') {
+                const char *e = (*s == '(') ? operand_end(s) : s + 1;
+                char ex[64] = {0};
+                size_t L = (size_t)(e - s);
+                if (L >= sizeof(ex)) L = sizeof(ex) - 1;
+                memcpy(ex, s, L);
+                /* 2^(10) → 2^{10}：整层括号去掉更接近手写 */
+                if (ex[0] == '(' && L > 2 && ex[L - 1] == ')' && !memchr(ex + 1, '(', L - 2)) {
+                    memmove(ex, ex + 1, L - 2);
+                    ex[L - 2] = 0;
+                }
+                a2t(ex, out, cap, po);
+                *po += (size_t)snprintf(out + *po, cap - *po, "}");
+                s = e;
+            } else {
+                if (*s) out[(*po)++] = *s++;
+                *po += (size_t)snprintf(out + *po, cap - *po, "}");
+            }
+            continue;
+        }
+        if (*s == '(') {                        /* (a)/(b) → \frac{a}{b} */
+            const char *e1 = operand_end(s);
+            if (e1 > s && *e1 == '/' && e1[1] == '(') {
+                const char *e2 = operand_end(e1 + 1);
+                char a[128] = {0}, b2[128] = {0};
+                size_t La = (size_t)(e1 - s), Lb = (size_t)(e2 - (e1 + 1));
+                if (La < sizeof(a) && Lb < sizeof(b2)) {
+                    memcpy(a, s, La); memcpy(b2, e1 + 1, Lb);
+                    /* (2)/(3) → \frac{2}{3}：把分子分母各自的整层括号去掉 */
+                    for (int k = 0; k < 2; k++) {
+                        char *z = k ? b2 : a;
+                        size_t Z = strlen(z);
+                        if (Z > 2 && z[0] == '(' && z[Z - 1] == ')' && !memchr(z + 1, '(', Z - 2)) {
+                            memmove(z, z + 1, Z - 2); z[Z - 2] = 0;
+                        }
+                    }
+                    *po += (size_t)snprintf(out + *po, cap - *po, "\\frac{");
+                    a2t(a, out, cap, po);
+                    *po += (size_t)snprintf(out + *po, cap - *po, "}{");
+                    a2t(b2, out, cap, po);
+                    *po += (size_t)snprintf(out + *po, cap - *po, "}");
+                    s = e2;
+                    continue;
+                }
+            }
+        }
+        if (*s == '*') { s++; *po += (size_t)snprintf(out + *po, cap - *po, "\\times "); continue; }
+        if (!strncmp(s, "pi", 2)) { s += 2; *po += (size_t)snprintf(out + *po, cap - *po, "\\pi "); continue; }
+        out[(*po)++] = *s++;
+    }
+    out[*po] = 0;
+}
+
+static void ascii_to_tex(const char *in, char *out, size_t cap) {
+    size_t o = 0;
+    out[0] = 0;
+    a2t(in, out, cap, &o);
+}
+
+/* 中文算式：归一化 → 求值 → 带 LaTeX 的两步推导 */
+static char *do_calc_zh(const char *src) {
+    char nx[512] = {0};
+    zh_norm(src, nx, sizeof(nx));
+    zh_trim(nx);
+    int ok = 0;
+    char err[128] = {0};
+    double v = eval(nx, NULL, 0, &ok, err, sizeof(err));
+    if (!ok) return err_json(err);
+    char nb[64];
+    fmt_num(nb, sizeof(nb), v);
+
+    char tex[900] = {0};
+    ascii_to_tex(nx, tex, sizeof(tex));
+
+    char text[1600];
+    size_t nl = strlen(nx);
+    if (nl > 6 && !strncmp(nx, "sqrt(", 5) && nx[nl - 1] == ')') {
+        char inner[512] = {0};
+        snprintf(inner, sizeof(inner), "%.*s", (int)(nl - 6), nx + 5);
+        int ok2 = 0;
+        char e2[128] = {0};
+        double vi = eval(inner, NULL, 0, &ok2, e2, sizeof(e2));
+        char texin[400] = {0};
+        ascii_to_tex(inner, texin, sizeof(texin));
+        if (ok2) {
+            char nib[64];
+            fmt_num(nib, sizeof(nib), vi);
+            snprintf(text, sizeof(text),
+                     "$$%s = %s$$\n\n$$\n\\sqrt{%s} = %s\n$$", texin, nib, nib, nb);
+        } else {
+            snprintf(text, sizeof(text), "$$%s = %s$$", tex, nb);
+        }
+    } else {
+        snprintf(text, sizeof(text), "$$%s = %s$$", tex, nb);
+    }
+    return json_pair(text, nb, NULL);
+}
+
 static char *do_calc(const char *expr) {
     int ok = 0;
     char err[128] = {0};
@@ -527,6 +1066,15 @@ static char *do_calc(const char *expr) {
     snprintf(o, 160, "{\"value\":%s,\"expr\":\"%s\"}", nb, expr);
     return o;
 }
+
+
+/* 纯 ASCII 走原路径，含中文走归一化 */
+static char *calc_any(const char *expr) {
+    for (const unsigned char *p = (const unsigned char *)expr; *p; p++)
+        if (*p >= 0x80) return do_calc_zh(expr);
+    return do_calc(expr);
+}
+
 
 /* ============ 未知数识别 ============ */
 /* 从表达式里挑出单字母未知数。排除函数名、pi、e（自然常数）。
@@ -1293,12 +1841,28 @@ static char *do_work(const char *task) {
 /* ============ 鸡兔同笼：假设法 ============
  * 头 h、脚 f → 兔 = (f - 2h)/2，鸡 = h - 兔
  */
+/* 单位后面紧跟的数字："头共35个"、"脚共94只"（中文里数字常放在单位后面） */
+static double num_after_unit(const char *t, const char *unit) {
+    const char *p = strstr(t, unit);
+    if (!p) return NAN;
+    p += strlen(unit);
+    for (int guard = 0; *p && guard < 16; guard++) {
+        if (isdigit((unsigned char)*p)) return atof(p);
+        if ((unsigned char)*p >= 0x80) p += 3;
+        else p++;
+    }
+    return NAN;
+}
+
 static char *do_chicken(const char *task) {
     double h = num_before_unit(task, "个头");
     if (isnan(h)) h = num_before_unit(task, "头");
+    if (isnan(h)) h = num_after_unit(task, "头");          /* "头共35个" */
     double f = num_before_unit(task, "只脚");
     if (isnan(f)) f = num_before_unit(task, "条腿");
     if (isnan(f)) f = num_before_unit(task, "只腿");
+    if (isnan(f)) f = num_after_unit(task, "脚");          /* "脚共94只" */
+    if (isnan(f)) f = num_after_unit(task, "腿");
     if (isnan(h) || isnan(f) || h <= 0 || f <= 0) return NULL;
     if (!strstr(task, "鸡") || !strstr(task, "兔")) return NULL;
 
@@ -1687,7 +2251,7 @@ static char *run(const char *json_in) {
          * 注意 do_solve 收的是方程字符串本身，不是 JSON。 */
         if (strchr(expr, '=') && strstr(expr, "==") == NULL)
             return do_solve(expr);
-        return do_calc(expr);
+        return calc_any(expr);
     }
     if (!strcmp(op, "solve") || !strcmp(op, "equation")) {
         /* 模型爱把应用题硬转成方程，还经常列错（火车题能写成 20t+200=600）。
@@ -1720,6 +2284,10 @@ static char *run(const char *json_in) {
             }
         }
         if (!eq[0]) return err_json("缺少 equation（给我 \"3x+5=20\" 这种）");
+        /* 没有等号就不是方程：模型常把「根号2加根号3」这类算式发成 op=solve。
+         * 以前这里报"方程里没有等号"，框架判失败、重试一次再失败就整个任务
+         * 作废（3B 一步 170 秒，两步白烧）。算式就直接算。 */
+        if (!strchr(eq, '=')) return calc_any(eq);
         return do_solve(eq);
     }
     if (!strcmp(op, "system") || !strcmp(op, "equations")) {

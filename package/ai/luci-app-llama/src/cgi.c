@@ -65,7 +65,9 @@ static int pid_alive(long p) {
 #define PLUGIN_DIR  "/opt/llama/agent/plugins"
 #define KEEP_DAYS   3
 #define MAX_BODY    (24 * 1024 * 1024)
-#define MAX_OUTPUT  6000
+/* 任务日志的尾部窗口。插件结果（表格 JSON）很容易超过 6KB，切在中间时
+ * 前端 JSON.parse 必然失败，卡片就退化成"一条连在一起的文本"。 */
+#define MAX_OUTPUT  32000
 
 /* ---------------- 输出 ---------------- */
 static void out_json(const char *fmt, ...);
@@ -124,7 +126,14 @@ static char *read_body(size_t *len) {
     if (n <= 0 || n > MAX_BODY) { *len = 0; return NULL; }
     char *buf = malloc((size_t)n + 1);
     if (!buf) { *len = 0; return NULL; }
-    size_t got = fread(buf, 1, (size_t)n, stdin);
+    /* 管道上 fread 可能短读（大文件上传尤其明显），要读到读不动为止，
+     * 否则 base64 只拿到前半截 → 解出来的文件是坏的 → 解析失败且没提示。 */
+    size_t got = 0;
+    while (got < (size_t)n) {
+        size_t r = fread(buf + got, 1, (size_t)n - got, stdin);
+        if (r == 0) break;
+        got += r;
+    }
     buf[got] = 0;
     *len = got;
     return buf;
@@ -860,6 +869,7 @@ static void do_upload(const char *body) {
     char txtpath[800], esc_txt[4096];
     snprintf(txtpath, sizeof(txtpath), "%s.txt", path);
     snprintf(esc_txt, sizeof(esc_txt), "（未转换）");
+    int txt_chars = 0;      /* 真正转出来的正文字节数；转不出就是 0，不是"（未转换）"的长度 */
 
     const char *dot = strrchr(name, '.');
 
@@ -920,6 +930,7 @@ static void do_upload(const char *body) {
                     if (dtxt && dtxt[0]) {
                         FILE *of = fopen(txtpath, "w");
                         if (of) { fwrite(dtxt, 1, strlen(dtxt), of); fclose(of); }
+                        txt_chars = (int)strlen(dtxt);
                     }
                     if (dj) json_free(dj);
                     free(dres);
@@ -935,7 +946,7 @@ static void do_upload(const char *body) {
     jesc(esc_txtp, sizeof(esc_txtp), txtpath);
     jesc(esc_name, sizeof(esc_name), name);
     if (dot) jesc(esc_ext, sizeof(esc_ext), dot + 1);
-    int chars = (int)strlen(esc_txt);      /* 转出来的文本长度（字节） */
+    int chars = txt_chars;      /* 转出来的文本长度（字节，转不出=0） */
     out_json("{\"ok\":1,\"name\":\"%s\",\"file\":\"%s\",\"path\":\"%s\","
              "\"chars\":%d,\"bytes\":%d,\"kind\":\"%s\",\"plugin\":\"doc\"}",
              esc_name, esc_txtp, esc_path, chars, rn, esc_ext);

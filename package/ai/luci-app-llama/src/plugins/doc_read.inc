@@ -226,6 +226,36 @@ static void xml_unescape_into(const char *s, size_t n, buf_t *b) {
     }
 }
 
+/* 有界 strstr：只在 [p,end) 里找。doc_read 的调用点都在"某个标签/单元格
+ * 之内"，用无界 strstr 会一路扫到文档末尾 —— 2 万行的 xlsx 就是 O(n²)，
+ * 实测能跑到两分半（ARM 上更久，浏览器直接超时）。 */
+static const char *strstr_lim(const char *p, const char *end, const char *needle) {
+    size_t nl = strlen(needle);
+    if (!p || !needle || !nl || !end || end <= p) return NULL;
+    const char *q = p;
+    while (q + nl <= end) {
+        const char *h = memchr(q, needle[0], (size_t)(end - q - nl + 1));
+        if (!h) return NULL;
+        if (!memcmp(h, needle, nl)) return h;
+        q = h + 1;
+    }
+    return NULL;
+}
+
+/* 写一个单元格的内容。xlsx 的单元格里可以有换行（多选题的每个选项一行），
+ * 直接吐进 TSV 会把"一行一条记录"彻底打乱 —— 实测一份题库 xlsx 出来
+ * 4.6 万行里只有 1.1 万行是完整的 6 列，其余都被拆成 1 列，表格按列统计
+ * 自然全错。这里把单元格内的 \n \r \t（以及 xlsx 的 _x000a_ 转义）压成空格。 */
+static void buf_put_cell(buf_t *b, const char *s) {
+    if (!s) return;
+    for (const char *p = s; *p; p++) {
+        if (*p == '_' && !strncmp(p, "_x000a_", 7)) { buf_putb(b, ' '); p += 6; continue; }
+        if (*p == '_' && !strncmp(p, "_x000d_", 7)) { buf_putb(b, ' '); p += 6; continue; }
+        char c = (*p == '\n' || *p == '\r' || *p == '\t') ? ' ' : *p;
+        buf_putb(b, c);
+    }
+}
+
 /* 抽出所有 <tag ...>内容</tag> 里的文本（tag 传 "w:t" 这种） */
 static void xml_collect_tag_lim(const char *xml, const char *stop, const char *tag,
                                 buf_t *out, int newline_each) {
@@ -234,16 +264,15 @@ static void xml_collect_tag_lim(const char *xml, const char *stop, const char *t
     snprintf(close, sizeof(close), "</%s>", tag);
     size_t ol = strlen(open), cl = strlen(close);
     const char *p = xml;
-    while ((p = strstr(p, open)) != NULL) {
-        if (stop && p >= stop) break;
+    const char *lim = stop ? stop : xml + strlen(xml);
+    while ((p = strstr_lim(p, lim, open)) != NULL) {
         /* <w:t 或 <w:t> 都算，但 <w:tbl 不算 */
         char after = p[ol];
         if (after != '>' && after != ' ' && after != '\t' && after != '\n') { p += ol; continue; }
-        const char *gt = strchr(p, '>');
+        const char *gt = memchr(p, '>', (size_t)(lim - p));
         if (!gt) break;
-        const char *end = strstr(gt + 1, close);
+        const char *end = strstr_lim(gt + 1, lim, close);
         if (!end) break;
-        if (stop && end >= stop) break;
         xml_unescape_into(gt + 1, (size_t)(end - gt - 1), out);
         if (newline_each) buf_putb(out, '\n');
         p = end + cl;
@@ -330,15 +359,42 @@ static char *doc_read_xlsx(const char *path) {
     while ((p = strstr(p, "<c ")) != NULL) {
         const char *gt = strchr(p, '>');
         if (!gt) break;
+
+        /* 自闭合空单元格 <c r="F2" s="1"/>：没有 </c>。以前这里直接
+         * strstr(gt,"</c>") 会找到"下一行"的 </c>，把跨行的内容当成一格，
+         * 行分隔符就此丢失 —— 整表被拼成一条超长记录（实测 1 万多行里
+         * 有 500 多行变成 11 列，按列统计全错）。 */
+        if (gt[-1] == '/') {
+            const char *after = gt + 1;
+            while (*after == ' ' || *after == '\t' || *after == '\n' || *after == '\r') after++;
+            if (!strncmp(after, "</row>", 6)) { buf_putb(&b, '\n'); p = after + 6; }
+            else { buf_putb(&b, '\t'); p = gt + 1; }
+            continue;
+        }
+
         const char *ve = strstr(gt, "</c>");
+        const char *nrow = strstr(gt, "</row>");
+        if (ve && nrow && nrow < ve) {
+            /* 这个单元格缺 </c>：到行尾为止都别碰，直接收行 */
+            buf_putb(&b, '\n');
+            p = nrow + 6;
+            continue;
+        }
         if (!ve) break;
-        int is_shared  = (strstr(p, "t=\"s\"") && strstr(p, "t=\"s\"") < gt);
-        int is_inline  = (strstr(p, "t=\"inlineStr\"") && strstr(p, "t=\"inlineStr\"") < gt);
+        /* 只在 <c ...> 这段头里判断类型。以前用 strstr(p, ...) 无界搜索，
+         * 每个非内联单元格都要把整张表扫一遍 → 2 万行直接卡死。 */
+        int is_shared = (strstr_lim(p, gt, "t=\"s\"") != NULL);
+        int is_inline = (strstr_lim(p, gt, "t=\"inlineStr\"") != NULL);
 
         if (is_inline) {
             /* openpyxl 等写的短字符串是内联的：<is><t>文本</t></is>，
              * 不走 sharedStrings（实测 openpyxl 根本不生成那个文件） */
-            xml_collect_tag_lim(gt, ve, "t", &b, 0);
+            buf_t tb;
+            if (buf_init(&tb, 256) == 0) {
+                xml_collect_tag_lim(gt, ve, "t", &tb, 0);
+                buf_put_cell(&b, tb.p);
+                buf_free(&tb);
+            }
         } else {
             const char *v = strstr(gt, "<v>");
             if (v && v < ve) {
@@ -346,16 +402,28 @@ static char *doc_read_xlsx(const char *path) {
                 if (vend) {
                     if (is_shared) {
                         long idx = strtol(v + 3, NULL, 10);
-                        if (idx >= 0 && idx < ns && strs[idx]) buf_puts(&b, strs[idx]);
+                        if (idx >= 0 && idx < ns && strs[idx]) buf_put_cell(&b, strs[idx]);
                     } else {
-                        buf_putn(&b, v + 3, (size_t)(vend - v - 3));
+                        size_t L = (size_t)(vend - v - 3);
+                        char tmp[512];
+                        if (L >= sizeof(tmp)) L = sizeof(tmp) - 1;
+                        memcpy(tmp, v + 3, L);
+                        tmp[L] = 0;
+                        buf_put_cell(&b, tmp);
                     }
                 }
             }
         }
-        /* 一行（<row>）结束换行 */
-        const char *rowe = strstr(gt, "</row>");
-        if (rowe && rowe < ve) { buf_putb(&b, '\n'); p = rowe + 6; }
+        /* 单元格之间是 \t，行末是 \n。
+         * 以前的判断是 strstr(gt, "</row>") < ve —— 从本单元格的 '>' 往后找
+         * 第一个 </row>，那个一定在本行最后一个单元格之后，永远 >= ve，
+         * 所以 else 分支恒成立：整张表的行分隔符全变成 \t，整个 sheet 输出成
+         * 一行。表现就是上传 xlsx 后 doc 给出的一行里塞了 237 行数据，
+         * 表格类操作（按某列排 TOP）根本没东西可排。
+         * 正确判断：本单元格 </c> 之后紧跟的就是 </row> → 说明这是行末。 */
+        const char *after = ve + 4;
+        while (*after == ' ' || *after == '\t' || *after == '\n' || *after == '\r') after++;
+        if (!strncmp(after, "</row>", 6)) { buf_putb(&b, '\n'); p = after + 6; }
         else { buf_putb(&b, '\t'); p = ve + 4; }
     }
 

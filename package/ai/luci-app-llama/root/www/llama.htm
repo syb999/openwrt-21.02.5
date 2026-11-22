@@ -1306,6 +1306,33 @@
   /* 插件返回的是 JSON（{"value":...} / {"text":...} / {"value":"| 表格 |"}），
      直接 esc 出来就是一行 JSON，用户看不出内容。
      这里解出有意义的字段，表格/公式再交给 render 渲染。 */
+  /* doc 读出来的正文是"制表符分列、换行分行"（xlsx 就长这样）。直接丢给
+     markdown 渲染会被压成一坨 —— 制表符不是分隔符，用户看到的就是
+     "一堆挤压在一起的文字"。这里认出表格形状就转成真正的 markdown 表格。 */
+  function dataToMd(txt, maxRows){
+    var lines = String(txt || "").split("\n").filter(function(L){ return L.trim() !== ""; });
+    if (lines.length < 2) return null;
+    var first = lines[0];
+    var sep = /^\s*\|/.test(first) ? "|" : (first.indexOf("\t") >= 0 ? "\t" : null);
+    if (!sep) return null;
+    var cells = function(L){
+      if (sep === "|") return L.replace(/^\s*\|/, "").replace(/\|\s*$/, "").split("|");
+      return L.split("\t");
+    };
+    var head = cells(first);
+    if (head.length < 2) return null;
+    var n = Math.min(lines.length, (maxRows || 20) + 1);
+    var clean = function(x){ return String(x).trim().replace(/\|/g, "｜"); };
+    var out = ["| " + head.map(clean).join(" | ") + " |",
+               "|" + head.map(function(){ return " --- "; }).join("|") + "|"];
+    for (var i = 1; i < n; i++){
+      var c = cells(lines[i]);
+      while (c.length < head.length) c.push("");
+      out.push("| " + c.slice(0, head.length).map(clean).join(" | ") + " |");
+    }
+    return { md: out.join("\n"), rows: lines.length - 1, cols: head.length };
+  }
+
   function pluginResultHtml(raw){
     var t = String(raw || "");
     if (/^\s*\{/.test(t)) {
@@ -1370,7 +1397,14 @@
         }
         else if (j.value !== undefined) v = j.value;
         else if (j.answer !== undefined) v = j.answer;
-        else if (j.text !== undefined) v = j.text;
+        else if (j.text !== undefined) {
+          var dt = dataToMd(j.text, 20);
+          if (dt) {
+            v = dt.md;
+            extra.push(dt.rows + " 行 × " + dt.cols + " 列"
+                       + (dt.rows > 20 ? "（只显示前 20 行，完整内容点下载）" : ""));
+          } else v = j.text;
+        }
         else if (j.factors !== undefined) v = "质因数：" + j.factors.join(" × ");
         else if (j.sections !== undefined) v = "(PPT 章节已生成，共 " + (j.sections.length || 0) + " 节)";
 
@@ -1499,6 +1533,15 @@
         else h += audioPlayers(h) + videoPlayers(h);
         return h;
       } catch (e) {
+        /* JSON 被截断（日志尾部窗口切在中间）时没有任何 }：把 value 里的
+         * 文本按转义还原出来渲染 —— 至少表格还能正常显示，而不是糊成一行。 */
+        var mv = t.match(/"value"\s*:\s*"/);
+        if (mv) {
+          var sv = t.slice(mv.index + mv[0].length);
+          sv = sv.replace(/\\n/g, "\n").replace(/\\t/g, "\t")
+                 .replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+          return render(sv, false, true);
+        }
         /* 日志里这一行的 JSON 后面可能粘了下一段的标题
          * （"【接着导出 xlsx】"这种被当成续行追加进来），
          * 截到最后一个 } 再试一次，否则整张卡片只能显示原始 JSON。 */
@@ -1685,27 +1728,48 @@
     fr.onload = function(){
       var b64 = String(fr.result).split(",")[1] || "";
       toast("上传并转换中… " + f.name, 60000);
+      /* 上传 + 解析是同步的：大文件要几秒。先在气泡里挂一条"正在解析"，
+       * 成功/失败都就地改它 —— 以前只在 toast 里闪一下，失败了用户看不到。 */
+      var t0 = Date.now();
+      addMsg("bot", '<div class="awarn" id="upmsg">正在解析 <b>' + esc(f.name) + '</b> …'
+        + (b64.length > 900000 ? '<br><span style="color:#7c8794">文件较大（'
+            + (b64.length * 0.75 / 1048576).toFixed(1) + ' MB），稍等几秒</span>' : '')
+        + '</div>');
+      scrollDown(true);
+      function upDone(html){
+        var b = document.getElementById("upmsg");
+        if (b) b.innerHTML = html; else addMsg("bot", html);
+        scrollDown(true);
+      }
       fetch("/cgi-bin/agent?upload=1", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({name: f.name, data: b64})
-      }).then(function(r){ return r.json(); })
-        .then(function(j){
+      }).then(function(r){
+          return r.text().then(function(t){
+            try { return JSON.parse(t); }
+            catch (e) { throw new Error("服务端返回异常（HTTP " + r.status + "）：" + t.slice(0, 120)); }
+          });
+      }).then(function(j){
           if (!j.ok) throw new Error(j.error || "上传失败");
           UPLOADS.push({name: j.name, file: j.file, chars: j.chars, info: j.info});
           /* 标明这次是谁解析的：builtin=内置文本，plugin=doc 插件 */
           var how = j.builtin ? "内置文本"
                   : (j.plugin ? (j.plugin + " 插件解析") : "");
           var kindTxt = j.kind ? (" · " + j.kind) : "";
-          addMsg("bot", '<div class="awarn">已上传 <b>' + esc(j.name) + '</b>（'
-            + esc(kindTxt ? kindTxt.slice(3) : "文件") + '，' + j.chars + ' 字）'
+          var secs = ((Date.now() - t0) / 1000).toFixed(1);
+          upDone('<div class="awarn">已上传 <b>' + esc(j.name) + '</b>（'
+            + esc(kindTxt ? kindTxt.slice(3) : "文件") + '，' + j.chars + ' 字，用时 ' + secs + 's）'
             + (how ? '<br><span style="color:#7c8794;font-size:calc(12.5px * var(--fs))">解析方式：'
                      + esc(how) + '</span>' : '')
             + '<br>现在已经转成纯文本，可以直接让我总结 / 翻译 / 就内容提问。</div>');
           toast("");
-          scrollDown(true);
-        })
-        .catch(function(e){ toast(e.message || "上传失败"); });
+      }).catch(function(e){
+          var m = e && e.message ? e.message : String(e);
+          upDone('<div class="awarn" style="border-color:#a13b3b">上传失败：' + esc(m)
+            + '<br><span style="color:#7c8794">文件没用上。换个格式或把文件拆小一点再试。</span></div>');
+          toast("上传失败：" + m);
+      });
     };
     fr.readAsDataURL(f);
   });
