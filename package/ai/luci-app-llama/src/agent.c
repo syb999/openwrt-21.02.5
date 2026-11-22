@@ -996,6 +996,10 @@ static const route_t ROUTES[] = {
     {"music", "音乐|midi|MIDI|旋律|作曲|编曲|mp3|MP3|节奏|伴奏|曲子|歌曲|音色"},
     {"browser", "需要登录|登录后|cookie|session|鉴权|自动化浏览器|selenium"},
     {"table", "排序|排行|top|TOP|筛选|名次|前.*名"},
+    /* JSON 类：探结构 / 取字段 / 导 CSV。以前表里没有 jq，只有"全都不命中
+     * 才全列兜底"时它才进 prompt —— 问"这个 json 有哪些字段"基本选不到它。 */
+    {"jq",    "json|JSON|字段|键值|导出.*csv|转.*csv|翻页|jq|结构.*(多少|有哪些)|"
+              "多少条|有几条"},
     {"batch", "分批|大量|很多(页|章|节)|长文档|多章节|整套"},
     {"sysmon","监控|巡检|告警|阈值|采样"},
     /* 抓包类：必须单独一项，否则这句话在 3B 眼里就是个知识问答
@@ -1117,6 +1121,28 @@ static const char *op_to_plugin(const char *js, const char *op) {
     for (int i = 0; M[i].op; i++)
         if (!strcmp(M[i].op, op)) return M[i].plug;
     return NULL;
+}
+
+/* 前端会把"已上传的文件 / 上文参考"这段框架自己生成的说明拼在任务前面。
+ * 那段里写着"服务端已转成纯文本"、文件名里还带 .xlsx —— 这些词正好命中
+ * 直连通道的关键词（"转" + "xlsx" = 打包 xlsx），用户真正的请求（"展示
+ * 表格里播放量 top10"）就被顶掉，跑完只得到一句"直接转：用最新 csv"。
+ *
+ * 意图判断只看用户自己写的那一段：附件块以【用户已上传的文件 开头，
+ * 到第一个空行为止；追问块以【当前任务（只做这个）】标记结尾。 */
+static const char *intent_text(const char *task) {
+    static char buf[4096];
+    if (!task || !task[0]) return "";
+    const char *cur = strstr(task, "【当前任务");
+    if (cur) {
+        const char *nl = strstr(cur, "】");
+        if (nl) { snprintf(buf, sizeof(buf), "%s", nl + strlen("】")); return buf; }
+    }
+    if (!strncmp(task, "【用户已上传的文件", strlen("【用户已上传的文件"))) {
+        const char *p = strstr(task, "\n\n");
+        if (p) { snprintf(buf, sizeof(buf), "%s", p + 2); return buf; }
+    }
+    return task;
 }
 
 /* 认出是插件命令就直接执行，返回 1（结果已打到 stdout） */
@@ -1352,7 +1378,11 @@ typedef struct {
 } chunk_rule_t;
 
 static const chunk_rule_t CHUNKS[] = {
-    {"表格|table",              "jq",  "table", 0},
+    /* 只认"把数据做成表格"这个动作。以前关键词是光秃秃的「表格」，
+     * "展示表格内播放量 top10" 也会命中，框架就抢在模型前面把最新一份
+     * csv 原样 dump 15 行 —— 用户要的是按列排的榜单，拿到的是无关子表。 */
+    {"转成表格|导出表格|生成表格|做成表格|弄成表格|输出表格|存成表格|"
+     "保存为表格|表格化|转表格",  "jq",  "table", 0},
     {"xlsx|excel|电子表格",     "doc", "xlsx",  1},
     /* 系统状态类：确定性查询，直接调 sysinfo，别让模型先 list 再瞎算 */
     {"磁盘空间|剩余空间|磁盘占用|内存占用|系统负载|芯片温度|系统信息|load average|df|free -m",
@@ -2156,8 +2186,8 @@ static char *write_by_sections(const char *task, int target, const char *host,
     return all;
 }
 
-static char *try_write_article(const char *task, const char *host, int port,
-                               const char *model) {
+static int try_write_article(const char *task, const char *host, int port,
+                             const char *model) {
     if (!task || task[0] == '{') return 0;
     if (!is_article_task(task)) return 0;
 
@@ -2190,8 +2220,13 @@ static char *try_write_article(const char *task, const char *host, int port,
  * 所以：插件返回 ok + answer 时，直接把结果给用户，不再问模型。
  * 只对"自成一体"的插件这么做 —— browser/batch/curl 常常是链条中的一环
  * （抓回来还要接着分析），跳过后面的步骤就断了。
+ *
+ * 这里只判断、不打印：调用方要先把插件原始结果（卡片）打出去，再打
+ * "最终回答"。顺序反了的话，前端"最终回答"的收集器会把后面所有行都并进
+ * 答案气泡，用户看到的就是一坨 {"value":"..."} 原文（math 解题就是）。
  */
-static int try_direct_answer(const char *tool, const char *out, int step) {
+static int direct_answer_of(const char *tool, const char *out, int step,
+                            char *ans, size_t cap) {
     if (!g_direct_answer) return 0;
     if (step > 1) return 0;                  /* 多步任务里不抢 */
     if (!out || strstr(out, "\"error\"")) return 0;
@@ -2204,13 +2239,186 @@ static int try_direct_answer(const char *tool, const char *out, int step) {
     if (!ok) return 0;
 
     /* 必须有 answer 且够像一句话（太短的"ok"不算答案） */
-    char ans[600] = {0};
-    json_str_field(out, "answer", ans, sizeof(ans));
+    ans[0] = 0;
+    json_str_field(out, "answer", ans, cap);
     if (strlen(ans) < 6) return 0;
     if (!strstr(out, "\"ok\"") && !strstr(out, "\"value\"")) return 0;
+    return 1;
+}
 
-    printf("\n最终回答: %s\n", ans);
-    printf("\n（插件结论直接采用，没有再让模型复述一遍）\n");
+/* ---------- 生成文档（PPT / Word / PDF）直连 ----------
+ *
+ * "根据 wireguard 技术写一个 10 页 PPT" 交给主循环必挂：模型要在一次
+ * JSON 里塞下十页正文，240 token 直接截断；而 3B 往往干脆漏掉 path，
+ * doc 落到读分支报"缺少 path"，重试两次就停 —— 用户看到的就是
+ * "插件 doc 连续失败两次"。
+ *
+ * 这里改成：框架按页数分段问模型要 markdown（request 不带 JSON 约束），
+ * 再把内容交给 doc 写文件。模型只负责写字，路径/格式/落盘由框架管。
+ */
+static int doc_pages(const char *t) {
+    for (const char *p = t; *p; p++) {
+        if (*p < '0' || *p > '9') continue;
+        if (p > t && (isdigit((unsigned char)p[-1]) || isalpha((unsigned char)p[-1]))) continue;
+        long v = atol(p);
+        const char *q = p;
+        while (*q >= '0' && *q <= '9') q++;
+        while (*q == ' ') q++;
+        if ((!strncmp(q, "页", 3) || !strncmp(q, "张", 3)) && v >= 1 && v <= 60)
+            return (int)v;
+    }
+    return 0;
+}
+
+static char *gen_doc_md(const char *topic, int parts, int ppt, int per_part,
+                        int chars_each, const char *host, int port, const char *model) {
+    char *all = calloc(1, 40000);
+    if (!all) return NULL;
+    size_t used = 0;
+
+    for (int from = 1; from <= parts; from += per_part) {
+        int to = from + per_part - 1;
+        if (to > parts) to = parts;
+        int n = to - from + 1;
+
+        char te[6000], tv[20000], body[BIG];
+        jesc(topic, te, sizeof(te));
+        /* 只把最后 8KB 当续写上下文：既省 token，也保证截断落在字符边界上 */
+        {
+            char ctx[12000];
+            size_t al = used > 8000 ? 8000 : used;
+            memcpy(ctx, all + used - al, al);
+            ctx[al] = 0;
+            utf8_cut(ctx, 8000);
+            jesc(ctx, tv, sizeof(tv));
+        }
+
+        /* 系统提示里不放引号：这段是直接拼进 JSON 字符串的，少一层转义少一个坑 */
+        const char *sysp = ppt
+            ? "你是文档撰写助手。只输出 Markdown：每页以一行「# 标题」开始，"
+              "下面列 3 到 5 条「- 要点」，要点必须具体（术语、数字、步骤、配置项），"
+              "不要目录、不要解释、不要任何前后缀。"
+            : "你是文档撰写助手。只输出 Markdown 正文：用「## 小标题」分节，"
+              "每节一个完整段落，不要目录、不要解释、不要标注字数。";
+
+        if (all[0])
+            snprintf(body, BIG,
+                "{\"model\":\"%s\",\"messages\":["
+                "{\"role\":\"system\",\"content\":\"%s\"},"
+                "{\"role\":\"user\",\"content\":\"主题：%s。只写第 %d-%d 个%s（共 %d 个）。\"},"
+                "{\"role\":\"assistant\",\"content\":\"%s\"},"
+                "{\"role\":\"user\",\"content\":\"接着往下写第 %d-%d 个，格式完全一致，"
+                "不要重复前面写过的内容。\"}],"
+                "\"max_tokens\":%d,\"temperature\":0.6,\"stream\":false}",
+                model, sysp, te, from - per_part, from - 1,
+                ppt ? "页" : "节", parts, tv, from, to,
+                n * (ppt ? 110 : chars_each) + 160);
+        else
+            snprintf(body, BIG,
+                "{\"model\":\"%s\",\"messages\":["
+                "{\"role\":\"system\",\"content\":\"%s\"},"
+                "{\"role\":\"user\",\"content\":\"主题：%s。共 %d 个%s，先写第 %d-%d 个。\"}],"
+                "\"max_tokens\":%d,\"temperature\":0.6,\"stream\":false}",
+                model, sysp, te, parts, ppt ? "页" : "节", from, to,
+                n * (ppt ? 110 : chars_each) + 160);
+
+        printf("（生成第 %d-%d/%d 个…）\n", from, to, parts);
+        fflush(stdout);
+        char *resp = http_post(host, port, "/v1/chat/completions", body, 420);
+        if (!resp) { printf("（这一段超时/断连，跳过）\n"); continue; }
+        char *c = extract_content(resp);
+        free(resp);
+        if (!c || !c[0]) { free(c); printf("（这一段返回空，跳过）\n"); continue; }
+        size_t L = strlen(c);
+        if (used + L + 4 < 40000) {
+            memcpy(all + used, c, L);
+            used += L;
+            all[used++] = '\n';
+            all[used] = 0;
+        }
+        free(c);
+    }
+    if (!all[0]) { free(all); return NULL; }
+    return all;
+}
+
+static int try_write_doc(const char *task, const char *host, int port, const char *model) {
+    if (!task || !task[0] || task[0] == '{' || task[0] == '/') return 0;
+
+    int ppt  = strstr(task, "ppt") || strstr(task, "PPT") || strstr(task, "幻灯片")
+            || strstr(task, "演示文稿") || strstr(task, "演示稿");
+    int word = strstr(task, "word") || strstr(task, "Word") || strstr(task, "WORD")
+            || strstr(task, "docx");
+    int pdf  = strstr(task, "pdf") || strstr(task, "PDF");
+    if (!ppt && !word && !pdf) return 0;
+
+    /* 只接"从零写一份"；带数据源的（表格/附件/文件路径）交给 doc 的读改写链 */
+    int act = strstr(task, "写") || strstr(task, "做") || strstr(task, "生成")
+           || strstr(task, "制作") || strstr(task, "整");
+    if (!act) return 0;
+    if (strstr(task, "表格") || strstr(task, "csv") || strstr(task, "CSV")
+        || strstr(task, "附件") || strstr(task, "上传") || strstr(task, "uploads/")
+        || strstr(task, ".xlsx") || strstr(task, ".docx") || strstr(task, ".csv"))
+        return 0;
+    /* "把这段文字/以下内容写成 pdf" 用的是现成文字，不是从零写 —— 这种
+     * 交给模型走 doc 写操作，别让这条通道再编一份新的出来。 */
+    if (strstr(task, "这段") || strstr(task, "以上") || strstr(task, "以下")
+        || strstr(task, "如下") || strstr(task, "上面") || strstr(task, "翻译"))
+        return 0;
+    if (strstr(task, ".mp4") || strstr(task, ".mkv") || strstr(task, ".mov")) return 0;
+
+    plugin_desc_t *pl = find_plugin("doc");
+    if (!pl) return 0;
+
+    /* PPT：一页一屏；Word/PDF：按节写，要了字数就按字数换算节数 */
+    int chars = want_chars(task);
+    int parts, per_part, chars_each = 300;
+    if (ppt) {
+        parts = doc_pages(task);
+        if (parts <= 0) parts = 8;
+        per_part = 4;
+    } else {
+        parts = doc_pages(task);
+        if (parts > 0) per_part = 2;
+        else if (chars > 0) { parts = (chars + 299) / 300; if (parts < 2) parts = 2; per_part = 2; }
+        else { parts = 4; per_part = 2; }
+        if (parts > 12) parts = 12;
+    }
+
+    printf("（文档生成：%s，%d 个%s）\n", ppt ? "PPT" : (pdf ? "PDF" : "Word"),
+           parts, ppt ? "页面" : "小节");
+    char *md = gen_doc_md(task, parts, ppt, per_part, chars_each, host, port, model);
+    if (!md) { printf("（模型没给出内容，改走正常流程）\n"); return 0; }
+
+    char outdir[256], outp[512];
+    snprintf(outdir, sizeof(outdir), "%s/gen", WORK_DIR);
+    mkdir(outdir, 0777);
+    const char *ext = ppt ? "pptx" : (pdf ? "pdf" : "docx");
+    snprintf(outp, sizeof(outp), "%s/%s_%ld.%s", outdir,
+             ppt ? "slides" : (pdf ? "doc" : "doc"), (long)time(NULL), ext);
+
+    size_t mcap = strlen(md) * 2 + strlen(outp) * 2 + 512;
+    char *me = malloc(mcap);
+    char *call = malloc(mcap + 256);
+    if (!me || !call) { free(me); free(call); free(md); return 0; }
+    jesc(md, me, mcap);
+    free(md);
+    snprintf(call, mcap + 256,
+        "{\"op\":\"%s\",\"path\":\"%s\",\"markdown\":\"%s\"}", ext, outp, me);
+    free(me);
+
+    printf("【插件 doc 开始工作】\n");
+    fflush(stdout);
+    char *res = pl->run(call);
+    free(call);
+    if (!res) return 0;
+    if (strstr(res, "\"error\"")) {
+        printf("%s\n", res);
+        free(res);
+        return 1;               /* 已经给用户明确错误，别再让模型瞎猜一遍 */
+    }
+    printf("%s\n", res);
+    free(res);
     return 1;
 }
 
@@ -2369,10 +2577,15 @@ int main(int argc, char **argv) {
     /* 任务本身就是一条插件命令（{"op":"probe",...}）→ 直接执行，不惊动模型。
      * 3B 模型不认识这种输入，会当普通文本乱答。 */
     if (task && try_direct_plugin(task)) return 0;
-    if (task && try_math_direct(task)) return 0;
-    if (task && try_music_direct(task)) return 0;
-    if (task && try_csv_to_xlsx(task)) return 0;
-    if (task && try_write_article(task, host, port, model)) return 0;
+    /* 意图判断只看用户自己写的那段（附件/上文提示块里有"转成纯文本"、
+     * 文件名里的 .xlsx 之类，会把下面这些直连通道误触发）。 */
+    const char *itask = intent_text(task);
+    if (itask && try_math_direct(itask)) return 0;
+    if (itask && try_music_direct(itask)) return 0;
+    /* 文档生成要早于"写文章"：写 word/ppt 的诉求是拿到文件，不是一段正文 */
+    if (itask && try_write_doc(itask, host, port, model)) return 0;
+    if (itask && try_write_article(itask, host, port, model)) return 0;
+    if (itask && try_csv_to_xlsx(itask)) return 0;
     if (task && try_video_direct(task)) return 0;
     if (auto_state_only) {
         /* 高频轮询专用：不探测环境、不输出描述，只回状态，几十字节。
@@ -2514,11 +2727,11 @@ int main(int argc, char **argv) {
      * 后一句常被忽略，加第三个动作还得改代码。 */
     /* 登录任务：框架直连（比模型两轮快得多，也不怕 3B 组不出参数） */
     if (!g_prefetched && g_n > 0) {
-        if (run_login_flow(task)) { free(task_esc); return 0; }
+        if (run_login_flow(itask)) { free(task_esc); return 0; }
     }
 
     if (!g_prefetched && g_n > 0 && strlen(task) < 120) {
-        int nran = run_task_chunks(task);
+        int nran = run_task_chunks(itask);
         if (nran > 0) {
             free(task_esc);
             return 0;
@@ -2750,7 +2963,7 @@ int main(int argc, char **argv) {
          * "content":"# ...  原样显示出来。现在一律丢弃 + 预算翻 4 倍重试。 */
         char *content = NULL;
         char fin[24] = {0};
-        int tok = is_pure_chat(task) ? 180 : 240;
+        int tok = is_pure_chat(itask) ? 180 : 240;
         for (int att = 0; att < 3; att++) {
             char *body = malloc(BIG);
             if (!body) { free(log_esc); log_esc = NULL; break; }
@@ -2975,9 +3188,16 @@ int main(int argc, char **argv) {
         fflush(stdout);
         char *out = p->run(enr);
         free(content);
-        if (out && try_direct_answer(tool, out, step)) {
-            /* 插件已经把答案写清楚了，别再花 100~190 秒让模型复述 */
-            printf("%s\n", out);
+        char dans[600] = {0};
+        if (out && direct_answer_of(tool, out, step, dans, sizeof(dans))) {
+            /* 插件已经把答案写清楚了，别再花 100~190 秒让模型复述。
+             * 先打插件原始结果（前端渲染成卡片），再打"最终回答" ——
+             * 反过来的话原始 JSON 会被并进答案气泡。 */
+            char cutd[BIG];
+            snprintf(cutd, sizeof(cutd), "%s", out);
+            utf8_cut(cutd, 4000);
+            printf("  [%s] %s\n", p->name, cutd);
+            printf("\n最终回答: %s\n", dans);
             free(out);
             rc = 0;
             break;

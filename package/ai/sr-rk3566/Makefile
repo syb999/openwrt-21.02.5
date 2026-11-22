@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=sr-rk3566
-PKG_VERSION:=1.0.0
+PKG_VERSION:=1.0.1
 PKG_RELEASE:=2
 
 PKG_LICENSE:=MIT
@@ -17,9 +17,10 @@ endef
 
 define Package/sr-rk3566/description
  2x video upscaling with Real-ESRGAN animevideov3 running on the RK3566 NPU.
- Picks the tile size from the source aspect ratio (4:3 -> 288x216,
- 16:9 -> 320x180), tiles the frame at native resolution, runs 4x per tile
- and downscales to a 2x output with the original audio copied over.
+ Picks the model by resolution, largest first: 640x480 / 576x432 (4:3) and
+ 640x360 (16:9) run the whole frame in one tile (no seams), falling back to
+ 288x216 / 320x180 tiles when the source is bigger than the model.
+ Runs 4x per tile and downscales to a 2x output with the original audio.
  The 18 KB C runner and both RKNN models ship prebuilt because librknnrt
  is a glibc-only vendor blob.
 endef

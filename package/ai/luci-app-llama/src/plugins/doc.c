@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include "plugin.h"
@@ -175,7 +176,59 @@ static int is_write_op(const char *op) {
 
 static char *run(const char *json_in) {
     char op[32] = {0};
+    char path[512] = {0};
     jget(json_in, "op", op, sizeof(op));
+    jget(json_in, "path", path, sizeof(path));
+
+    /* 模型常把"写一个 ppt"发成 op=write / create / new / 生成，或者给了
+     * path=xxx.pptx 却不给 op。这些都不是读操作 —— 按扩展名/format 归到
+     * 对应的写操作。以前它们全落到下面的读分支，统一报"缺少 path"，
+     * 模型看不懂，原样重发两次就被框架判"连续失败"停了。 */
+    if (!op[0] || !strcmp(op, "write") || !strcmp(op, "create") || !strcmp(op, "new")
+        || !strcmp(op, "gen") || !strcmp(op, "生成") || !strcmp(op, "输出")
+        || !strcmp(op, "out")) {
+        char fmt[16] = {0};
+        jget(json_in, "format", fmt, sizeof(fmt));
+        const char *e = path[0] ? strrchr(path, '.') : NULL;
+        if (e && !strcasecmp(e, ".pptx"))      snprintf(op, sizeof(op), "pptx");
+        else if (e && !strcasecmp(e, ".docx")) snprintf(op, sizeof(op), "docx");
+        else if (e && !strcasecmp(e, ".pdf"))  snprintf(op, sizeof(op), "pdf");
+        else if (e && (!strcasecmp(e, ".xlsx") || !strcasecmp(e, ".xlsm")))
+            snprintf(op, sizeof(op), "xlsx");
+        else if (e && (!strcasecmp(e, ".txt") || !strcasecmp(e, ".md")))
+            snprintf(op, sizeof(op), "text");
+        else if (fmt[0]) snprintf(op, sizeof(op), "%s", fmt);
+    }
+
+    /* 写操作没给 path：路径由框架定，别拿"缺少 path"把任务做废。
+     * 放在 /tmp/llama_agent/gen/ 下（页面 ?file= 能取到、也能下载）。 */
+    if (op[0] && is_write_op(op) && !path[0]) {
+        const char *ext = !strcmp(op, "pptx") ? "pptx"
+                        : !strcmp(op, "docx") || !strcmp(op, "docx_append") ? "docx"
+                        : !strcmp(op, "pdf") ? "pdf"
+                        : !strcmp(op, "text") ? "txt" : "xlsx";
+        mkdir("/tmp/llama_agent", 0777);
+        mkdir("/tmp/llama_agent/gen", 0777);
+        snprintf(path, sizeof(path), "/tmp/llama_agent/gen/%s_%ld.%s",
+                 op, (long)time(NULL), ext);
+        /* 补出来的 path/op 追加到原 JSON 末尾 —— Python 的 json 遇到重复键
+         * 取后一个，所以顺序必须是"原来的一坨, path, op}。 */
+        size_t L = strlen(json_in);
+        size_t n = L + sizeof(path) + 128;
+        char *nj = malloc(n);
+        if (nj) {
+            if (L > 1 && json_in[0] == '{') {
+                size_t strip = (json_in[L - 1] == '}') ? 1 : 0;
+                snprintf(nj, n, "%.*s,\"path\":\"%s\",\"op\":\"%s\"}",
+                         (int)(L - strip), json_in, path, op);
+            } else {
+                snprintf(nj, n, "{\"op\":\"%s\",\"path\":\"%s\"}", op, path);
+            }
+            char *r = run_py(op, nj);
+            free(nj);
+            return r;
+        }
+    }
 
     /* 写操作：fork 出 python3，脚本从 py_write.h 内嵌的源码走 -c 传进去，
      * 数据走 stdin。板上不需要任何 .py 文件，只要 python3 + 相应用库。 */
@@ -183,9 +236,9 @@ static char *run(const char *json_in) {
         return run_py(op, json_in);
     }
 
-    char path[512] = {0};
-    jget(json_in, "path", path, sizeof(path));
-    if (!path[0]) return strdup("{\"error\":\"缺少 path\"}");
+    if (!path[0])
+        return strdup("{\"error\":\"缺少 path：读文档要给 path；生成文档要用 "
+                      "op=xlsx/docx/pptx/pdf+markdown\"}");
 
     /* docx / xlsx / pptx 用纯 C 解（zip + xml，实测验证过）。
      *

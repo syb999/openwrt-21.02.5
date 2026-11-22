@@ -16,7 +16,7 @@ memcheck.c     内存记账（--memcheck 打开）
 memstat.sh     扫日志里的 [mem] 行做汇总
 Makefile       编译规则
 
-plugins/       11 个插件，见下表
+plugins/       14 个插件，见下表
 docwrite.py    文档写入脚本的源（生成 py_write.h）
 py_write.h     docwrite.py 转成的 C 字符串，doc.so 内嵌执行
 doc_read.inc   文档读取：docx/xlsx/pptx 的 zip+xml 解析（纯 C）
@@ -50,7 +50,7 @@ chmod 755 /opt/llama/agent/agent-c /www/cgi-bin/agent /opt/llama/agent/plugins/*
 agent-c       主程序
 
 memstat.sh    可选，分析内存记账
-plugins/      11 个 .so
+plugins/      14 个 .so
 ```
 
 ## 插件
@@ -69,8 +69,13 @@ plugins/      11 个 .so
 | `table` | 按列排序取 TOP/BOTTOM |
 | `sysmon` | 系统快照 + 自动巡检（`sysmon-auto`） |
 | `browser` | 登录态网站：probe 探测登录框 / autologin 自动填表取 cookie（chrome+selenium） |
+| `netcap` | 抓包分析：网卡/抓包/DNS/SNI/明文 URL/流量排行（tcpdump） |
+| `video` | 视频：转竖屏/压缩/水印/合并/切片/抽帧/GIF/去字幕/画面优化(2x 超分) |
 
-后两个是自动化插件：默认停用，支持前台跑和后台守护，网页可启停。
+`mediad`（media.c）不是插件，是 8091 端口的只读视频服务：uhttpd 21.02
+不把 Range 头传给 CGI、也不给静态文件做 206，手机拖进度条要靠它。
+
+`browser` 和 `sysmon` 是自动化插件：默认停用，支持前台跑和后台守护，网页可启停。
 
 ## 依赖
 
@@ -666,6 +671,29 @@ curl 抓到 JSON 就自动让 jq 报一下结构（多少条、有哪些字段�
 
 路由一个都没命中、也没有强动作词 → 不给插件表，prompt 从 1.5KB 降到 150 字节。
 先跑路由再判断，否则 `帮我算一下` 这种会被误判成闲聊。
+
+**生成文档直连**（`try_write_doc()`）
+
+"写一个 10 页 PPT" 不能让模型把十页正文塞进一次 JSON —— 240 token 必然截断，
+截断重试翻到 3840 token 又要跑半小时，3B 还常常漏掉 path（doc 落到读分支报
+"缺少 path"，重试两次就被判失败）。现在框架按页数分段向模型要 markdown
+（请求不带 JSON 约束，每段 4 页 / 2 节，带上一段结尾续写），再自己调
+doc 的 pptx/docx/pdf 写文件，路径由框架定（`/tmp/llama_agent/gen/`）。
+带数据源的（表格 / 附件 / "把这段文字"）不走这条路。
+
+**意图判断只看用户原文**（`intent_text()`）
+
+前端会把"已上传的文件 / 上文参考"这段框架自己生成的说明拼在任务前面，
+里面有"服务端已转成纯文本"、文件名还带 `.xlsx` —— 正好命中直连通道的关键词
+（"转" + "xlsx" = 打包 xlsx）。所以直连通道一律用 `intent_text()` 剥掉那几段，
+否则用户问"展示表格里播放量 top10"会得到一句"直接转：用最新 csv"。
+
+**表格按列名选数据源**（table 插件）
+
+一个问题解析出来的 csv 有十几个 sheet，模型只说得清"按播放量排"，说不清路径。
+table 现在按表头找：谁有这一列就用谁（给错 path 也不用），列名对不上就报错并
+列出候选列，不再静默按第 0 列排出一张假榜。`sort_by` 缺省时从 `_task` 里
+认表头中真实存在的列名。
 
 **生成必须非流式**
 

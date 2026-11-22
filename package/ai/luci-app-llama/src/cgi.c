@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <strings.h>
@@ -380,6 +381,36 @@ static void do_model_dl(const char *key) {
     char part[600], pidf[640], cmd[1600];
     snprintf(part, sizeof(part), "%s.part", m->dest);
     snprintf(pidf, sizeof(pidf), "%s.pid", part);
+
+    /* 已经在跑就别再起一个：两个 curl 同时往同一个 .part 追加，下完就是
+     * 一个大小对、内容坏的 GGUF（llama-server 加载直接失败，还得自己删）。
+     * 重新点"开始下载"以前是静默再起一个进程，看不出来。 */
+    {
+        long rp = 0;
+        FILE *rf = fopen(pidf, "r");
+        if (rf) { if (fscanf(rf, "%ld", &rp) != 1) rp = 0; fclose(rf); }
+        if (pid_alive(rp)) {
+            out_json("{\"ok\":0,\"error\":\"这个模型正在下载中（pid %ld），别重复启动\",\"running\":1}", rp);
+            return;
+        }
+    }
+
+    /* 空间检查：2GB 模型写的是 overlay，塞满会把系统搞挂（overlay 写满后
+     * 连 /etc/config 都存不进去）。已下了一部分的话按剩余量算。 */
+    {
+        long long have = fsize_ll(part);
+        long long need = m->total - (have > 0 ? have : 0) + (256LL << 20);
+        struct statfs sf;
+        if (statfs("/opt/llama", &sf) == 0) {
+            long long freeb = (long long)sf.f_bavail * (long long)sf.f_frsize;
+            if (freeb < need) {
+                out_json("{\"ok\":0,\"error\":\"空间不够：还需要 %.1f GB，/opt/llama 只剩 %.1f GB\"}",
+                         need / 1073741824.0, freeb / 1073741824.0);
+                return;
+            }
+        }
+    }
+
     unlink(pidf);
     if (!strstr(m->dest, "/opt/llama/")) {
         out_json("{\"ok\":0,\"error\":\"目标路径异常\"}");

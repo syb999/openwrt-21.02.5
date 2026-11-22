@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 
 import numpy as np
 
@@ -23,6 +24,23 @@ BIN = os.path.join(DIR, 'anime4k_rknn')
 LOADER = '/opt/glibc/ld-linux-aarch64.so.1'
 LIBPATH = '/opt/glibc:/opt/rknpu'
 FF = '/usr/bin/ffmpeg-rkrga' if os.path.exists('/usr/bin/ffmpeg-rkrga') else 'ffmpeg'
+
+# 进度文件（可选，第 3 个参数）。video 插件的 op_job 只认 ffmpeg 的
+# -progress 格式（out_time_us / progress=end），所以这里照那个格式写。
+# 以前这个参数根本不存在，sr 任务的 .prog 永远是空文件 —— 页面上进度
+# 一直 0%，跑完了还显示"已停止"。
+PROG = sys.argv[3] if len(sys.argv) > 3 else ''
+
+
+def progress(sec, done=False):
+    if not PROG:
+        return
+    try:
+        with open(PROG, 'w') as f:
+            f.write('out_time_us=%d\n' % int(max(0.0, sec) * 1000000))
+            f.write('progress=%s\n' % ('end' if done else 'continue'))
+    except Exception:
+        pass
 
 # 块边缘丢弃宽度（源像素）。
 # 模型在块边界做 zero-padding，边缘 M 像素的输出是坏的（偏暗/偏亮/发虚）。
@@ -115,11 +133,39 @@ def main():
     raw_out = os.path.join(tmp, 'out.rgb')
     env = dict(os.environ, LD_LIBRARY_PATH=LIBPATH)
     fsz = w * h * 3
+    n = 0                      # 提前定义：解码失败时 finally 里的进度也要能算
 
     try:
         sys.stderr.write('解码...\n')
-        subprocess.run([FF, '-y', '-v', 'error', '-i', src, '-f', 'rawvideo',
-                        '-pix_fmt', 'rgb24', raw_in], check=True)
+        progress(0)
+        # 解码这一大段（约占总时间三分之一）也要有进度。
+        # ffmpeg 的 -progress 文件在收尾时会写 progress=end，直接拿给插件会被
+        # 当成"任务完成"（推理还没开始），所以解码写到旁路文件，由线程把
+        # out_time_us 转发到真正的进度文件，不转发那个 end。
+        dec_prog = (PROG + '.dec') if PROG else '/dev/null'
+        stop_poll = threading.Event()
+
+        def mirror():
+            while not stop_poll.is_set():
+                try:
+                    with open(dec_prog) as df:
+                        for ln in df:
+                            if ln.startswith('out_time_us='):
+                                progress(int(ln.split('=')[1]) / 1000000.0)
+                                break
+                except Exception:
+                    pass
+                stop_poll.wait(1.0)
+
+        pth = threading.Thread(target=mirror, daemon=True)
+        if PROG:
+            pth.start()
+        try:
+            subprocess.run([FF, '-y', '-v', 'error', '-nostats', '-progress', dec_prog,
+                            '-i', src, '-f', 'rawvideo',
+                            '-pix_fmt', 'rgb24', raw_in], check=True)
+        finally:
+            stop_poll.set()
 
         tw_out, th_out = w * 2, h * 2
         # SR_MODE=single：整帧一次推理，绝对没有块边界 → 绝对没有接缝。
@@ -187,6 +233,7 @@ def main():
                 out = fit_out(o4) + 0.5
                 fout.write(np.clip(out, 0, 255).astype(np.uint8).tobytes())
                 n += 1
+                progress(n / fps)
                 if n % 25 == 0:
                     sys.stderr.write('  %d frames\n' % n)
                 continue
@@ -217,12 +264,14 @@ def main():
                         half[cy0 * 2:cy1 * 2, cx0 * 2:cx1 * 2] + 0.5
             fout.write(np.clip(out, 0, 255).astype(np.uint8).tobytes())
             n += 1
+            progress(n / fps)
             if n % 25 == 0:
                 sys.stderr.write('  %d frames\n' % n)
         fin.close()
         fout.close()
         if n == 0:
             die('没读到帧')
+        progress(n / fps)
 
         sys.stderr.write('编码...\n')
         # 音频从原片流复制；-aspect 必须写，否则 SAR 为空、播放器按 16:9 拉伸
@@ -235,8 +284,11 @@ def main():
                         '-c:v', 'h264_rkmpp', '-pix_fmt', 'nv12', '-b:v', '20M',
                         '-c:a', 'copy', '-shortest', dst], check=True)
     finally:
+        # 失败时不要写 progress=end —— 那会让插件把崩溃当成"完成 100%"。
+        # 正常结束的 end 在编码之后单独写。
         shutil.rmtree(tmp, ignore_errors=True)
 
+    progress(n / fps, done=True)
     sz = os.path.getsize(dst) if os.path.exists(dst) else 0
     sys.stderr.write('done: %d frames -> %s (%.1f MB, %dx%d, 模型 %s)\n'
                      % (n, dst, sz / 1048576.0, tw_out, th_out, mname))

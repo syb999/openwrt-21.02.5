@@ -2280,7 +2280,9 @@ static char *op_sr(const char *json) {
         return errf("画面优化未安装（需要 sr-rk3566 包提供 /opt/sr-rk3566/sr-rk3566.py）%s%s", "", "");
 
     const char *mname = (sw * 9 == sh * 16) ? "16:9" : "4:3";
-    const char *tile = (sw * 9 == sh * 16) ? "320x180" : "288x216";
+    /* 具体用哪个模型/切多大块由脚本按分辨率挑（640x480 / 576x432 / 640x360 /
+     * 288x216 / 320x180），这里别写死 —— 以前写死 288x216，面板上显示的
+     * 块尺寸跟实际跑的完全不是一回事。 */
 
     char out[900];
     out_name(path, "sr2x", "mp4", out, sizeof(out));
@@ -2297,7 +2299,7 @@ static char *op_sr(const char *json) {
     mkdir(VJOBS, 0777);
     snprintf(prog, sizeof(prog), "%s/%s.prog", VJOBS, id);
     snprintf(logf, sizeof(logf), "%s/%s.log", VJOBS, id);
-    snprintf(cmd, sizeof(cmd), "python3 %s '%s' '%s'", py, path, out);
+    snprintf(cmd, sizeof(cmd), "python3 %s '%s' '%s' '%s'", py, path, out, prog);
 
     /* 实测 5.15 秒/帧（576x432 源 + 576x432 大模型 = 1 块，2026-11 实测 25 帧 139 秒）。
      * 源片比模型还大时会自动切块，那种情况会慢 2 倍以上，这里的估算只覆盖常见情况。 */
@@ -2319,10 +2321,10 @@ static char *op_sr(const char *json) {
         job_record(id, (int)pid, out, dur, "画面优化");
         snprintf(text, sizeof(text),
                  "**画面优化已开始（后台）**\n\n| 项 | 值 |\n|---|---|\n"
-                 "| 任务 ID | `%s` |\n| 源片 | `%dx%d`（%s，切块 %s）|\n"
-                 "| 引擎 | Real-ESRGAN animevideov3 on RKNPU |\n"
+                 "| 任务 ID | `%s` |\n| 源片 | `%dx%d`（%s）|\n"
+                 "| 引擎 | Real-ESRGAN animevideov3 on RKNPU（按分辨率自动选模型/块）|\n"
                  "| 输出 | `%dx%d` |\n| 帧数 | %d 帧（约 %.0f 分钟）|\n| 文件 | `%s` |\n",
-                 id, sw, sh, mname, tile, sw * 2, sh * 2, nfr, est_min, out);
+                 id, sw, sh, mname, sw * 2, sh * 2, nfr, est_min, out);
         snprintf(ans, sizeof(ans),
                  "画面优化已开始（%d 帧，约 %.0f 分钟），用 job 查进度", nfr, est_min);
         snprintf(extra, sizeof(extra),

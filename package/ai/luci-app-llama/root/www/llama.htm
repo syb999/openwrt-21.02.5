@@ -1533,7 +1533,7 @@
     var hasPluginLine = /^\s*\[[a-zA-Z_]+\]\s*\{/m.test(src);
     if (!hasPluginLine && src.indexOf('── 第') < 0 && src.indexOf('最终回答') < 0) {
       var clean = src.split("\n").filter(function(L){
-        return !/^(已加载:|自动化:|跳过 |任务:|插件:)/.test(L);
+        return !/^(已加载:|自动化:|跳过 |任务:|插件:|【插件)/.test(L);
       }).join("\n").replace(/^\s+|\s+$/g, "");
       if (!clean) clean = "（没有输出）";
       /* 插件命令直连（{"op":"probe",...}）时框架不加载模型、也不打步骤行，
@@ -1555,6 +1555,9 @@
       var L = lines[i].replace(/\s+$/, "");
       if (!L.trim()) continue;
       if (/^(任务:|模型:)/.test(L)) continue;
+      /* "【插件 doc 开始工作】" 只是分隔提示。以前它会被当成上一条插件结果
+         的续行，粘进 JSON 后面，前一张卡片就解析失败、只剩原始文本。 */
+      if (/^【插件[^】]*】$/.test(L)) continue;
       var mStep = L.match(/^──\s*第\s*(\d+)\s*步\s*──/);
       if (mStep){ cur = null; continue; }   /* 只做分隔，卡片由后面的"模型"行创建 */
       /* 流式生成中的实时文本（3B 一句话要两分钟，不给进度等于卡死） */
@@ -1605,7 +1608,12 @@
            "标题 + 10 行数据"，只取第一行就只剩个空标题 ——
            用户看到的正是"只有标题不展示数据"。 */
         var finLines = [L.replace(/^最终回答[^:]*:\s*/, "")];
-        while (i + 1 < lines.length && !/^\[统计\]/.test(lines[i + 1])){
+        while (i + 1 < lines.length && !/^\[统计\]/.test(lines[i + 1])
+               /* 插件结果行 / 框架步骤行不是答案的一部分：以前无条件收，
+                  插件原始 JSON 会被并进答案气泡，页面上就是一坨
+                  {"value":"..."}（math 解题过程就是这么露出来的）。 */
+               && !/^\s*\[[a-zA-Z_]+\]\s*\{/.test(lines[i + 1])
+               && !/^【/.test(lines[i + 1])){
           i++;
           finLines.push(lines[i]);
         }
