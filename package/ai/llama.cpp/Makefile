@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=llama.cpp
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=1
+PKG_RELEASE:=3
 PKG_SOURCE:=llama.cpp-v$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://github.com/ggml-org/llama.cpp/archive/refs/tags/v$(PKG_VERSION).tar.gz
 PKG_HASH:=3f5f750e36326aea4d65c7623e7d597a33e395d65f4d76e5e0532171f252532b
@@ -10,10 +10,14 @@ PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
 PKG_BUILD_PARALLEL:=1
-PKG_USE_MIPS16:=0
+
+RSTRIP:=:
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk
+
+TARGET_CFLAGS   += -O3 -mcpu=cortex-a55+dotprod
+TARGET_CXXFLAGS += -O3 -mcpu=cortex-a55+dotprod
 
 define Package/llama.cpp
   SECTION:=utils
