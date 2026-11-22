@@ -1,0 +1,11 @@
+{
+	"luci-app-llama": {
+		"description": "Grant access to the local llama.cpp inference app",
+		"read": {
+			"uci": [ "llama" ]
+		},
+		"write": {
+			"uci": [ "llama" ]
+		}
+	}
+}

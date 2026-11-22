@@ -1,0 +1,43 @@
+#!/bin/sh
+# Config discovery endpoint for the login-free page (/www/llama.htm).
+#
+# Single source of truth is /etc/config/llama.  Nothing is defaulted here on
+# purpose: a missing option makes the response say so, instead of silently
+# falling back to a baked-in port/path that would then disagree with UCI and
+# look like a dead backend.
+#
+# This endpoint never returns the access key, a password, or any filesystem
+# path (the model is reduced to its basename).
+
+. /lib/functions.sh
+
+config_load llama
+
+config_get_bool enabled main enabled 1
+config_get port     main port
+config_get model    main model
+config_get key_file main key_file
+
+# basename without the .gguf suffix, quotes/backslashes stripped for JSON
+model="${model##*/}"
+model="${model%.gguf}"
+model=$(printf '%s' "$model" | tr -d '\\"')
+
+need_key=0
+if [ -n "$key_file" ] && [ -s "$key_file" ]; then
+	need_key=1
+fi
+
+printf 'Content-Type: application/json\r\n'
+printf 'Cache-Control: no-store\r\n'
+printf 'Access-Control-Allow-Origin: *\r\n'
+printf '\r\n'
+
+if [ -z "$port" ]; then
+	printf '{"ok":0,"error":"port is not set in /etc/config/llama"}\n'
+	exit 0
+fi
+
+printf '{"ok":1,"enabled":%s,"port":"%s","model":"%s","need_key":%s}\n' \
+	"$([ "$enabled" = "1" ] && echo 1 || echo 0)" \
+	"$port" "$model" "$need_key"

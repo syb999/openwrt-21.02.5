@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vue 登录 · 基础</title>
+<script src="vue.global.js"></script>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,-apple-system,"PingFang SC",sans-serif;
+     background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh;
+     display:flex;align-items:center;justify-content:center}
+.card{background:#fff;padding:36px 32px;border-radius:14px;width:340px;
+      box-shadow:0 18px 50px rgba(0,0,0,.28)}
+h2{margin:0 0 22px;font-size:21px;color:#222}
+.field{margin-bottom:14px}
+input{width:100%;padding:11px 13px;border:1px solid #ddd;border-radius:8px;
+      font-size:14px;outline:none;transition:border .2s}
+input:focus{border-color:#667eea}
+button{width:100%;padding:12px;border:0;border-radius:8px;font-size:15px;
+       background:#667eea;color:#fff;cursor:pointer;margin-top:6px}
+button:disabled{background:#aab;cursor:not-allowed}
+.err{color:#e33;font-size:13px;margin:10px 0 0}
+.ok{padding:20px 0;text-align:center}
+.ok h2{color:#2a7}
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="card">
+    <template v-if="!logged">
+      <h2>会员登录</h2>
+      <div class="field">
+        <input v-model="form.username" placeholder="用户名 / 手机号" autocomplete="username">
+      </div>
+      <div class="field">
+        <input v-model="form.password" type="password" placeholder="登录密码" autocomplete="current-password">
+      </div>
+      <button :disabled="loading" @click="doLogin">{{ loading ? '登录中…' : '登 录' }}</button>
+      <p class="err" v-if="err">{{ err }}</p>
+    </template>
+    <div class="ok" v-else>
+      <h2>欢迎回来，{{ user.name }}</h2>
+      <p style="color:#888;font-size:13px">登录态存在 localStorage</p>
+      <button @click="doLogout">退出登录</button>
+    </div>
+  </div>
+</div>
+<script>
+const { createApp, ref, reactive } = Vue;
+createApp({
+  setup() {
+    const form = reactive({ username: '', password: '' });
+    const logged = ref(false);
+    const loading = ref(false);
+    const err = ref('');
+    const user = reactive({ name: '' });
+
+    async function doLogin() {
+      err.value = '';
+      if (!form.username || !form.password) { err.value = '请输入账号和密码'; return; }
+      loading.value = true;
+      await new Promise(r => setTimeout(r, 600));       // 模拟后端
+      if (form.password.length < 3) {
+        err.value = '密码错误'; loading.value = false; return;
+      }
+      const token = 'vuat_' + Math.random().toString(36).slice(2, 12);
+      localStorage.setItem('access_token', token);
+      localStorage.setItem('user_name', form.username);
+      sessionStorage.setItem('sess_id', 'vsess_' + Date.now());
+      document.cookie = 'vue_sid=' + token + ';path=/';
+      user.name = form.username;
+      logged.value = true;
+      loading.value = false;
+      document.title = '登录成功';
+    }
+    function doLogout() {
+      localStorage.clear(); sessionStorage.clear();
+      document.cookie = 'vue_sid=;path=/;max-age=0';
+      logged.value = false; document.title = 'Vue 登录 · 基础';
+    }
+    // 刷新后恢复登录态（真实 SPA 都这么干）
+    const t = localStorage.getItem('access_token');
+    if (t) { logged.value = true; user.name = localStorage.getItem('user_name') || ''; }
+    return { form, logged, loading, err, user, doLogin, doLogout };
+  }
+}).mount('#app');
+</script>
+</body>
+</html>

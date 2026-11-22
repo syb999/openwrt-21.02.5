@@ -1,0 +1,84 @@
+#!/bin/sh /etc/rc.common
+# llama-server (local LLM inference). Portable: binary / model / port / threads
+# all come from UCI so the same package works on other boards.
+#
+# The optional access key is read from a file (--api-key-file), never from
+# the command line, so it does not show up in `ps`/`top` argv.
+
+START=96
+STOP=10
+USE_PROCD=1
+
+start_mediad() {
+	# 视频服务（8091）：uhttpd 不支持 Range，手机播 mp4 必须另起一个
+	[ -x /opt/llama/agent/mediad ] || return 0
+	procd_open_instance mediad
+	procd_set_param command /opt/llama/agent/mediad 8091
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+start_service() {
+	config_load llama
+	local enabled binary model port threads ctx key_file
+	config_get_bool enabled main enabled 1
+	config_get binary    main binary
+	config_get model     main model
+	config_get port      main port
+	config_get threads   main threads   "4"
+	config_get ctx       main ctx       "2048"
+	config_get parallel  main parallel  "1"
+	config_get key_file  main key_file
+
+	[ "$enabled" = "1" ] || return 0
+
+	# binary / model / port / key_file have no built-in defaults: UCI is the
+	# only place they may come from, so a wrong value can never be masked by
+	# a fallback baked into this script.
+	local missing=""
+	[ -n "$binary" ] || missing="$missing binary"
+	[ -n "$model" ]  || missing="$missing model"
+	[ -n "$port" ]   || missing="$missing port"
+	if [ -n "$missing" ]; then
+		logger -t llama "missing required option(s):$missing in /etc/config/llama"
+		return 1
+	fi
+
+	if [ ! -x "$binary" ]; then
+		logger -t llama "binary missing or not executable: $binary"
+		return 1
+	fi
+	if [ ! -f "$model" ]; then
+		logger -t llama "model missing: $model"
+		return 1
+	fi
+
+	procd_open_instance
+	procd_set_param command "$binary" \
+		-m "$model" \
+		--host 0.0.0.0 \
+		--port "$port" \
+		-t "$threads" \
+		-c "$ctx" \
+		-np "$parallel" \
+		--cors-origins "*" \
+		--no-webui
+
+	# access key: file only, keeps it out of argv
+	if [ -s "$key_file" ]; then
+		procd_append_param command --api-key-file "$key_file"
+	fi
+
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+
+	start_mediad
+}
+
+service_triggers() {
+	procd_add_reload_trigger "llama"
+}

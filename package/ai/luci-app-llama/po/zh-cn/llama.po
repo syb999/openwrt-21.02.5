@@ -1,0 +1,90 @@
+msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8\n"
+"Project-Id-Version: luci-app-llama\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "Llama AI"
+msgstr "本地 AI"
+
+msgid "Local AI Chat"
+msgstr "本地 AI 对话"
+
+msgid "Chat"
+msgstr "对话"
+
+msgid "Settings"
+msgstr "设置"
+
+msgid "Powered by llama.cpp on this device. Same UI as the login-free page"
+msgstr "由本机 llama.cpp 提供推理，与免登录页面是同一个界面"
+
+msgid "Local LLM inference served by llama-server. The chat page and the login-free page both talk to this service over HTTP."
+msgstr "由 llama-server 提供本地大模型推理，对话页与免登录页都通过 HTTP 访问它。"
+
+msgid "Service"
+msgstr "服务"
+
+msgid "Enable"
+msgstr "启用"
+
+msgid "Start llama-server on boot and keep it running."
+msgstr "开机自启并保持运行。"
+
+msgid "Model file"
+msgstr "模型文件"
+
+msgid "Absolute path to a .gguf file on the device."
+msgstr "设备上 .gguf 文件的绝对路径。"
+
+msgid "Port"
+msgstr "端口"
+
+msgid "Threads"
+msgstr "线程数"
+
+msgid "CPU threads used for inference."
+msgstr "推理使用的 CPU 线程数。"
+
+msgid "Context size"
+msgstr "上下文长度"
+
+msgid "Larger values use more RAM for the KV cache."
+msgstr "数值越大，KV cache 占用内存越多。"
+
+msgid "Server binary"
+msgstr "服务端程序"
+
+msgid "Full path of the llama-server executable on this device."
+msgstr "本设备上 llama-server 可执行文件的完整路径。"
+
+msgid "Access key"
+msgstr "访问口令"
+
+msgid "Optional. When set, clients must send this key. Leave empty for an open service. The key is stored in a 0600 file, never in UCI or in any web page."
+msgstr "可选。设置后客户端必须携带此口令；留空则服务开放。口令只写入权限 0600 的文件，不留在 UCI，也不出现在任何网页里。"
+
+msgid "Access key file"
+msgstr "口令文件"
+
+msgid "Passed to llama-server as --api-key-file so the key never appears in ps."
+msgstr "以 --api-key-file 传给 llama-server，口令不会出现在 ps 的命令行里。"
+
+msgid "Open standalone page"
+msgstr "打开独立页面"
+
+msgid "running"
+msgstr "运行中"
+
+msgid "loading model"
+msgstr "模型加载中"
+
+msgid "disabled"
+msgstr "已禁用"
+
+msgid "no response"
+msgstr "未响应"
+
+msgid "unknown"
+msgstr "未知"

@@ -1,0 +1,146 @@
+<%+header%>
+
+<h2 name="content"><%:Local AI Chat%></h2>
+
+<div class="cbi-map">
+	<div class="llama-cards">
+		<div class="llama-card">
+			<span class="llama-label"><%:Service%></span>
+			<span class="llama-value"><i class="llama-dot" id="llama-dot"></i><span id="llama-state">…</span></span>
+		</div>
+		<div class="llama-card">
+			<span class="llama-label"><%:Model file%></span>
+			<span class="llama-value llama-mono" id="llama-model">…</span>
+		</div>
+		<div class="llama-card">
+			<span class="llama-label"><%:Port%></span>
+			<span class="llama-value llama-mono" id="llama-port">…</span>
+		</div>
+	</div>
+
+	<div class="llama-toolbar">
+		<a class="llama-btn llama-btn-primary" href="/llama.htm" target="_blank" rel="noopener">
+			<%:Open standalone page%>
+		</a>
+		<a class="llama-btn" href="<%=luci.dispatcher.build_url('admin/services/llama/settings')%>">
+			<%:Settings%>
+		</a>
+		<span class="llama-url">http://<%=luci.http.getenv("HTTP_HOST") or ""%>/llama.htm</span>
+	</div>
+
+	<div class="llama-frame-wrap">
+		<%-
+			-- 给 iframe 的 URL 带上构建时间戳：不这么做的话浏览器会一直用
+			-- 缓存的旧 /llama.htm，改了前端页面用户看不到（iframe 的缓存
+			-- 比普通页面更顽固，强刷主页也不一定管用）。
+			local v = "20261119c"
+		-%>
+		<iframe id="llama-frame" src="/llama.htm?embed=1&amp;v=<%=v%>" title="<%:Local AI Chat%>"></iframe>
+	</div>
+</div>
+
+<style type="text/css">
+	.llama-cards{
+		display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+		gap:10px; margin:0 0 12px;
+	}
+	.llama-card{
+		display:flex; flex-direction:column; gap:5px;
+		padding:11px 14px; border-radius:10px;
+		background:rgba(127,127,127,.07);
+		border:1px solid rgba(127,127,127,.2);
+	}
+	.llama-label{
+		font-size:11px; letter-spacing:.4px; text-transform:uppercase;
+		opacity:.6;
+	}
+	.llama-value{
+		display:flex; align-items:center; gap:7px;
+		font-size:14px; font-weight:600; overflow:hidden;
+		text-overflow:ellipsis; white-space:nowrap;
+	}
+	.llama-mono{ font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-weight:500; font-size:13px; }
+	.llama-dot{
+		width:8px; height:8px; border-radius:50%; flex:0 0 auto;
+		background:#8b96a5; box-shadow:0 0 0 3px rgba(139,150,165,.15);
+		transition:.25s;
+	}
+	.llama-dot.ok{ background:#3fb950; box-shadow:0 0 0 3px rgba(63,185,80,.18); }
+	.llama-dot.load{ background:#d29922; box-shadow:0 0 0 3px rgba(210,153,34,.18); }
+	.llama-dot.err{ background:#f85149; box-shadow:0 0 0 3px rgba(248,81,73,.18); }
+
+	.llama-toolbar{
+		display:flex; align-items:center; gap:9px; flex-wrap:wrap; margin:0 0 12px;
+	}
+	.llama-btn{
+		display:inline-flex; align-items:center; padding:7px 15px; border-radius:8px;
+		font-size:13px; font-weight:600; text-decoration:none; cursor:pointer;
+		background:rgba(127,127,127,.12); border:1px solid rgba(127,127,127,.26);
+		color:inherit; transition:.16s;
+	}
+	.llama-btn:hover{ background:rgba(127,127,127,.2); text-decoration:none; }
+	.llama-btn-primary{
+		background:#2f7fe0; border-color:#2f7fe0; color:#fff;
+	}
+	.llama-btn-primary:hover{ background:#3d8bea; }
+	.llama-url{
+		margin-left:auto; font-size:11.5px; opacity:.55;
+		font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+	}
+
+	.llama-frame-wrap{
+		border-radius:12px; overflow:hidden;
+		border:1px solid rgba(127,127,127,.25);
+		box-shadow:0 6px 26px rgba(0,0,0,.22);
+		background:#0b0f14;
+	}
+	#llama-frame{
+		display:block; width:100%;
+		height:calc(100vh - 330px); min-height:480px; border:0;
+	}
+
+	@media (max-width:700px){
+		#llama-frame{ height:calc(100vh - 300px); min-height:420px; }
+		.llama-url{ display:none; }
+	}
+</style>
+
+<script type="text/javascript">
+(function(){
+	var dot = document.getElementById('llama-dot');
+	var stateEl = document.getElementById('llama-state');
+	var modelEl = document.getElementById('llama-model');
+	var portEl = document.getElementById('llama-port');
+
+	var L = {
+		running:  '<%:running%>',
+		loading:  '<%:loading model%>',
+		disabled: '<%:disabled%>',
+		noreply:  '<%:no response%>',
+		unknown:  '<%:unknown%>'
+	};
+
+	function setState(cls, text){
+		if (dot) dot.className = 'llama-dot ' + cls;
+		if (stateEl) stateEl.textContent = text;
+	}
+
+	fetch('/cgi-bin/llama?_=' + Date.now(), {cache:'no-store'})
+		.then(function(r){ return r.ok ? r.json() : null; })
+		.then(function(j){
+			if (!j || !j.ok){ setState('err', L.unknown); return; }
+			if (modelEl) modelEl.textContent = j.model || '—';
+			if (portEl) portEl.textContent = j.port || '—';
+			if (!j.enabled){ setState('err', L.disabled); return; }
+			var base = location.protocol + '//' + location.hostname + ':' + j.port;
+			return fetch(base + '/health', {cache:'no-store'})
+				.then(function(r){ return r.json(); })
+				.then(function(h){ setState(h && h.status === 'ok' ? 'ok' : 'load',
+					h && h.status === 'ok' ? L.running : L.loading); })
+				.catch(function(){ setState('err', L.noreply); });
+		})
+		.catch(function(){ setState('err', L.unknown); });
+})();
+</script>
+
+<%+footer%>

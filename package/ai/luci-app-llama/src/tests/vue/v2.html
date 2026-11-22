@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Vue 登录 · 复杂</title>
+<script src="vue.global.js"></script>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,-apple-system,"PingFang SC",sans-serif;background:#f7f8fa}
+header{background:#1f2937;color:#fff;padding:14px 22px;display:flex;
+       align-items:center;justify-content:space-between}
+.brand{font-weight:600}
+.login-link{color:#9fd; font-size:14px}
+main{max-width:1000px;margin:0 auto;padding:26px 18px}
+article{background:#fff;border-radius:10px;padding:22px;margin-bottom:16px;
+        box-shadow:0 2px 10px rgba(0,0,0,.05)}
+.mask{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;
+      align-items:center;justify-content:center}
+.modal{background:#fff;border-radius:14px;width:360px;padding:30px 28px}
+.tabs{display:flex;gap:18px;border-bottom:1px solid #eee;margin-bottom:20px}
+.tabs span{padding:8px 2px;font-size:14px;color:#888;cursor:pointer}
+.tabs span.on{color:#2563eb;border-bottom:2px solid #2563eb;font-weight:600}
+input{width:100%;padding:11px 13px;border:1px solid #ddd;border-radius:8px;
+      font-size:14px;outline:none;margin-bottom:12px}
+input:focus{border-color:#2563eb}
+button{width:100%;padding:12px;border:0;border-radius:8px;background:#2563eb;
+       color:#fff;font-size:15px;cursor:pointer}
+button:disabled{background:#9bb}
+.qr{text-align:center;padding:24px 0;color:#888}
+.spin{color:#888;font-size:13px;padding:18px 0}
+.err{color:#e33;font-size:13px;margin:8px 0 0}
+.avatar{width:26px;height:26px;border-radius:50%;background:#2563eb;color:#fff;
+        display:inline-flex;align-items:center;justify-content:center;font-size:13px}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="brand">示例门户</div>
+    <div v-if="user">
+      <span class="avatar">{{ user.name.charAt(0) }}</span>
+      <span style="margin:0 10px">{{ user.name }}</span>
+      <a href="#" class="login-link" @click.prevent="logout">退出</a>
+    </div>
+    <a href="#" class="login-link" v-else @click.prevent="openLogin">登录 / 注册</a>
+  </header>
+
+  <main>
+    <article><h3>今日头条</h3><p style="color:#666">这是一篇演示文章，登录之后才能看到完整内容。</p></article>
+    <article><h3>技术分享</h3><p style="color:#666">Vue 3 的响应式原理与性能优化实践。</p></article>
+  </main>
+
+  <!-- 登录弹窗：默认显示扫码 tab，需要点"账号登录"才出表单 -->
+  <div class="mask" v-if="show">
+    <div class="modal">
+      <div class="tabs">
+        <span :class="{on: tab==='qr'}" @click="tab='qr'">扫码登录</span>
+        <span :class="{on: tab==='pwd'}" @click="tab='pwd'">账号登录</span>
+      </div>
+
+      <div class="qr" v-if="tab==='qr'">
+        <div style="font-size:52px">▣</div>
+        <p>请用手机扫码</p>
+      </div>
+
+      <!-- 表单是异步渲染的：切到 pwd 之后再等一会儿才出现 -->
+      <div v-else>
+        <div class="spin" v-if="!ready">加载中…</div>
+        <template v-else>
+          <input v-model="form.username" placeholder="邮箱 / 手机号">
+          <input v-model="form.password" type="password" placeholder="密码">
+          <button :disabled="busy" @click="submit">{{ busy ? '验证中…' : '账号登录' }}</button>
+          <p class="err" v-if="err">{{ err }}</p>
+        </template>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+const { createApp, ref, reactive, watch } = Vue;
+createApp({
+  setup() {
+    const show = ref(false);
+    const tab = ref('qr');
+    const ready = ref(false);
+    const busy = ref(false);
+    const err = ref('');
+    const user = ref(null);
+    const form = reactive({ username: '', password: '' });
+
+    // 切到账号 tab 后延迟 800ms 才渲染表单（模拟懒加载组件）
+    watch(tab, (v) => {
+      ready.value = false;
+      if (v === 'pwd') setTimeout(() => { ready.value = true; }, 800);
+    });
+
+    function openLogin() {
+      show.value = true; tab.value = 'qr'; err.value = '';
+    }
+    async function submit() {
+      err.value = '';
+      if (!form.username || !form.password) { err.value = '请填写完整'; return; }
+      busy.value = true;
+      await new Promise(r => setTimeout(r, 900));
+      const token = 'vub_' + Math.random().toString(36).slice(2, 12);
+      localStorage.setItem('token', token);
+      localStorage.setItem('nick', form.username);
+      sessionStorage.setItem('sid', 'ss_' + Date.now());
+      document.cookie = 'portal_sid=' + token + ';path=/';
+      user.value = { name: form.username };
+      show.value = false; busy.value = false;
+      document.title = '已登录 · ' + form.username;
+    }
+    function logout() {
+      localStorage.clear(); sessionStorage.clear();
+      document.cookie = 'portal_sid=;path=/;max-age=0';
+      user.value = null; document.title = 'Vue 登录 · 复杂';
+    }
+    return { show, tab, ready, busy, err, user, form, openLogin, submit, logout };
+  }
+}).mount('#app');
+</script>
+</body>
+</html>
