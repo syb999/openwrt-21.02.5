@@ -88,3 +88,39 @@ msgstr "未响应"
 
 msgid "unknown"
 msgstr "未知"
+
+msgid "基本设置"
+msgstr "Basic settings"
+
+msgid "llama 模型设置"
+msgstr "llama model"
+
+msgid "语音设置"
+msgstr "Voice (TTS/ASR)"
+
+msgid "语音模型"
+msgstr "Voice models"
+
+msgid "本地上传模型包"
+msgstr "Upload model package"
+
+msgid "支持的模型文件名"
+msgstr "Required model filenames"
+
+msgid "上传"
+msgstr "Upload"
+
+msgid "解包到哪个模型"
+msgstr "Extract into"
+
+msgid "解包安装"
+msgstr "Extract & install"
+
+msgid "已安装"
+msgstr "Installed"
+
+msgid "说明"
+msgstr "Note"
+
+msgid "语音转文字"
+msgstr "Speech to text"

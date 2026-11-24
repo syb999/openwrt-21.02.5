@@ -15,7 +15,7 @@ CFLAGS  := -O2 -Wall -Wextra -fPIC -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
 LDFLAGS ?= -ldl
 
 # 插件列表：新增插件只要往这里加一行
-PLUGINS := math table batch doc net netcap video sysmon owrt sys music curl jsonq browser
+PLUGINS := math table batch doc net netcap video sysmon owrt sys music curl jsonq browser voice
 
 all: agent cgi mediad desub_fill desub_shot $(PLUGINS:%=plugins/%.so)
 
@@ -49,8 +49,9 @@ plugins/doc.so: py_write.h plugins/doc_read.inc
 plugins/browser.so: py_browse.h
 # curl_table.inc 是 curl.c include 进来的，改了它必须重编 curl.so
 plugins/jsonq.so: plugins/json_table.inc
+plugins/music.so: plugins/music_sheet.inc
 plugins/%.so: plugins/%.c plugin.h
-	$(CC) $(CFLAGS) -I. -shared -o $@ $< -lz $(LDFLAGS)
+	$(CC) $(CFLAGS) -I. -shared -o $@ $< -lz -lm $(LDFLAGS)
 	@mkdir -p plugins
 
 # 安装清单是【白名单】：逐条 install 具体产物，不用 cp -r。

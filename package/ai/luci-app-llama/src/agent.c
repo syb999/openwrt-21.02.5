@@ -1014,13 +1014,14 @@ static const route_t ROUTES[] = {
               "路由器|配置.*网络|init\\.d|iwinfo"},
     {"doc",   "pdf|PDF|word|Word|excel|Excel|ppt|PPT|文档|xlsx|docx|pptx|"
               "导出|生成.*报告|做个.*表|幻灯片|演示"},
-    {"music", "音乐|midi|MIDI|旋律|作曲|编曲|mp3|MP3|节奏|伴奏|曲子|歌曲|音色"},
+    {"music", "音乐|midi|MIDI|旋律|作曲|编曲|mp3|MP3|节奏|伴奏|曲子|歌曲|音色|五线谱|乐谱|曲谱|简谱"},
     {"browser", "需要登录|登录后|cookie|session|鉴权|自动化浏览器|selenium"},
     {"table", "排序|排行|top|TOP|筛选|名次|前.*名"},
     /* JSON 类：探结构 / 取字段 / 导 CSV。以前表里没有 jq，只有"全都不命中
      * 才全列兜底"时它才进 prompt —— 问"这个 json 有哪些字段"基本选不到它。 */
     {"batch", "分批|大量|很多(页|章|节)|长文档|多章节|整套"},
     {"sysmon","监控|巡检|告警|阈值|采样"},
+    {"voice", "语音|朗读|念出来|读出来|配音|播报|TTS|tts|转语音|文字转语音"},
     /* 抓包类：必须单独一项，否则这句话在 3B 眼里就是个知识问答
      * （实测直接答"你可以用 Wireshark"）。命中后只提供 netcap 一个插件，
      * 模型没有别的可挑，选对的概率高得多。 */
@@ -1115,6 +1116,7 @@ static const char *op_to_plugin(const char *js, const char *op) {
         {"docx","doc"}, {"xlsx","doc"}, {"pptx","doc"}, {"pdf","doc"},
         {"text","doc"}, {"docx_append","doc"}, {"xlsx_edit","doc"},
         {"xlsx_read","doc"},
+        {"ocr","doc"}, {"image","doc"}, {"img2txt","doc"},   /* 图片认字（RKNPU PP-OCR） */
         {"sysinfo","sys"}, {"shell","sys"}, {"list","sys"}, {"du","sys"},
         {"grep","sys"}, {"http_get","sys"}, {"download","sys"},
         {"uci_get","owrt"}, {"uci_set","owrt"}, {"uci_commit","owrt"},
@@ -1136,8 +1138,11 @@ static const char *op_to_plugin(const char *js, const char *op) {
         {"iwinfo","owrt"}, {"iw","owrt"}, {"service","owrt"}, {"logread","owrt"},
         {"passwd","owrt"}, {"reboot","owrt"}, {"opkg_list","owrt"},
         {"midi","music"}, {"render","music"}, {"import","music"}, {"wav","music"},
+        {"omr","music"}, {"sheetmusic","music"},    /* 五线谱图片→MIDI */
         {"bgm","music"},
         {"parse","curl"},        /* curl 插件的 op 名是 parse（吃 cURL 原文） */
+        {"tts","voice"}, {"speak","voice"}, {"say","voice"}, {"voice","voice"},
+        {"asr","voice"}, {"stt","voice"}, {"transcribe","voice"},   /* 语音转文字 */
         {"snapshot","sysmon"},
         {"start","sysmon-auto"}, {"stop","sysmon-auto"}, {"status","sysmon-auto"},
         {NULL, NULL}
@@ -2469,6 +2474,120 @@ static int try_json_xlsx_direct(const char *task) {
     return 1;
 }
 
+/* ---------- 文字转语音直连 ----------
+ * "念：xxx" / "朗读 xxx" / "把这段读出来：xxx" —— 直接合成，不用等模型。
+ * 3B 模型去调 voice 插件也行，但这一步是纯机械的，没必要烧几十秒推理。 */
+static int try_tts_direct(const char *task) {
+    if (!task || !task[0]) return 0;
+    static const char *LEAD[] = {"用男声念", "用男声朗读", "男声念", "男声朗读", "用男声说",
+                                 "朗读一下", "朗读", "念一下", "念出来", "念", "读出来",
+                                 "读一下", "用语音说", "转成语音", "语音播报", "配音",
+                                 "合成语音", "文字转语音", NULL};
+    const char *txt = NULL;
+    for (int i = 0; LEAD[i]; i++) {
+        size_t L = strlen(LEAD[i]);
+        if (strncmp(task, LEAD[i], L)) continue;
+        const char *q = task + L;
+        while (*q == ' ' || *q == '：' || *q == ':' || *q == '，' || *q == ',') q += (*q == '：' ? 3 : 1);
+        if (*q) { txt = q; break; }
+    }
+    if (!txt) return 0;
+    /* "用男声念：…" / "男声朗读 …" → 走 kokoro 男声（sid 60）。
+     * 正文里把这些前缀词逐个剥掉，剩下的才是要念的内容。 */
+    int want_male = (strstr(task, "男声") || strstr(task, "男音") || strstr(task, "male") != NULL);
+    static char buf2[2400];
+    snprintf(buf2, sizeof(buf2), "%s", txt);
+    if (want_male) {
+        static const char *DROP[] = {"请", "帮我", "用", "以", "男声", "男音", "male", "Male",
+                                     "念", "朗读", "读", "说", "的", "声音", "语音",
+                                     "：", ":", "，", ",", "、", " ", "\t", NULL};
+        int changed = 1, guard = 0;
+        while (changed && guard++ < 60) {
+            changed = 0;
+            for (int k = 0; DROP[k]; k++) {
+                size_t L = strlen(DROP[k]);
+                if (!strncmp(buf2, DROP[k], L)) {
+                    memmove(buf2, buf2 + L, strlen(buf2 + L) + 1);
+                    changed = 1;
+                }
+            }
+        }
+        /* 行尾残留的冒号也去掉 */
+        for (size_t n2 = strlen(buf2); n2 > 0; n2--) {
+            char c = buf2[n2 - 1];
+            if (c == ' ' || c == '\t' || c == '\n' || c == ':' || c == ',') buf2[n2 - 1] = 0;
+            else break;
+        }
+        if (buf2[0]) txt = buf2;
+    }
+    plugin_desc_t *pl = find_plugin("voice");
+    if (!pl) return 0;
+
+    /* 拼 JSON（正文里的引号/换行要转义） */
+    size_t cap = strlen(txt) * 2 + 256;
+    char *req = malloc(cap);
+    if (!req) return 0;
+    size_t o = (size_t)snprintf(req, cap, "{\"op\":\"tts\"%s,\"text\":\"",
+                                want_male ? ",\"voice\":\"male\"" : "");
+    for (const char *p = txt; *p && o + 8 < cap; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c == '\\') { req[o++] = '\\'; req[o++] = (char)c; }
+        else if (c == '\n') { req[o++] = '\\'; req[o++] = 'n'; }
+        else if (c >= 0x20) req[o++] = (char)c;
+    }
+    snprintf(req + o, cap - o, "\"}");
+
+    char *r = pl->run(req);
+    free(req);
+    if (!r) return 0;
+    if (strstr(r, "\"error\"")) {
+        printf("【插件 voice 开始工作】\n  [voice] %s\n", r);
+        char m[300] = {0};
+        json_str_field(r, "error", m, sizeof(m));
+        if (m[0]) printf("\n最终回答: %s\n", m);
+        free(r);
+        return 1;
+    }
+    printf("【插件 voice 开始工作】\n  [voice] %s\n", r);
+    char a[300] = {0};
+    json_str_field(r, "answer", a, sizeof(a));
+    if (a[0]) printf("\n最终回答: %s\n", a);
+    free(r);
+    return 1;
+}
+
+/* ---------- 五线谱图片 → MIDI 直连 ----------
+ * 任务里同时出现"五线谱/乐谱/曲谱"和"midi/bgm/生成"时直接走 music 的 omr。
+ * 不直连的话，3B 会把它当"要一段背景音乐"去调 op=bgm（风格模板随机生成），
+ * 跟用户想的"照着这张谱子弹"完全不是一回事。 */
+static int try_sheet_direct(const char *task) {
+    if (!task || !task[0]) return 0;
+    int sheet = strstr(task, "五线谱") || strstr(task, "乐谱") || strstr(task, "曲谱")
+             || strstr(task, "谱面") || strstr(task, "简谱");
+    int act = strstr(task, "midi") || strstr(task, "MIDI") || strstr(task, "bgm")
+           || strstr(task, "BGM") || strstr(task, "生成") || strstr(task, "转成")
+           || strstr(task, "识别") || strstr(task, "扒");
+    if (!(sheet && act)) return 0;
+    plugin_desc_t *pl = find_plugin("music");
+    if (!pl) return 0;
+    char *r = pl->run("{\"op\":\"omr\"}");     /* 不给 path：插件自动用最近上传的图片 */
+    if (!r) return 0;
+    if (strstr(r, "\"error\"")) {
+        printf("【插件 music 开始工作】\n  [music] %s\n", r);
+        char m[400] = {0};
+        json_str_field(r, "error", m, sizeof(m));
+        if (m[0]) printf("\n最终回答: %s\n", m);
+        free(r);
+        return 1;
+    }
+    printf("【插件 music 开始工作】\n  [music] %s\n", r);
+    char a[400] = {0};
+    json_str_field(r, "answer", a, sizeof(a));
+    if (a[0]) printf("\n最终回答: %s\n", a);
+    free(r);
+    return 1;
+}
+
 /* ---------- 表格 TOP-N 直连 ----------
  *
  * "展示表格内 播放量 top10" 让模型去做，3B 只会回一句"直接转"或者干脆
@@ -2931,6 +3050,8 @@ int main(int argc, char **argv) {
      * 文件名里的 .xlsx 之类，会把下面这些直连通道误触发）。 */
     const char *itask = intent_text(task);
     if (itask && try_math_direct(itask)) return 0;
+    if (itask && try_tts_direct(itask)) return 0;
+    if (itask && try_sheet_direct(itask)) return 0;
     if (itask && try_table_direct(itask)) return 0;
     if (itask && try_json_xlsx_direct(itask)) return 0;
     if (itask && try_music_direct(itask)) return 0;

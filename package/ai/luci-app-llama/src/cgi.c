@@ -834,6 +834,22 @@ static int cgi_have_pymod(const char *mod) {
     return 0;
 }
 
+/* dlopen 一个插件并跑一次（cgi 里多处要用） */
+static char *plug_run(const char *plugin, const char *req) {
+    char ph[256];
+    snprintf(ph, sizeof(ph), "/opt/llama/agent/plugins/%s.so", plugin);
+    void *dh = dlopen(ph, RTLD_NOW);
+    if (!dh) return NULL;
+    plugin_desc_t *(*dentry)(void) = (plugin_desc_t *(*)(void))dlsym(dh, "plugin_entry");
+    char *r = NULL;
+    if (dentry) {
+        plugin_desc_t *dp = dentry();
+        if (dp && dp->run) r = dp->run(req);
+    }
+    dlclose(dh);
+    return r;
+}
+
 static void do_upload(const char *body) {
     char name[256] = {0};
     if (jget(body, "name", name, sizeof(name)) != 0 || !name[0]) {
@@ -882,6 +898,109 @@ static void do_upload(const char *body) {
         out_json("{\"ok\":1,\"name\":\"%s\",\"file\":\"%s\",\"path\":\"%s\","
                  "\"chars\":%d,\"bytes\":%d,\"kind\":\"text\",\"builtin\":1}",
                  esc_name0, esc_path0, esc_path0, rn, rn);
+        return;
+    }
+
+    /* 音频：交给 voice 的 op=asr（sherpa-onnx sense-voice）转写，再把文字当上传内容。
+     * 这样"传一段录音 → 直接问内容"就通了，跟图片走 OCR 是同一个套路。 */
+    if (dot && (!strcasecmp(dot, ".mp3") || !strcasecmp(dot, ".wav")
+                || !strcasecmp(dot, ".m4a") || !strcasecmp(dot, ".ogg")
+                || !strcasecmp(dot, ".flac") || !strcasecmp(dot, ".aac"))) {
+        if (access("/opt/llama/agent/plugins/voice.so", R_OK) != 0
+            || access("/opt/asr/asr_sherpa", X_OK) != 0) {
+            unlink(path);
+            out_json("{\"ok\":0,\"error\":\"不支持 %s：没装语音转文字（需要 voice 插件 + /opt/asr 识别程序）\"}", dot);
+            return;
+        }
+        char dreq[900];
+        snprintf(dreq, sizeof(dreq), "{\"op\":\"asr\",\"path\":\"%s\"}", path);
+        char *dres = plug_run("voice", dreq);
+        int okau = 0, chau = 0;
+        if (dres) {
+            char derr2[128];
+            jval *dj = json_parse(dres, derr2, sizeof(derr2));
+            const char *dtxt = dj ? json_str(json_get(dj, "text")) : NULL;
+            if (dtxt && dtxt[0]) {
+                FILE *of = fopen(txtpath, "w");
+                if (of) { fwrite(dtxt, 1, strlen(dtxt), of); fclose(of); }
+                chau = (int)strlen(dtxt);
+                okau = 1;
+            }
+            if (dj) json_free(dj);
+        }
+        if (!okau) {
+            unlink(path);
+            char m2[300] = {0};
+            if (dres) {
+                jval *dj2 = json_parse(dres, (char[64]){0}, 64);
+                const char *e2 = dj2 ? json_str(json_get(dj2, "error")) : NULL;
+                if (e2) snprintf(m2, sizeof(m2), "%s", e2);
+                if (dj2) json_free(dj2);
+            }
+            free(dres);
+            out_json("{\"ok\":0,\"error\":\"语音转文字失败：%s\"}", m2[0] ? m2 : "没识别出内容");
+            return;
+        }
+        free(dres);
+        char ea[2048], en2[1024], et[2048];
+        jesc(ea, sizeof(ea), path);
+        jesc(en2, sizeof(en2), name);
+        jesc(et, sizeof(et), txtpath);
+        out_json("{\"ok\":1,\"name\":\"%s\",\"file\":\"%s\",\"path\":\"%s\","
+                 "\"chars\":%d,\"bytes\":%d,\"kind\":\"audio\",\"plugin\":\"asr\"}",
+                 en2, et, ea, chau, rn);
+        return;
+    }
+
+    /* 图片：交给 doc 的 op=ocr（板上的 RKNPU PP-OCRv4）认字，再把文字当上传内容。
+     * 纯 CPU 跑的是纯文本 3B，没有视觉模型 —— 但"把图里的字读出来"这条路
+     * 后续问答完全够用。 */
+    if (dot && (!strcasecmp(dot, ".jpg") || !strcasecmp(dot, ".jpeg")
+                || !strcasecmp(dot, ".png") || !strcasecmp(dot, ".bmp")
+                || !strcasecmp(dot, ".webp"))) {
+        if (access("/opt/llama/agent/plugins/doc.so", R_OK) != 0) {
+            unlink(path);
+            out_json("{\"ok\":0,\"error\":\"不支持 %s：没装 doc 插件（图片识别走 doc 的 ocr）\"}", dot);
+            return;
+        }
+        char dreq[900];
+        snprintf(dreq, sizeof(dreq), "{\"op\":\"ocr\",\"path\":\"%s\"}", path);
+        char *dres = plug_run("doc", dreq);      /* 见下方 helper */
+        int okimg = 0, chars2 = 0;
+        if (dres) {
+            char derr2[128];
+            jval *dj = json_parse(dres, derr2, sizeof(derr2));
+            const char *dtxt = dj ? json_str(json_get(dj, "text")) : NULL;
+            if (dtxt) {
+                FILE *of = fopen(txtpath, "w");
+                if (of) { fwrite(dtxt, 1, strlen(dtxt), of); fclose(of); }
+                chars2 = (int)strlen(dtxt);
+                okimg = 1;
+            }
+            if (dj) json_free(dj);
+        }
+        if (!okimg) {
+            unlink(path);
+            char m[400] = {0};
+            if (dres) {
+                jval *dj2 = json_parse(dres, (char[64]){0}, 64);
+                const char *e2 = dj2 ? json_str(json_get(dj2, "error")) : NULL;
+                if (e2) snprintf(m, sizeof(m), "%s", e2);
+                if (dj2) json_free(dj2);
+            }
+            free(dres);
+            out_json("{\"ok\":0,\"error\":\"图片识别失败：%s\"}",
+                     m[0] ? m : "OCR 没返回文字");
+            return;
+        }
+        free(dres);
+        char esc_path1[2048], esc_name1[1024], esc_txt1[2048];
+        jesc(esc_path1, sizeof(esc_path1), path);
+        jesc(esc_name1, sizeof(esc_name1), name);
+        jesc(esc_txt1, sizeof(esc_txt1), txtpath);
+        out_json("{\"ok\":1,\"name\":\"%s\",\"file\":\"%s\",\"path\":\"%s\","
+                 "\"chars\":%d,\"bytes\":%d,\"kind\":\"image\",\"plugin\":\"ocr\"}",
+                 esc_name1, esc_txt1, esc_path1, chars2, rn);
         return;
     }
 
@@ -1183,6 +1302,7 @@ int main(void) {
     char q[1024];
     snprintf(q, sizeof(q), "%s", qs);
     char *pjob = NULL, *penv = NULL, *pfile = NULL, *pupload = NULL, *pstat = NULL;
+    char *pplug = NULL, *preq = NULL, *pop = NULL, *pname = NULL;  /* ?plug=插件名&req=base64(JSON) 或 &op=&name= */
     char *pauto = NULL, *pargs = NULL, *pautolist = NULL, *pdaemon = NULL, *pautostop = NULL;
     char *pautostate = NULL;
     char *save = NULL;
@@ -1196,6 +1316,10 @@ int main(void) {
         else if (!strcmp(t, "env")) penv = v;
         else if (!strcmp(t, "file")) pfile = v;
         else if (!strcmp(t, "upload")) pupload = v;
+        else if (!strcmp(t, "plug")) pplug = v;
+        else if (!strcmp(t, "req")) preq = v;
+        else if (!strcmp(t, "op")) pop = v;
+        else if (!strcmp(t, "name")) pname = v;
         else if (!strcmp(t, "status")) pstat = v;
         else if (!strcmp(t, "auto")) pauto = v;
         else if (!strcmp(t, "args")) pargs = v;
@@ -1282,6 +1406,27 @@ int main(void) {
             do_model_dl(mk);
             return 0;
         }
+    }
+
+    /* 直接调插件：?plug=voice&req=<base64 的 JSON>
+     * 给页面上的"语音模型管理"这类小面板用，不必绕模型。GET/POST 都行。 */
+    if (pplug && pplug[0] && ((preq && preq[0]) || (pop && pop[0]))) {
+        char q[4096];
+        if (preq && preq[0]) {
+            int qn = b64d(preq, (unsigned char *)q, sizeof(q) - 1);
+            if (qn <= 0) { out_json("{\"error\":\"req 不是合法 base64\"}"); return 0; }
+            q[qn] = 0;
+        } else {
+            /* ?plug=voice&op=models&name=kokoro —— LuCI 的 lua 里拼 JSON 麻烦，直给字段 */
+            if (pname && pname[0])
+                snprintf(q, sizeof(q), "{\"op\":\"%s\",\"name\":\"%s\"}", pop, pname);
+            else
+                snprintf(q, sizeof(q), "{\"op\":\"%s\"}", pop);
+        }
+        char *r = plug_run(pplug, q);
+        if (r) { out_json("%s", r); free(r); }
+        else out_json("{\"error\":\"插件 %s 调用失败（没这个插件？）\"}", pplug);
+        return 0;
     }
 
     if (!strcasecmp(method, "POST")) {

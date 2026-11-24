@@ -9,6 +9,7 @@
  * 输出：{"text":"...","chars":1234} 或 {"error":"缺少 pypdf，PDF 无法解析"}
  */
 #include <stdio.h>
+#include <dirent.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <string.h>
@@ -174,6 +175,100 @@ static int is_write_op(const char *op) {
     return 0;
 }
 
+/* ---------- 图片 OCR ----------
+ * 板上 /opt/ppocr 是 RKNPU 版 PP-OCRv4（ppocr_demo 用 aarch64 的可执行文件，
+ * 依赖 /opt/glibc 的 loader 和 /opt/rknpu/librknnrt.so）。
+ * 用法：ppocr_demo <det.rknn> <rec.rknn> <image>
+ * 输出每行形如：regconize result: Hello OCRTest 12345, score=0.953433
+ *
+ * 这台板子是纯 CPU 跑 3B 文本模型，没有视觉模型 —— 图片只能"认字"，
+ * 认完的字交给模型继续问答，这条路是可行的。 */
+static char *op_ocr(const char *path) {
+    struct stat st;
+    if (!path[0] || stat(path, &st) != 0) {
+        char m[600];
+        snprintf(m, sizeof(m), "{\"error\":\"图片不存在：%s\"}", path);
+        return strdup(m);
+    }
+    const char *loader = "/opt/glibc/ld-linux-aarch64.so.1";
+    const char *demo = "/opt/ppocr/ppocr_demo";
+    if (access(demo, X_OK) != 0)
+        return strdup("{\"error\":\"板上没有 OCR 引擎（/opt/ppocr/ppocr_demo）。"
+                      "这是 RK3566 的 RKNPU 版 PP-OCRv4，缺了就没法识别图片文字。\"}");
+
+    char cmd[2048];
+    if (access(loader, X_OK) == 0)
+        snprintf(cmd, sizeof(cmd),
+                 "cd /opt/ppocr && LD_LIBRARY_PATH=/opt/glibc:/opt/rknpu:/usr/lib:/lib:/opt/ppocr "
+                 "%s ./ppocr_demo models/ppocrv4_det.rknn models/ppocrv4_rec.rknn '%s' 2>/dev/null",
+                 loader, path);
+    else
+        snprintf(cmd, sizeof(cmd),
+                 "cd /opt/ppocr && ./ppocr_demo models/ppocrv4_det.rknn models/ppocrv4_rec.rknn '%s' 2>/dev/null",
+                 path);
+
+    FILE *pp = popen(cmd, "r");
+    if (!pp) return strdup("{\"error\":\"OCR 引擎启动失败\"}");
+
+    size_t cap = 1 << 16, n = 0;
+    char *text = malloc(cap);
+    if (!text) { pclose(pp); return NULL; }
+    text[0] = 0;
+    int lines = 0;
+    char line[1024];
+    const char *KEY = "regconize result: ";
+    while (fgets(line, sizeof(line), pp)) {
+        char *k = strstr(line, KEY);
+        if (!k) continue;
+        k += strlen(KEY);
+        char *sc = strstr(k, ", score=");
+        if (!sc) continue;
+        double score = atof(sc + strlen(", score="));
+        *sc = 0;
+        /* 去掉首尾空白 */
+        while (*k == ' ') k++;
+        for (char *e = k + strlen(k); e > k && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' '); e--) e[-1] = 0;
+        if (!k[0] || score < 0.45) continue;
+        size_t L = strlen(k);
+        if (n + L + 4 >= cap) {
+            cap *= 2;
+            char *nt = realloc(text, cap);
+            if (!nt) break;
+            text = nt;
+        }
+        memcpy(text + n, k, L); n += L;
+        text[n++] = '\n';
+        lines++;
+    }
+    pclose(pp);
+    text[n] = 0;
+
+    if (!text[0]) {
+        free(text);
+        return strdup("{\"text\":\"\",\"lines\":0,\"chars\":0,"
+                      "\"answer\":\"这张图里没认出文字（可能是纯图片，也可能是字太小/太花）\"}");
+    }
+    /* JSON 转义 */
+    size_t jc = n * 2 + 512;
+    char *jt = malloc(jc), *res = malloc(jc + 512);
+    if (!jt || !res) { free(jt); free(res); free(text); return NULL; }
+    size_t jo = 0;
+    for (const char *q = text; *q && jo + 8 < jc; q++) {
+        if (*q == '"' || *q == '\\') { jt[jo++] = '\\'; jt[jo++] = *q; }
+        else if (*q == '\n') { jt[jo++] = '\\'; jt[jo++] = 'n'; }
+        else if ((unsigned char)*q < 0x20) jt[jo++] = ' ';
+        else jt[jo++] = *q;
+    }
+    jt[jo] = 0;
+    snprintf(res, jc + 512,
+             "{\"text\":\"%s\",\"lines\":%d,\"chars\":%d,\"engine\":\"PP-OCRv4 @ RKNPU\","
+             "\"answer\":\"认出 %d 行文字，共 %d 字\"}",
+             jt, lines, (int)n, lines, (int)n);
+    free(jt);
+    free(text);
+    return res;
+}
+
 static char *run(const char *json_in) {
     char op[32] = {0};
     char path[512] = {0};
@@ -255,6 +350,37 @@ static char *run(const char *json_in) {
      * 数据走 stdin。板上不需要任何 .py 文件，只要 python3 + 相应用库。 */
     if (op[0] && is_write_op(op)) {
         return run_py(op, json_in);
+    }
+
+    /* 图片：交给 RKNPU 上的 PP-OCRv4 认字 */
+    if (!strcmp(op, "ocr") || !strcmp(op, "image") || !strcmp(op, "img2txt")) {
+        if (!path[0]) {
+            /* 没给 path 就用最近上传的图片 */
+            DIR *d = opendir("/tmp/llama_agent/uploads");
+            if (d) {
+                struct dirent *e;
+                struct stat st2;
+                time_t best = 0;
+                char cand[900] = {0};
+                while ((e = readdir(d)) != NULL) {
+                    const char *x = strrchr(e->d_name, '.');
+                    if (!x) continue;
+                    if (strcasecmp(x, ".jpg") && strcasecmp(x, ".jpeg") && strcasecmp(x, ".png")
+                        && strcasecmp(x, ".bmp") && strcasecmp(x, ".webp")) continue;
+                    char fp[900];
+                    snprintf(fp, sizeof(fp), "/tmp/llama_agent/uploads/%s", e->d_name);
+                    if (stat(fp, &st2) == 0 && st2.st_mtime >= best) {
+                        best = st2.st_mtime;
+                        snprintf(cand, sizeof(cand), "%s", fp);
+                    }
+                }
+                closedir(d);
+                if (cand[0]) snprintf(path, sizeof(path), "%s", cand);
+            }
+        }
+        if (!path[0])
+            return strdup("{\"error\":\"没有图片可识别：先上传一张图，或给 path=图片路径\"}");
+        return op_ocr(path);
     }
 
     if (!path[0])

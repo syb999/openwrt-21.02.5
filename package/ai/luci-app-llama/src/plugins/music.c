@@ -20,6 +20,8 @@
 #include <math.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <time.h>
 #include "plugin.h"
 
 #define SR        32000
@@ -970,6 +972,187 @@ static char *op_bgm(const char *json) {
 }
 
 /* ---------------- 入口 ---------------- */
+#include "music_sheet.inc"
+
+/* 五线谱图片 → MIDI。谱面识别见 music_sheet.inc。 */
+static char *op_sheet(const char *json) {
+    char p[512] = {0}, out[512] = {0};
+    jget(json, "path", p, sizeof(p));
+    jget(json, "out", out, sizeof(out));
+    char path[768] = {0};
+    if (p[0]) {
+        resolve_path(p, path, sizeof(path));
+    } else {
+        /* 没给 path：用 uploads 里最新的图片 */
+        DIR *d = opendir(WORK_DIR "/uploads");
+        if (d) {
+            struct dirent *e;
+            struct stat st2;
+            time_t best = 0;
+            while ((e = readdir(d)) != NULL) {
+                const char *x = strrchr(e->d_name, '.');
+                if (!x) continue;
+                if (strcasecmp(x, ".jpg") && strcasecmp(x, ".jpeg") && strcasecmp(x, ".png")
+                    && strcasecmp(x, ".bmp") && strcasecmp(x, ".webp")) continue;
+                char fp[900];
+                snprintf(fp, sizeof(fp), WORK_DIR "/uploads/%s", e->d_name);
+                if (stat(fp, &st2) == 0 && st2.st_mtime >= best) {
+                    best = st2.st_mtime;
+                    snprintf(path, sizeof(path), "%s", fp);
+                }
+            }
+            closedir(d);
+        }
+    }
+    if (!path[0]) return jerr("没有谱面图片：先上传一张五线谱，或给 path=图片路径");
+
+    double tempo = jget_num(json, "tempo", 96);
+    if (tempo < 40 || tempo > 240) tempo = 96;
+
+    note_t *notes = malloc(sizeof(note_t) * MAX_NOTE);
+    int *xs = malloc(sizeof(int) * MAX_NOTE);
+    int *uis = malloc(sizeof(int) * MAX_NOTE);
+    if (!notes || !xs || !uis) return NULL;
+    int ns = 0, nh = 0;
+    char why[400] = {0};
+    mkdir("/tmp/llama_agent/gen", 0777);
+    snprintf(g_annot_path, sizeof(g_annot_path),
+             "/tmp/llama_agent/gen/omr_%ld.bmp", (long)time(NULL));
+    int nn = sheet_to_notes(path, notes, xs, uis, MAX_NOTE, &ns, &nh, why, sizeof(why));
+    if (!nn) {
+        free(notes); free(xs); free(uis);
+        return jerr(why[0] ? why : "没认出谱面");
+    }
+
+    /* 按 x 排序（三列一起搬），保证从左到右 */
+    for (int i = 1; i < nn; i++) {
+        note_t kn = notes[i]; int kx = xs[i], ku = uis[i];
+        int j = i - 1;
+        while (j >= 0 && xs[j] > kx) { notes[j + 1] = notes[j]; xs[j + 1] = xs[j]; uis[j + 1] = uis[j]; j--; }
+        notes[j + 1] = kn; xs[j + 1] = kx; uis[j + 1] = ku;
+    }
+
+    /* 时间轴：按识别出的时值累加（1/16 为单位）。四分音符=4u=1 拍 */
+    double beat = 60.0 / tempo, t = 0;
+    int hist[17] = {0};
+    for (int i = 0; i < nn; i++) {
+        int u = uis[i];
+        if (u < 1) u = 4;
+        if (u > 16) u = 16;
+        hist[u]++;
+        double beats = u / 4.0;
+        notes[i].start = t;
+        notes[i].dur = beats * beat;
+        notes[i].ch = 0;
+        t += beats * beat;
+    }
+    double total_sec = t;
+
+    /* ---------- 节拍处理 ----------
+     * 只按识别出来的时值排时间轴有两个毛病：
+     *   ① 时值判错（比如八分判成四分）会让整段节奏塌掉；
+     *   ② 每个音各自留 5% 空隙 → 听着"断断续续"、没有连贯的拍子。
+     * 这里做三件事：onset 对齐到八分网格、时值填满到下一个音（连奏）、
+     * 再叠一层每拍一下的节拍声（可关：metronome=0）。 */
+    double grid = beat / 2.0;                        /* 八分音符网格 */
+    int metro = (int)jget_num(json, "metronome", 1);
+    int nn_melody = nn;                     /* 报告用：不含节拍器 */
+    for (int i = 0; i < nn; i++) {
+        double g = (double)(long)(notes[i].start / grid + 0.5) * grid;
+        notes[i].start = g;
+    }
+    for (int i = 0; i < nn; i++) {
+        double end = (i + 1 < nn) ? notes[i + 1].start : notes[i].start + grid;
+        if (end <= notes[i].start) end = notes[i].start + grid;
+        notes[i].dur = (end - notes[i].start) * 0.98;   /* 连奏：填满，只留 2% 断点 */
+        if (notes[i].dur < grid * 0.9) notes[i].dur = grid * 0.9;
+    }
+    if (nn > 0) total_sec = notes[nn - 1].start + notes[nn - 1].dur;
+
+    if (metro) {
+        /* 每拍一个短促高音当节拍器（96 BPM 时 1 拍 = 0.625 秒），
+         * 第一拍加重（更响更高），这样"拍子"是听得见的 */
+        int nb2 = (int)(total_sec / beat) + 1;
+        int cap2 = nn + nb2;
+        int k = nn;
+        for (int b2 = 0; b2 < nb2 && k < MAX_NOTE; b2++) {
+            notes[k].pitch = (b2 % 4 == 0) ? 88 : 81;
+            notes[k].start = b2 * beat;
+            notes[k].dur = 0.045;
+            notes[k].ch = 9;                       /* 单独一轨，别混进旋律 */
+            k++;
+        }
+        nn = k;
+    }
+
+    /* 时值分布写进日志，方便核对（1u=十六分 2=八分 4=四分 8=二分 16=全） */
+    fprintf(stderr, "  [omr] 时值分布 16分=%d 8分=%d 4分=%d 2分=%d 全=%d 总长=%.1fs\n",
+            hist[1], hist[2], hist[4], hist[8], hist[16], total_sec);
+
+    /* 音域兜底：整段挪到 C4–C6 之间，免得全是加线外的怪音 */
+    int lo = 127, hi = 0;
+    for (int i = 0; i < nn; i++) {
+        if (notes[i].pitch < lo) lo = notes[i].pitch;
+        if (notes[i].pitch > hi) hi = notes[i].pitch;
+    }
+    /* 单谱表还跨两个八度以上 → 谱号/加线判断不可靠，拒绝。
+     * 多谱表（钢琴大谱表、钢琴+小提琴）本来就跨三四个八度，不能一刀切。 */
+    if (ns == 1 && hi - lo > 24) {
+        free(notes);
+        return jerr("认出的音域过宽（超过两个八度），多半不是单声部谱面，先不生成，避免出一段乱旋律");
+    }
+
+    /* 1) 写 .mid —— 复用 op_midi 的写入器（把音符序列打包成它的入参） */
+    char midi_path[768] = {0};
+    if (out[0]) {
+        resolve_path(out, midi_path, sizeof(midi_path));
+    } else {
+        mkdir("/tmp/llama_agent/gen", 0777);
+        snprintf(midi_path, sizeof(midi_path), WORK_DIR "/gen/sheet_%ld.mid", (long)time(NULL));
+    }
+    if (!strstr(midi_path, ".mid")) strncat(midi_path, ".mid", sizeof(midi_path) - strlen(midi_path) - 1);
+
+    size_t cap = 4096 + (size_t)nn * 48;
+    char *mj = malloc(cap);
+    char *mr = NULL;
+    if (mj) {
+        size_t o = (size_t)snprintf(mj, cap,
+            "{\"op\":\"midi\",\"tempo\":%d,\"path\":\"%s\",\"notes\":[", (int)tempo, midi_path);
+        for (int i = 0; i < nn && o + 60 < cap; i++) {
+            double beats = notes[i].dur / beat;
+            if (beats < 0.25) beats = 0.25;
+            o += (size_t)snprintf(mj + o, cap - o, "%s{\"pitch\":%d,\"dur\":%.2f}",
+                                  i ? "," : "", notes[i].pitch, beats);
+        }
+        snprintf(mj + o, cap - o, "]}");
+        mr = op_midi(mj);
+        free(mj);
+    }
+
+    /* 2) 顺手合成一段 MP3 试听（不影响 .mid 交付） */
+    char wavbase[900];
+    snprintf(wavbase, sizeof(wavbase), "%s", midi_path);
+    char *dotm = strrchr(wavbase, '.');
+    if (dotm) *dotm = 0;
+    char *rr = do_render(notes, nn, wavbase, NULL, tempo);
+    free(rr);
+
+    char mp3[900] = {0};
+    snprintf(mp3, sizeof(mp3), "%s.mp3", wavbase);
+    free(notes); free(xs); free(uis);
+    free(mr);
+
+    char *res = malloc(1400);
+    if (!res) return NULL;
+    snprintf(res, 1400,
+        "{\"ok\":1,\"path\":\"%s\",\"file\":\"%s\",\"mp3\":\"%s\",\"image\":\"%s\","
+        "\"notes\":%d,\"staves\":%d,"
+        "\"engine\":\"内置 OMR（PP 谱线投影 + 符头厚度）\","
+        "\"answer\":\"从五线谱认出 %d 个音符（%d 组谱表），已生成 MIDI：%s\"}",
+        midi_path, mp3, mp3, g_annot_path, nn_melody, ns, nn_melody, ns, midi_path);
+    return res;
+}
+
 static char *run(const char *json_in) {
     char op[32] = {0};
     jget(json_in, "op", op, sizeof(op));
@@ -978,6 +1161,9 @@ static char *run(const char *json_in) {
             snprintf(op, sizeof(op), "midi");
         else if (strstr(json_in, "\"path\"") && strstr(json_in, ".mid"))
             snprintf(op, sizeof(op), "import");
+        else if (strstr(json_in, "五线谱") || strstr(json_in, "乐谱") || strstr(json_in, "曲谱")
+                 || strstr(json_in, ".jpg") || strstr(json_in, ".png"))
+            snprintf(op, sizeof(op), "omr");
         else
             snprintf(op, sizeof(op), "render");
     }
@@ -986,8 +1172,12 @@ static char *run(const char *json_in) {
     if (!strcmp(op, "render") || !strcmp(op, "play")) return op_render(json_in);
     if (!strcmp(op, "import") || !strcmp(op, "wav"))  return op_import(json_in);
     if (!strcmp(op, "bgm") || !strcmp(op, "music"))   return op_bgm(json_in);
+    /* 注意：op 名字不能叫 sheet —— video 插件的 sheet 是"缩略图阵列"，
+     * op_to_plugin 会先把它抢走。用 omr / sheetmusic。 */
+    if (!strcmp(op, "omr") || !strcmp(op, "sheetmusic") || !strcmp(op, "五线谱"))
+        return op_sheet(json_in);
 
-    return jerr("不支持的 op：midi / render / import");
+    return jerr("不支持的 op：midi / render / import / bgm / omr（五线谱图片→MIDI）");
 }
 
 static plugin_desc_t desc = {
@@ -995,7 +1185,7 @@ static plugin_desc_t desc = {
     "music",
     "音乐（纯 C）：**要背景音乐/BGM 一律用 op=bgm 加 style**，插件按风格模板确定性生成"
     "（比你逐个音符编快得多，也不会跑调）；style 可选 欢快/舒缓/悲伤/紧张/神秘/电子/game/march/chinese，"
-    "不给就随机。其它：midi=手写音符出 MIDI，render=合成 MP3，import=读 MIDI 转 MP3",
+    "不给就随机。其它：omr=**五线谱图片→MIDI**（高音谱号单声部印刷体），midi=手写音符出 MIDI，render=合成 MP3，import=读 MIDI 转 MP3",
     "{\"op\":\"midi\",\"path\":\"/tmp/llama_agent/a.mid\",\"tempo\":160,"
     "\"notes\":[{\"pitch\":72,\"dur\":1},{\"pitch\":74,\"dur\":1}]}"
     "  或分轨 {\"op\":\"midi\",\"melody\":[...],\"bass\":[...],\"drums\":[...]}"
