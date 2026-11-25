@@ -1022,6 +1022,7 @@ static const route_t ROUTES[] = {
     {"batch", "分批|大量|很多(页|章|节)|长文档|多章节|整套"},
     {"sysmon","监控|巡检|告警|阈值|采样"},
     {"voice", "语音|朗读|念出来|读出来|配音|播报|TTS|tts|转语音|文字转语音"},
+    {"image", "修复图片|图片修复|放大图片|图片放大|变清晰|模糊照片|老照片|清晰度|超分图片"},
     /* 抓包类：必须单独一项，否则这句话在 3B 眼里就是个知识问答
      * （实测直接答"你可以用 Wireshark"）。命中后只提供 netcap 一个插件，
      * 模型没有别的可挑，选对的概率高得多。 */
@@ -1143,6 +1144,9 @@ static const char *op_to_plugin(const char *js, const char *op) {
         {"parse","curl"},        /* curl 插件的 op 名是 parse（吃 cURL 原文） */
         {"tts","voice"}, {"speak","voice"}, {"say","voice"}, {"voice","voice"},
         {"asr","voice"}, {"stt","voice"}, {"transcribe","voice"},   /* 语音转文字 */
+        {"fix","image"}, {"upscale","image"}, {"enhance","image"},  /* 图片修复/放大 */
+        {"whiten","image"}, {"scan","image"}, {"deshadow","image"}, /* 去阴影/背景取白 */
+        {"moire","image"}, {"screen","image"},                      /* 去摩尔纹（拍屏幕） */
         {"snapshot","sysmon"},
         {"start","sysmon-auto"}, {"stop","sysmon-auto"}, {"status","sysmon-auto"},
         {NULL, NULL}

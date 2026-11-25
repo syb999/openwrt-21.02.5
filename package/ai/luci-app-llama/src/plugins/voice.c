@@ -145,6 +145,7 @@ static unsigned long hash_str(const char *s) {
 
 static void trim(char *s);        /* 定义在后面，切段函数要用 */
 static void tidy_spaces(char *t);
+static void expand_symbols(char *t, size_t cap);
 static void sh_quote(const char *src, char *dst, size_t cap);   /* 同上 */
 
 
@@ -467,6 +468,71 @@ static char *run_asr(const char *json_in) {
     return o;
 }
 
+
+/* ---------- 符号 → 中文（三个 TTS 模型都是词典/音素表驱动，
+ * 遇到 % ℃ $ 这类符号直接丢掉，所以"30%"会念成"30"）----------
+ * 处理顺序有讲究：百分号要插到数字**前面**（30% → 百分之30），
+ * 再由模型自带的 number.fst 把 30 念成"三十"。 */
+static void expand_symbols(char *t, size_t cap) {
+    static char out[MAX_TEXT * 8 + 64];
+    size_t o = 0;
+    for (size_t i = 0; t[i] && o + 40 < sizeof(out); ) {
+        unsigned char c = (unsigned char)t[i];
+        /* 百分号：全角 ％ = EF BC 85，半角 % */
+        int is_pct = (c == '%') ||
+                     (c == 0xEF && (unsigned char)t[i + 1] == 0xBC && (unsigned char)t[i + 2] == 0x85);
+        if (is_pct) {
+            /* 往回找数字串的起点：把"百分之"插到数字前面 */
+            size_t back = o;
+            while (back > 0) {
+                unsigned char b = (unsigned char)out[back - 1];
+                if ((b >= '0' && b <= '9') || b == '.') back--;
+                else break;
+            }
+            if (back < o) {
+                size_t numlen = o - back;
+                memmove(out + back + 9, out + back, numlen);   /* "百分之" 是 9 字节 */
+                memcpy(out + back, "百分之", 9);
+                o += 9;
+            } else {
+                memcpy(out + o, "百分之", 9); o += 9;
+            }
+            i += (c == '%') ? 1 : 3;
+            continue;
+        }
+        /* 一对一的符号替换 */
+        const char *rep = NULL;
+        size_t adv = 1;
+        if (c == 0xE2 && (unsigned char)t[i+1] == 0x84 && (unsigned char)t[i+2] == 0x83) {   /* ℃ */
+            rep = "摄氏度"; adv = 3;
+        } else if (c == 0xC2 && (unsigned char)t[i+1] == 0xB0) {                              /* ° */
+            rep = "度"; adv = 2;
+        } else if (c == 0xEF && (unsigned char)t[i+1] == 0xBF && (unsigned char)t[i+2] == 0xA5) { /* ￥ */
+            rep = "元"; adv = 3;
+        } else if (c == '$') { rep = "美元"; }
+        else if (c == '&') { rep = "和"; }
+        else if (c == '+') { rep = "加"; }
+        else if (c == '=') { rep = "等于"; }
+        else if (c == '<') { rep = "小于"; }
+        else if (c == '>') { rep = "大于"; }
+        else if (c == '~') { rep = "到"; }
+        else if (c == '*') { rep = "乘"; }
+        else if (c == '/') { rep = "斜杠"; }
+        else if (c == '\\') { rep = "反斜杠"; }
+        else if (c == '@') { rep = "艾特"; }
+        else if (c == '#') { rep = "井号"; }
+        if (rep) {
+            size_t L = strlen(rep);
+            memcpy(out + o, rep, L); o += L;
+            i += adv;
+            continue;
+        }
+        out[o++] = t[i++];
+    }
+    out[o] = 0;
+    snprintf(t, cap, "%s", out);
+}
+
 /* ---------- 选模型 ----------
  * /opt/tts-rk3566/matcha        纯中文 matcha-zh-baker（22MB，中文最自然）
  * /opt/tts-rk3566/zh-en-model   中英双语 vits-melo-tts（lexicon-us-en + lexicon-zh），
@@ -564,6 +630,7 @@ static char *run_tts(const char *json_in) {
     /* 缓存键和送去合成的文本都用"整理过空格"的版本 —— 否则会命中旧缓存，
      * 听到的还是带空格那版怪音（这就是"修了但还是怪"的原因）。 */
     tidy_spaces(spoken);
+    expand_symbols(spoken, sizeof(spoken));   /* 30% → 百分之30（再由 number.fst 念成三十） */
 
     const char *mdir = use_kokoro ? "/opt/tts-rk3566/kokoro"
                      : (use_biling ? "/opt/tts-rk3566/zh-en-model" : "/opt/tts-rk3566/matcha");

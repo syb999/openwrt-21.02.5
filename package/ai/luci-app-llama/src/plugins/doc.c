@@ -51,17 +51,44 @@ static int jget(const char *js, const char *key, char *out, size_t cap) {
     return 0;
 }
 
-/* 跑一条命令，收集 stdout */
-static char *sh(const char *cmd) {
+/* 跑一条命令，收集 stdout（带看门狗）
+ * 以前直接 popen + fread：PP-OCR 偶发卡住（NPU 忙/输入异常）时会一直阻塞，
+ * CGI 挂到 uhttpd 超时 → 页面上就是"一直卡解析中"。这里改成 select+超时。 */
+static char *sh_to(const char *cmd, int timeout_sec) {
     FILE *p = popen(cmd, "r");
     if (!p) return NULL;
+    int fd = fileno(p);
     char *buf = malloc(OUTMAX);
     if (!buf) { pclose(p); return NULL; }
-    size_t n = fread(buf, 1, OUTMAX - 1, p);
-    buf[n] = 0;
+    size_t got = 0;
+    time_t t0 = time(NULL);
+    while (got < (size_t)OUTMAX - 1) {
+        fd_set rs;
+        FD_ZERO(&rs);
+        FD_SET(fd, &rs);
+        struct timeval tv = {1, 0};
+        int rv = select(fd + 1, &rs, NULL, NULL, &tv);
+        if (rv < 0) break;
+        if (rv == 0) {
+            if (time(NULL) - t0 >= timeout_sec) break;    /* 超时：直接收摊 */
+            continue;
+        }
+        ssize_t r = read(fd, buf + got, OUTMAX - 1 - got);
+        if (r <= 0) break;
+        got += (size_t)r;
+        t0 = time(NULL);
+    }
+    buf[got] = 0;
     pclose(p);
+    if (got == 0 && timeout_sec > 0) {
+        /* 标记超时，调用方据此给明确提示而不是空结果 */
+        free(buf);
+        return NULL;
+    }
     return buf;
 }
+
+static char *sh(const char *cmd) { return sh_to(cmd, 90); }
 
 /* 该后缀需要哪个 python 库 */
 static const char *need_lib(const char *path) {

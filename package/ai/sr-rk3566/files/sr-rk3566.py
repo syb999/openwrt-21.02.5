@@ -47,6 +47,25 @@ def progress(sec, done=False):
 # 每块只保留中心区域，边缘交给相邻块的中心来补 → 接缝两边都是"好像素"。
 # M 越大越安全但块数越多；16 对 288x216 的块够用。SR_MARGIN=24 可再稳一点。
 TILE_MARGIN = int(os.environ.get('SR_MARGIN', '32'))
+FEATHER = int(os.environ.get('SR_FEATHER', '16'))      # 重叠区羽化宽度（源像素）
+
+def _feather(w, h, ramp):
+    """块内权重：中心 1.0，靠边缘 ramp 像素内按余弦降到 0（只对"内部边"羽化）。
+    拼接时按权重加权平均 —— 硬切会在重叠区留下可见分割线。"""
+    import numpy as _np
+    wx = _np.ones(w, _np.float32)
+    wy = _np.ones(h, _np.float32)
+    r = min(ramp, max(0, (w - 1) // 2), max(0, (h - 1) // 2))
+    if r > 1:
+        t = (_np.arange(r, dtype=_np.float32) + 0.5) / r
+        ramp_v = 0.5 - 0.5 * _np.cos(_np.pi * t)      # 0 → 1 余弦过渡
+        wx[:r] = ramp_v
+        wx[w - r:] = ramp_v[::-1]
+        wy[:r] = ramp_v
+        wy[h - r:] = ramp_v[::-1]
+    return (wy[:, None] * wx[None, :])[:, :, None]
+
+
 
 MODELS = [
     # 大块模型（优先）：源片 ≤ 模型尺寸时只有 1 块 —— 零接缝、实推面积最小最快。
@@ -58,6 +77,27 @@ MODELS = [
     ('4:3', 4.0 / 3.0, os.path.join(DIR, 'av3_res.rknn'), 288, 216),
     ('16:9', 16.0 / 9.0, os.path.join(DIR, 'av3_320x180.rknn'), 320, 180),
 ]
+
+# Real-ESRGAN general-x4v3（实拍/压缩片；animevideov3 是动画向的，对实拍过锐+出纹理）
+# 也用 4 倍模型，外层同样 2x2 平均成 2 倍输出，和 av3 链路一致。
+GEN_MODELS = [
+    # 块尺寸和宽高比必须对得上：640x360 是 16:9，384x384 是 1:1，192x192 只能兜底。
+    # （以前把 640x360 标成 4:3，4:3 片源也会选它 → 补边一半、推理全浪费）
+    ('16:9', 16.0 / 9.0, os.path.join(DIR, 'realesr-general-x4v3_640x360.rknn'), 640, 360),
+    ('4:3', 4.0 / 3.0, os.path.join(DIR, 'realesr-general-x4v3_384x384.rknn'), 384, 384),
+    ('1:1', 1.0, os.path.join(DIR, 'realesr-general-x4v3_192x192.rknn'), 192, 192),
+    ('16:9', 16.0 / 9.0, os.path.join(DIR, 'realesr-general-x4v3_192x192.rknn'), 192, 192),
+    ('4:3', 4.0 / 3.0, os.path.join(DIR, 'realesr-general-x4v3_192x192.rknn'), 192, 192),
+]
+
+_SR_MODEL = os.environ.get('SR_MODEL', '').lower()
+if _SR_MODEL in ('general', 'gen', 'realesr'):
+    _g = [m for m in GEN_MODELS if os.path.exists(m[2])]
+    if _g:
+        MODELS = _g
+        sys.stderr.write('模型：Real-ESRGAN general-x4v3（实拍向）\n')
+    else:
+        sys.stderr.write('SR_MODEL=general 但 /opt/sr-rk3566 里没有 general 的 rknn，退回 animevideov3\n')
 
 
 def die(msg):
@@ -99,6 +139,20 @@ def probe(path):
     return w, h, fps, dar
 
 
+
+def _pick_encoder():
+    """挑视频编码器：老固件有 h264_rkmpp（硬件），新固件只有 libx264 / h264_v4l2m2m。
+    以前写死 h264_rkmpp，刷机后直接报 Unknown encoder → BrokenPipeError。"""
+    try:
+        out = subprocess.run([FF, '-hide_banner', '-encoders'],
+                             capture_output=True, text=True).stdout
+    except Exception:
+        out = ''
+    for e in ('h264_rkmpp', 'h264_v4l2m2m', 'libx264'):
+        if (' %s ' % e) in out or ('%s ' % e) in out:
+            return e
+    return 'libx264'
+
 def pick_model(w, h):
     ar = w / float(h)
     best = None
@@ -128,7 +182,34 @@ def main():
     sys.stderr.write('源 %dx%d %.3ffps DAR=%.3f → 模型 %s（块 %dx%d，%dx%d=%d 块，补齐 %.1f%%）\n'
                      % (w, h, fps, dar, mname, tw, th, nx, ny, nx * ny, waste * 100))
 
-    tmp = tempfile.mkdtemp(prefix='sr_', dir='/opt/llama/out' if os.path.isdir('/opt/llama/out') else '/tmp')
+    # 中间文件（整段未压缩 RGB）会很大：1080p 2x 输出约 25MB/帧，十分钟就 2GB+。
+    # /tmp 是 tmpfs（内存盘，只有 1.9G），长片子必然 ENOSPC —— 所以按剩余空间挑目录。
+    def _pick_tmpdir(need_bytes):
+        cands = []
+        env = os.environ.get('SR_TMP')
+        if env:
+            cands.append(env)
+        cands += ['/opt/llama/out', '/opt/sr-tmp', '/tmp']
+        best = None
+        for d in cands:
+            try:
+                if not os.path.isdir(d):
+                    os.makedirs(d, exist_ok=True)
+                st = os.statvfs(d)
+                free = st.f_bavail * st.f_frsize
+            except Exception:
+                continue
+            if free >= need_bytes:
+                return d
+            if best is None or free > best[1]:
+                best = (d, free)
+        return best[0] if best else '/tmp'
+
+    # 需求按 1GB 估（更准的算法要在解码后才知道帧数，而解码本身就好几分钟）
+    _need = int(1024 * 1024 * 1024)
+    _tmpdir = _pick_tmpdir(_need)
+    tmp = tempfile.mkdtemp(prefix='sr_', dir=_tmpdir)
+    sys.stderr.write('临时目录：%s（中间文件会放在这里，别用 tmpfs）\n' % tmp)
     raw_in = os.path.join(tmp, 'in.rgb')
     raw_out = os.path.join(tmp, 'out.rgb')
     env = dict(os.environ, LD_LIBRARY_PATH=LIBPATH)
@@ -213,6 +294,11 @@ def main():
             return o4[yi][:, xi].astype(np.float32)
 
         fin = open(raw_in, 'rb')
+        # 输出不走中间文件：处理完一帧就塞进 ffmpeg 的 stdin，
+        # 省掉"整段未压缩 RGB 落盘"（1080p 2x 约 25MB/帧，十分钟要 25GB）。
+        # 注意：不要改成"管道直连 ffmpeg" —— 实测 mpp 编码器会和 RKNN 抢
+        # DMA/NPU 内存，报 "failed to malloc npu memory, size: 190MB"。
+        # 所以仍然先写文件，最后再编码；空间问题由上面的 tmpdir 选择解决。
         fout = open(raw_out, 'wb')
         n = 0
         while True:
@@ -221,6 +307,7 @@ def main():
                 break
             img = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
             out = np.zeros((th_out, tw_out, 3), np.float32)
+            wsum = np.zeros((th_out, tw_out, 1), np.float32)   # 羽化加权累加
             if single:
                 tile = fit_tile(img)
                 np.ascontiguousarray(tile.astype(np.uint8)).tofile(os.path.join(tmp, 't.rgb'))
@@ -259,6 +346,10 @@ def main():
                     cy1 = min(th_, th - M) if y0 + th < h else th_
                     if cx1 <= cx0 or cy1 <= cy0:
                         continue
+                    # 羽化加权：块在"内部边"渐变到 0，重叠区两个块平滑融合。
+                    # 画面最外沿（x0==0 / 右/上/下贴边）不羽化，否则边缘会变暗。
+                    # 权重按"输出分辨率"建（输出是输入的 2 倍），否则形状对不上
+                    # 原版：每块只写自己的中心区，硬切覆盖（改坏了，已回退）
                     out[(y0 + cy0) * 2:(y0 + cy1) * 2,
                         (x0 + cx0) * 2:(x0 + cx1) * 2] = \
                         half[cy0 * 2:cy1 * 2, cx0 * 2:cx1 * 2] + 0.5
@@ -269,20 +360,21 @@ def main():
                 sys.stderr.write('  %d frames\n' % n)
         fin.close()
         fout.close()
-        if n == 0:
-            die('没读到帧')
-        progress(n / fps)
-
         sys.stderr.write('编码...\n')
-        # 音频从原片流复制；-aspect 必须写，否则 SAR 为空、播放器按 16:9 拉伸
+        _ENC = _pick_encoder()
+        _PF = 'nv12' if ('rkmpp' in _ENC or 'v4l2m2m' in _ENC) else 'yuv420p'
         subprocess.run([FF, '-y', '-v', 'error',
                         '-f', 'rawvideo', '-pix_fmt', 'rgb24',
                         '-s', '%dx%d' % (tw_out, th_out), '-r', '%.6f' % fps,
                         '-i', raw_out, '-i', src,
                         '-map', '0:v:0', '-map', '1:a?',
                         '-aspect', ('%d:%d' % (round(dar * 1000), 1000)),
-                        '-c:v', 'h264_rkmpp', '-pix_fmt', 'nv12', '-b:v', '20M',
+                        '-c:v', _ENC, '-pix_fmt', _PF, '-b:v', '20M',
                         '-c:a', 'copy', '-shortest', dst], check=True)
+        if n == 0:
+            die('没读到帧')
+        progress(n / fps)
+
     finally:
         # 失败时不要写 progress=end —— 那会让插件把崩溃当成"完成 100%"。
         # 正常结束的 end 在编码之后单独写。

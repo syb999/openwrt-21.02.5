@@ -1,0 +1,18 @@
+#!/bin/sh
+# imgup <输入图片> <输出图片> [倍数 2|4] [av3|general]
+# 用 RKNPU 跑 Real-ESRGAN：解图 → 分块超分 → 编码回图片
+set -e
+IN="$1"; OUT="$2"; SCALE="${3:-4}"; WHICH="${4:-general}"
+[ -f "$IN" ] || { echo "用法: imgup 输入 输出 [2|4] [general]"; exit 2; }
+MODEL=/opt/realesrgan/models/realesr-general-x4v3_640x360.rknn
+[ -f "$MODEL" ] || MODEL=$(ls /opt/realesrgan/models/*.rknn | head -1)
+W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$IN")
+H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$IN")
+T=/tmp/imgup_$$; mkdir -p "$T"
+ffmpeg -v error -y -i "$IN" -pix_fmt rgb24 "$T/in.rgb"
+env LD_LIBRARY_PATH=/opt/glibc:/opt/rknpu /opt/glibc/ld-linux-aarch64.so.1 \
+    /opt/realesrgan/sr_img "$MODEL" "$T/in.rgb" "$W" "$H" "$T/out.rgb" "$SCALE" 32
+OW=$((W*SCALE)); OH=$((H*SCALE))
+ffmpeg -v error -y -f rawvideo -pix_fmt rgb24 -s ${OW}x${OH} -i "$T/out.rgb" "$OUT"
+rm -rf "$T"
+echo "完成: $IN ${W}x${H} -> $OUT ${OW}x${OH}"

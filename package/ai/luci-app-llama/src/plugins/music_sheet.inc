@@ -232,6 +232,67 @@ static int cc_label(unsigned char *b, int w, int h, cc_t *out, int maxo) {
     return nb;
 }
 
+
+/* ---------- 模型检测（YOLOv8n → RKNN，RK3566 NPU）----------
+ * 用训练好的符号检测器取代手写连通块：符头位置/实心空心准得多。
+ * 外部程序 /opt/omr/omr_detect 输出 "cls score cx cy w h"（原图坐标），
+ * cls: 0 实心符头 1 空心符头 2 横桁 3 休止 4 谱号。
+ * 返回 1 表示用上了模型，0 表示没有（调用方退回手写检测）。 */
+typedef struct { float cx, cy, w, h, score; } mbox_t;
+
+static int omr_model_ready(void) {
+    return access("/opt/omr/omr_detect", X_OK) == 0 &&
+           access("/opt/omr/model/best.rknn", R_OK) == 0;
+}
+
+/* 跑一次检测，把各类框读进数组 */
+static int omr_run_model(const char *img, int scale, mbox_t *heads, int maxh,
+                         int *nh, mbox_t *beams, int *nb, mbox_t *clefs, int *nc,
+                         int *outw, int *outh) {
+    *nh = *nb = *nc = 0;
+    char raw[600], cmd[1600];
+    snprintf(raw, sizeof(raw), "/tmp/llama_agent/.omr_%ld.rgb", (long)getpid());
+    if (scale > 1)
+        snprintf(cmd, sizeof(cmd),
+                 "ffmpeg -v error -y -i '%s' -vf scale=iw*%d:ih*%d:flags=lanczos "
+                 "-pix_fmt rgb24 '%s' 2>/dev/null", img, scale, scale, raw);
+    else
+        snprintf(cmd, sizeof(cmd),
+                 "ffmpeg -v error -y -i '%s' -pix_fmt rgb24 '%s' 2>/dev/null", img, raw);
+    if (system(cmd) != 0) { unlink(raw); return 0; }
+
+    /* 尺寸：从文件大小反推不了宽高，单独问一次 ffprobe */
+    char pcmd[1400];
+    snprintf(pcmd, sizeof(pcmd),
+             "ffprobe -v error -select_streams v:0 -show_entries stream=width,height "
+             "-of csv=p=0:s=x '%s' 2>/dev/null", img);
+    int w = 0, h = 0;
+    FILE *pf = popen(pcmd, "r");
+    if (pf) { if (fscanf(pf, "%dx%d", &w, &h) != 2) { w = h = 0; } pclose(pf); }
+    if (w <= 0) { unlink(raw); return 0; }
+    w *= (scale > 0 ? scale : 1);
+    h *= (scale > 0 ? scale : 1);
+
+    char rcmd[1600];
+    snprintf(rcmd, sizeof(rcmd),
+             "env LD_LIBRARY_PATH=/opt/glibc:/opt/rknpu /opt/glibc/ld-linux-aarch64.so.1 "
+             "/opt/omr/omr_detect /opt/omr/model/best.rknn '%s' %d %d 0.35 2>/dev/null",
+             raw, w, h);
+    FILE *pp = popen(rcmd, "r");
+    if (!pp) { unlink(raw); return 0; }
+    int cls; float sc, cx, cy, bw, bh;
+    while (fscanf(pp, "%d %f %f %f %f %f", &cls, &sc, &cx, &cy, &bw, &bh) == 6) {
+        mbox_t m = {cx, cy, bw, bh, sc};
+        if (cls <= 1) { if (*nh < maxh) heads[(*nh)++] = m; }
+        else if (cls == 2) { if (*nb < 200) beams[(*nb)++] = m; }
+        else if (cls == 4) { if (*nc < 20) clefs[(*nc)++] = m; }
+    }
+    pclose(pp);
+    unlink(raw);
+    *outw = w; *outh = h;
+    return 1;
+}
+
 /* 抹线后的工作区：band 内的像素拷贝 + 抹线 + 连通块 + 判定符头和时值。
  * 输出 band 坐标（y 要加 y0off）。 */
 static int detect_heads(unsigned char *src, int w, int h, const staff_t *s,
@@ -503,6 +564,24 @@ static int sheet_to_notes(const char *img, note_t *notes, int *xs, int *uis, int
     int nn = 0, heads = 0;
     head_t *hdall = malloc(sizeof(head_t) * 2000);
     int ndall = 0;
+
+    /* ---- 优先用训练好的检测器（YOLOv8n on NPU）----
+     * 手写的连通块法在密集/连桁谱面上位置和实心判定都不稳；
+     * 模型给的是"符头中心 + 实心/空心"，把几何部分（谱表/音高/时值）留给后面的逻辑。 */
+    mbox_t *mheads = NULL, *mbeams = NULL, *mclefs = NULL;
+    int nmh = 0, nmb = 0, nmc = 0, mw = 0, mh = 0, use_model = 0;
+    if (omr_model_ready() && getenv("OMR_NO_MODEL") == NULL) {
+        mheads = malloc(sizeof(mbox_t) * 800);
+        mbeams = malloc(sizeof(mbox_t) * 200);
+        mclefs = malloc(sizeof(mbox_t) * 20);
+        if (mheads && mbeams && mclefs &&
+            omr_run_model(img, upscaled, mheads, 800, &nmh, mbeams, &nmb, mclefs, &nmc, &mw, &mh) &&
+            nmh > 3) {
+            use_model = 1;
+            fprintf(stderr, "  [omr] 模型检测：符头 %d、横桁 %d、谱号 %d（图 %dx%d）\n",
+                    nmh, nmb, nmc, mw, mh);
+        }
+    }
     head_t *hd = malloc(sizeof(head_t) * 4000);
     if (!hd) { free(px); return 0; }
 
@@ -511,7 +590,42 @@ static int sheet_to_notes(const char *img, note_t *notes, int *xs, int *uis, int
         if (sp < 4) continue;
         int treble = staff_is_treble(px, w, h, &st[s]);
         /* 按列厚度找符头（谱线不擦：符头骑在线上，擦线会把它切成两半） */
-        int nb = detect_heads(px, w, h, &st[s], hd, 4000);
+        int nb;
+        if (use_model) {
+            /* 把这个谱表范围内的模型符头转成 head_t（x,y,u）
+             * u 是时值（1/16 为单位）：先按实心/空心给基础值，
+             * 横桁覆盖到的实心符头降成八分（2）。 */
+            nb = 0;
+            for (int mi = 0; mi < nmh && nb < 4000; mi++) {
+                int my = (int)mheads[mi].cy;
+                int mx = (int)mheads[mi].cx;
+                if (my < st[s].top - sp * 3 || my > st[s].bot + sp * 3) continue;
+                int hollow = 0;
+                /* 空心/实心由模型给不了（合并成一类了），用图上的墨量判定 */
+                int x0 = mx - sp / 2, x1 = mx + sp / 2, y0 = my - sp / 2, y1 = my + sp / 2;
+                int ink = 0, area = 0;
+                for (int yy = y0; yy <= y1; yy++)
+                    for (int xx = x0; xx <= x1; xx++) {
+                        if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                        area++;
+                        if (px[(size_t)yy * w + xx]) ink++;
+                    }
+                if (area > 0 && ink * 100 / area < 45) hollow = 1;
+                int u = hollow ? 8 : 4;                 /* 空心→二分, 实心→四分 */
+                for (int bi = 0; bi < nmb; bi++) {
+                    float dx = mheads[mi].cx - mbeams[bi].cx;
+                    float dy = mheads[mi].cy - mbeams[bi].cy;
+                    if (fabsf(dx) < mbeams[bi].w * 0.6f && fabsf(dy) < mbeams[bi].h * 0.8f + sp) {
+                        u = 2;                           /* 有横桁 → 八分 */
+                        break;
+                    }
+                }
+                hd[nb].x = mx; hd[nb].y = my; hd[nb].u = u;
+                nb++;
+            }
+        } else {
+            nb = detect_heads(px, w, h, &st[s], hd, 4000);
+        }
         for (int i = 0; i < nb && ndall < 2000; i++) hdall[ndall++] = hd[i];
         for (int i = 0; i < nb && nn < maxn; i++) {
             /* y → 音高：以最下面那条线为锚点，每半间距一级。

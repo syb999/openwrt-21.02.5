@@ -33,6 +33,11 @@
 #include <sys/types.h>
 #include "plugin.h"
 
+/* 高质量缩放（hq）——定义在后面，这里先声明，避免隐式声明变成外部符号 */
+static void scale_tail(char *buf, size_t cap, const char *json,
+                       int src_w, int src_h, int dst_w, int dst_h);
+static int probe_dim(const char *path, int *pw, int *ph);
+
 #define OUTMAX   24576
 #define WORK_DIR "/tmp/llama_agent"
 /* 视频产物必须落【磁盘】：/tmp 是 1.9G 的 tmpfs（吃内存），
@@ -902,7 +907,11 @@ static char *op_thumb(const char *json) {
     char out[900], ss[32], scale[64] = {0};
     out_name(path, "thumb", "png", out, sizeof(out));
     snprintf(ss, sizeof(ss), "%.2f", at);
-    if (w > 0) snprintf(scale, sizeof(scale), "scale=%d:-2", w);
+    if (w > 0) {
+        char tl[128];
+        scale_tail(tl, sizeof(tl), json, 0, 0, w, 0);
+        snprintf(scale, sizeof(scale), "scale=%d:-2%s", w, tl);
+    }
 
     argv_t a;
     av_init(&a, 30);
@@ -1183,7 +1192,11 @@ static char *op_compress(const char *json) {
     if (scale_w > 3840) scale_w = 3840;
     char crfs[16], vf[64] = {0};
     snprintf(crfs, sizeof(crfs), "%d", crf);
-    if (scale_w > 0) snprintf(vf, sizeof(vf), "scale=%d:-2", scale_w);
+    if (scale_w > 0) {
+        char tl[128];
+        scale_tail(tl, sizeof(tl), json, 0, 0, scale_w, 0);
+        snprintf(vf, sizeof(vf), "scale=%d:-2%s", scale_w, tl);
+    }
 
     struct stat st0;
     stat(path, &st0);
@@ -1396,6 +1409,50 @@ static char *op_watermark(const char *json) {
 }
 
 /* ---------------- 裁剪 / 缩放 ---------------- */
+
+/* ---------- 高质量缩放（hq） ----------
+ * ffmpeg 默认 scale 是 bicubic：缩小丢高频、色度还要多插一次，观感糊。
+ * hq=1（默认）：lanczos + accurate_rnd + full_chroma_int —— 纯重采样参数，
+ *               零额外算力，缩小/放大都更清楚；
+ * hq=2：再叠一个 cas=0.4（对比度自适应锐化）—— 专门给"缩小"用，
+ *       补回缩放丢的锐度，比 unsharp 自然；
+ * hq=0：回到老行为（bicubic），兼容用。
+ * 注意：这是 CPU/SIMD 的 swscale 滤镜，不走 NPU（缩小本来就不需要推理）。
+ */
+static int probe_dim(const char *path, int *pw, int *ph) {
+    /* 这里要的是 ffprobe，不是 ffmpeg —— 以前拿 ff_path() 去跑 ffprobe 参数，
+     * 直接失败返回 0，导致 src_w=0、"是否缩小"判断永远为假（cas 从不生效）。 */
+    char probe[512];
+    snprintf(probe, sizeof(probe), "%s", ff_path());
+    char *sl = strrchr(probe, '/');
+    if (sl && strstr(sl, "ffmpeg")) snprintf(sl + 1, sizeof(probe) - (size_t)(sl + 1 - probe), "ffprobe");
+    else snprintf(probe, sizeof(probe), "ffprobe");
+    char cmd[1400];
+    snprintf(cmd, sizeof(cmd),
+        "%s -v error -select_streams v:0 -show_entries stream=width,height "
+        "-of csv=p=0:s=x '%s' 2>/dev/null", probe, path);
+    FILE *pp = popen(cmd, "r");
+    if (!pp) return 0;
+    int w = 0, h = 0;
+    if (fscanf(pp, "%dx%d", &w, &h) != 2) { w = h = 0; }
+    pclose(pp);
+    *pw = w; *ph = h;
+    return w > 0 && h > 0;
+}
+
+/* 按目标尺寸生成 scale 的参数尾巴 */
+static void scale_tail(char *buf, size_t cap, const char *json,
+                       int src_w, int src_h, int dst_w, int dst_h) {
+    int hq = (int)jget_int(json, "hq", 1);
+    if (hq <= 0) { buf[0] = 0; return; }
+    int down = (src_w > 0 && dst_w > 0 && dst_w < src_w) ||
+               (src_h > 0 && dst_h > 0 && dst_h < src_h);
+    if (hq >= 2 && down)
+        snprintf(buf, cap, ":flags=lanczos+accurate_rnd+full_chroma_int,cas=0.4");
+    else
+        snprintf(buf, cap, ":flags=lanczos+accurate_rnd+full_chroma_int");
+}
+
 static char *op_crop_scale(const char *json) {
     char p[768] = {0}, op2[16] = {0};
     jget(json, "path", p, sizeof(p));
@@ -1414,9 +1471,13 @@ static char *op_crop_scale(const char *json) {
         else snprintf(vf, sizeof(vf), "crop=%d:ih:%d:%d", w, x, y);
     } else {
         if (w <= 0 && h <= 0) return errf("scale 需要 width 或 height%s%s", "", "");
-        if (w > 0 && h > 0) snprintf(vf, sizeof(vf), "scale=%d:%d", w, h);
-        else if (w > 0) snprintf(vf, sizeof(vf), "scale=%d:-2", w);
-        else snprintf(vf, sizeof(vf), "scale=-2:%d", h);
+        int sw = 0, sh = 0;
+        probe_dim(path, &sw, &sh);
+        char tail[128];
+        scale_tail(tail, sizeof(tail), json, sw, sh, w, h);
+        if (w > 0 && h > 0) snprintf(vf, sizeof(vf), "scale=%d:%d%s", w, h, tail);
+        else if (w > 0) snprintf(vf, sizeof(vf), "scale=%d:-2%s", w, tail);
+        else snprintf(vf, sizeof(vf), "scale=-2:%d%s", h, tail);
     }
 
     char out[900];

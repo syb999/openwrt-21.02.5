@@ -15,7 +15,7 @@ CFLAGS  := -O2 -Wall -Wextra -fPIC -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
 LDFLAGS ?= -ldl
 
 # 插件列表：新增插件只要往这里加一行
-PLUGINS := math table batch doc net netcap video sysmon owrt sys music curl jsonq browser voice
+PLUGINS := math table batch doc net netcap video sysmon owrt sys music curl jsonq browser voice image
 
 all: agent cgi mediad desub_fill desub_shot $(PLUGINS:%=plugins/%.so)
 

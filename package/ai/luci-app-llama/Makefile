@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-llama
-PKG_VERSION:=3.1.96
+PKG_VERSION:=3.1.115
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=local
@@ -9,7 +9,7 @@ PKG_MAINTAINER:=local
 LUCI_TITLE:=LuCI app for local llama.cpp inference
 LUCI_DESCRIPTION:=llama-server (GGUF, pure CPU) plus a login-free page at /llama.htm \
  with a C agent: 14 plugins (math / curl / jq / doc / sys / net / owrt / music / batch / table / sysmon / browser / netcap / video)
-LUCI_DEPENDS:=+luci-base +zlib +jq-full +curl +python3-light +desub-rk3566 +llama.cpp +sr-rk3566 +tts-rk3566
+LUCI_DEPENDS:=+luci-base +zlib +jq-full +curl +python3-light +desub-rk3566 +llama.cpp +sr-rk3566 +realesrgan-rk3566
 
 LUCI_PKGARCH:=aarch64_cortex-a53
 

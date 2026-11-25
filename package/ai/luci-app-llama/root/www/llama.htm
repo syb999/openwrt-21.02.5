@@ -532,6 +532,27 @@
   .stabpane{display:none}
   .stabpane.active{display:block}
   .stip{color:#8a8f98;font-size:12px;margin:0 0 8px}
+  .fixcard{margin-top:10px;padding:10px 12px;border:1px solid #2b3442;border-radius:10px;
+           background:linear-gradient(180deg,rgba(45,108,223,.10),rgba(45,108,223,.02))}
+  .fixt{font-size:calc(13px * var(--fs));color:#cfd6e0;font-weight:600;margin-bottom:3px}
+  .fixd{font-size:calc(12px * var(--fs));color:#8a939f;margin-bottom:8px}
+  .fixb{display:flex;gap:8px;flex-wrap:wrap}
+  .fixb a.fixlink{display:inline-block;padding:6px 14px;border-radius:8px;border:1px solid #2d6cdf;
+           background:#2d6cdf;color:#fff;text-decoration:none;font-size:calc(12.5px * var(--fs));
+           transition:.15s;box-shadow:0 1px 2px rgba(0,0,0,.25)}
+  .fixb a.fixlink:hover{background:#3b7aec;border-color:#3b7aec}
+  .fixb a.fixlink.alt2{background:transparent;color:#6fc2a8;border-color:#2c5a4c}
+  .fixb a.fixlink.alt2:hover{background:rgba(111,194,168,.12)}
+  .fixb a.fixlink.alt{background:transparent;color:#e0b64a;border-color:#6b5a25}
+  .fixb a.fixlink.alt:hover{background:rgba(224,182,74,.12)}
+  .fixb a.fixlink.ghost{background:transparent;color:#7fa8f0;border-color:#33476b}
+  .fixb a.fixlink.ghost:hover{background:rgba(45,108,223,.12)}
+  .imgprev{display:block;max-width:100%;max-height:420px;margin:8px 0;border-radius:8px;
+           border:1px solid #2b3442;cursor:zoom-in;background:#0f1319}
+  .ocrtext{white-space:pre-wrap;word-break:break-word;max-height:260px;overflow:auto;
+           margin:8px 0;padding:10px 12px;border-radius:8px;border:1px solid #2b3442;
+           background:#11161d;color:#d8dee8;font-size:calc(12.5px * var(--fs));
+           line-height:1.55;font-family:ui-monospace,Menlo,Consolas,monospace}
 </style>
 </head>
 <body>
@@ -567,7 +588,7 @@
     </div>
   </main>
 
-  <div class="hint">本地推理 · 纯 CPU<span id="ver"> · v3.1.96</span></div>
+  <div class="hint">本地推理 · 纯 CPU<span id="ver"> · v3.1.115</span></div>
 
   <div class="envpanel" id="envpanel">
     <h4>底层运行时</h4>
@@ -1258,8 +1279,14 @@
 
   /* 原片 / 处理后 双播放器：改过视频的结果里带 src（源文件），
    * 两个一起显示，效果对比最直观。都走 mediad（:8091），能拖进度条。 */
+  var VIDEXT = /\.(mp4|mkv|webm|mov|m4v|avi|flv|ts|m2ts|mpg|mpeg)$/i;
+  function isVid(p){ return VIDEXT.test(String(p || "").split("?")[0].split("#")[0]); }
+
   function dualPlayers(srcPath, outPath){
+    /* 只给真视频做播放器：图片修复结果里也有 src/file 字段，
+     * 以前会被这里当成"原片/处理后"造出两个 <video>（用户看到的"图片变成播放器"）。 */
     if (!srcPath || !outPath) return "";
+    if (!isVid(srcPath) || !isVid(outPath)) return "";
     var host = location.hostname || "127.0.0.1";
     /* 末尾加 #t=0.5：只写 preload=metadata 时浏览器不渲染首帧，框是黑的；
      * 带时间片段的 URL 会强制显示那一帧，两个播放器都有画面才好对比。 */
@@ -1318,6 +1345,24 @@
   /* ---- 音频播放器（DOM 版） ----
    * 见过太多"拼字符串拼坏属性"的坑：这里只在气泡插进 DOM 之后，
    * 找 a.fdl[href*=".mp3"]，用 createElement 造 <audio>，src 直接取 href。 */
+  /* 上传图片后那个"修复这张图"按钮：直接发 fix 任务（走 image 插件 + realesrgan-rk3566） */
+  document.addEventListener('click', function(ev){
+    var a = ev.target && ev.target.closest ? ev.target.closest('a.fixlink') : null;
+    if (!a) return;
+    ev.preventDefault();
+    var p = a.getAttribute('data-p') || '';
+    if (!p) return;
+    var box = document.getElementById('input') || document.querySelector('textarea, input[type=text]');
+    var sc = a.getAttribute('data-s') || '4';
+    var txt;
+    if (a.getAttribute('data-ocr')) txt = '{"op":"ocr","path":"' + p + '"}';
+    else if (a.getAttribute('data-w')) txt = '{"op":"whiten","path":"' + p + '","strength":50}';
+    else if (a.getAttribute('data-m')) txt = '{"op":"moire","path":"' + p + '","strength":' + (a.getAttribute('data-m') || 2) + '}';
+    else txt = '{"op":"fix","path":"' + p + '","scale":' + sc + '}';
+    if (window.sendTask) { window.sendTask(txt); return; }
+    if (box) { box.value = txt; box.dispatchEvent(new Event('input')); }
+  });
+
   function addAudioPlayers(root){
     if (!root || !root.querySelectorAll) return;
     /* 先清重复下载链接：同一 href 只留第一个。
@@ -1332,7 +1377,39 @@
         else seen[hq] = 1;
       }
     } catch (e) {}
-    var links = root.querySelectorAll('a.fdl[href]');
+    /* 只给音频做播放器：以前没判扩展名，修复图产出的 .png 下载链接也被
+     * 当成音频造了 <audio>，一次出两个空的播放器。 */
+    /* 兜底：把"src 不是音频"的 <audio> 全部清掉。
+     * 图片修复产物是 .png，如果哪条渲染路径把它当音频造了播放器，这里会收拾干净。 */
+    try {
+      Array.prototype.forEach.call(root.querySelectorAll('audio'), function(au){
+        var src = (au.getAttribute('src') || '').toLowerCase();
+        if (!/(mp3|wav|m4a|ogg|aac|flac)/.test(src)) {
+          if (au.parentNode) au.parentNode.removeChild(au);
+        }
+      });
+    } catch (e) {}
+
+    /* 图片结果直接在气泡里显示预览：以前只有下载链接，用户看不到修复后的样子 */
+    try {
+      Array.prototype.forEach.call(root.querySelectorAll('a.fdl[href]'), function(a){
+        var h = (a.getAttribute('href') || '');
+        if (!/\.(png|jpg|jpeg|bmp|webp)(%|&|$|")/i.test(h) && !/\.(png|jpg|jpeg|bmp|webp)(%|$)/i.test(h)) return;
+        if (a.getAttribute('data-prev')) return;
+        a.setAttribute('data-prev', '1');
+        var im = document.createElement('img');
+        im.src = h;
+        im.className = 'imgprev';
+        im.loading = 'lazy';
+        im.onclick = function(){ window.open(h, '_blank'); };
+        a.parentNode && a.parentNode.insertBefore(im, a);
+      });
+    } catch (e) {}
+
+    var links = Array.prototype.filter.call(root.querySelectorAll('a.fdl[href]'), function(a){
+      var h = (a.getAttribute('href') || '').toLowerCase();
+      return /(mp3|wav|m4a|ogg|aac|flac)(&|$|%|")/.test(h) || /\.(mp3|wav|m4a|ogg|aac|flac)$/.test(h);
+    });
     for (var i = 0; i < links.length; i++) {
       var href = links[i].getAttribute('href') || '';
       if (!/\.(mp3|wav|ogg)$/i.test(href)) continue;
@@ -1404,6 +1481,13 @@
     if (/^\s*\{/.test(t)) {
       try {
         var j = JSON.parse(t);
+        /* OCR / 转写这类结果的核心是"识别出来的文字"本身。
+         * 以前只显示 answer（"认出 1 行文字，共 12 字"），正文反而没地方看。 */
+        var bodyText = "";
+        if (j && typeof j.text === "string" && j.text.trim()) {
+          var txt = j.text.length > 6000 ? j.text.slice(0, 6000) + "…" : j.text;
+          bodyText = '<pre class="ocrtext">' + esc(txt) + '</pre>';
+        }
         /* 下载行渲染。必须放在 error 分支之前 —— 失败时也要让用户拿到
          * 复现脚本，那才是排查问题的入口。 */
         var seenDl = {};
@@ -1505,7 +1589,7 @@
          * /tmp/llama_agent/bgm_x.mp3 以前只显示成一串路径，用户还得自己去
          * 拼地址。linkFiles 对 mp3/wav 还会顺手加个 <audio> 播放器。
          * 注意只对 render() 出来的纯文本套，别套已经带 <a> 的 HTML。 */
-        var h = linkFiles(render(String(v), false, true));
+        var h = bodyText + linkFiles(render(String(v), false, true));
 
         if (extra.length) h += '<div class="pmeta">' + esc(extra.join(" · ")) + '</div>';
         /* 有落盘文件就给个下载入口 —— 摘要只是一部分，完整数据要靠这个下载 */
@@ -1801,7 +1885,7 @@
     var f = fileInput.files && fileInput.files[0];
     fileInput.value = "";
     if (!f) return;
-    if (f.size > 20 * 1024 * 1024){ toast("文件太大（上限 20MB）"); return; }
+    if (f.size > 17 * 1024 * 1024){ toast("文件太大（上限 17MB，base64 后约 23MB，服务端上限 24MB）"); return; }
     var fr = new FileReader();
     fr.onload = function(){
       var b64 = String(fr.result).split(",")[1] || "";
@@ -1809,19 +1893,28 @@
       /* 上传 + 解析是同步的：大文件要几秒。先在气泡里挂一条"正在解析"，
        * 成功/失败都就地改它 —— 以前只在 toast 里闪一下，失败了用户看不到。 */
       var t0 = Date.now();
-      addMsg("bot", '<div class="awarn" id="upmsg">正在解析 <b>' + esc(f.name) + '</b> …'
+      /* 【老 bug】以前每条上传气泡都写死 id="upmsg"，getElementById 永远拿到第一条，
+       * 于是第二次上传去改第一次的气泡：两张图的"正在解析"互相覆盖，
+       * 上一张的名字变成"……"，而且第一个请求还挂着不结束 → 页面像卡死。
+       * 现在每次上传自己建一个 div，直接持有引用，不再靠 id 找。 */
+      var upId = "upmsg_" + Date.now() + "_" + Math.floor(Math.random() * 10000);
+      addMsg("bot", '<div class="awarn" id="' + upId + '">正在解析 <b>' + esc(f.name) + '</b> …'
         + (b64.length > 900000 ? '<br><span style="color:#7c8794">文件较大（'
             + (b64.length * 0.75 / 1048576).toFixed(1) + ' MB），稍等几秒</span>' : '')
         + '</div>');
       scrollDown(true);
+      var upNode = document.getElementById(upId);   /* 只属于这一次上传 */
       function upDone(html){
-        var b = document.getElementById("upmsg");
-        if (b) b.innerHTML = html; else addMsg("bot", html);
+        if (upNode && upNode.parentNode) upNode.innerHTML = html;
+        else addMsg("bot", html);
         scrollDown(true);
       }
-      fetch("/cgi-bin/agent?upload=1", {
+      fetch("/cgi-bin/agent?upload=1" + (/\.(jpg|jpeg|png|bmp|webp)$/i.test(f.name) ? "&noocr=1" : ""), {
         method: "POST",
         headers: {"Content-Type": "application/json"},
+        /* 超时控制：没有它的话，连接半开（服务端不响应/被掐）会一直停在"解析中" */
+        signal: (window.AbortController ? (function(){ var c = new AbortController();
+                 setTimeout(function(){ try{ c.abort(); }catch(e){} }, 180000); return c.signal; })() : undefined),
         body: JSON.stringify({name: f.name, data: b64})
       }).then(function(r){
           return r.text().then(function(t){
@@ -1838,13 +1931,26 @@
           var secs = ((Date.now() - t0) / 1000).toFixed(1);
           upDone('<div class="awarn">已上传 <b>' + esc(j.name) + '</b>（'
             + esc(j.kind === "image" ? "图片·OCR" : (j.kind === "audio" ? "音频·转写" : (kindTxt ? kindTxt.slice(3) : "文件")))
-            + '，' + j.chars + ' 字，用时 ' + secs + 's）'
+            + '，' + (j.chars > 0 ? (j.chars + ' 字') : '未识别文字') + '，用时 ' + secs + 's）'
             + (how ? '<br><span style="color:#7c8794;font-size:calc(12.5px * var(--fs))">解析方式：'
                      + esc(how) + '</span>' : '')
-            + '<br>现在已经转成纯文本，可以直接让我总结 / 翻译 / 就内容提问。</div>');
+            + (j.kind === "image"
+                ? '<div class="fixcard">'
+                  + '<div class="fixt">这张图还能处理</div>'
+                  + '<div class="fixd">放大变清晰（NPU）、去阴影取白底（拍照的 A4 纸）、去摩尔纹（拍屏幕）、识别文字</div>'
+                  + '<div class="fixb">'
+                  + '<a href="javascript:void 0" class="fixlink" data-p="' + esc(j.path || "") + '" data-s="4">🪄 修复 4 倍</a>'
+                  + '<a href="javascript:void 0" class="fixlink ghost" data-p="' + esc(j.path || "") + '" data-s="2">2 倍（更平滑）</a>'
+                  + '<a href="javascript:void 0" class="fixlink alt" data-w="1" data-p="' + esc(j.path || "") + '">☀ 去阴影 / 背景取白</a>'
+                  + '<a href="javascript:void 0" class="fixlink ghost" data-ocr="1" data-p="' + esc(j.path || "") + '">🔍 识别文字</a>'
+                  + '<a href="javascript:void 0" class="fixlink alt2" data-m="2" data-p="' + esc(j.path || "") + '">📺 去摩尔纹</a>'
+                  + '</div></div>'
+                : '<br>现在已经转成纯文本，可以直接让我总结 / 翻译 / 就内容提问。')
+            + '</div>');
           toast("");
       }).catch(function(e){
-          var m = e && e.message ? e.message : String(e);
+          var m = (e && e.name === "AbortError") ? "超过 180 秒没响应（图片太大或板子忙）"
+                  : (e && e.message ? e.message : String(e));
           upDone('<div class="awarn" style="border-color:#a13b3b">上传失败：' + esc(m)
             + '<br><span style="color:#7c8794">文件没用上。换个格式或把文件拆小一点再试。</span></div>');
           toast("上传失败：" + m);
@@ -2702,6 +2808,21 @@
       ],
       note: "只处理文本表格。xlsx 先用 doc 插件读出来，或者直接用 doc 处理。"
     },
+    image: {
+      what: "图片修复 / 放大：模糊照片、压缩截图、老图放大变清晰。"
+          + "用 Real-ESRGAN general-x4v3 跑 RKNPU（int8），模型在独立包 realesrgan-rk3566 里，"
+          + "和视频超分（sr-rk3566）分开装、分开跑。单张图没有帧率压力，可以直接出 4 倍。",
+      ops: [
+        {n: "fix", d: "修复/放大。scale=4（最清晰，默认）或 2（2x2 平均，噪点更少）",
+         c: '{"op":"fix","path":"/tmp/old.jpg","scale":4}'},
+        {n: "status", d: "查底层程序/模型在不在", c: '{"op":"status"}'}
+      ],
+      sample: '修复这张图片 /tmp/old.jpg，放大 4 倍',
+      note: "上传图片后气泡里会出现「🪄 修复这张图（4 倍）」按钮，点一下就行；"
+          + "也可以直接发命令。产物在 /tmp/llama_agent/gen/fix_*.png。"
+          + "底层是 /usr/bin/imgup → /opt/realesrgan/sr_img（glibc 程序，走 /opt/glibc loader）。"
+          + "RK3566 的 NPU 只能跑 int8，fp16 会退化成 CPU、慢到不可用。"
+    },
     voice: {
       what: "文字转语音：中文 / 中英混读合成 MP3（离线、纯 CPU）。结果直接在气泡里给播放器和下载按钮。"
           + "两套模型自动选：纯中文走 matcha-zh-baker（22.05kHz，RTF 0.95，快）；"
@@ -2898,7 +3019,7 @@
           '<div id="vlmmSet" class="vlmm">读取中…</div>' +
         "</div>" +
         '<div class="qask-foot">' +
-          '<span class="ver">htm 3.1.96</span>' +
+          '<span class="ver">htm 3.1.115</span>' +
           '<button class="cancel">取消</button>' +
           '<button class="ok">保存</button>' +
         "</div>" +

@@ -850,6 +850,8 @@ static char *plug_run(const char *plugin, const char *req) {
     return r;
 }
 
+static int g_noocr = 0;      /* ?upload=1&noocr=1：图片只存不 OCR */
+
 static void do_upload(const char *body) {
     char name[256] = {0};
     if (jget(body, "name", name, sizeof(name)) != 0 || !name[0]) {
@@ -949,6 +951,22 @@ static void do_upload(const char *body) {
         out_json("{\"ok\":1,\"name\":\"%s\",\"file\":\"%s\",\"path\":\"%s\","
                  "\"chars\":%d,\"bytes\":%d,\"kind\":\"audio\",\"plugin\":\"asr\"}",
                  en2, et, ea, chau, rn);
+        return;
+    }
+
+    /* 图片 + noocr=1：只保存文件、不跑 OCR。
+     * PP-OCR 对某些图会卡住（NPU 忙/输入异常），一卡整个上传就挂住 —— 用户只是想修图，
+     * 不需要认字；需要文字时再显式走 OCR。 */
+    if (dot && (!strcasecmp(dot, ".jpg") || !strcasecmp(dot, ".jpeg")
+                || !strcasecmp(dot, ".png") || !strcasecmp(dot, ".bmp")
+                || !strcasecmp(dot, ".webp")) && g_noocr) {
+        char ea[2048], en2[1024], ep[2048];
+        jesc(ea, sizeof(ea), path);
+        jesc(en2, sizeof(en2), name);
+        jesc(ep, sizeof(ep), path);
+        out_json("{\"ok\":1,\"name\":\"%s\",\"path\":\"%s\",\"file\":\"%s\","
+                 "\"chars\":0,\"bytes\":%d,\"kind\":\"image\",\"plugin\":\"none\"}",
+                 en2, ep, ea, (int)rn);
         return;
     }
 
@@ -1320,6 +1338,7 @@ int main(void) {
         else if (!strcmp(t, "req")) preq = v;
         else if (!strcmp(t, "op")) pop = v;
         else if (!strcmp(t, "name")) pname = v;
+        else if (!strcmp(t, "noocr")) g_noocr = (v && v[0] == '1');
         else if (!strcmp(t, "status")) pstat = v;
         else if (!strcmp(t, "auto")) pauto = v;
         else if (!strcmp(t, "args")) pargs = v;
