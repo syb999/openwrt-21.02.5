@@ -101,6 +101,33 @@ static int ext_ok(const char *p) {
     return 0;
 }
 
+
+/* 内存守卫：板上 4GB，3B 模型常驻要占 2.2GB。图像处理（FFT/超分）一旦把内存吃满，
+ * 内核 OOM 会先杀最大的进程 —— 正好是 llama-server，用户那边就是"模型连不上"。
+ * 所以动手前先看 MemAvailable，不够就直接拒绝并说明。 */
+static long mem_avail_mb(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return -1;
+    char line[256];
+    long kb = -1;
+    while (fgets(line, sizeof(line), f))
+        if (!strncmp(line, "MemAvailable:", 13)) { sscanf(line + 13, "%ld", &kb); break; }
+    fclose(f);
+    return kb < 0 ? -1 : kb / 1024;
+}
+
+static char *need_mem(long mb, const char *who) {
+    long av = mem_avail_mb();
+    if (av >= 0 && av < mb) {
+        char m[300];
+        snprintf(m, sizeof(m),
+            "%s 需要约 %ldMB 可用内存，现在只剩 %ldMB —— 再跑就会被内核 OOM 杀掉，"
+            "连带把 3B 模型（占 2.2GB）打死。先停掉模型或等它空闲再试。", who, mb, av);
+        return jerr(m);
+    }
+    return NULL;
+}
+
 static char *run_fix(const char *json_in) {
     char path[600] = {0};
     if (jget(json_in, "path", path, sizeof(path)) != 0 || !path[0])   /* jget 返回 0 才是成功 */
@@ -108,6 +135,8 @@ static char *run_fix(const char *json_in) {
     int scale = (int)jget_int(json_in, "scale", 4);
     if (scale != 2 && scale != 4) scale = 4;
 
+    char *memerr = need_mem(1200, "4 倍超分（分块推理 + 中间缓冲）");
+    if (memerr) return memerr;
     if (access("/usr/bin/imgup", X_OK) != 0)
         return jerr("没装 realesrgan-rk3566（/usr/bin/imgup 不存在）");
     if (!ext_ok(path)) return jerr("只支持 jpg / png / bmp / webp");
@@ -189,6 +218,8 @@ static char *run_whiten(const char *json_in) {
     char path[600] = {0};
     if (jget(json_in, "path", path, sizeof(path)) != 0 || !path[0])
         return jerr("要给 path=图片路径");
+    char *memerr = need_mem(600, "去阴影（整幅灰度 + 积分图）");
+    if (memerr) return memerr;
     int strength = jget_int(json_in, "strength", 50);      /* 0..100 */
     if (strength < 0) strength = 0;
     if (strength > 100) strength = 100;
@@ -313,6 +344,8 @@ static char *run_moire(const char *json_in) {
     char path[600] = {0};
     if (jget(json_in, "path", path, sizeof(path)) != 0 || !path[0])
         return jerr("要给 path=图片路径");
+    char *memerr = need_mem(900, "去摩尔纹（FFT）");
+    if (memerr) return memerr;
     int strength = jget_int(json_in, "strength", 2);      /* 1 轻 / 2 默认 / 3 重 */
     if (strength < 1) strength = 1;
     if (strength > 3) strength = 3;

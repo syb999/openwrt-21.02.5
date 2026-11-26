@@ -588,7 +588,7 @@
     </div>
   </main>
 
-  <div class="hint">本地推理 · 纯 CPU<span id="ver"> · v3.1.115</span></div>
+  <div class="hint">本地推理 · 纯 CPU<span id="ver"> · v3.1.132</span></div>
 
   <div class="envpanel" id="envpanel">
     <h4>底层运行时</h4>
@@ -2572,6 +2572,8 @@
     browser: {
       what: "用真实浏览器（chrome + selenium）打开网站，在登录态下操作页面，并把页面自己发出的请求头抓下来。很多站点的签名（X-Sign / X-Token）是 JS 现算的，逆向极难，让浏览器跑一遍再抄走是最省事的路子。跑完自动生成一份能独立运行的 Python 复现脚本。",
       ops: [
+        {n: "gen", d: "把「检查元素」复制的标签变成 Selenium 定位+操作代码：CSS / XPath（id、name、class、placeholder、text）/ JS 三套，并按元素类型自动给 type、click、select、hover、滚动、取文本的代码。不启浏览器、不走模型，1 秒出结果",
+         c: '{"op":"gen","html":"<input type=\\"text\\" name=\\"wd\\" class=\\"search-input\\">","action":"type"}'},
         {n: "probe", d: "只看不动：把页面上重要元素全探一遍。每个输入框/按钮都给 CSS 选择器、XPath、能不能点到（hit）、是不是靠 JS 事件绑定（jsOnly）、在哪个 iframe 里（frame）。JS 实现的按钮没有 href/onclick，用 XPath 按文字定位最稳。",
          c: '{"op":"probe","url":"https://x.com/login","wait":8}'},
         {n: "autologin", d: "自动找账号框和密码框 → 填 → 点登录 → 返回 cookie 和「到底登没登进去」的判据。密码错会立即停止不重试。",
@@ -2660,16 +2662,20 @@
     },
 
     music: {
-      what: "纯 C 生成音乐：写 MIDI、合成 FC 游戏机音色的 MP3、导入现成 MIDI 转换。",
+      what: "纯 C 的音乐插件：一是一句话生成背景音乐（BGM，确定性、毫秒级，很快）；二是五线谱图片转 MIDI；三是手写音符出 MIDI；四是合成 MP3 或导入现成 MIDI。",
       ops: [
-        {n: "midi", d: "按音符串生成 MIDI 文件。格式「音名八度:时值」，空格分隔。",
-         c: '{"op":"midi","notes":"C4:1 D4:1 E4:2 G4:1","path":"/tmp/a.mid"}'},
-        {n: "render", d: "把生成或导入的音符合成成 MP3，用 FC 音色。",
-         c: '{"op":"render","notes":"C4:1 D4:1 E4:2","path":"/tmp/a.mp3"}'},
-        {n: "import", d: "读入现成的 MIDI 文件，转成其它格式。",
-         c: '{"op":"import","path":"/tmp/in.mid","to":"mp3"}'}
+        {n: "bgm", d: "★ 要背景音乐用这个：给风格和时长即可，不用自己编音符。style：happy 欢快 / calm 舒缓 / sad 悲伤 / tense 紧张 / mystery 神秘 / electronic 电子 / game 游戏 / march 进行曲 / chinese 国风；seconds 想要的秒数",
+         c: '{"op":"bgm","style":"calm","seconds":30}'},
+        {n: "bgm（中文风格名）", d: "风格也认中文关键词", c: '{"op":"bgm","style":"舒缓的钢琴曲","seconds":20}'},
+        {n: "omr", d: "五线谱图片 → MIDI（需要 /opt/omr 模型，走 NPU）", c: '{"op":"omr","path":"/tmp/score.jpg"}'},
+        {n: "midi", d: "按音符串生成 MIDI：格式「音名八度:时值」，空格分隔", c: '{"op":"midi","notes":"C4:1 D4:1 E4:2 G4:1","path":"/tmp/a.mid"}'},
+        {n: "render", d: "把音符合成 MP3（FC 音色）", c: '{"op":"render","notes":"C4:1 D4:1 E4:2","path":"/tmp/a.mp3"}'},
+        {n: "import", d: "读现成 MIDI 转 MP3", c: '{"op":"import","path":"/tmp/in.mid","to":"mp3"}'}
       ],
-      note: "合成依赖板上的 sox / ffmpeg，跑之前确认装了。"
+      sample: '来一段 30 秒舒缓的背景音乐',
+      note: "BGM 是模板化确定性生成（和弦进行 + 动机复用 + 低音/鼓分轨），不是 3B 模型逐音编曲，所以快且不跑调；"
+          + "音色是插件内置合成器（FC 风格），要更好的音色请在手机/电脑上播 MIDI，或用 render 出 MP3 后处理。"
+          + "产物在 /tmp/llama_agent/ 下（bgm_<风格>_<时间>.mid/.mp3）。"
     },
 
     video: {
@@ -2809,38 +2815,45 @@
       note: "只处理文本表格。xlsx 先用 doc 插件读出来，或者直接用 doc 处理。"
     },
     image: {
-      what: "图片修复 / 放大：模糊照片、压缩截图、老图放大变清晰。"
-          + "用 Real-ESRGAN general-x4v3 跑 RKNPU（int8），模型在独立包 realesrgan-rk3566 里，"
-          + "和视频超分（sr-rk3566）分开装、分开跑。单张图没有帧率压力，可以直接出 4 倍。",
+      what: "图片处理四合一：超分放大、去阴影/背景取白（拍 A4 纸）、去摩尔纹（拍屏幕）、OCR 认字。"
+          + "超分用 Real-ESRGAN general-x4v3 跑 RKNPU（int8）；另外三个是纯 CPU 算法。"
+          + "模型在独立包 realesrgan-rk3566 里，和视频超分 sr-rk3566 分开装、分开跑。",
       ops: [
-        {n: "fix", d: "修复/放大。scale=4（最清晰，默认）或 2（2x2 平均，噪点更少）",
+        {n: "fix", d: "超分放大。scale=4（最清晰，默认）或 2（2x2 平均，噪点更少）",
          c: '{"op":"fix","path":"/tmp/old.jpg","scale":4}'},
-        {n: "status", d: "查底层程序/模型在不在", c: '{"op":"status"}'}
+        {n: "whiten", d: "去阴影 / 背景取白：纸面有阴影时把背景压成纯白、字保持黑。strength 0~100（默认 50，越大越白）",
+         c: '{"op":"whiten","path":"/tmp/paper.jpg","strength":50}'},
+        {n: "moire", d: "去摩尔纹：手机拍显示器的彩色波浪条纹。strength=1 轻 / 2 默认(FFT陷波) / 3 重(降采样+锐化)",
+         c: '{"op":"moire","path":"/tmp/screen.jpg","strength":2}'},
+        {n: "status", d: "查底层程序与模型是否就绪", c: '{"op":"status"}'}
       ],
-      sample: '修复这张图片 /tmp/old.jpg，放大 4 倍',
-      note: "上传图片后气泡里会出现「🪄 修复这张图（4 倍）」按钮，点一下就行；"
-          + "也可以直接发命令。产物在 /tmp/llama_agent/gen/fix_*.png。"
-          + "底层是 /usr/bin/imgup → /opt/realesrgan/sr_img（glibc 程序，走 /opt/glibc loader）。"
-          + "RK3566 的 NPU 只能跑 int8，fp16 会退化成 CPU、慢到不可用。"
+      sample: '这张纸拍出来有阴影，帮我去掉阴影、背景取白',
+      note: "上传图片后气泡里直接有五个按钮：「🪄 修复 4 倍」「2 倍（更平滑）」「☀ 去阴影/背景取白」"
+          + "「📺 去摩尔纹」「🔍 识别文字」。OCR 走 doc 插件，正文会显示在气泡里。"
+          + "产物在 /tmp/llama_agent/gen/。限制：去摩尔纹对整幅静止的规则条纹有效，"
+          + "对随位置漂移的拍屏条纹只能减弱。内存不足时会直接拒绝，避免把 3B 模型挤掉。"
     },
     voice: {
-      what: "文字转语音：中文 / 中英混读合成 MP3（离线、纯 CPU）。结果直接在气泡里给播放器和下载按钮。"
-          + "两套模型自动选：纯中文走 matcha-zh-baker（22.05kHz，RTF 0.95，快）；"
-          + "正文里英文占比 ≥8% 走 melo-tts zh_en 双语（44.1kHz，英文是真英语发音，RTF≈5，慢）。"
-          + "长文本按标点分段合成再拼接，不会一次卡几分钟。首次调用要加载模型（约 20 秒），同文本命中缓存秒回。",
+      what: "语音三件套：文字转语音（中文女声 / 中英双语 / 男声）、语音转文字、模型管理。全部离线、纯 CPU。"
+          + "纯中文走 matcha 女声（最快）；英文占比 ≥8% 走 melo 中英双语（真英语发音）；"
+          + "voice=male 或「用男声念」走 kokoro（上百音色，最慢）。长文本分段合成再拼接，同文本命中缓存秒回。",
       ops: [
-        {n: "tts", d: "把 text 念成 mp3。speed 0.5~2.0；bitrate 32k/64k/96k；lang 可强制 zh / zh-en",
-         c: '{"op":"tts","text":"欢迎使用本地语音助手","speed":1.0,"bitrate":"64k"}'},
-        {n: "tts（中英混读）", d: "不写 lang 也会自动判：英文占比够就切双语模型",
-         c: '{"op":"tts","text":"我在用 GPU 训练模型，速度还行","lang":"zh-en"}'},
-        {n: "tts（从文件读）", d: "正文太长不想塞进命令，就写进文件再指过去",
+        {n: "tts", d: "文字转 MP3。speed 0.5~2.0；bitrate 32k/64k/96k；lang 强制 zh / zh-en；voice=male 走男声；sid 选音色（男声 60/70/90/100）",
+         c: '{"op":"tts","text":"今天气温30℃，湿度45%","speed":1.0}'},
+        {n: "tts（男声）", d: "kokoro 男声，sid=60 是默认男声",
+         c: '{"op":"tts","text":"这是男声测试","voice":"male","sid":60}'},
+        {n: "tts（长文）", d: "正文太长就写进文件再指过去",
          c: '{"op":"tts","path":"/tmp/正文.txt"}'},
-        {n: "probe", d: "查板上有没有装 tts-rk3566", c: '{"op":"probe"}'}
+        {n: "asr", d: "语音转文字（中/英/日/韩/粤），结果落 .txt",
+         c: '{"op":"asr","path":"/tmp/录音.mp3"}'},
+        {n: "models", d: "列出三套 TTS 模型是否已装、各占多少 MB", c: '{"op":"models"}'},
+        {n: "model_install", d: "按需下载安装模型（zh-en / kokoro）", c: '{"op":"model_install","name":"kokoro"}'},
+        {n: "model_remove", d: "卸载可选模型回收空间（matcha 内置，不许删）", c: '{"op":"model_remove","name":"kokoro"}'}
       ],
-      sample: '念：今天天气不错，适合出门散步',
-      note: "自然语言直连：以 念 / 朗读 / 读出来 / 用语音说 / 转成语音 开头，后面跟正文（不走模型，直连 voice）。"
-          + "产出在 /tmp/llama_agent/gen/tts_<hash>.mp3；纯中文走 matcha，中英混读走双语模型；"
-          + "双语模型慢（1 秒语音约 5 秒算），长文本已按标点分段。"
+      sample: '用男声念：今天气温30℃，湿度45%',
+      note: "自然语言直接可用：「念：…」中文女声、「用男声念：…」男声、「念：我在用 GPU 训练模型」自动切双语；"
+          + "上传 mp3/wav 会自动转文字。符号会展开成中文（30% → 百分之30、℃ → 摄氏度、￥ → 元）。"
+          + "模型管理在设置 → 语音模型，可下载/卸载（ipk 里只带 matcha 39MB）。"
     }
   };
 
@@ -3019,7 +3032,7 @@
           '<div id="vlmmSet" class="vlmm">读取中…</div>' +
         "</div>" +
         '<div class="qask-foot">' +
-          '<span class="ver">htm 3.1.115</span>' +
+          '<span class="ver">htm 3.1.132</span>' +
           '<button class="cancel">取消</button>' +
           '<button class="ok">保存</button>' +
         "</div>" +

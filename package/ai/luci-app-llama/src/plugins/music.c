@@ -220,7 +220,7 @@ static int cmp_ev(const void *a, const void *b) {
 }
 
 static void write_track(FILE *f, note_t *notes, int n, int ch, int div, double beat,
-                        int with_tempo, unsigned us_per_beat) {
+                        int with_tempo, unsigned us_per_beat, int prog) {
     ev_t ev[MAX_NOTE * 2];
     int ne = 0;
     for (int i = 0; i < n && ne < MAX_NOTE * 2 - 2; i++) {
@@ -236,6 +236,12 @@ static void write_track(FILE *f, note_t *notes, int n, int ch, int div, double b
     unsigned char *buf = malloc((size_t)ne * 8 + 64);
     if (!buf) return;
     size_t len = 0;
+    /* 音色：program change（0xC0|ch, prog）。以前从来没写过，所以所有风格都是同一个默认音色 */
+    if (prog >= 0 && ch != 9) {
+        buf[len++] = 0x00;                              /* delta time 0 */
+        buf[len++] = (unsigned char)(0xC0 | (ch & 0x0F));
+        buf[len++] = (unsigned char)(prog & 0x7F);
+    }
     long last = 0;
 
     /* 速度事件必须写，否则任何软件读回来都按默认 120 BPM */
@@ -320,6 +326,17 @@ static char *op_midi(const char *json) {
     fputc((int)((div >> 8) & 0xFF), f); fputc((int)(div & 0xFF), f);
 
     /* 每个通道一条轨 */
+    /* 注意：jget 只取字符串值，	"program":0 是数字，必须自己按数字解析 */
+    int prog_mel = -1;
+    {
+        const char *q = strstr(json, "\"program\":");
+        if (q) {
+            q += 10;
+            while (*q == ' ') q++;
+            if (*q >= '0' && *q <= '9') prog_mel = atoi(q);
+        }
+    }
+    int prog_bass = 33;                                   /* 默认指弹贝斯 */
     int first_trk = 0;
     for (int c = 0; c < 3; c++) {
         int want = (c == 0) ? 0 : (c == 1) ? 1 : 9;
@@ -329,7 +346,8 @@ static char *op_midi(const char *json) {
             if (notes[i].ch == want && nn < MAX_NOTE) tmp[nn++] = notes[i];
         if (nn == 0) continue;
         unsigned us = (unsigned)(60000000.0 / tempo);
-        write_track(f, tmp, nn, want, div, beat, (first_trk++ == 0), us);
+        int pg = (c == 0) ? prog_mel : (c == 1 ? prog_bass : -1);
+        write_track(f, tmp, nn, want, div, beat, (first_trk++ == 0), us, pg);
     }
     fclose(f);
     free(notes);
@@ -753,6 +771,128 @@ static unsigned int bgm_rand(unsigned int *st) {
     return *st;
 }
 
+
+/* ---------- 和弦进行（用音阶级数表示，0 基）----------
+ * 只靠"音阶内随机走音"听起来是散的；真正的曲子靠和弦骨架 + 动机重复。
+ * 这里给每个调式几套常见进行（I-V-vi-IV、vi-IV-I-V、ii-V-I 等），
+ * 主和弦在最后一小节回归，形成终止感。 */
+static const int PROG_MAJOR[3][8] = {
+    {0, 4, 5, 3, 0, 4, 5, 3},        /* I-V-vi-IV */
+    {0, 5, 3, 4, 0, 5, 3, 4},        /* I-vi-IV-V */
+    {3, 0, 4, 5, 3, 0, 4, 5},        /* IV-I-V-vi */
+};
+static const int PROG_MINOR[3][8] = {
+    {0, 5, 2, 6, 0, 5, 2, 6},        /* i-VI-III-VII */
+    {0, 3, 5, 4, 0, 3, 5, 4},        /* i-iv-VI-V */
+    {0, 6, 5, 4, 0, 6, 5, 4},        /* i-VII-VI-V */
+};
+static const int PROG_DORIAN[2][8] = {
+    {0, 3, 0, 6, 0, 3, 6, 3},
+    {0, 6, 3, 0, 0, 6, 3, 6},
+};
+static const int PROG_PENTA[2][8] = {
+    {0, 3, 4, 0, 0, 4, 3, 0},
+    {0, 4, 0, 3, 0, 4, 3, 4},
+};
+
+
+/* ---------- 经典乐句库（全部公版：巴洛克/古典/民谣，已过版权期）----------
+ * 用法：随机挑一条，按当前调式移调后作为开头 2 小节的旋律素材，
+ * 后面再接自动生成的部分 —— 这样既有"耳熟的动机"，又不是整段照抄。
+ * deg 是按大调音阶级数（0=do），dur 单位是拍，mode: 0=大调 1=小调 2=五声 */
+typedef struct {
+    const char *name;
+    const signed char *deg;
+    const float *dur;
+    int n;
+    int mode;
+} phrase_t;
+
+/* 欢乐颂（贝多芬第九）3 3 4 5 5 4 3 2 1 1 2 3 3 2 2 */
+static const signed char PH_ODE[]  = {2,2,3,4,4,3,2,1,0,0,1,2,2,1,1};
+static const float PH_ODE_D[]      = {1,1,1,1,1,1,1,1,1,1,1,1,1.5f,0.5f,2};
+/* 小星星 1 1 5 5 6 6 5 / 4 4 3 3 2 2 1 */
+static const signed char PH_TWINKLE[] = {0,0,4,4,5,5,4,3,3,2,2,1,1};
+static const float PH_TWINKLE_D[]     = {1,1,1,1,1,1,2,1,1,1,1,1,1};
+/* 致爱丽丝开头（E D# E D# E B D C A）→ 用级数近似 2,#1,2,#1,2,6,1,0,5 */
+static const signed char PH_ELISE[] = {2,2,2,2,2,6,1,0,5};
+static const float PH_ELISE_D[]     = {0.5f,0.5f,0.5f,0.5f,0.5f,0.5f,0.5f,0.5f,2};
+/* 绿袖子（小调）0,2,3,4,5,4,3,2 … */
+static const signed char PH_GREEN[] = {0,2,3,4,5,4,3,2,0,2,3,4,3,2,1};
+static const float PH_GREEN_D[]     = {1,1,2,1,1,1,1,2,1,1,2,1,1,1,2};
+/* 卡农主题（大调级进+跳进）0,4,2,5,3,6,4,0 */
+static const signed char PH_CANON[] = {0,4,2,5,3,6,4,0,2,4,6,7};
+static const float PH_CANON_D[]     = {2,2,2,2,2,2,2,2,1,1,1,1};
+/* 茉莉花（五声）3,3,5,5,6,5,3,2,1,1,2,3 */
+static const signed char PH_JASMINE[] = {3,3,5,5,6,5,3,2,1,1,2,3};
+static const float PH_JASMINE_D[]     = {1,1,1,1,1,1,1,1,1,1,1,2};
+/* 摇篮曲（勃拉姆斯）0,0,4,0,0,4,0,4,5,4,2 … */
+static const signed char PH_LULLABY[] = {0,0,4,0,0,4,0,4,5,4,2,0};
+static const float PH_LULLABY_D[]     = {1,1,2,1,1,2,1,1,1,1,3};
+
+
+/* 友谊地久天长（苏格兰民谣 1788，公版）：5 1 1 1 3 2 1 → 以 sol(4) 起头 */
+static const signed char PH_AULD[] = {4,0,0,0,2,1,0,4,0,0,2,1};
+static const float PH_AULD_D[]     = {1,1,1,2,1,1,3,1,1,1,2,2};
+/* 铃儿响叮当（1857，公版）：3 3 3 | 3 3 3 | 3 5 1 2 3 → 以 mi(2) 起头 */
+static const signed char PH_JINGLE[] = {2,2,2,2,2,2,2,4,0,1,2};
+static const float PH_JINGLE_D[]     = {1,1,1,1,1,1,1,2,1,1,3};
+/* 送别（旋律 Ordway 1851，公版）：5 3 5 1 7 1 6 → 以 sol(4) 起头 */
+static const signed char PH_FAREWELL[] = {4,2,4,7,6,7,5,7,5,4};
+static const float PH_FAREWELL_D[]     = {2,2,3,1,1,2,2,1,2,4};
+
+static const phrase_t PHRASES[] = {
+    {"欢乐颂",   PH_ODE,     PH_ODE_D,     15, 0},
+    {"小星星",   PH_TWINKLE, PH_TWINKLE_D, 13, 0},
+    {"致爱丽丝", PH_ELISE,   PH_ELISE_D,    9, 0},
+    {"绿袖子",   PH_GREEN,   PH_GREEN_D,   15, 1},
+    {"卡农",     PH_CANON,   PH_CANON_D,   12, 0},
+    {"茉莉花",   PH_JASMINE, PH_JASMINE_D, 12, 2},
+    {"摇篮曲",   PH_LULLABY, PH_LULLABY_D, 12, 0},
+    {"友谊地久天长", PH_AULD,     PH_AULD_D,     12, 0},   /* sol 起 */
+    {"铃儿响叮当",   PH_JINGLE,   PH_JINGLE_D,   11, 0},   /* mi 起 */
+    {"送别",         PH_FAREWELL, PH_FAREWELL_D, 10, 0},   /* sol 起 */
+};
+
+
+/* 风格对应的 GM 音色号（0 基）：以前 MIDI 里从不写 program change，
+ * 所以不管什么风格，播放器都用同一个默认音色 —— 这是"听起来都一个味"的主因之一。 */
+static int style_program(const bgm_style_t *st) {
+    if (!strcmp(st->id, "happy"))      return 0;    /* 大钢琴 */
+    if (!strcmp(st->id, "calm"))       return 4;    /* 电钢琴 */
+    if (!strcmp(st->id, "sad"))        return 42;   /* 大提琴 */
+    if (!strcmp(st->id, "tense"))      return 81;   /* 合成 lead */
+    if (!strcmp(st->id, "mystery"))    return 88;   /* Pad */
+    if (!strcmp(st->id, "electronic")) return 80;   /* 方波 lead */
+    if (!strcmp(st->id, "game"))       return 80;
+    if (!strcmp(st->id, "march"))      return 56;   /* 小号 */
+    if (!strcmp(st->id, "chinese"))    return 105;  /* 古筝 */
+    return 0;
+}
+
+static const int *bgm_prog(const bgm_style_t *st, int *plen, unsigned int *seed) {
+    unsigned int r = bgm_rand(seed);
+    if (st->scale == SC_MINOR)  { *plen = 8; return PROG_MINOR[r % 3]; }
+    if (st->scale == SC_DORIAN) { *plen = 8; return PROG_DORIAN[r % 2]; }
+    if (st->scale == SC_PENTA)  { *plen = 8; return PROG_PENTA[r % 2]; }
+    *plen = 8; return PROG_MAJOR[r % 3];
+}
+
+/* 取音阶第 deg 级的音高（deg 可以越界，自动上下八度） */
+static int bgm_deg_pitch(const bgm_style_t *st, int deg) {
+    int oct = 0;
+    while (deg < 0) { deg += st->slen; oct--; }
+    while (deg >= st->slen) { deg -= st->slen; oct++; }
+    return st->root + st->scale[deg] + oct * 12;
+}
+
+/* 三和弦音（根/三/五） */
+static void bgm_triad(const bgm_style_t *st, int root_deg, int *p3) {
+    p3[0] = bgm_deg_pitch(st, root_deg);
+    p3[1] = bgm_deg_pitch(st, root_deg + 2);
+    p3[2] = bgm_deg_pitch(st, root_deg + 4);
+}
+
 static const bgm_style_t *bgm_pick(const char *style) {
     if (style && style[0]) {
         for (int i = 0; BGM_STYLES[i].id; i++)
@@ -821,6 +961,12 @@ static char *op_bgm(const char *json) {
     }
     if (bars < 1) bars = 1;
     if (bars > 64) bars = 64;
+    /* 时长要准：bars 定下来后微调 tempo，使 bars*4*60/tempo ≈ want_sec。
+     * 138→141 BPM 这种人耳几乎听不出，但总长能精确到 ±0.2 秒。 */
+    if (want_sec > 0 && bars > 0) {
+        double t2 = bars * 240.0 / want_sec;
+        if (t2 >= 40.0 && t2 <= 220.0) tempo = t2;
+    }
     if (want_sec > 0 && bars * 4.0 * 60.0 / tempo > want_sec * 1.15) {
         /* 宁可短一点也不超太多 */
         bars = (long)(want_sec * tempo / 240.0);
@@ -838,101 +984,176 @@ static char *op_bgm(const char *json) {
     unsigned int seed = 0;
     for (const char *q = st->id; *q; q++) seed = seed * 131u + (unsigned char)*q;
     seed = seed * 131u + (unsigned int)bars;
+    /* 每次生成要有变化：以前种子只由风格+小节数决定，同样的参数跑四次就是同一首。
+     * 想要可复现就传 seed 参数。 */
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        seed ^= (unsigned int)time(NULL) * 2654435761u;
+        seed ^= (unsigned int)(ts.tv_nsec & 0x7fffffff);
+    }
 
     /* 组装 melody / bass / drums 三段 */
     char mel[12000] = {0}, bas[3000] = {0}, drm[3000] = {0};
     size_t mi = 0, bi = 0, di = 0;
     int nn = 0;
 
-    for (long bar = 0; bar < bars; bar++) {
-        /* 低音：每小节主音，两拍一个 */
-        for (int b = 0; b < 2; b++) {
-            int bp = st->root - 12 + st->scale[0];
-            bi += (size_t)snprintf(bas + bi, sizeof(bas) - bi, "%s{\"pitch\":%d,\"dur\":2}",
-                                   bi ? "," : "", bp);
-        }
-        /* 鼓：强拍底鼓、弱拍军鼓 */
-        if (st->drums) {
-            di += (size_t)snprintf(drm + di, sizeof(drm) - di, "%s{\"pitch\":36,\"dur\":1}",
-                                   di ? "," : "");
-            di += (size_t)snprintf(drm + di, sizeof(drm) - di, ",{\"pitch\":38,\"dur\":1}");
-            di += (size_t)snprintf(drm + di, sizeof(drm) - di, ",{\"pitch\":36,\"dur\":1}");
-            di += (size_t)snprintf(drm + di, sizeof(drm) - di, ",{\"pitch\":38,\"dur\":1}");
-        }
-        /* 旋律：按 density 均分 4 拍，音级在音阶上随机走 */
-        int nN = st->density;
-        double dur = 4.0 / nN;
-        int deg = 0;
-        for (int k = 0; k < nN; k++) {
-            unsigned int r = bgm_rand(&seed);
-            int step = (int)(r % 3) - 1;              /* -1 / 0 / +1 级 */
-            if (st->mood == 1 && (r & 4)) step = -abs(step);   /* 暗淡偏好下行 */
-            deg += step;
-            if (deg < 0) deg += st->slen;
-            if (deg >= st->slen) deg -= st->slen;
-            int oct = (int)((r >> 8) % 3);            /* 偶尔跳八度 */
-            int pitch = st->root + st->scale[deg] + (oct == 2 ? 12 : 0);
-            if (pitch < 24) pitch += 12;
-            if (pitch > 96) pitch -= 12;
-            mi += (size_t)snprintf(mel + mi, sizeof(mel) - mi,
-                                   "%s{\"pitch\":%d,\"dur\":%.3g}",
-                                   mi ? "," : "", pitch, dur);
-            nn++;
-        }
-        /* 每隔两小节让旋律落回主音，听起来有句读 */
-        if (bar % 2 == 1 && nN > 1) {
-            mi = 0;
-            /* 简化：直接在上面已生成的内容里不动，只是计数 */
-            (void)mi;
-            break;
-        }
+    int plen = 0;
+    const int *prog = bgm_prog(st, &plen, &seed);
+
+    /* 55% 的概率用一条经典乐句开头（按调式匹配），后面再接自动生成 */
+    int use_ph = -1;
+    if ((bgm_rand(&seed) % 100) < 55) {
+        int want = (st->scale == SC_MINOR) ? 1 : ((st->scale == SC_PENTA) ? 2 : 0);
+        int cand[8], nc = 0;
+        for (int i = 0; i < (int)(sizeof(PHRASES) / sizeof(PHRASES[0])); i++)
+            if (PHRASES[i].mode == want) cand[nc++] = i;
+        if (!nc)
+            for (int i = 0; i < (int)(sizeof(PHRASES) / sizeof(PHRASES[0])); i++)
+                if (PHRASES[i].mode == 0) cand[nc++] = i;
+        if (nc) use_ph = cand[bgm_rand(&seed) % (unsigned)nc];
     }
-
-    /* 整段重新生成（上面为了控制句读的写法太绕，这里用直白版本保证正确） */
-    mi = bi = di = 0;
-    mel[0] = bas[0] = drm[0] = 0;
-    nn = 0;
-    seed = 0;
-    for (const char *q = st->id; *q; q++) seed = seed * 131u + (unsigned char)*q;
-    seed = seed * 131u + (unsigned int)bars;
-
-    for (long bar = 0; bar < bars; bar++) {
-        for (int b = 0; b < 2; b++)
-            bi += (size_t)snprintf(bas + bi, sizeof(bas) - bi, "%s{\"pitch\":%d,\"dur\":2}",
-                                   bi ? "," : "", st->root - 12 + st->scale[0]);
-        if (st->drums) {
-            const int pat[4] = {36, 38, 36, 38};
-            for (int k = 0; k < 4; k++)
-                di += (size_t)snprintf(drm + di, sizeof(drm) - di, "%s{\"pitch\":%d,\"dur\":1}",
-                                       di ? "," : "", pat[k]);
-        }
-        int nN = st->density;
-        double dur = 4.0 / nN;
-        int deg = 0;
-        for (int k = 0; k < nN; k++) {
+    /* 造一个 2 小节动机（8 个音级）：以主/三/五为骨架，级进为主，偶尔跳进。
+     * 后面每 2 小节复用它并做移位变奏 —— 这是"听起来像曲子"的关键。 */
+    /* 三个动机（各 4 音）→ AABA 结构。以前只有 1 个 8 音动机整曲反复，
+     * 所以"同一个风格每次都像同一首"。 */
+    int motif[3][4];
+    for (int m = 0; m < 3; m++) {
+        int base = (m == 1) ? 2 : 0;
+        for (int k = 0; k < 4; k++) {
             unsigned int r = bgm_rand(&seed);
             int step = (int)(r % 3) - 1;
             if (st->mood == 1 && (r & 4)) step = -abs(step);
-            deg += step;
-            while (deg < 0) deg += st->slen;
-            while (deg >= st->slen) deg -= st->slen;
-            int pitch = st->root + st->scale[deg];
-            if (((r >> 8) % 6) == 0) pitch += 12;
-            if (bar % 2 == 1 && k == nN - 1) pitch = st->root;   /* 句尾回主音 */
-            if (pitch < 24) pitch += 12;
-            if (pitch > 96) pitch -= 12;
-            mi += (size_t)snprintf(mel + mi, sizeof(mel) - mi,
-                                   "%s{\"pitch\":%d,\"dur\":%.3g}",
-                                   mi ? "," : "", pitch, dur);
-            nn++;
+            if (k == 0) base = (m == 2) ? 4 : 0;
+            else base += step;
+            if (base < -3) base += 4;
+            if (base > 9)  base -= 4;
+            motif[m][k] = base;
+        }
+    }
+    /* 节奏池按风格分三组（以前全风格共用一批图案，happy/tense 抽到的一样） */
+    static const double RHY_DENSE[6][8] = {   /* 欢快/紧张：密、切分 */
+        {1,1,1,1,0,0,0,0}, {0.5,0.5,1,1,1,0,0,0}, {1,0.5,0.5,2,0,0,0,0},
+        {0.5,0.5,0.5,0.5,1,1,0,0}, {0.5,1,0.5,1,1,0,0,0}, {1,0.5,0.5,1,0.5,0.5,0,0}
+    };
+    static const double RHY_SPARSE[5][8] = {  /* 舒缓/悲伤：疏、长音 */
+        {2,2,0,0,0,0,0,0}, {3,1,0,0,0,0,0,0}, {1,1,2,0,0,0,0,0},
+        {4,0,0,0,0,0,0,0}, {2,1,1,0,0,0,0,0}
+    };
+    static const double RHY_MID[6][8] = {     /* 神秘/国风/电子：中密度 */
+        {1,1,2,0,0,0,0,0}, {1.5,0.5,1,1,0,0,0,0}, {2,1,1,0,0,0,0,0},
+        {1,2,1,0,0,0,0,0}, {1,1,1,1,0,0,0,0}, {0.5,0.5,1,2,0,0,0,0}
+    };
+    int rhyset = 1;
+    if (!strcmp(st->id, "happy") || !strcmp(st->id, "tense") || !strcmp(st->id, "game")
+        || !strcmp(st->id, "march")) rhyset = 0;
+    else if (!strcmp(st->id, "calm") || !strcmp(st->id, "sad")) rhyset = 2;
+    /* 段落结构每次随机：AABA / ABAB / AABB */
+    int start_off = (int)(bgm_rand(&seed) % 3);   /* 起音落在和弦的 根/三/五 */
+    int start_skip = (int)(bgm_rand(&seed) % 4);  /* 开头 0~3 拍留白，形成弱起 */
+    int sect = (int)(bgm_rand(&seed) % 3);
+    int sect_map[4];
+    if (sect == 0) { sect_map[0]=0; sect_map[1]=0; sect_map[2]=1; sect_map[3]=0; }
+    else if (sect == 1) { sect_map[0]=0; sect_map[1]=1; sect_map[2]=0; sect_map[3]=1; }
+    else { sect_map[0]=0; sect_map[1]=0; sect_map[2]=1; sect_map[3]=1; }
+
+    for (long bar = 0; bar < bars; bar++) {
+        /* 低音：跟和弦根音走（不再一直是主音），节奏型随风格 */
+        int croot = prog[bar % plen];
+        int bp = bgm_deg_pitch(st, croot) - 12;
+        if (bp < 28) bp += 12;
+        if (st->drums) {
+            /* 有鼓的曲子：根音 + 五度交替（2+1+1） */
+            bi += (size_t)snprintf(bas + bi, sizeof(bas) - bi, "%s{\"pitch\":%d,\"dur\":2}",
+                                   bi ? "," : "", bp);
+            bi += (size_t)snprintf(bas + bi, sizeof(bas) - bi, ",{\"pitch\":%d,\"dur\":1}",
+                                   bgm_deg_pitch(st, croot + 4) - 12);
+            bi += (size_t)snprintf(bas + bi, sizeof(bas) - bi, ",{\"pitch\":%d,\"dur\":1}", bp);
+        } else {
+            /* 舒缓：整小节长音，第二小节换五度，制造呼吸 */
+            int p2 = (bar % 2) ? bgm_deg_pitch(st, croot + 4) - 12 : bp;
+            bi += (size_t)snprintf(bas + bi, sizeof(bas) - bi, "%s{\"pitch\":%d,\"dur\":4}",
+                                   bi ? "," : "", p2);
+        }
+        /* 鼓：底鼓(36) 军鼓(38) 踩镲(42)；每 4 小节最后一拍过门 */
+        if (st->drums) {
+            const char *pat = (bar % 4 == 3)
+                ? ",{\"pitch\":36,\"dur\":1},{\"pitch\":38,\"dur\":1},{\"pitch\":38,\"dur\":0.5},{\"pitch\":38,\"dur\":0.5},{\"pitch\":45,\"dur\":0.5},{\"pitch\":43,\"dur\":0.5}"
+                : ",{\"pitch\":36,\"dur\":1},{\"pitch\":38,\"dur\":1},{\"pitch\":36,\"dur\":1},{\"pitch\":38,\"dur\":1}";
+            if (!di) di += (size_t)snprintf(drm, sizeof(drm), "{\"pitch\":42,\"dur\":0.5}");
+            for (int k = 0; k < 8; k++)
+                di += (size_t)snprintf(drm + di, sizeof(drm) - di, ",{\"pitch\":42,\"dur\":0.5}");
+            di += (size_t)snprintf(drm + di, sizeof(drm) - di, "%s", pat);
+        }
+        /* 先看这一段有没有经典乐句要铺 */
+        int ph_used = 0;
+        if (use_ph >= 0) {
+            const phrase_t *ph = &PHRASES[use_ph];
+            double acc = 0.0;
+            for (int i = 0; i < ph->n; i++) {
+                double t0 = acc;
+                acc += ph->dur[i];
+                if (t0 + 0.001 < (double)bar * 4.0) continue;
+                if (t0 >= (double)(bar + 1) * 4.0) break;
+                int pitch = bgm_deg_pitch(st, ph->deg[i]) + 12;
+                if (pitch < 46) pitch += 12;
+                if (pitch > 96) pitch -= 12;
+                mi += (size_t)snprintf(mel + mi, sizeof(mel) - mi,
+                                       "%s{\"pitch\":%d,\"dur\":%.3g}",
+                                       mi ? "," : "", pitch, ph->dur[i]);
+                nn++;
+                ph_used = 1;
+            }
+            if (acc >= 4.0 * (double)bars) use_ph = -1;   /* 乐句用完，后面转回生成 */
+        }
+        /* 旋律：按节奏型走；AABA 结构取动机；强拍落和弦音；偶尔休止 */
+        if (!ph_used) {
+            int p3[3]; bgm_triad(st, croot, p3);
+            int rh;
+            if (rhyset == 0) rh = (int)(bgm_rand(&seed) % 6);
+            else if (rhyset == 2) rh = (int)(bgm_rand(&seed) % 5);
+            else rh = (int)(bgm_rand(&seed) % 6);
+            /* 开头不再强制固定节奏型：以前每首前两拍结构相同，听起来"总是一样" */
+            if (bar == bars - 1) rh = (rhyset == 2) ? 3 : 0;   /* 结尾长音收 */
+            int mt = sect_map[bar % 4];
+            const double *row = (rhyset == 0) ? RHY_DENSE[rh]
+                              : (rhyset == 2) ? RHY_SPARSE[rh] : RHY_MID[rh];
+            double pos = 0.0;
+            for (int k = 0; k < 8; k++) {
+                double d = row[k];
+                if (d <= 0) break;
+                int strong = (pos < 0.01) || (pos > 1.99 && pos < 2.01);
+                unsigned int r = bgm_rand(&seed);
+                /* 弱起：整曲最开头留 0~3 拍，让每首的"进点"不同 */
+                if (bar == 0 && pos + 0.001 < (double)start_skip) { pos += d; continue; }
+                /* 弱拍偶尔留白（休止），比"每拍都塞音"更像真实旋律 */
+                if (!strong && (r % 9) == 0) { pos += d; continue; }
+                int pitch;
+                if (strong) {
+                    pitch = p3[(int)((bar * 2 + (int)pos + start_off) % 3)];
+                    while (pitch < st->root) pitch += 12;
+                } else {
+                    int md = motif[mt][k % 4];
+                    if (r % 7 == 0) md += ((r & 8) ? 1 : -1);
+                    pitch = bgm_deg_pitch(st, md) + 12;
+                }
+                if (bar == bars - 1 && k == 0) pitch = st->root + 12;
+                if (pitch < 46) pitch += 12;
+                if (pitch > 96) pitch -= 12;
+                mi += (size_t)snprintf(mel + mi, sizeof(mel) - mi,
+                                       "%s{\"pitch\":%d,\"dur\":%.3g}",
+                                       mi ? "," : "", pitch, d);
+                nn++;
+                pos += d;
+            }
         }
     }
 
     /* 先出 MIDI */
     char j1[20000];
     snprintf(j1, sizeof(j1),
-             "{\"path\":\"%s.mid\",\"tempo\":%.4g,\"melody\":[%s],\"bass\":[%s]%s%s%s}",
-             base, tempo, mel, bas,
+             "{\"path\":\"%s.mid\",\"tempo\":%.4g,\"program\":%d,\"melody\":[%s],\"bass\":[%s]%s%s%s}",
+             base, tempo, style_program(st), mel, bas,
              di ? ",\"drums\":[" : "", di ? drm : "",
              di ? "]}" : "}");
     char *mid_res = op_midi(j1);

@@ -1144,6 +1144,8 @@ static const char *op_to_plugin(const char *js, const char *op) {
         {"parse","curl"},        /* curl 插件的 op 名是 parse（吃 cURL 原文） */
         {"tts","voice"}, {"speak","voice"}, {"say","voice"}, {"voice","voice"},
         {"asr","voice"}, {"stt","voice"}, {"transcribe","voice"},   /* 语音转文字 */
+        {"gen","browser"}, {"locator","browser"}, {"xpath","browser"}, /* 生成 Selenium 代码 */
+        {"css","browser"}, {"selenium","browser"},
         {"fix","image"}, {"upscale","image"}, {"enhance","image"},  /* 图片修复/放大 */
         {"whiten","image"}, {"scan","image"}, {"deshadow","image"}, /* 去阴影/背景取白 */
         {"moire","image"}, {"screen","image"},                      /* 去摩尔纹（拍屏幕） */

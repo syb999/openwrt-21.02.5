@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-llama
-PKG_VERSION:=3.1.115
+PKG_VERSION:=3.1.135
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=local
