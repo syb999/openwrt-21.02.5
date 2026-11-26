@@ -1,0 +1,110 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: ethernet: airoha: account PON data path TX counters and guard the control wake
+
+ponwrt 922 also wires the PON data-path counters into the TX submit and
+completion paths, and guards the TX NAPI PON branch with an ops-table check.
+The 5.4 port brought only the counter struct plus the reader, so the
+diagnostics page reported zeros, and its wake branch read netdev_priv() on
+whatever netdev the skb came from - including the omci0/oam0 control
+netdevs, whose private area is not a airoha_gdm_port.
+
+Port the misses from 922:
+
+  * forward declaration of airoha_netdev_ops (922 adds it too);
+  * tx_busy bump when the shared ring has no room;
+  * tx_packets_submitted / tx_bytes_submitted / tx_channel_packets /
+    last_tx_msg0|1 after the descriptors are queued;
+  * one ops-checked block in the TX NAPI poll that accounts the data path
+    TX completion (hardware drop vs completed) and wakes the control
+    netdev once the shared ring recovers.
+
+Diagnostics and robustness only - the data path behaviour is unchanged.
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-16 10:10:00.000000000 +0800
++++ b/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-16 10:10:01.000000000 +0800
+@@ -21,6 +21,8 @@
+ 
+ #include "airoha_regs.h"
+ #include "airoha_eth.h"
++
++static const struct net_device_ops airoha_netdev_ops;
+ 
+ u32 airoha_rr(void __iomem *base, u32 offset)
+ {
+@@ -1164,21 +1166,35 @@
+ 			    q->ndesc - q->queued >= q->free_thr)
+ 				netif_tx_wake_queue(txq);
+ 
+-			/* PON: wake the control netdev when the shared ring recovers. */
+-			if (skb->dev) {
++			/*
++			 * PON: this ring serves pon0 and the omci/oam control netdevs,
++			 * so check the ops table before reading a airoha_gdm_port out
++			 * of the private area. Account the data path TX completion and
++			 * wake the control netdev once the shared ring recovers.
++			 */
++			if (skb->dev && skb->dev->netdev_ops == &airoha_netdev_ops) {
+ 				struct airoha_gdm_port *tport = netdev_priv(skb->dev);
+ 
+-				if ((tport->flags & AIROHA_PRIV_F_PON) &&
+-				    airoha_qdma_get_txq(qdma, 0) == qid) {
+-					const struct airoha_pon_link_ops *ops;
+-					void *priv;
+-
+-					rcu_read_lock();
+-					ops = READ_ONCE(tport->pon_link_ops);
+-					priv = READ_ONCE(tport->pon_link_priv);
+-					if (ops && ops->wake_control_tx && priv)
+-						ops->wake_control_tx(priv);
+-					rcu_read_unlock();
++				if (tport->flags & AIROHA_PRIV_F_PON) {
++					if (airoha_qdma_get_txq(qdma, 0) == qid) {
++						const struct airoha_pon_link_ops *ops;
++						void *priv;
++
++						rcu_read_lock();
++						ops = READ_ONCE(tport->pon_link_ops);
++						priv = READ_ONCE(tport->pon_link_priv);
++						if (ops && ops->wake_control_tx && priv)
++							ops->wake_control_tx(priv);
++						rcu_read_unlock();
++					}
++
++					if (desc_ctrl & QDMA_DESC_DROP_MASK)
++						atomic64_inc(&tport->pon_stats.tx_packets_hw_dropped);
++					else {
++						atomic64_inc(&tport->pon_stats.tx_packets_completed);
++						atomic64_add(skb->len,
++							     &tport->pon_stats.tx_bytes_completed);
++					}
+ 				}
+ 			}
+ 
+@@ -2417,6 +2433,8 @@
+ 
+ 	if (q->queued + nr_frags >= q->ndesc) {
+ 		/* not enough space in the queue */
++		if (pon_data)
++			atomic64_inc(&port->pon_stats.tx_busy);
+ 		netif_tx_stop_queue(txq);
+ 		spin_unlock_bh(&q->lock);
+ 		rcu_read_unlock();
+@@ -2463,6 +2481,15 @@
+ 		len = skb_frag_size(frag);
+ 	}
+ 	q->queued += i;
++	if (pon_data) {
++		u8 channel = FIELD_GET(QDMA_ETH_TXMSG_CHAN_MASK, msg0);
++
++		atomic64_inc(&port->pon_stats.tx_packets_submitted);
++		atomic64_add(skb->len, &port->pon_stats.tx_bytes_submitted);
++		atomic64_inc(&port->pon_stats.tx_channel_packets[channel]);
++		WRITE_ONCE(port->pon_stats.last_tx_msg0, msg0);
++		WRITE_ONCE(port->pon_stats.last_tx_msg1, msg1);
++	}
+ 
+ 	skb_tx_timestamp(skb);
+ 	netdev_tx_sent_queue(txq, skb->len);

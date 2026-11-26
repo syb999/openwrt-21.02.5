@@ -307,11 +307,17 @@ capture_interface() {
 	local output="$2"
 	local size_mb="$3"
 	local files="$4"
-	local size status
+	local size status tcpdump
 	shift 4
 
 	CAPTURE_LOG="$CAPTURE_DIR/$output.log"
 	mkdir -p "$CAPTURE_DIR"
+	# OpenWrt installs tcpdump in /usr/sbin, not /usr/bin.
+	tcpdump="$(command -v tcpdump)"
+	if [ -z "$tcpdump" ]; then
+		date "+capture_unavailable=%Y-%m-%dT%H:%M:%S%z tcpdump not installed" >> "$CAPTURE_LOG"
+		return 0
+	fi
 	# procd signals only this shell; tcpdump must exit to flush its ring.
 	trap stop_capture INT TERM
 	while true; do
@@ -329,7 +335,7 @@ capture_interface() {
 			[ "$size" -lt "$CAPTURE_LOG_BYTES" ] || mv -f "$CAPTURE_LOG" "$CAPTURE_LOG.1"
 		fi
 		date "+capture_start=%Y-%m-%dT%H:%M:%S%z run=$CAPTURE_RUN" >> "$CAPTURE_LOG"
-		/usr/bin/tcpdump -i "$device" -n -s 0 -U -C "$size_mb" -W "$files" \
+		"$tcpdump" -i "$device" -n -s 0 -U -C "$size_mb" -W "$files" \
 			-w "$CAPTURE_DIR/$output-$(date +%Y%m%d-%H%M%S)-$$-$CAPTURE_RUN.pcap" \
 			"$@" >> "$CAPTURE_LOG" 2>&1 &
 		CAPTURE_PID=$!

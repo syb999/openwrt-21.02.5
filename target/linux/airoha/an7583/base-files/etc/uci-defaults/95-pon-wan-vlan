@@ -1,0 +1,58 @@
+#!/bin/sh
+#
+# Shanghai Unicom delivers the internet service as PPPoE carried in VLAN 914.
+# An untagged PADI leaves the ONU, the OLT drops it (tag-mode port), and no
+# PADO ever comes back, so wan must sit on the tagged subinterface.
+#
+# Migration for boards whose generated wan still points at the raw pon0:
+#   - make sure an 8021q device pon0.<vid> exists (reuse a manual one)
+#   - move wan onto it
+#   - drop the dhcpv6 wan6 that was generated for the untagged device
+# The VLAN lives in 'pon.<line>.wan_vlan' so another line only needs that
+# one value changed.
+#
+# Runs from /etc/uci-defaults, so it also fires after a sysupgrade that keeps
+# /etc/config.
+
+[ -f /etc/config/network ] || exit 0
+
+wan_vlan="$(uci -q get pon.line0.wan_vlan)"
+if [ -z "$wan_vlan" ]; then
+	wan_vlan=914
+	if [ -n "$(uci -q get pon.line0)" ]; then
+		uci set pon.line0.wan_vlan="$wan_vlan"
+		uci commit pon
+	fi
+fi
+
+# pppd must not exit on a failed discovery: netifd would tear the device down
+# and that restarts the whole PON line every 15 s, which keeps the OLT from
+# ever seeing a stable ONU.
+if [ "$(uci -q get network.wan.proto)" = "pppoe" ] &&
+   [ -z "$(uci -q get network.wan.persist)" ]; then
+	uci set network.wan.persist='1'
+	uci commit network
+fi
+
+wan_device="$(uci -q get network.wan.device)"
+[ "$wan_device" = "pon0" ] || exit 0
+
+vlan_if="pon0.$wan_vlan"
+
+# An 8021q device may already exist as an anonymous section (manual setup).
+section="$(uci show network | grep -F ".name='$vlan_if'" | head -n 1 |
+	sed -e "s/^network\.//" -e "s/\.name=.*//")"
+if [ -z "$section" ]; then
+	section="pon0_$wan_vlan"
+	uci set network."$section"=device
+	uci set network."$section".type='8021q'
+fi
+uci set network."$section".ifname='pon0'
+uci set network."$section".vid="$wan_vlan"
+uci set network."$section".name="$vlan_if"
+
+uci set network.wan.device="$vlan_if"
+# pppoe runs IPv6 over the same session through 'option ipv6 auto'.
+[ "$(uci -q get network.wan6.proto)" = "dhcpv6" ] && uci -q delete network.wan6
+uci commit network
+exit 0

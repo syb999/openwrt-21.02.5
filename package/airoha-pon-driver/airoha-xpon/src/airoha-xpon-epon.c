@@ -985,19 +985,34 @@ int airoha_xpon_epon_advance(struct airoha_xpon *xpon, u32 phy_events,
 
 	airoha_xpon_epon_stop_rx(xpon);
 	xpon->epon.recovery_count++;
+	*delay = msecs_to_jiffies(
+		airoha_xpon_retry_backoff_ms(xpon->epon.recovery_count,
+		                             AIROHA_XPON_NO_SYNC_RECOVERY_MS));
 	full_reinit = xpon->epon.recovery_count % 5 == 0;
 	if (full_reinit) {
 		xpon->pcs_profile_valid = false;
 		xpon->epon.full_reinit_count++;
-		dev_warn_ratelimited(
-			xpon->dev,
-			"EPON PCS remains unsynchronized; running full PMA initialization (recovery %u)\n",
-			xpon->epon.recovery_count);
+		if (airoha_xpon_retry_log_visible(xpon->epon.recovery_count))
+			dev_warn(
+				xpon->dev,
+				"EPON PCS remains unsynchronized; running full PMA initialization (recovery %u)\n",
+				xpon->epon.recovery_count);
+		else
+			dev_dbg(
+				xpon->dev,
+				"EPON PCS unsynchronized; full PMA init (recovery %u)\n",
+				xpon->epon.recovery_count);
 	} else {
-		dev_warn_ratelimited(
-			xpon->dev,
-			"EPON PCS remains unsynchronized; running short PMA retrain (recovery %u)\n",
-			xpon->epon.recovery_count);
+		if (airoha_xpon_retry_log_visible(xpon->epon.recovery_count))
+			dev_warn(
+				xpon->dev,
+				"EPON PCS remains unsynchronized; running short PMA retrain (recovery %u)\n",
+				xpon->epon.recovery_count);
+		else
+			dev_dbg(
+				xpon->dev,
+				"EPON PCS unsynchronized; short PMA retrain (recovery %u)\n",
+				xpon->epon.recovery_count);
 	}
 
 	ret = airoha_xpon_epon_start_rx(xpon);

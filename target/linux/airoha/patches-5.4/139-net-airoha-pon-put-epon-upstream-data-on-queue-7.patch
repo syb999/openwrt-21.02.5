@@ -1,0 +1,52 @@
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -651,6 +651,8 @@
+ }
+ 
+ /* Forward declarations for PON helpers defined near the end of this file. */
++#define AIROHA_PON_DATA_QUEUE		7
++
+ static netdev_tx_t airoha_dev_xmit(struct sk_buff *skb, struct net_device *netdev);
+ static u32 airoha_pon_select_flow(struct airoha_gdm_port *port, struct sk_buff *skb);
+ static void airoha_pon_read_datapath_stats(struct airoha_gdm_port *dev,
+@@ -2364,13 +2366,25 @@
+ 			goto error;
+ 		}
+ 		channel = FIELD_GET(AIROHA_PON_QDMA_TCONT_MASK, pon_tag);
+-		msg0 = FIELD_PREP(QDMA_ETH_TXMSG_CHAN_MASK, channel) |
+-		       FIELD_PREP(QDMA_ETH_TXMSG_QUEUE_MASK,
+-				  qid % AIROHA_NUM_QOS_QUEUES);
++		msg0 = FIELD_PREP(QDMA_ETH_TXMSG_CHAN_MASK, channel);
+ 		/* XG-PON carries GEM Port-ID in SP_TAG; EPON selects an LLID channel. */
+-		if (!(pon_tag & AIROHA_PON_QDMA_EPON))
+-			msg0 |= FIELD_PREP(QDMA_ETH_TXMSG_SP_TAG_MASK,
++		if (pon_tag & AIROHA_PON_QDMA_EPON) {
++			/*
++			 * AN7581 vendor reference (ewan_prepare_tx_message) sends
++			 * every EPON upstream frame, data included, on QoS queue 7
++			 * with the PON descriptor bit set. Queue 0 is the MPCP/OAM
++			 * slot the OLT only grants for control traffic, so data
++			 * queued there never leaves the MAC.
++			 */
++			msg0 |= FIELD_PREP(QDMA_ETH_TXMSG_QUEUE_MASK,
++					   AIROHA_PON_DATA_QUEUE) |
++				QDMA_ETH_TXMSG_OAM_MASK;
++		} else {
++			msg0 |= FIELD_PREP(QDMA_ETH_TXMSG_QUEUE_MASK,
++					   qid % AIROHA_NUM_QOS_QUEUES) |
++				FIELD_PREP(QDMA_ETH_TXMSG_SP_TAG_MASK,
+ 					   FIELD_GET(AIROHA_PON_QDMA_GEM_MASK, pon_tag));
++		}
+ 		nboq = channel;
+ 	} else {
+ 		tag = airoha_get_dsa_tag(skb, netdev);
+@@ -2407,7 +2421,8 @@
+ 	if (ctrl || (port->flags & AIROHA_PRIV_F_PON))
+ 		msg1 |= FIELD_PREP(QDMA_ETH_TXMSG_ACNT_G0_MASK, 0x1f) |
+ 			FIELD_PREP(QDMA_ETH_TXMSG_ACNT_G1_MASK, 0x1f);
+-	if (ctrl) {
++	/* PON data frames carry the LLID index in NBOQ exactly like control. */
++	if (ctrl || (port->flags & AIROHA_PRIV_F_PON)) {
+ 		msg1 |= FIELD_PREP(QDMA_ETH_TXMSG_NBOQ_MASK, nboq);
+ 		msg1 |= QDMA_ETH_TXMSG_NO_DROP;
+ 	}

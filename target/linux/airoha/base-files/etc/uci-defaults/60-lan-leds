@@ -1,0 +1,22 @@
+#!/bin/sh
+# LAN2/3/4 的灯改为软件驱动：绑定 netdev 触发器（link 常亮 / tx rx 闪）
+# 这几颗灯的物理接法是低有效，DTS 里已写 GPIO_ACTIVE_LOW。
+
+set_led() {
+	local name="$1" sysfs="$2" dev="$3"
+	[ -e "/sys/class/leds/$sysfs" ] || return 0
+	uci -q set system."$name"=led
+	uci -q set system."$name".name="$dev"
+	uci -q set system."$name".sysfs="$sysfs"
+	uci -q set system."$name".trigger='netdev'
+	uci -q set system."$name".dev="$dev"
+	uci -q set system."$name".mode='link tx rx'
+}
+
+set_led led_lan2 'green:lan-2' lan2
+set_led led_lan3 'green:lan-3' lan3
+set_led led_lan4 'green:lan-4' lan4
+
+uci -q commit system
+[ -x /etc/init.d/led ] && /etc/init.d/led restart >/dev/null 2>&1
+exit 0

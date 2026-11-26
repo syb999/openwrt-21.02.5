@@ -68,6 +68,7 @@ int oam_run_agent(const char *interface, const struct oam_config *cfg, const cha
 	struct ctc_session ctc;
 	struct oam_status_hub hub;
 	char service_ready[300];
+	char status_path[160];
 	bool has_service_ready = false;
 	bool published_service_ready = false;
 	uint8_t buffer[RECEIVE_BUFFER_LEN];
@@ -85,6 +86,19 @@ int oam_run_agent(const char *interface, const struct oam_config *cfg, const cha
 		has_service_ready = true;
 	publish_service_ready(service_ready, has_service_ready, false);
 
+	{
+		char parent[64];
+
+		if (pond_parent_interface(interface, parent, sizeof(parent)) == 0 &&
+		    parent[0]) {
+			char fp[160];
+
+			snprintf(fp, sizeof(fp),
+				 "/sys/kernel/debug/airoha-xpon-%s/frontend", parent);
+			ctc_set_frontend_debug_path(fp);
+		}
+	}
+
 	ieee_session_init(&ieee);
 	ctc_session_init(&ctc);
 	oam_status_init(&hub, interface, cfg->operator, cfg->loid_len > 0, &ctc);
@@ -94,6 +108,17 @@ int oam_run_agent(const char *interface, const struct oam_config *cfg, const cha
 		pond_sock_close(&sock);
 		return 1;
 	}
+
+	/* Mirror the status JSON next to the socket for the web UI. */
+	snprintf(status_path, sizeof(status_path), "%s", socket_path);
+	{
+		char *dot = strrchr(status_path, '.');
+
+		if (dot && !strcmp(dot, ".sock"))
+			snprintf(dot, (size_t)sizeof(status_path) - (size_t)(dot - status_path),
+				 ".json");
+	}
+	oam_status_publish_json(&hub, status_path);
 
 	printf("OAM agent started: interface=%s operator=%s control_socket=%s\n",
 	       interface, cfg->operator, socket_path);
@@ -109,8 +134,21 @@ int oam_run_agent(const char *interface, const struct oam_config *cfg, const cha
 		if (n < 0) {
 			if (-n == EINTR)
 				continue;
-			if (-n == ENETDOWN && pond_sock_present(&sock)) {
-				oam_status_record_event(&hub, "line", "PON control netdev is down");
+			if (-n == ENETDOWN || -n == ENODEV || -n == ENXIO) {
+				/*
+				 * A PON line restart unregisters oam0. Exiting here would
+				 * drop the control socket (the web UI loses the OAM block)
+				 * and force a fresh CTC session on every retry, so wait for
+				 * the netdev to come back instead of breaking the loop.
+				 */
+				oam_status_record_event(&hub, "line",
+							"PON control netdev is down; waiting for it");
+				oam_status_publish_json(&hub, status_path);
+				pond_sock_close(&sock);
+				while (pond_sock_open(&sock, interface) < 0)
+					usleep(200000);
+				oam_status_record_event(&hub, "line",
+							"PON control netdev is back");
 				continue;
 			}
 			break;
@@ -185,6 +223,7 @@ int oam_run_agent(const char *interface, const struct oam_config *cfg, const cha
 		}
 
 		oam_status_update_ctc(&hub, &ctc);
+		oam_status_publish_json(&hub, status_path);
 		{
 			bool ready = !strcmp(ctc.authentication, "accepted");
 

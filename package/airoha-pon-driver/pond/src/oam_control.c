@@ -200,6 +200,46 @@ static void status_json(char *out, size_t cap, struct oam_status_hub *hub)
 	(void)o;
 }
 
+/*
+ * LuCI cannot rely on exec'ing pondctl: rpcd canonicalises the command path
+ * before its ACL check, so the /usr/bin/pondctl symlink is matched against
+ * the ACL as /usr/sbin/airoha-pond and the call is denied, leaving the web UI
+ * without any OAM status. Publish the same JSON to a runtime file instead and
+ * let the page read that file.
+ *
+ * Writes are throttled to one per second and done through a rename so a
+ * reader never sees a partially written document.
+ */
+void oam_status_publish_json(struct oam_status_hub *hub, const char *path)
+{
+	static time_t last_publish;
+	struct timespec now;
+	char out[8192], tmp[220];
+	FILE *f;
+
+	if (!path || !path[0])
+		return;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (last_publish && now.tv_sec == last_publish)
+		return;
+	last_publish = now.tv_sec;
+
+	pthread_mutex_lock(&hub->lock);
+	status_json(out, sizeof(out), hub);
+	pthread_mutex_unlock(&hub->lock);
+
+	if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp))
+		return;
+
+	f = fopen(tmp, "w");
+	if (!f)
+		return;
+	if (fputs(out, f) < 0 || fclose(f) != 0)
+		return;
+	rename(tmp, path);
+}
+
 static void serve_connection(struct oam_status_hub *hub, int fd)
 {
 	char request[256], out[8192];

@@ -5,8 +5,11 @@
 
 const uint8_t oam_slow_protocols_multicast[6] = { 0x01, 0x80, 0xc2, 0x00, 0x00, 0x02 };
 
-#define ETHER_TYPE_SLOW_PROTOCOLS 0x8809
-#define OAM_SUBTYPE 0x03
+#define OAM_ETHERTYPE_OFF	12
+#define OAM_ETHERTYPE_HI	0x88
+#define OAM_ETHERTYPE_LO	0x09
+#define OAM_SUBTYPE_OFF		14
+#define OAM_SUBTYPE		0x03
 
 size_t oam_frame_len(size_t payload_len)
 {
@@ -18,15 +21,15 @@ size_t oam_frame_len(size_t payload_len)
 int oam_pdu_parse(const uint8_t *frame, size_t len, struct oam_pdu *out)
 {
 	if (len < OAM_HEADER_LEN)
-		return -1;	/* shorter than its header */
-	if (frame[12] != (ETHER_TYPE_SLOW_PROTOCOLS >> 8) ||
-	    frame[13] != (ETHER_TYPE_SLOW_PROTOCOLS & 0xff))
-		return -2;	/* unexpected EtherType */
-	if (frame[14] != OAM_SUBTYPE)
-		return -3;	/* not an OAMPDU */
+		return -1;
+	if (frame[OAM_ETHERTYPE_OFF] != OAM_ETHERTYPE_HI ||
+	    frame[OAM_ETHERTYPE_OFF + 1] != OAM_ETHERTYPE_LO)
+		return -1;
+	if (frame[OAM_SUBTYPE_OFF] != OAM_SUBTYPE)
+		return -1;
 
-	/* bytes 15..16 are the flags, byte 17 the code */
-	out->code = frame[17];
+	/* DA(6) SA(6) ethertype(2) subtype(1) flags(2) code(1) */
+	out->code = frame[OAM_HEADER_LEN - 1];
 	out->payload = frame + OAM_HEADER_LEN;
 	out->payload_len = len - OAM_HEADER_LEN;
 	return 0;
@@ -40,11 +43,11 @@ int oam_pdu_build(const uint8_t source[6], uint16_t flags, uint8_t code,
 
 	if (total > out_cap)
 		return -1;
-	memcpy(out, oam_slow_protocols_multicast, 6);
+	memcpy(out, oam_slow_protocols_multicast, sizeof(oam_slow_protocols_multicast));
 	memcpy(out + 6, source, 6);
-	out[12] = ETHER_TYPE_SLOW_PROTOCOLS >> 8;
-	out[13] = ETHER_TYPE_SLOW_PROTOCOLS & 0xff;
-	out[14] = OAM_SUBTYPE;
+	out[OAM_ETHERTYPE_OFF] = OAM_ETHERTYPE_HI;
+	out[OAM_ETHERTYPE_OFF + 1] = OAM_ETHERTYPE_LO;
+	out[OAM_SUBTYPE_OFF] = OAM_SUBTYPE;
 	out[15] = (uint8_t)(flags >> 8);
 	out[16] = (uint8_t)flags;
 	out[17] = code;

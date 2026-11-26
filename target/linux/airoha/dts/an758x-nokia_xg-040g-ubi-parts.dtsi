@@ -34,7 +34,6 @@
 					#address-cells = <1>;
 					#size-cells = <1>;
 
-					/* The UBI volume retains its header while NVMEM exposes 512-byte BOB. */
 					pon_calibration: calibration@2 {
 						reg = <0x2 0x200>;
 					};

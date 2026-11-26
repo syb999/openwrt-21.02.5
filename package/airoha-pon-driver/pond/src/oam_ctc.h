@@ -89,4 +89,6 @@ int ctc_handle_set(struct ctc_session *s, const uint8_t *data, size_t data_len,
 /* VLAN ids decoded from the last recorded Set (sorted, de-duplicated). */
 size_t ctc_vlan_ids(const struct ctc_session *s, uint16_t *out, size_t cap);
 
+void ctc_set_frontend_debug_path(const char *path);
+
 #endif

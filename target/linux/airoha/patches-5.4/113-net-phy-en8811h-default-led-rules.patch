@@ -1,0 +1,27 @@
+--- a/drivers/net/phy/air_en8811h.c
++++ b/drivers/net/phy/air_en8811h.c
+@@ -1001,12 +1001,22 @@
+ 	phydev->c45_ids.devices_in_package |= MDIO_DEVS_PMAPMD | MDIO_DEVS_AN;
+ 
+ #if AIR_EN8811H_PHY_LED
++	/*
++	 * 5.4 上没有把 PHY-LED 的 netdev hw-control 触发器接起来 (DT 的 leds 子节点
++	 * 没有 linux,default-trigger), 而这里原来用 AIR_LED_MODE_DISABLE 把 LED 整块
++	 * 关掉 ⇒ 2.5G 口 (LAN1) 的灯永远不亮。
++	 * 改成 USER_DEFINE 模式, 并直接下发驱动自带的默认规则
++	 * (AIR_DEFAULT_TRIGGER_LED0 = LINK|RX|TX), 让 LED 由 PHY 硬件跟随链路/活动。
++	 */
+ 	ret = air_leds_init(phydev, EN8811H_LED_COUNT, AIR_PHY_LED_DUR,
+-			    AIR_LED_MODE_DISABLE);
++			    AIR_LED_MODE_USER_DEFINE);
+ 	if (ret < 0) {
+-		phydev_err(phydev, "Failed to disable leds: %d\n", ret);
++		phydev_err(phydev, "Failed to init leds: %d\n", ret);
+ 		return ret;
+ 	}
++	air_led_hw_control_set(phydev, 0, AIR_DEFAULT_TRIGGER_LED0);
++	air_led_hw_control_set(phydev, 1, AIR_DEFAULT_TRIGGER_LED1);
++	air_led_hw_control_set(phydev, 2, AIR_DEFAULT_TRIGGER_LED2);
+ #endif /* AIR_EN8811H_PHY_LED */
+ 
+ 	/* Configure led gpio pins as output */

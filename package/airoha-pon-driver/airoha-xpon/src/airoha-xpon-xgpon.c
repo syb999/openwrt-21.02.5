@@ -664,6 +664,9 @@ static void airoha_xpon_xgpon_recover_no_sync(struct airoha_xpon *xpon,
 	}
 
 	xpon->stats.no_ready_recovery_count++;
+	*delay = msecs_to_jiffies(
+		airoha_xpon_retry_backoff_ms(xpon->stats.no_ready_recovery_count,
+		                             AIROHA_XPON_NO_SYNC_RECOVERY_MS));
 	full_reinit = (xpon->stats.no_ready_recovery_count + 3) %
 	                      AIROHA_XPON_FULL_REINIT_PERIOD ==
 	              0;
@@ -672,15 +675,27 @@ static void airoha_xpon_xgpon_recover_no_sync(struct airoha_xpon *xpon,
 		airoha_xpon_xgpon_hold_digital_rx_reset(xpon);
 		xpon->pcs_profile_valid = false;
 		xpon->stats.full_reinit_count++;
-		dev_warn_ratelimited(
-			xpon->dev,
-			"optical signal present without XGTC sync; running full PON PHY reinitialization (recovery %u)\n",
-			xpon->stats.no_ready_recovery_count);
+		if (airoha_xpon_retry_log_visible(xpon->stats.no_ready_recovery_count))
+			dev_warn(
+				xpon->dev,
+				"optical signal present without XGTC sync; running full PON PHY reinitialization (recovery %u)\n",
+				xpon->stats.no_ready_recovery_count);
+		else
+			dev_dbg(
+				xpon->dev,
+				"no XGTC sync; full PHY reinit (recovery %u)\n",
+				xpon->stats.no_ready_recovery_count);
 	} else {
-		dev_warn_ratelimited(
-			xpon->dev,
-			"optical signal present without XGTC sync; running short PMA recovery (recovery %u)\n",
-			xpon->stats.no_ready_recovery_count);
+		if (airoha_xpon_retry_log_visible(xpon->stats.no_ready_recovery_count))
+			dev_warn(
+				xpon->dev,
+				"optical signal present without XGTC sync; running short PMA recovery (recovery %u)\n",
+				xpon->stats.no_ready_recovery_count);
+		else
+			dev_dbg(
+				xpon->dev,
+				"no XGTC sync; short PMA recovery (recovery %u)\n",
+				xpon->stats.no_ready_recovery_count);
 	}
 
 	ret = airoha_xpon_xgpon_start_rx(xpon);

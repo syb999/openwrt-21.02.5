@@ -1,0 +1,100 @@
+From: airoha-port <airoha@local>
+Subject: [PATCH] net: ethernet: airoha: start and stop the PON line from ndo_open/ndo_stop
+
+The 6.18 stack starts the PON line from airoha_dev_open() by calling the
+registered controller's start op, and stops it from airoha_dev_stop() before
+QDMA/NAPI teardown (ponwrt 922).  The 5.4 port brought in only the controller
+registration and the pon%d netdev, so opening pon0 never started the line:
+
+  LuCI PON status showed current line mode "Not active", line state
+  "Stopped", transmit optical power -40.00 dBm, PCS/MPCP never ran and the
+  OAM channel saw 0 messages - while the receiver did measure -26.38 dBm, so
+  the fiber itself was fine.
+
+Mirror the 6.18 open/stop wiring:
+
+  * refuse to open the PON port while no controller is registered,
+  * keep carrier off and the TX queues stopped until airoha-xpon publishes
+    the bearer (EPON: after LLID0 registration),
+  * call pon_link_ops->start() once QDMA and NAPI are ready, unwinding the
+    partial open when it fails,
+  * call pon_link_ops->stop() in ndo_stop before QDMA/NAPI teardown.
+
+FE_PSE_PORT_DROP does not exist in this tree's register header, so the
+failure path restores FE_PSE_PORT_PPE1, the default the open path installs.
+
+Signed-off-by: airoha-port <airoha@local>
+---
+diff -ruN a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-16 00:00:00.000000000 +0800
++++ b/drivers/net/ethernet/airoha/airoha_eth.c	2026-10-16 00:00:01.000000000 +0800
+@@ -1907,6 +1907,11 @@
+ 	struct airoha_gdm_port *port = netdev_priv(dev);
+ 	struct airoha_qdma *qdma = port->qdma;
+ 
++	/* PON GDM2 only opens with a registered line controller. */
++	if ((port->flags & AIROHA_PRIV_F_PON) &&
++	    (!READ_ONCE(port->pon_link_ops) || !READ_ONCE(port->pon_link_priv)))
++		return -ENODEV;
++
+ 	if (airhoa_is_phy_external(port)) {
+ 		/* Attach the PHY only once.  phylink_of_phy_connect() ->
+ 		 * phy_attach_direct() -> phy_init_hw() -> config_init()
+@@ -1962,7 +1967,17 @@
+ 					    pse_port);
+ 	}
+ 
+-	netif_tx_start_all_queues(dev);
++	if (port->flags & AIROHA_PRIV_F_PON) {
++		/*
++		 * airoha-xpon leaves the queues stopped and raises carrier once the
++		 * bearer is up (EPON: after LLID0 registration).
++		 */
++		netif_carrier_off(dev);
++		netif_tx_disable(dev);
++	} else {
++		netif_tx_start_all_queues(dev);
++	}
++
+ 	err = airoha_set_vip_for_gdm_port(port, true);
+ 	if (err)
+ 		return err;
+@@ -1987,6 +2002,25 @@
+ 			GLOBAL_CFG_RX_DMA_EN_MASK);
+ 	atomic_inc(&qdma->users);
+ 
++	if (port->flags & AIROHA_PRIV_F_PON) {
++		/* Start the PON line once QDMA and NAPI are ready. */
++		err = port->pon_link_ops->start(port->pon_link_priv);
++		if (err) {
++			netdev_err(dev, "failed to queue PON line start: %d\n",
++				   err);
++			airoha_set_vip_for_gdm_port(port, false);
++			if (atomic_dec_and_test(&qdma->users)) {
++				airoha_qdma_clear(qdma, REG_QDMA_GLOBAL_CFG,
++						  GLOBAL_CFG_TX_DMA_EN_MASK |
++							  GLOBAL_CFG_RX_DMA_EN_MASK);
++				airoha_set_gdm_port_fwd_cfg(qdma->eth,
++							    REG_GDM_FWD_CFG(port->id),
++							    FE_PSE_PORT_PPE1);
++			}
++			return err;
++		}
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1997,6 +2031,12 @@
+ 	int i, err;
+ 
+ 	netif_tx_disable(dev);
++	netif_carrier_off(dev);
++	if ((port->flags & AIROHA_PRIV_F_PON) && READ_ONCE(port->pon_link_ops)) {
++		/* Stop the PON controller before tearing down QDMA/NAPI. */
++		port->pon_link_ops->stop(port->pon_link_priv);
++	}
++
+ 	err = airoha_set_vip_for_gdm_port(port, false);
+ 	if (err)
+ 		return err;

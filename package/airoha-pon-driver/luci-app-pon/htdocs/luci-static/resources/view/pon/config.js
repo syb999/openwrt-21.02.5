@@ -139,6 +139,7 @@ return view.extend({
 		o.value('', _('Driver default'));
 		o.value('xgpon', _('XG-PON'));
 		o.value('xgspon', _('XGS-PON'));
+		o.value('epon-1g', _('EPON 1G/1G'));
 		o.value('epon-10g-1g', _('10G-EPON 10G/1G'));
 		o.value('epon-10g-10g', _('10G-EPON 10G/10G'));
 

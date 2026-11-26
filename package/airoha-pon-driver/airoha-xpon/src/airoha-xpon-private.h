@@ -289,6 +289,22 @@ struct airoha_xpon {
 #define AIROHA_XGPON_PLOAMD_MAX_DRAIN    20
 #define AIROHA_XPON_LINK_POLL_MS         250
 #define AIROHA_XPON_RETRAIN_RETRY_MS     2000
+
+/* 连续恢复失败时对重试间隔做指数退避（最多 32 倍），避免无限刷屏 + 反复重置前端 */
+static inline unsigned long airoha_xpon_retry_backoff_ms(u32 count,
+                                                         unsigned long base_ms)
+{
+	unsigned int shift = count > 3 ?
+		min_t(unsigned int, (count - 3) / 5, 5) : 0;
+
+	return base_ms << shift;
+}
+
+/* 前 3 次 + 每 20 次打印一次即可，其余降到 dev_dbg，避免刷屏掩盖有用日志 */
+static inline bool airoha_xpon_retry_log_visible(u32 count)
+{
+	return count <= 3 || !(count % 20);
+}
 #define AIROHA_XPON_SYNC_LOSS_CONFIRM_MS AIROHA_XPON_LINK_POLL_MS
 /* Allow 3500 ms for readiness or LOS recovery before another PMA reset. */
 #define AIROHA_XPON_NO_SYNC_RECOVERY_MS 3500

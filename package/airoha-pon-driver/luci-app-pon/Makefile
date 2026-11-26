@@ -8,7 +8,7 @@ LUCI_DEPENDS:=+luci-base +airoha-ponctl +airoha-pond +pon-board-identity \
 	+mtd +ubi-utils +nand-utils +jshn +jsonfilter
 LUCI_PKGARCH:=all
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=3
+PKG_RELEASE:=5
 PKG_LICENSE:=Apache-2.0 GPL-2.0-only
 
 include $(TOPDIR)/feeds/luci/luci.mk

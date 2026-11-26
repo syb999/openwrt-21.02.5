@@ -645,15 +645,23 @@ static int en7572_prepare(struct airoha_pon_frontend *frontend,
 		return base;
 
 	/*
-	 * AdaptivePon() truncates erased bytes to each register's field width.
-	 * PON MAC retains control of burst timing with these default codes.
+	 * Stock firmware behavior: when the selected BOB calibration table is
+	 * unpopulated (all 0xFF), MD32 manages analog defaults internally.
+	 * Bypassing manual register overrides avoids writing 0xFF-truncated
+	 * extreme codes (e.g. max IMOD/IAV) into hardware registers.
 	 */
 	if ((base == EN7572_BOB_A0_BASE && !en->bob_a0_valid) ||
-	    (base == EN7572_BOB_A2_BASE && !en->bob_a2_valid))
-		dev_warn(
+	    (base == EN7572_BOB_A2_BASE && !en->bob_a2_valid)) {
+		dev_info(
 			&en->program->dev,
-			"preparing %s with an empty BOB table using stock-compatible register codes\n",
+			"BOB table for %s is empty; letting MD32 self-manage analog defaults\n",
 			en7572_mode_name(mode));
+		mutex_lock(&en->lock);
+		en->prepared_mode = mode;
+		en->prepared = true;
+		mutex_unlock(&en->lock);
+		return 0;
+	}
 
 	mutex_lock(&en->lock);
 	en->prepared = false;
@@ -901,7 +909,7 @@ static int en7572_probe(struct i2c_client *client, const struct i2c_device_id *i
 	struct device *dev = &client->dev;
 	struct en7572 *en;
 
-	dev_info(dev, "XPONDBG en7572 probe entry\n");
+	dev_dbg(dev, "XPONDBG en7572 probe entry\n");
 	u32 supported_modes =
 		AIROHA_PON_FRONTEND_MODE_BIT(AIROHA_PON_FRONTEND_MODE_GPON) |
 		AIROHA_PON_FRONTEND_MODE_BIT(AIROHA_PON_FRONTEND_MODE_XGPON) |
@@ -949,14 +957,14 @@ static int en7572_probe(struct i2c_client *client, const struct i2c_device_id *i
 	 * giving up for good.
 	 */
 	ret = en7572_read_u16(en->runtime, EN7572_CHIP_ID_REG, &en->chip_id);
-	dev_info(dev, "XPONDBG en7572 chip_id read ret=%d id=0x%04x (runtime addr=0x%02x)\n",
+	dev_dbg(dev, "XPONDBG en7572 chip_id read ret=%d id=0x%04x (runtime addr=0x%02x)\n",
 	         ret, ret ? 0 : en->chip_id, en->runtime->addr);
 	if (ret)
 		return dev_err_probe(dev, -EPROBE_DEFER,
 		                     "EN7572 chip ID not readable yet (%d)\n", ret);
 
 	ret = en7572_read_u16(en->runtime, EN7572_CHIP_REV_REG, &en->chip_rev);
-	dev_info(dev, "XPONDBG en7572 chip_rev read ret=%d rev=0x%04x\n",
+	dev_dbg(dev, "XPONDBG en7572 chip_rev read ret=%d rev=0x%04x\n",
 	         ret, ret ? 0 : en->chip_rev);
 	if (ret) {
 		/* The chip ID at 0x51 already proved the part is an EN7572 and is
@@ -1018,7 +1026,7 @@ static int en7572_probe(struct i2c_client *client, const struct i2c_device_id *i
 	                         &en7572_frontend_ops, en, supported_modes);
 	i2c_set_clientdata(client, &en->frontend);
 	ret = airoha_pon_frontend_register(&en->frontend);
-	dev_info(dev, "XPONDBG en7572 register ret=%d\n", ret);
+	dev_dbg(dev, "XPONDBG en7572 register ret=%d\n", ret);
 	if (ret) {
 		i2c_set_clientdata(client, NULL);
 		return dev_err_probe(

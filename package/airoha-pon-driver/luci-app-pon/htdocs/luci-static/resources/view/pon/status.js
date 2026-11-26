@@ -204,13 +204,24 @@ function displayBroadcastKeys(values) {
 }
 
 function loadProtocolStatus(section, unavailable, invalid) {
-	return L.resolveDefault(
-		fs.exec_direct('/usr/bin/pondctl', [ 'status', '--line', section.line ]), null
-	).then(function(output) {
-		if (output == null)
+	/*
+	 * pond mirrors its status JSON to /var/run so the page never has to exec
+	 * pondctl: rpcd canonicalises the command path before checking the exec
+	 * ACL, so a /usr/bin/pondctl symlink fails the ACL check and the status
+	 * read used to fail with an empty reply.
+	 */
+	var path = '/var/run/airoha-pond.%s.json'.format(section.line);
+
+	return L.resolveDefault(fs.read(path), null).then(function(output) {
+		if (output == null || output === '')
 			return { section: section, values: {}, error: unavailable };
 		try {
-			return { section: section, values: JSON.parse(output), error: null };
+			var values = JSON.parse(output);
+
+			if (values.protocol_version !== 1)
+				throw new Error('unsupported protocol');
+
+			return { section: section, values: values, error: null };
 		} catch (exception) {
 			return { section: section, values: {}, error: invalid };
 		}

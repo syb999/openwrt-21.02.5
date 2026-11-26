@@ -1,0 +1,10 @@
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -874,6 +874,7 @@
+ 				continue;
+ 			}
+ 
++			q->skb = NULL;
+ 			done++;
+ 			airoha_qdma_dispatch_pon_control(port, port->dev, cskb, msg0);
+ 			continue;

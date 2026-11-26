@@ -1,0 +1,41 @@
+--- a/drivers/net/phy/air_en8811h.c
++++ b/drivers/net/phy/air_en8811h.c
+@@ -1019,13 +1019,6 @@
+ 	air_led_hw_control_set(phydev, 2, AIR_DEFAULT_TRIGGER_LED2);
+ #endif /* AIR_EN8811H_PHY_LED */
+ 
+-	/* Configure led gpio pins as output */
+-	ret = air_buckpbus_reg_modify(phydev, EN8811H_GPIO_OUTPUT,
+-				      EN8811H_GPIO_OUTPUT_345,
+-				      EN8811H_GPIO_OUTPUT_345);
+-	if (ret < 0)
+-		return ret;
+-
+ 	return 0;
+ }
+ 
+@@ -1089,8 +1082,24 @@
+ 		phydev_err(phydev, "Failed to initialize leds: %d\n", ret);
+ 		return ret;
+ 	}
++	air_led_hw_control_set(phydev, 0, AIR_DEFAULT_TRIGGER_LED0);
+ #endif /* AIR_EN8811H_PHY_LED */
+ 
++	/*
++	 * Configure led gpio pins as output.  en8811h_restart_mcu() above
++	 * resets buckpbus-mapped MCU state including EN8811H_GPIO_OUTPUT,
++	 * so it must be reapplied on every .config_init() call -- otherwise
++	 * the LED GPIOs fall back to inputs after the first re-init and the
++	 * PHY LEDs stop reflecting link/activity.
++	 * (upstream: 03b4702f "net: phy: air_en8811h: move LED GPIO
++	 *  configuration to config_init")
++	 */
++	ret = air_buckpbus_reg_modify(phydev, EN8811H_GPIO_OUTPUT,
++				      EN8811H_GPIO_OUTPUT_345,
++				      EN8811H_GPIO_OUTPUT_345);
++	if (ret < 0)
++		return ret;
++
+ 	return 0;
+ }
+ 

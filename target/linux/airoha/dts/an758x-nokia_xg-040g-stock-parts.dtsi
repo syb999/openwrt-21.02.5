@@ -71,7 +71,7 @@
 		label = "bosa";
 		reg = <0x51c0000 0x40000>;
 
-		/* The 512-byte A0/A2 optical table follows the backup header. */
+		/* The 512-byte A0/A2 optical table follows the 0x150-byte backup header on this board. */
 		nvmem-layout {
 			compatible = "fixed-layout";
 

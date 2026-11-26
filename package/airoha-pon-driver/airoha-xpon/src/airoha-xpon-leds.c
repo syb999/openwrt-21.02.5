@@ -37,24 +37,37 @@ struct airoha_xpon_leds {
 static void airoha_xpon_led_apply(struct led_trigger *trigger,
                                   enum airoha_xpon_led_state state)
 {
-	/* The LED core treats delay_off=0 as steady on and stops the blink timer. */
+	unsigned long on, off;
+
+	/*
+	 * 🔴 内核 API 签名是 led_trigger_blink(trigger, unsigned long *delay_on,
+	 *    unsigned long *delay_off) —— 要传**地址**。原代码直接传了数值 200/500/1/0，
+	 *    结果 LED core 把 500(0x1f4) 当指针解引用 ⇒
+	 *    "Unable to handle kernel NULL pointer dereference at 0x1f4"，
+	 *    Comm: airoha-pond，调用栈 airoha_xpon_leds_update -> led_trigger_blink
+	 *    -> led_blink_set -> led_blink_setup，PON 一上线就 panic 无限重启。
+	 */
 	switch (state) {
 	case AIROHA_XPON_LED_FAST_BLINK:
-		led_trigger_blink(trigger, AIROHA_XPON_LED_FAST_BLINK_MS,
-		                  AIROHA_XPON_LED_FAST_BLINK_MS);
+		on = AIROHA_XPON_LED_FAST_BLINK_MS;
+		off = AIROHA_XPON_LED_FAST_BLINK_MS;
 		break;
 	case AIROHA_XPON_LED_SLOW_BLINK:
-		led_trigger_blink(trigger, AIROHA_XPON_LED_SLOW_BLINK_MS,
-		                  AIROHA_XPON_LED_SLOW_BLINK_MS);
+		on = AIROHA_XPON_LED_SLOW_BLINK_MS;
+		off = AIROHA_XPON_LED_SLOW_BLINK_MS;
 		break;
 	case AIROHA_XPON_LED_ON:
-		led_trigger_blink(trigger, 1, 0);
+		/* LED core 把 delay_off=0 当作常亮并停掉 blink 定时器 */
+		on = 1;
+		off = 0;
 		break;
 	case AIROHA_XPON_LED_OFF:
 	default:
 		led_trigger_event(trigger, LED_OFF);
-		break;
+		return;
 	}
+
+	led_trigger_blink(trigger, &on, &off);
 }
 
 struct airoha_xpon_leds *airoha_xpon_leds_create(struct device *dev,

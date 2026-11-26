@@ -57,5 +57,6 @@ void oam_status_update_ctc(struct oam_status_hub *hub, const struct ctc_session 
 
 int oam_status_server_start(struct oam_status_hub *hub, const char *socket_path);
 void oam_status_server_stop(void);
+void oam_status_publish_json(struct oam_status_hub *hub, const char *path);
 
 #endif

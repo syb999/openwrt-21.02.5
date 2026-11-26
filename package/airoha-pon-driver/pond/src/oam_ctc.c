@@ -35,6 +35,7 @@
 #define LEAF_ONU_CAPABILITIES_2	0x0007
 #define LEAF_ONU_CAPABILITIES_3	0x000c
 #define LEAF_VLAN		0x0021
+#define LEAF_ONU_OPTICAL_STATUS	0x0005
 
 #define SET_OK			0x80
 #define BAD_PARAMETERS		0x86
@@ -488,6 +489,50 @@ static int handle_authentication(struct ctc_session *s, const uint8_t *data, siz
 	}
 }
 
+/*
+ * The OLT polls c7/0005 about every 30 s and expects the five SFF-8472
+ * diagnostic words of the optical module (temperature, voltage, bias, TX
+ * power, RX power). Answering NO_RESOURCE there makes the OLT treat the ONU
+ * as unhealthy and it never opens the service port - the reference vendor
+ * firmware returns the same ten bytes the module reports. The driver already
+ * publishes those words through debugfs in 8472 encoding.
+ */
+static char frontend_debug_path[128];
+
+void ctc_set_frontend_debug_path(const char *path)
+{
+	snprintf(frontend_debug_path, sizeof(frontend_debug_path), "%s",
+		 path ? path : "");
+}
+
+static void read_frontend_ddm(uint16_t ddm[5])
+{
+	char line[128];
+	FILE *f;
+
+	memset(ddm, 0, sizeof(uint16_t) * 5);
+	if (!frontend_debug_path[0])
+		return;
+	f = fopen(frontend_debug_path, "r");
+	if (!f)
+		return;
+	while (fgets(line, sizeof(line), f)) {
+		unsigned int value;
+
+		if (sscanf(line, "temperature_8472: 0x%x", &value) == 1)
+			ddm[0] = (uint16_t)value;
+		else if (sscanf(line, "voltage_8472: 0x%x", &value) == 1)
+			ddm[1] = (uint16_t)value;
+		else if (sscanf(line, "tx_bias_8472: 0x%x", &value) == 1)
+			ddm[2] = (uint16_t)value;
+		else if (sscanf(line, "tx_power_8472: 0x%x", &value) == 1)
+			ddm[3] = (uint16_t)value;
+		else if (sscanf(line, "rx_power_8472: 0x%x", &value) == 1)
+			ddm[4] = (uint16_t)value;
+	}
+	fclose(f);
+}
+
 /* ---------- GET ---------- */
 
 static int get_value(const struct ctc_session *s, uint8_t branch, uint16_t leaf,
@@ -619,8 +664,24 @@ static int get_value(const struct ctc_session *s, uint8_t branch, uint16_t leaf,
 		*out_len = 1;
 		return 0;
 
+	case LEAF_ONU_OPTICAL_STATUS: {
+		uint16_t ddm[5];
+
+		if (object)
+			break;
+		if (out_cap < 10)
+			return BAD_PARAMETERS;
+		read_frontend_ddm(ddm);
+		for (int i = 0; i < 5; i++) {
+			out[i * 2] = (uint8_t)(ddm[i] >> 8);
+			out[i * 2 + 1] = (uint8_t)(ddm[i] & 0xff);
+		}
+		*out_len = 10;
+		return 0;
+	}
+
 	default:
-		return leaf == 0x0005 ? NO_RESOURCE : BAD_PARAMETERS;
+		return BAD_PARAMETERS;
 	}
 	return BAD_PARAMETERS;
 }
@@ -689,11 +750,35 @@ int ctc_handle_get(struct ctc_session *s, const uint8_t *data, size_t data_len,
 
 /* ---------- SET ---------- */
 
+/*
+ * Extended attributes the OLT provisions for the ONU's internal L2 switch: the
+ * per-UNI VLAN mode, MAC table entries, the ageing time, multicast/IGMP policy
+ * and SLA parameters. pon0 has no internal switch - the kernel forwards the
+ * frames - which is exactly the transparent behaviour these attributes ask
+ * for, so acknowledge them and let the raw values show up in the event log.
+ * Rejecting them (the old behaviour) made the OLT retry the whole provisioning
+ * block on every registration and left the service port closed.
+ */
+static bool ctc_switch_config_leaf(uint8_t branch, uint16_t leaf)
+{
+	if (branch == EXTENDED_ATTRIBUTE &&
+	    (leaf == 0x0042 || leaf == 0x0043 || leaf == 0x0045 ||
+	     leaf == 0x0081 || leaf == 0x00a4 || leaf == 0x00b1))
+		return true;
+	if (branch == STANDARD_ATTRIBUTE && leaf == 0x013a)
+		return true;
+	if (branch == EXTENDED_ACTION && leaf == 0x0048)
+		return true;
+	return false;
+}
+
 static uint8_t set_value(struct ctc_session *s, uint8_t branch, uint16_t leaf,
 			 const struct ctc_object *object, const uint8_t *value, size_t value_len)
 {
 	uint8_t mode;
 
+	if (ctc_switch_config_leaf(branch, leaf))
+		return SET_OK;
 	if (branch != EXTENDED_ATTRIBUTE || leaf != LEAF_VLAN) {
 		s->unsupported_requests++;
 		return BAD_PARAMETERS;

@@ -4,9 +4,30 @@
 START=18
 USE_PROCD=1
 
+# Mode and identity may only be applied once the xpon driver has bound ponX.
+apply_mode_identity() {
+	local section="$1" device="$2" mode="$3" serial="$4"
+	local registration="$5" active
+
+	if [ -n "$mode" ]; then
+		active=$(/usr/sbin/ponctl --device "$device" mode show 2>/dev/null |
+			sed -n 's/^active=//p')
+		if [ "$active" != "$mode" ]; then
+			# A line mode only takes effect on the next activation.
+			ip link set "$device" down 2>/dev/null
+			/usr/sbin/ponctl --device "$device" mode set "$mode" ||
+				return 1
+		fi
+	fi
+
+	/usr/sbin/ponctl --device "$device" identity set \
+		--serial "$serial" \
+		--registration-id "$registration"
+}
+
 apply_line() {
 	local section="$1"
-	local device mode serial registration
+	local device mode serial registration i=0
 
 	config_get device "$section" device
 	config_get mode "$section" mode
@@ -20,17 +41,40 @@ apply_line() {
 	[ -n "$serial" ] || serial=default
 	[ -n "$registration" ] || registration=default
 
-	if [ -n "$mode" ]; then
-		/usr/sbin/ponctl --device "$device" mode set "$mode" || return 1
-	fi
-	/usr/sbin/ponctl --device "$device" identity set \
-		--serial "$serial" \
-		--registration-id "$registration"
+	# The PON MAC only starts in ndo_open, so the line stays stopped - and
+	# nothing ever registers - until the netdev is brought up.  The xpon
+	# driver may still be probing, hence the bounded retry.
+	while [ "$i" -lt 5 ]; do
+		if [ -e "/sys/class/net/$device" ] &&
+			apply_mode_identity "$section" "$device" "$mode" "$serial" \
+				"$registration" &&
+			ip link set "$device" up; then
+			return 0
+		fi
+		i=$((i + 1))
+		sleep 1
+	done
+
+	echo "failed to bring up PON line $device" >&2
+	return 1
+}
+
+stop_line() {
+	local section="$1"
+	local device
+
+	config_get device "$section" device
+	[ -z "$device" ] || ip link set "$device" down 2>/dev/null
 }
 
 apply_all_lines() {
 	config_load pon
 	config_foreach apply_line xpon
+}
+
+stop_all_lines() {
+	config_load pon
+	config_foreach stop_line xpon
 }
 
 start_service() {
@@ -39,6 +83,10 @@ start_service() {
 
 reload_service() {
 	apply_all_lines
+}
+
+stop_service() {
+	stop_all_lines
 }
 
 service_triggers() {

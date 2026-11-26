@@ -1,0 +1,37 @@
+#!/bin/sh
+#
+# Shanghai Unicom authorises this ONU by LOID (24 hex digits, no password).
+# The value lives in /etc/config/pon, which is a conffile: any LuCI PON page
+# save done from a stale browser copy, or a sysupgrade that replaced the file,
+# can drop the option. Without it the OLT never sends CTC AUTH_SUCCESS
+# (pond reports loid_configured=false / authentication_status=pending), the
+# ONU stays unauthorised, and no service VLAN, PPPoE or multicast reaches it.
+#
+# Restore the line defaults when they are missing. Existing non-empty values
+# are never overwritten, so editing them in LuCI still works.
+
+[ -f /etc/config/pon ] || exit 0
+[ -n "$(uci -q get pon.line0_oam)" ] || exit 0
+
+changed=
+
+if [ -z "$(uci -q get pon.line0_oam.operator)" ]; then
+	uci set pon.line0_oam.operator='ctc'
+	changed=1
+fi
+if [ -z "$(uci -q get pon.line0_oam.ge_ports)" ]; then
+	uci set pon.line0_oam.ge_ports='1'
+	changed=1
+fi
+if [ -z "$(uci -q get pon.line0_oam.loid)" ]; then
+	uci set pon.line0_oam.loid='000000000000000013960689'
+	changed=1
+fi
+if [ -z "$(uci -q get pon.line0.wan_vlan)" ]; then
+	uci set pon.line0.wan_vlan='914'
+	changed=1
+fi
+
+[ -n "$changed" ] || exit 0
+uci commit pon
+exit 0
