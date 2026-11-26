@@ -596,6 +596,7 @@ static int sheet_to_notes(const char *img, note_t *notes, int *xs, int *uis, int
              * u 是时值（1/16 为单位）：先按实心/空心给基础值，
              * 横桁覆盖到的实心符头降成八分（2）。 */
             nb = 0;
+            int stem_heads[4000], nstem = 0;
             for (int mi = 0; mi < nmh && nb < 4000; mi++) {
                 int my = (int)mheads[mi].cy;
                 int mx = (int)mheads[mi].cx;
@@ -620,8 +621,50 @@ static int sheet_to_notes(const char *img, note_t *notes, int *xs, int *uis, int
                         break;
                     }
                 }
+                /* 横桁检不到时用几何判时值：符头左右两侧扫竖列墨迹找符干，
+                 * 有符干 → 至少八分；相邻符干符头间距近 → 两者都判八分 */
+                if (u == 4) {
+                    int has_stem = 0;
+                    for (int side = -1; side <= 1 && !has_stem; side += 2) {
+                        for (int dxp = 1; dxp <= (int)(sp * 0.7f) && !has_stem; dxp++) {
+                            int xr = mx + side * ((int)(sp * 0.35f) + dxp);
+                            if (xr < 0 || xr >= w) continue;
+                            for (int dir = -1; dir <= 1 && !has_stem; dir += 2) {
+                                int run = 0, gap = 0;
+                                for (int k = 1; k < sp * 3; k++) {
+                                    int yy = my + dir * k;
+                                    if (yy < 0 || yy >= h) break;
+                                    if (px[(size_t)yy * w + xr]) { run++; gap = 0; }
+                                    else if (++gap > 3) break;
+                                }
+                                if (run >= (int)(sp * 1.5f)) has_stem = 1;
+                            }
+                        }
+                    }
+                    if (has_stem) {
+                        /* 有符干：先记四分，等间距复核时再把"靠得很近的一对"降成八分 */
+                        if (nstem < 4000) stem_heads[nstem++] = nb;
+                    }
+                }
                 hd[nb].x = mx; hd[nb].y = my; hd[nb].u = u;
                 nb++;
+            }
+            /* stem_heads 存的是处理顺序，必须先按 x 排序，否则"相邻"不是谱面上的相邻 */
+            for (int a = 0; a < nstem; a++)
+                for (int b = a + 1; b < nstem; b++)
+                    if (hd[stem_heads[b]].x < hd[stem_heads[a]].x) {
+                        int t = stem_heads[a]; stem_heads[a] = stem_heads[b]; stem_heads[b] = t;
+                    }
+            {
+                for (int a = 0; a + 1 < nstem; a++) {
+                    int i0 = stem_heads[a], i1 = stem_heads[a + 1];
+                    int gapx = hd[i1].x - hd[i0].x;
+                    if (gapx < 0) gapx = -gapx;          /* 符头未必按 x 排序 */
+                    if (gapx > 0 && gapx < (int)(sp * 3.0f)) {
+                        hd[i0].u = 2;
+                        hd[i1].u = 2;
+                    }
+                }
             }
         } else {
             nb = detect_heads(px, w, h, &st[s], hd, 4000);

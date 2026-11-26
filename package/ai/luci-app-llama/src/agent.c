@@ -1140,7 +1140,7 @@ static const char *op_to_plugin(const char *js, const char *op) {
         {"passwd","owrt"}, {"reboot","owrt"}, {"opkg_list","owrt"},
         {"midi","music"}, {"render","music"}, {"import","music"}, {"wav","music"},
         {"omr","music"}, {"sheetmusic","music"},    /* 五线谱图片→MIDI */
-        {"bgm","music"},
+        {"bgm","music"}, {"jianpu","music"}, {"omr","music"},
         {"parse","curl"},        /* curl 插件的 op 名是 parse（吃 cURL 原文） */
         {"tts","voice"}, {"speak","voice"}, {"say","voice"}, {"voice","voice"},
         {"asr","voice"}, {"stt","voice"}, {"transcribe","voice"},   /* 语音转文字 */
@@ -2576,7 +2576,10 @@ static int try_sheet_direct(const char *task) {
     if (!(sheet && act)) return 0;
     plugin_desc_t *pl = find_plugin("music");
     if (!pl) return 0;
-    char *r = pl->run("{\"op\":\"omr\"}");     /* 不给 path：插件自动用最近上传的图片 */
+    /* 简谱走 jianpu，五线谱才走 omr —— 以前一律走 omr，用户说"识别简谱"也会报
+     * "没找到五线谱" */
+    int is_jianpu = (strstr(task, "简谱") != NULL) && (strstr(task, "五线谱") == NULL);
+    char *r = pl->run(is_jianpu ? "{\"op\":\"jianpu\"}" : "{\"op\":\"omr\"}");
     if (!r) return 0;
     if (strstr(r, "\"error\"")) {
         printf("【插件 music 开始工作】\n  [music] %s\n", r);

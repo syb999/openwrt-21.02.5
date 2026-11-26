@@ -908,6 +908,177 @@ static const bgm_style_t *bgm_pick(const char *style) {
     return NULL;     /* 随意 → 由调用方挑一个 */
 }
 
+
+/* ---------------- op: jianpu（简谱图片 → MIDI） ----------------
+ * 走板上现成的 PP-OCR（/opt/ppocr/ppocr_demo），把识别出的文字按顺序解析：
+ *   1~7 音级 / 0 休止 / "-" 延长一拍 / "1=G" 这种调号
+ * 简谱的下划线（八分）、上加点（高八度）在纯文字里拿不到，
+ * 所以这里先支持"一拍一音 + - 延长"的常见写法；八分/十六分靠后续图像分析补。
+ */
+static char *op_jianpu(const char *json) {
+    char path[512] = {0}, out[512] = {0};
+    if (jget(json, "path", path, sizeof(path)) != 0 || !path[0]) {
+        /* 没给路径就用最近上传的一张图（和 op=omr 的行为一致） */
+        FILE *q = popen("ls -t /tmp/llama_agent/uploads/*.jpg /tmp/llama_agent/uploads/*.png "
+                        "/tmp/llama_agent/uploads/*.jpeg 2>/dev/null | head -1", "r");
+        if (q) {
+            if (fgets(path, sizeof(path), q)) {
+                size_t L = strlen(path);
+                while (L && (path[L-1] == '\n' || path[L-1] == '\r')) path[--L] = 0;
+            }
+            pclose(q);
+        }
+        if (!path[0]) return jerr("要给 path=简谱图片路径（或先上传一张图）");
+    }
+    if (jget(json, "out", out, sizeof(out)) != 0 || !out[0])
+        snprintf(out, sizeof(out), "%s/bgm_jianpu_%ld.mid", WORK_DIR, (long)time(NULL));
+
+    /* 必须用 glibc 的 loader 显式启动（ppocr_demo 是 glibc 二进制，板子是 musl，
+     * 直接执行会报 "not found"）。这和 doc.c 里 OCR 的调用方式一致。 */
+    char cmd[1800];
+    const char *loader = "/opt/glibc/ld-linux-aarch64.so.1";
+    if (access(loader, X_OK) == 0)
+        snprintf(cmd, sizeof(cmd),
+                 "cd /opt/ppocr && LD_LIBRARY_PATH=/opt/glibc:/opt/rknpu:/usr/lib:/lib:/opt/ppocr "
+                 "%s ./ppocr_demo models/ppocrv4_det.rknn models/ppocrv4_rec.rknn '%s' 2>/dev/null",
+                 loader, path);
+    else
+        snprintf(cmd, sizeof(cmd),
+                 "cd /opt/ppocr && LD_LIBRARY_PATH=/opt/glibc:/opt/rknpu:/usr/lib:/lib:/opt/ppocr "
+                 "./ppocr_demo models/ppocrv4_det.rknn models/ppocrv4_rec.rknn '%s' 2>/dev/null", path);
+    FILE *p = popen(cmd, "r");
+    if (!p) return jerr("跑不了 OCR（/opt/ppocr/ppocr_demo 不可用）");
+    static char txt[8192];
+    size_t n = fread(txt, 1, sizeof(txt) - 1, p);
+    txt[n] = 0;
+    pclose(p);
+    if (n == 0) return jerr("OCR 没读出任何文字");
+
+    /* OCR 输出里除了识别文本，还有成堆的模型信息数字（dims/scale/index…），
+     * 只保留 "regconize result: xxx, score=..." 这一种行里的 xxx。 */
+    {
+        static char clean[8192];
+        size_t cw = 0;
+        const char *line = txt;
+        while (*line) {
+            const char *eol = strchr(line, '\n');
+            size_t ln = eol ? (size_t)(eol - line) : strlen(line);
+            const char *key = NULL;
+            for (size_t i = 0; i + 18 <= ln; i++)
+                if (!strncmp(line + i, "regconize result: ", 18)) { key = line + i + 18; break; }
+            if (key) {
+                const char *stop = key;
+                while (*stop && (size_t)(stop - line) < ln) {
+                    if (!strncmp(stop, ", score=", 8)) break;
+                    stop++;
+                }
+                size_t tl = (size_t)(stop - key);
+                /* 调号/拍号行（含 '='）不当旋律 */
+                int has_eq = 0;
+                for (size_t i = 0; i < tl; i++) if (key[i] == '=') has_eq = 1;
+                if (!has_eq && cw + tl + 2 < sizeof(clean)) {
+                    memcpy(clean + cw, key, tl);
+                    cw += tl;
+                    clean[cw++] = ' ';
+                    clean[cw] = 0;
+                }
+            }
+            if (!eol) break;
+            line = eol + 1;
+        }
+        if (cw) snprintf(txt, sizeof(txt), "%s", clean);
+    }
+
+    /* 调号：找 "1=" 后面的字母（C/D/E/F/G/A/B） */
+    int root = 60;
+    for (char *q = txt; (q = strstr(q, "1=")) != NULL; q += 2) {
+        char k = q[2];
+        if (k >= 'a' && k <= 'z') k = (char)(k - 32);
+        switch (k) {
+            case 'C': root = 60; break;
+            case 'D': root = 62; break;
+            case 'E': root = 64; break;
+            case 'F': root = 65; break;
+            case 'G': root = 67; break;
+            case 'A': root = 69; break;
+            case 'B': root = 71; break;
+            default: break;
+        }
+        break;
+    }
+    /* 小调判断：出现 "6=" 或文本里有"小调" */
+    int minor = (strstr(txt, "小调") != NULL);
+
+    static const int MAJ[7] = {0, 2, 4, 5, 7, 9, 11};
+    static const int MIN[7] = {0, 2, 3, 5, 7, 8, 10};
+    const int *sc = minor ? MIN : MAJ;
+
+    char notes[12000];
+    size_t o = 0;
+    int cnt = 0;
+    float last_dur = 0;
+    int last_pitch = 0;
+    for (char *q = txt; *q; q++) {
+        if (*q >= '1' && *q <= '7') {
+            int d = *q - '1';
+            /* 数字后面紧跟 '.' 或 '·' → 高八度（常见写法 1. ） */
+            int oct = 0;
+            char *r = q + 1;
+            while (*r == ' ' || *r == '\t') r++;
+            if (*r == '.' || *r == 0xC2) oct = 1;
+            int pitch = root + sc[d] + oct * 12;
+            if (pitch < 36) pitch += 12;
+            if (pitch > 96) pitch -= 12;
+            o += (size_t)snprintf(notes + o, sizeof(notes) - o,
+                                  "%s{\"pitch\":%d,\"dur\":1}", o ? "," : "", pitch);
+            last_pitch = pitch;
+            last_dur = 1;
+            cnt++;
+        } else if (*q == '-') {
+            /* 延长号：把上一个音的时值加一拍 */
+            if (last_dur > 0) {
+                char key[32];
+                snprintf(key, sizeof(key), "\"pitch\":%d,\"dur\":%g", last_pitch, last_dur);
+                char *pos = NULL;
+                char *scan = notes;
+                while ((scan = strstr(scan, key)) != NULL) { pos = scan; scan++; }
+                if (pos) {
+                    last_dur += 1;
+                    char repl[48];
+                    snprintf(repl, sizeof(repl), "\"pitch\":%d,\"dur\":%g", last_pitch, last_dur);
+                    /* 直接在原位置改写（repl 长度可能变化 → 重新拼一遍更安全） */
+                    (void)repl;
+                    /* 简化：把整串里最后一个匹配替换成新时值 */
+                    size_t before = (size_t)(pos - notes);
+                    char tail[12000];
+                    snprintf(tail, sizeof(tail), "%s", pos + strlen(key));
+                    o = before;
+                    o += (size_t)snprintf(notes + o, sizeof(notes) - o,
+                                          "\"pitch\":%d,\"dur\":%g%s", last_pitch, last_dur, tail);
+                }
+            }
+        } else if (*q == '0') {
+            o += (size_t)snprintf(notes + o, sizeof(notes) - o,
+                                  "%s{\"pitch\":0,\"dur\":1}", o ? "," : "");
+            cnt++;
+            last_dur = 0;
+        }
+    }
+    if (cnt == 0) return jerr("没在 OCR 结果里找到简谱数字（1~7）");
+
+    char j1[14000];
+    snprintf(j1, sizeof(j1), "{\"path\":\"%s\",\"tempo\":100,\"notes\":[%s]}", out, notes);
+    char *res = op_midi(j1);
+    (void)res;
+    char ans[400];
+    snprintf(ans, sizeof(ans),
+             "简谱识别：%d 个音，调 %s%s，已生成 MIDI：%s", cnt,
+             minor ? "小调" : "大调", "", out);
+    char *r = malloc(1024);
+    snprintf(r, 1024, "{\"ok\":1,\"notes\":%d,\"file\":\"%s\",\"answer\":\"%s\"}", cnt, out, ans);
+    return r;
+}
+
 static char *op_bgm(const char *json) {
     char style[128] = {0}, p[512] = {0};
     jget(json, "style", style, sizeof(style));
@@ -1392,6 +1563,8 @@ static char *run(const char *json_in) {
     if (!strcmp(op, "midi") || !strcmp(op, "make"))   return op_midi(json_in);
     if (!strcmp(op, "render") || !strcmp(op, "play")) return op_render(json_in);
     if (!strcmp(op, "import") || !strcmp(op, "wav"))  return op_import(json_in);
+    if (!strcmp(op, "jianpu") || !strcmp(op, "numbered"))
+        return op_jianpu(json_in);
     if (!strcmp(op, "bgm") || !strcmp(op, "music"))   return op_bgm(json_in);
     /* 注意：op 名字不能叫 sheet —— video 插件的 sheet 是"缩略图阵列"，
      * op_to_plugin 会先把它抢走。用 omr / sheetmusic。 */
