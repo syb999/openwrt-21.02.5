@@ -588,7 +588,22 @@ static int sheet_to_notes(const char *img, note_t *notes, int *xs, int *uis, int
     for (int s = 0; s < ns && nn < maxn; s++) {
         int sp = st[s].space;
         if (sp < 4) continue;
-        int treble = staff_is_treble(px, w, h, &st[s]);
+        /* 大谱表判定（实测数据驱动）：
+         * 两只老虎那张谱是 5 行 × 2 组 = 10 组，组内和组间的垂直间距几乎一样
+         * （253px 对 272px，都是 ~10 个五线间距，因为歌词占了一行），
+         * 所以"按间距配对"分不开高/低音谱表。
+         * 可靠规则：谱表数成偶数时，按上下顺序奇偶配对 —— 偶数=上行(高音)，奇数=下行(低音)。
+         * 谱表数为奇数（单行谱）时退回按谱号墨迹判断。 */
+        int treble, lower_staff = 0;
+        if (ns % 2 == 0) {
+            treble = (s % 2 == 0) ? 1 : 0;
+            lower_staff = (s % 2 == 1);
+        } else {
+            treble = staff_is_treble(px, w, h, &st[s]);
+        }
+        /* 注意：不能简单地"跳过下行谱表" —— 实测这张谱的符头大部分落在下行，
+         * 一跳就只剩 2 个音。旋律提取要在音符生成之后再按"同一时刻取最高音"做。 */
+        (void)lower_staff;
         /* 按列厚度找符头（谱线不擦：符头骑在线上，擦线会把它切成两半） */
         int nb;
         if (use_model) {
@@ -683,6 +698,15 @@ static int sheet_to_notes(const char *img, note_t *notes, int *xs, int *uis, int
             const int *STEPSEL = treble ? STEP_T : STEP_B;
             int midi = (treble ? 64 : 43) + STEPSEL[idx] + 12 * oct;
             if (midi < 36 || midi > 96) continue;
+            /* 取最高声部：同一 x 位置（同一拍）如果有更高的符头，就丢掉这个音。
+             * 钢琴谱里低音伴奏与旋律同拍出现，不筛就会把主旋律盖掉
+             * （两只老虎一直"听不出旋律"就是这原因）。 */
+            int is_low = 0;
+            for (int q = 0; q < ndall; q++) {
+                if (hdall[q].x > hd[i].x - sp && hdall[q].x < hd[i].x + sp &&
+                    hdall[q].y < hd[i].y - sp / 2) { is_low = 1; break; }
+            }
+            if (is_low) continue;
             notes[nn].pitch = midi;
             notes[nn].start = 0;
             notes[nn].dur = 0;

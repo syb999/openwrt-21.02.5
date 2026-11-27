@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include "plugin.h"
 
 /* 前向声明：run() 里用到，定义在后面（否则隐式声明会变成外部符号，
@@ -232,7 +233,7 @@ static int split_text(const char *in, char segs[][400], int maxseg, int maxlen) 
  *   kokoro  kokoro-int8-multi-lang-v1_1 男声/多音色  ~206MB
  * op=models 看装了没；op=model_install 后台下载解包；op=model_status 看进度。
  */
-typedef struct { const char *name, *dir, *url; const char *post; const char *desc; } tts_model_t;
+typedef struct { const char *name, *dir, *url; const char *post; const char *desc; int exp_mb; } tts_model_t;
 
 static const tts_model_t TTS_MODELS[] = {
     {"zh-en", "/opt/tts-rk3566/zh-en-model",
@@ -240,14 +241,14 @@ static const tts_model_t TTS_MODELS[] = {
      /* vits 路径用的是 model.onnx(fp32)，int8 那份用不上 → 装完删掉省 130MB */
      "rm -f model.int8.onnx; rm -rf espeak-ng-data; "
      "ls date.fst number.fst >/dev/null 2>&1 || cp ../matcha/*.fst .",
-     "中英双语（英文真发音）"},
+     "中英双语（英文真发音）", 160},
     {"kokoro", "/opt/tts-rk3566/kokoro",
      "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-int8-multi-lang-v1_1.tar.bz2",
      /* kokoro 只用 int8：fp32 和多余的 espeak 数据删掉，软链补齐程序要的名字 */
      "ln -sf date-zh.fst date.fst; ln -sf number-zh.fst number.fst; "
      "ln -sf model.int8.onnx model_int8.onnx; rm -f model.onnx; rm -rf espeak-ng-data",
-     "男声/上百种音色（RTF≈8 较慢）"},
-    {NULL, NULL, NULL, NULL, NULL}
+     "男声/上百种音色（RTF≈8 较慢）", 140},
+    {NULL, NULL, NULL, NULL, NULL, 0}
 };
 
 static long dir_size_mb(const char *d) {
@@ -260,6 +261,58 @@ static long dir_size_mb(const char *d) {
     pclose(pp);
     return v;
 }
+
+/* 模型名是从网页/查询串来的，只留字母数字和 - _：它会被拼进日志路径和目录名 */
+static void nm_safe(const char *in, char *out, size_t cap) {
+    size_t j = 0;
+    for (const char *p = in; *p && j + 1 < cap && j < 30; p++) {
+        char c = *p;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_')
+            out[j++] = c;
+    }
+    out[j] = 0;
+}
+
+/* 目录里有没有东西（小包 du -sm 会算成 0，不能只看 MB） */
+static int dir_nonempty(const char *d) {
+    DIR *dp = opendir(d);
+    if (!dp) return 0;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(dp)) != NULL)
+        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) { n = 1; break; }
+    closedir(dp);
+    return n;
+}
+
+/* 安装脚本跑完的标志：日志里有 [4/4] 完成 */
+static int log_done(const char *logpath) {
+    FILE *f = fopen(logpath, "r");
+    if (!f) return 0;
+    char buf[1600] = {0};
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, sz > 1500 ? sz - 1500 : 0, SEEK_SET);
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n] = 0;
+    fclose(f);
+    return strstr(buf, "[4/4] 完成") != NULL;
+}
+
+/* 同时只允许一个安装：两次点击会共用 /tmp/mdl.pkg、/tmp/mdl_x，
+ * 后一个把前一个的输入文件删掉 → 两个都失败（日志里是 can't open '/tmp/mdl.pkg'） */
+#define MDL_LOCK WORK_DIR "/.mdl.lock"
+static int install_locked(void) {
+    FILE *f = fopen(MDL_LOCK, "r");
+    if (!f) return 0;
+    long pid = 0;
+    if (fscanf(f, "%ld", &pid) != 1) pid = 0;
+    fclose(f);
+    if (pid > 0 && kill((pid_t)pid, 0) == 0) return 1;   /* 进程还在 → 真在装 */
+    return 0;                                            /* 残留的锁，忽略 */
+}
+
 
 static char *op_models(const char *json_in) {
     (void)json_in;
@@ -276,28 +329,44 @@ static char *op_models(const char *json_in) {
             ",{\"name\":\"%s\",\"desc\":\"%s\",\"installed\":%d,\"mb\":%ld}",
             TTS_MODELS[i].name, TTS_MODELS[i].desc, sz > 20 ? 1 : 0, sz);
     }
+    /* 自定义 URL 装的那份（/opt/tts-rk3566/custom）也列出来，装了就看得见、能卸 */
+    {
+        long cm = dir_size_mb("/opt/tts-rk3566/custom");
+        if ((cm > 0 || dir_nonempty("/opt/tts-rk3566/custom")) && off < 1900)
+            off += (size_t)snprintf(o + off, 2048 - off,
+                ",{\"name\":\"custom\",\"desc\":\"自定义 URL 下载\",\"installed\":1,\"mb\":%ld}", cm);
+    }
     snprintf(o + off, 2048 - off, "],\"answer\":\"语音模型已列出\"}");
     return o;
 }
 
 static char *op_model_install(const char *json_in) {
-    char name[32] = {0}, url[600] = {0};
-    jget(json_in, "name", name, sizeof(name));
+    char raw[32] = {0}, url[600] = {0}, name[32] = {0};
+    jget(json_in, "name", raw, sizeof(raw));
     jget(json_in, "url", url, sizeof(url));
+    nm_safe(raw, name, sizeof(name));
+    if (!name[0]) return jerr("要给 name=（zh-en / kokoro / custom）");
     const tts_model_t *M = NULL;
     for (int i = 0; TTS_MODELS[i].name; i++)
         if (!strcmp(TTS_MODELS[i].name, name)) { M = &TTS_MODELS[i]; break; }
     if (!M && !url[0])
-        return jerr("不认识的模型名（可用：zh-en / kokoro），或给 url=压缩包地址");
+        return jerr("不认识的模型名（可用：zh-en / kokoro / custom）；custom 必须给 url=压缩包地址");
+    if (install_locked())
+        return jerr("已经在装另一个语音模型了，等它跑完再点（重复点会互相删文件，两个都失败）");
     static tts_model_t custom;
     if (!M) {
-        custom.name = name; custom.dir = "/opt/tts-rk3566/custom"; custom.url = url;
-        custom.post = ""; custom.desc = "自定义";
+        /* 自定义包统一落到 /opt/tts-rk3566/custom，名字固定 custom ——
+         * op=models / model_status / model_remove 都按这个名字找，别用网页传来的原名 */
+        custom.name = "custom"; custom.dir = "/opt/tts-rk3566/custom"; custom.url = url;
+        custom.post = ""; custom.desc = "自定义 URL 下载";
         M = &custom;
     }
-    /* 已经装过就直接跳过：以前点"下载安装"会把 180~210MB 再下一次 */
+    /* 已经装过就直接跳过：以前点"下载安装"会把 180~210MB 再下一次。
+     * 小包 du 算出来是 0 MB，所以还要看日志有没有跑到 [4/4] 完成。 */
+    char log[700];
+    snprintf(log, sizeof(log), WORK_DIR "/gen/model_%s.log", M->name);
     long already = dir_size_mb(M->dir);
-    if (already > 20) {
+    if (already > 20 || (dir_nonempty(M->dir) && log_done(log))) {
         char *o = malloc(400);
         if (!o) return NULL;
         snprintf(o, 400,
@@ -306,20 +375,37 @@ static char *op_model_install(const char *json_in) {
             M->name, already, M->name, already);
         return o;
     }
+    /* /tmp/llama_agent 可能还没被建过（刚开机、也没跑过其它插件），
+     * 少了它 mkdir gen 会 ENOENT，后台任务的 `> log` 打不开就整个任务没了 */
+    mkdir(WORK_DIR, 0777);
     mkdir(WORK_DIR "/gen", 0777);
-    char log[700], q1[900], q2[900], q3[900];
-    snprintf(log, sizeof(log), WORK_DIR "/gen/model_%s.log", M->name);
+    char q1[900], q2[900], q3[900];
     sh_quote(M->url, q1, sizeof(q1));
     sh_quote(M->dir, q2, sizeof(q2));
     sh_quote(log, q3, sizeof(q3));
-    char sh[4000];
+    char sh[5200];
     snprintf(sh, sizeof(sh),
-        "( echo '[1/4] 下载'; curl -L --retry 3 -o /tmp/mdl.tbz %s || { echo '下载失败'; exit 1; }; "
-        "echo '[2/4] 解包'; rm -rf /tmp/mdl_x; mkdir -p /tmp/mdl_x; "
-        "bunzip2 -c /tmp/mdl.tbz | tar xf - -C /tmp/mdl_x || { echo '解包失败'; exit 1; }; "
-        "echo '[3/4] 安装'; mkdir -p %s; cp -r /tmp/mdl_x/*/* %s/ 2>/dev/null; "
-        "cd %s && ( %s ); echo '[4/4] 完成'; du -sm %s; rm -rf /tmp/mdl.tbz /tmp/mdl_x ) > %s 2>&1 &",
-        q1, q2, q2, q2, M->post[0] ? M->post : "true", q2, q3);
+        "( echo '[1/4] 下载'; rm -f /tmp/mdl.pkg; "
+        "curl -fL --retry 3 -o /tmp/mdl.pkg %s || { echo '下载失败（地址不通或 404）'; "
+        "rm -f /tmp/mdl.pkg " MDL_LOCK "; exit 1; }; "
+        "echo '[2/4] 解包'; ok=0; "
+        /* 板上 busybox tar 只有 -z（没有 -j / -J），吃不了 tar.bz2：
+         * 先用解压器解出 tar 流喂给 tar xf -，bz2 → gz → xz → 纯 tar 挨个试 */
+        "for d in bunzip2 gunzip xz; do "
+        "rm -rf /tmp/mdl_x; mkdir -p /tmp/mdl_x; "
+        "if [ $d = xz ]; then xz -dc /tmp/mdl.pkg 2>/dev/null | tar xf - -C /tmp/mdl_x && { ok=1; break; }; "
+        "else $d -c /tmp/mdl.pkg 2>/dev/null | tar xf - -C /tmp/mdl_x && { ok=1; break; }; fi; "
+        "done; "
+        "if [ $ok = 0 ]; then rm -rf /tmp/mdl_x; mkdir -p /tmp/mdl_x; "
+        "tar xf /tmp/mdl.pkg -C /tmp/mdl_x && ok=1; fi; "
+        "[ $ok = 1 ] || { echo '解包失败（tar.bz2 / tar.gz / tar.xz / 纯 tar 都试过）'; "
+        "rm -f /tmp/mdl.pkg " MDL_LOCK "; exit 1; }; "
+        "echo '[3/4] 安装'; mkdir -p %s; "
+        "( cp -r /tmp/mdl_x/*/* %s/ 2>/dev/null || cp -r /tmp/mdl_x/* %s/ ); "
+        "cd %s && ( %s ); echo '[4/4] 完成'; du -sm %s; "
+        "rm -rf /tmp/mdl.pkg /tmp/mdl_x " MDL_LOCK " ) > %s 2>&1 & "
+        "echo $! > " MDL_LOCK,
+        q1, q2, q2, q2, q2, M->post[0] ? M->post : "true", q2, q3);
     int rc = system(sh);
     if (rc != 0) return jerr("启动安装任务失败");
     char *o = malloc(1000);
@@ -334,38 +420,51 @@ static char *op_model_install(const char *json_in) {
 
 /* 卸载可选模型，回收空间（matcha 是内置的，不让删） */
 static char *op_model_remove(const char *json_in) {
-    char name[32] = {0};
-    jget(json_in, "name", name, sizeof(name));
+    char raw[32] = {0}, name[32] = {0};
+    jget(json_in, "name", raw, sizeof(raw));
+    nm_safe(raw, name, sizeof(name));
     if (!strcmp(name, "matcha"))
         return jerr("matcha 是内置模型（随 tts-rk3566 装的），不能从这里删");
     const tts_model_t *M = NULL;
     for (int i = 0; TTS_MODELS[i].name; i++)
         if (!strcmp(TTS_MODELS[i].name, name)) { M = &TTS_MODELS[i]; break; }
-    if (!M) return jerr("不认识的模型名（zh-en / kokoro）");
-    long before = dir_size_mb(M->dir);
-    if (before <= 0) return jerr("这个模型本来就没装");
+    if (!M && strcmp(name, "custom"))
+        return jerr("不认识的模型名（zh-en / kokoro / custom）");
+    const char *mname = M ? M->name : "custom";
+    const char *mdir  = M ? M->dir  : "/opt/tts-rk3566/custom";
+    long before = dir_size_mb(mdir);
+    if (!dir_nonempty(mdir)) return jerr("这个模型本来就没装");
     char q[900], cmd[1200];
-    sh_quote(M->dir, q, sizeof(q));
+    sh_quote(mdir, q, sizeof(q));
     snprintf(cmd, sizeof(cmd), "rm -rf %s", q);
     if (system(cmd) != 0) return jerr("删除失败（权限？）");
     char *o = malloc(600);
     if (!o) return NULL;
     snprintf(o, 600,
         "{\"ok\":1,\"name\":\"%s\",\"freed_mb\":%ld,\"answer\":\"已卸载 %s，回收 %ld MB\"}",
-        M->name, before, M->name, before);
+        mname, before, mname, before);
     return o;
 }
 
 static char *op_model_status(const char *json_in) {
-    char name[32] = {0};
-    jget(json_in, "name", name, sizeof(name));
+    char raw[32] = {0}, name[32] = {0};
+    jget(json_in, "name", raw, sizeof(raw));
+    nm_safe(raw, name, sizeof(name));
     const tts_model_t *M = NULL;
     for (int i = 0; TTS_MODELS[i].name; i++)
         if (!strcmp(TTS_MODELS[i].name, name)) { M = &TTS_MODELS[i]; break; }
-    if (!M) return jerr("不认识的模型名（zh-en / kokoro）");
+    if (!M) {
+        /* 自定义那份：目录和日志名固定用 custom，和 op_model_install 一致 */
+        if (!name[0] || !strcmp(name, "custom"))
+            snprintf(name, sizeof(name), "custom");
+        else
+            return jerr("不认识的模型名（zh-en / kokoro / custom）");
+    }
+    const char *mname = M ? M->name : name;
+    const char *mdir  = M ? M->dir  : "/opt/tts-rk3566/custom";
     char log[700];
-    snprintf(log, sizeof(log), WORK_DIR "/gen/model_%s.log", M->name);
-    long mb = dir_size_mb(M->dir);
+    snprintf(log, sizeof(log), WORK_DIR "/gen/model_%s.log", mname);
+    long mb = dir_size_mb(mdir);
     char tail[1200] = {0};
     FILE *f = fopen(log, "r");
     if (f) {
@@ -378,12 +477,19 @@ static char *op_model_status(const char *json_in) {
     }
     char esc[2600];
     jesc(tail, esc, sizeof(esc));
-    char *o = malloc(strlen(esc) + 800);
+    /* 装完的判定：日志跑到 [4/4]，或者目录已经够大（180MB 级的预设包） */
+    int done = log_done(log) || mb > 20;
+    /* 下载阶段给页面一个真实数字：/tmp/mdl.pkg 现在多大（解包阶段已经删了，所以会是 0） */
+    long dl_mb = 0;
+    struct stat st_pkg;
+    if (stat("/tmp/mdl.pkg", &st_pkg) == 0) dl_mb = (long)(st_pkg.st_size >> 20);
+    int exp_mb = M ? M->exp_mb : 0;
+    char *o = malloc(strlen(esc) + 900);
     if (!o) return NULL;
-    snprintf(o, strlen(esc) + 800,
-        "{\"ok\":1,\"name\":\"%s\",\"installed\":%d,\"mb\":%ld,\"running\":%d,\"log\":\"%s\"}",
-        M->name, mb > 20 ? 1 : 0, mb,
-        (strstr(tail, "[4/4] 完成") || mb > 20) ? 0 : (tail[0] ? 1 : 0), esc);
+    snprintf(o, strlen(esc) + 900,
+        "{\"ok\":1,\"name\":\"%s\",\"installed\":%d,\"mb\":%ld,\"running\":%d,"
+        "\"dl_mb\":%ld,\"exp_mb\":%d,\"log\":\"%s\"}",
+        mname, done, mb, done ? 0 : (tail[0] ? 1 : 0), dl_mb, exp_mb, esc);
     return o;
 }
 
@@ -769,9 +875,14 @@ static plugin_desc_t desc = {
     PLUGIN_API_VERSION,
     "voice",
     "文字转语音（离线中文 TTS，纯 CPU）：文本 → MP3，气泡里可直接播放/下载。"
-    "适合给回答配音、做语音播报、给视频配旁白。首次调用约 22 秒（加载 26MB 模型），同文本会命中缓存。",
+    "适合给回答配音、做语音播报、给视频配旁白。首次调用约 22 秒（加载 26MB 模型），同文本会命中缓存。"
+    "模型按需装：op=models 列已装情况，op=model_install 下载安装"
+    "（name=zh-en 中英双语 / kokoro 男声，或 name=custom + url=压缩包直链 装 GitHub 上的第三方模型包），"
+    "op=model_status 看下载进度，op=model_remove 卸载回收空间；matcha 是内置的不能删。",
     "{\"op\":\"tts\",\"text\":\"要念的中文\",\"speed\":1.0,\"bitrate\":\"64k\"}"
-    " 或 {\"op\":\"tts\",\"path\":\"/tmp/正文.txt\"}；op=probe 看是否已安装",
+    " 或 {\"op\":\"tts\",\"path\":\"/tmp/正文.txt\"}；op=probe 看是否已安装；"
+    "{\"op\":\"model_install\",\"name\":\"kokoro\"} 或 "
+    "{\"op\":\"model_install\",\"name\":\"custom\",\"url\":\"https://github.com/…/x.tar.bz2\"}",
     run,
     NULL
 };

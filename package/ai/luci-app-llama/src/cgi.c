@@ -1320,7 +1320,7 @@ int main(void) {
     char q[1024];
     snprintf(q, sizeof(q), "%s", qs);
     char *pjob = NULL, *penv = NULL, *pfile = NULL, *pupload = NULL, *pstat = NULL;
-    char *pplug = NULL, *preq = NULL, *pop = NULL, *pname = NULL;  /* ?plug=插件名&req=base64(JSON) 或 &op=&name= */
+    char *pplug = NULL, *preq = NULL, *pop = NULL, *pname = NULL, *purl = NULL;  /* ?plug=插件名&req=base64(JSON) 或 &op=&name=&url= */
     char *pauto = NULL, *pargs = NULL, *pautolist = NULL, *pdaemon = NULL, *pautostop = NULL;
     char *pautostate = NULL;
     char *save = NULL;
@@ -1338,6 +1338,7 @@ int main(void) {
         else if (!strcmp(t, "req")) preq = v;
         else if (!strcmp(t, "op")) pop = v;
         else if (!strcmp(t, "name")) pname = v;
+        else if (!strcmp(t, "url")) purl = v;
         else if (!strcmp(t, "noocr")) g_noocr = (v && v[0] == '1');
         else if (!strcmp(t, "status")) pstat = v;
         else if (!strcmp(t, "auto")) pauto = v;
@@ -1436,8 +1437,20 @@ int main(void) {
             if (qn <= 0) { out_json("{\"error\":\"req 不是合法 base64\"}"); return 0; }
             q[qn] = 0;
         } else {
-            /* ?plug=voice&op=models&name=kokoro —— LuCI 的 lua 里拼 JSON 麻烦，直给字段 */
-            if (pname && pname[0])
+            /* ?plug=voice&op=models&name=kokoro&url=… —— LuCI 的 lua 里拼 JSON 麻烦，直给字段。
+             * url 是自定义模型包的直链（已经是 url_decode 过的），要转义引号和反斜杠再塞进 JSON。 */
+            char uesc[2200] = {0};
+            if (purl && purl[0]) {
+                size_t uo = 0;
+                for (const char *p = purl; *p && uo + 3 < sizeof(uesc); p++) {
+                    if (*p == '"' || *p == '\\') uesc[uo++] = '\\';
+                    uesc[uo++] = *p;
+                }
+                uesc[uo] = 0;
+            }
+            if (pname && pname[0] && uesc[0])
+                snprintf(q, sizeof(q), "{\"op\":\"%s\",\"name\":\"%s\",\"url\":\"%s\"}", pop, pname, uesc);
+            else if (pname && pname[0])
                 snprintf(q, sizeof(q), "{\"op\":\"%s\",\"name\":\"%s\"}", pop, pname);
             else
                 snprintf(q, sizeof(q), "{\"op\":\"%s\"}", pop);

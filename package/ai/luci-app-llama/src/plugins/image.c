@@ -363,8 +363,14 @@ static char *run_moire(const char *json_in) {
      * 用板上的 python3 + numpy 算 FFT（比在 C 里手写 FFT 稳，也快）。
      * 万一 python/numpy 不可用，退回"降采样+中值"的弱办法并如实说明。 */
     char cmd[1600];
+    /* 输出目录必须先建好：/tmp 被清过之后 gen 目录可能不存在，
+     * 结果 python 保存失败 → 退回 ffmpeg 也失败 → 报"ffmpeg 处理出错"（实测踩过） */
+    snprintf(cmd, sizeof(cmd), "mkdir -p " WORK_DIR "/gen 2>/dev/null");
+    if (system(cmd) != 0) { /* 建不了就算了，后面会报具体错误 */ }
     snprintf(cmd, sizeof(cmd),
-             "python3 /opt/realesrgan/demoire.py '%s' '%s' %d 8 2>/dev/null", path, out, strength);
+             "python3 /opt/llama/agent/demoire.py '%s' '%s' %d 8 2>/dev/null"
+             " || python3 /opt/realesrgan/demoire.py '%s' '%s' %d 8 2>/dev/null",
+             path, out, strength, path, out, strength);
     int rc = system(cmd);
     int used_fft = (rc == 0);
     if (!used_fft || access(out, R_OK) != 0) {
@@ -437,7 +443,9 @@ static plugin_desc_t desc = {
     PLUGIN_API_VERSION,
     "image",
     "图片修复/放大（Real-ESRGAN general-x4v3 跑 RKNPU int8）：模糊照片、压缩截图、老图放大变清晰。"
-    "单张图不受帧率限制，可以直接出 4 倍。需要独立包 realesrgan-rk3566。",
+    "单张图不受帧率限制，可以直接出 4 倍。需要独立包 realesrgan-rk3566。"
+    "本插件不做谱面识别：拍的乐谱（五线谱 / 简谱）先用 whiten 去阴影或 fix 放大，"
+    "再交给 music 插件的 omr（五线谱）/ jianpu（简谱）转成 MIDI。",
     "{\"op\":\"fix\",\"path\":\"/tmp/old.jpg\",\"scale\":4} 放大；{\"op\":\"whiten\",\"path\":\"/tmp/paper.jpg\",\"strength\":50} 去阴影/背景取白；{\"op\":\"moire\",\"path\":\"/tmp/screen.jpg\",\"strength\":2} 去摩尔纹；op=status 查就绪",
     run,
     NULL

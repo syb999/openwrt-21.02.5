@@ -484,6 +484,8 @@ static int read_midi(const char *path, note_t *out, int maxn, double *beat_out) 
 
 /* ---------------- 合成 ---------------- */
 /* FC 音色参数（照搬 fc_synth.py 的试听结论） */
+/* 默认用加法合成（wave=2）：以前是 pulse/triangle，听感就是"电子琴"。
+ * 想回旧音色传 {"wave":0} 或 {"wave":1}。 */
 static double adsr_env(long i, long n) {
     const double a = 0.001, d = 0.075, s = 0.42, r = 0.030;
     long an = (long)(a * SR); if (an < 1) an = 1;
@@ -533,7 +535,16 @@ static void add_tone(float *buf, long total, double start, int pitch, double dur
         if (phase >= 1.0) phase -= (long)phase;
 
         double w;
-        if (wave == 0) {              /* pulse */
+        if (wave == 2) {              /* 加法合成：基频 + 6 次谐波，高次衰减更快 → 接近钢琴 */
+            double h = 0.0;
+            for (int k = 1; k <= 6; k++) {
+                double fk = f0 * k;
+                if (fk > SR * 0.45) break;
+                double dk = exp(-t * (2.0 + k * 1.7));   /* 钢琴：高次谐波掉得快 */
+                h += sin(2 * M_PI * fk * t) * dk / k;
+            }
+            w = h * 0.85;
+        } else if (wave == 0) {              /* pulse */
             w = (phase < duty) ? 1.0 : -1.0;
             w -= (2.0 * duty - 1.0);  /* 去直流 */
         } else {                      /* triangle */
@@ -621,9 +632,9 @@ static char *do_render(note_t *notes, int nn, const char *midi_path,
         if (x->ch == 9) {
             add_noise(buf, total, x->start, x->dur, 0.35);
         } else if (x->ch == 1) {
-            add_tone(buf, total, x->start, x->pitch, x->dur, 0.34, 1, 0.5, 0.0);
+            add_tone(buf, total, x->start, x->pitch, x->dur, 0.34, 2, 0.5, 0.0);
         } else {
-            add_tone(buf, total, x->start, x->pitch, x->dur, 0.42, 0, 0.5, 0.006);
+            add_tone(buf, total, x->start, x->pitch, x->dur, 0.42, 2, 0.5, 0.006);
         }
     }
 
@@ -1069,13 +1080,23 @@ static char *op_jianpu(const char *json) {
     char j1[14000];
     snprintf(j1, sizeof(j1), "{\"path\":\"%s\",\"tempo\":100,\"notes\":[%s]}", out, notes);
     char *res = op_midi(j1);
-    (void)res;
-    char ans[400];
-    snprintf(ans, sizeof(ans),
-             "简谱识别：%d 个音，调 %s%s，已生成 MIDI：%s", cnt,
-             minor ? "小调" : "大调", "", out);
-    char *r = malloc(1024);
-    snprintf(r, 1024, "{\"ok\":1,\"notes\":%d,\"file\":\"%s\",\"answer\":\"%s\"}", cnt, out, ans);
+    free(res);
+    /* 再渲染一份 MP3：页面上的播放器只认音频扩展名，只给 .mid 是播不了的 */
+    char mp3[600];
+    snprintf(mp3, sizeof(mp3), "%s", out);
+    char *dot = strrchr(mp3, '.');
+    if (dot) snprintf(dot, sizeof(mp3) - (size_t)(dot - mp3), ".mp3");
+    char j2[1200];
+    snprintf(j2, sizeof(j2), "{\"path\":\"%s\",\"to\":\"mp3\"}", out);
+    char *rr = op_render(j2);
+    free(rr);
+    char ans[500];
+    snprintf(ans, sizeof(ans), "简谱识别：%d 个音（%s调），已生成 MIDI 和可播放的 MP3",
+             cnt, minor ? "小" : "大");
+    char *r = malloc(1400);
+    snprintf(r, 1400,
+             "{\"ok\":1,\"notes\":%d,\"file\":\"%s\",\"midi\":\"%s\",\"answer\":\"%s\"}",
+             cnt, mp3, out, ans);
     return r;
 }
 
@@ -1553,6 +1574,8 @@ static char *run(const char *json_in) {
             snprintf(op, sizeof(op), "midi");
         else if (strstr(json_in, "\"path\"") && strstr(json_in, ".mid"))
             snprintf(op, sizeof(op), "import");
+        else if (strstr(json_in, "简谱") || strstr(json_in, "numbered"))
+            snprintf(op, sizeof(op), "jianpu");
         else if (strstr(json_in, "五线谱") || strstr(json_in, "乐谱") || strstr(json_in, "曲谱")
                  || strstr(json_in, ".jpg") || strstr(json_in, ".png"))
             snprintf(op, sizeof(op), "omr");
@@ -1571,7 +1594,7 @@ static char *run(const char *json_in) {
     if (!strcmp(op, "omr") || !strcmp(op, "sheetmusic") || !strcmp(op, "五线谱"))
         return op_sheet(json_in);
 
-    return jerr("不支持的 op：midi / render / import / bgm / omr（五线谱图片→MIDI）");
+    return jerr("不支持的 op：bgm / midi / render / import / omr（五线谱图片→MIDI）/ jianpu（简谱图片→MIDI）");
 }
 
 static plugin_desc_t desc = {
@@ -1579,14 +1602,22 @@ static plugin_desc_t desc = {
     "music",
     "音乐（纯 C）：**要背景音乐/BGM 一律用 op=bgm 加 style**，插件按风格模板确定性生成"
     "（比你逐个音符编快得多，也不会跑调）；style 可选 欢快/舒缓/悲伤/紧张/神秘/电子/game/march/chinese，"
-    "不给就随机。其它：omr=**五线谱图片→MIDI**（高音谱号单声部印刷体），midi=手写音符出 MIDI，render=合成 MP3，import=读 MIDI 转 MP3",
+    "不给就随机。"
+    "谱面识别有两档，别混：omr=**五线谱图片→MIDI**（要 /opt/omr 的 NPU 模型；只认干净的印刷体、"
+    "单声部、高音谱号、无升降号，拍号按 4/4、每个符头当一个四分音符；钢琴双谱表、带歌词或指法数字的谱面"
+    "识别率很低，先裁出旋律那一行再识别）；jianpu=**简谱图片→MIDI**（走板上 PP-OCR /opt/ppocr，认 "
+    "1~7、0 休止、- 延长、1=G 这类调号；下划线的八分音符和上加点的高八度拿不到，一律按一拍一音，"
+    "数字后面跟 . 才判高八度）。两者都给 MIDI + 可播放 MP3。"
+    "其它：midi=手写音符出 MIDI，render=合成 MP3，import=读 MIDI 转 MP3",
     "{\"op\":\"midi\",\"path\":\"/tmp/llama_agent/a.mid\",\"tempo\":160,"
     "\"notes\":[{\"pitch\":72,\"dur\":1},{\"pitch\":74,\"dur\":1}]}"
     "  或分轨 {\"op\":\"midi\",\"melody\":[...],\"bass\":[...],\"drums\":[...]}"
+    "  或 {\"op\":\"omr\",\"path\":\"/tmp/score.jpg\"}（五线谱）"
+    "  或 {\"op\":\"jianpu\",\"path\":\"/tmp/jp.jpg\"}（简谱）"
     "  或 {\"op\":\"render\",\"path\":\"/tmp/llama_agent/a.mid\"}"
     "  或 {\"op\":\"import\",\"path\":\"/tmp/llama_agent/x.mid\"}",
     run,
-    "midi,music,render,import,音乐,作曲,合成"
+    "midi,music,render,import,omr,jianpu,五线谱,简谱,乐谱,曲谱,音乐,作曲,合成"
 };
 
 plugin_desc_t *plugin_entry(void) { return &desc; }

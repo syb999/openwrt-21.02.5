@@ -1355,7 +1355,9 @@
     var box = document.getElementById('input') || document.querySelector('textarea, input[type=text]');
     var sc = a.getAttribute('data-s') || '4';
     var txt;
-    if (a.getAttribute('data-ocr')) txt = '{"op":"ocr","path":"' + p + '"}';
+    if (a.getAttribute('data-omr')) txt = '{"op":"omr","path":"' + p + '"}';
+    else if (a.getAttribute('data-jp')) txt = '{"op":"jianpu","path":"' + p + '"}';
+    else if (a.getAttribute('data-ocr')) txt = '{"op":"ocr","path":"' + p + '"}';
     else if (a.getAttribute('data-w')) txt = '{"op":"whiten","path":"' + p + '","strength":50}';
     else if (a.getAttribute('data-m')) txt = '{"op":"moire","path":"' + p + '","strength":' + (a.getAttribute('data-m') || 2) + '}';
     else txt = '{"op":"fix","path":"' + p + '","scale":' + sc + '}';
@@ -1937,13 +1939,15 @@
             + (j.kind === "image"
                 ? '<div class="fixcard">'
                   + '<div class="fixt">这张图还能处理</div>'
-                  + '<div class="fixd">放大变清晰（NPU）、去阴影取白底（拍照的 A4 纸）、去摩尔纹（拍屏幕）、识别文字</div>'
+                  + '<div class="fixd">放大变清晰（NPU）、去阴影取白底（拍照的 A4 纸）、去摩尔纹（拍屏幕）、识别文字、乐谱转 MIDI</div>'
                   + '<div class="fixb">'
                   + '<a href="javascript:void 0" class="fixlink" data-p="' + esc(j.path || "") + '" data-s="4">🪄 修复 4 倍</a>'
                   + '<a href="javascript:void 0" class="fixlink ghost" data-p="' + esc(j.path || "") + '" data-s="2">2 倍（更平滑）</a>'
                   + '<a href="javascript:void 0" class="fixlink alt" data-w="1" data-p="' + esc(j.path || "") + '">☀ 去阴影 / 背景取白</a>'
                   + '<a href="javascript:void 0" class="fixlink ghost" data-ocr="1" data-p="' + esc(j.path || "") + '">🔍 识别文字</a>'
                   + '<a href="javascript:void 0" class="fixlink alt2" data-m="2" data-p="' + esc(j.path || "") + '">📺 去摩尔纹</a>'
+                  + '<a href="javascript:void 0" class="fixlink alt" data-omr="1" data-p="' + esc(j.path || "") + '">🎼 五线谱转 MIDI</a>'
+                  + '<a href="javascript:void 0" class="fixlink alt" data-jp="1" data-p="' + esc(j.path || "") + '">🎵 简谱转 MIDI</a>'
                   + '</div></div>'
                 : '<br>现在已经转成纯文本，可以直接让我总结 / 翻译 / 就内容提问。')
             + '</div>');
@@ -2662,12 +2666,15 @@
     },
 
     music: {
-      what: "纯 C 的音乐插件：一是一句话生成背景音乐（BGM，确定性、毫秒级，很快）；二是五线谱图片转 MIDI；三是手写音符出 MIDI；四是合成 MP3 或导入现成 MIDI。",
+      what: "纯 C 的音乐插件：一是一句话生成背景音乐（BGM，确定性、毫秒级，很快）；二是五线谱图片转 MIDI；三是简谱图片转 MIDI；四是手写音符出 MIDI；五是合成 MP3 或导入现成 MIDI。",
       ops: [
         {n: "bgm", d: "★ 要背景音乐用这个：给风格和时长即可，不用自己编音符。style：happy 欢快 / calm 舒缓 / sad 悲伤 / tense 紧张 / mystery 神秘 / electronic 电子 / game 游戏 / march 进行曲 / chinese 国风；seconds 想要的秒数",
          c: '{"op":"bgm","style":"calm","seconds":30}'},
         {n: "bgm（中文风格名）", d: "风格也认中文关键词", c: '{"op":"bgm","style":"舒缓的钢琴曲","seconds":20}'},
-        {n: "omr", d: "五线谱图片 → MIDI（需要 /opt/omr 模型，走 NPU）", c: '{"op":"omr","path":"/tmp/score.jpg"}'},
+        {n: "omr", d: "五线谱图片 → MIDI（OMR）。先要 /opt/omr 的 NPU 模型在，否则报错。能力边界：只认干净印刷体、单声部、高音谱号、无升降号；拍号按 4/4、每个符头当一个四分音符（不认时值）；钢琴双谱表（高低音两行）、带歌词或指法数字的谱面识别率很低，建议先裁出只有旋律的那一行、必要时先用 image 插件的 fix/whiten 处理再识别",
+         c: '{"op":"omr","path":"/tmp/score.jpg"}'},
+        {n: "jianpu", d: "简谱图片 → MIDI（走板上 PP-OCR，要 /opt/ppocr + /opt/glibc）。认 1~7 音级、0 休止、- 延长一拍、1=G 这类调号（自动判大/小调）；拿不到的：下划线八分音符、上加点高八度（一律按一拍一音，只有数字后面跟 . 才判高八度）。产出 MIDI + 可播放 MP3",
+         c: '{"op":"jianpu","path":"/tmp/jianpu.jpg"}'},
         {n: "midi", d: "按音符串生成 MIDI：格式「音名八度:时值」，空格分隔", c: '{"op":"midi","notes":"C4:1 D4:1 E4:2 G4:1","path":"/tmp/a.mid"}'},
         {n: "render", d: "把音符合成 MP3（FC 音色）", c: '{"op":"render","notes":"C4:1 D4:1 E4:2","path":"/tmp/a.mp3"}'},
         {n: "import", d: "读现成 MIDI 转 MP3", c: '{"op":"import","path":"/tmp/in.mid","to":"mp3"}'}
@@ -2675,7 +2682,9 @@
       sample: '来一段 30 秒舒缓的背景音乐',
       note: "BGM 是模板化确定性生成（和弦进行 + 动机复用 + 低音/鼓分轨），不是 3B 模型逐音编曲，所以快且不跑调；"
           + "音色是插件内置合成器（FC 风格），要更好的音色请在手机/电脑上播 MIDI，或用 render 出 MP3 后处理。"
-          + "产物在 /tmp/llama_agent/ 下（bgm_<风格>_<时间>.mid/.mp3）。"
+          + "谱面识别两条路：五线谱走 omr（内置 OMR，见到「长横线五条一组」才认，识别不出会明确报错，不会硬造旋律）；"
+          + "简谱走 jianpu（靠 OCR 读数字）。拍歪/有阴影的谱子先上传，用上面的「去阴影」「修复 4 倍」处理好再点「🎼 五线谱转 MIDI」/「🎵 简谱转 MIDI」。"
+          + "产物在 /tmp/llama_agent/ 下（bgm_<风格>_<时间>.mid/.mp3、sheet_*.mid、bgm_jianpu_*.mid/.mp3）。"
     },
 
     video: {
@@ -2817,7 +2826,9 @@
     image: {
       what: "图片处理四合一：超分放大、去阴影/背景取白（拍 A4 纸）、去摩尔纹（拍屏幕）、OCR 认字。"
           + "超分用 Real-ESRGAN general-x4v3 跑 RKNPU（int8）；另外三个是纯 CPU 算法。"
-          + "模型在独立包 realesrgan-rk3566 里，和视频超分 sr-rk3566 分开装、分开跑。",
+          + "模型在独立包 realesrgan-rk3566 里，和视频超分 sr-rk3566 分开装、分开跑。"
+          + "本插件只做图像处理，不做谱面识别；拍的乐谱（五线谱 / 简谱）先用这里的「去阴影」「修复 4 倍」处理好，"
+          + "再交给 music 插件的 omr（五线谱）/ jianpu（简谱）转 MIDI。",
       ops: [
         {n: "fix", d: "超分放大。scale=4（最清晰，默认）或 2（2x2 平均，噪点更少）",
          c: '{"op":"fix","path":"/tmp/old.jpg","scale":4}'},
@@ -2828,8 +2839,10 @@
         {n: "status", d: "查底层程序与模型是否就绪", c: '{"op":"status"}'}
       ],
       sample: '这张纸拍出来有阴影，帮我去掉阴影、背景取白',
-      note: "上传图片后气泡里直接有五个按钮：「🪄 修复 4 倍」「2 倍（更平滑）」「☀ 去阴影/背景取白」"
-          + "「📺 去摩尔纹」「🔍 识别文字」。OCR 走 doc 插件，正文会显示在气泡里。"
+      note: "上传图片后气泡里直接有七个按钮：「🪄 修复 4 倍」「2 倍（更平滑）」「☀ 去阴影/背景取白」"
+          + "「📺 去摩尔纹」「🔍 识别文字」「🎼 五线谱转 MIDI」「🎵 简谱转 MIDI」。前四个走本插件，"
+          + "OCR 走 doc 插件（正文显示在气泡里），最后两个走 music 插件（omr / jianpu）—— "
+          + "拍歪、有阴影的谱子先用前四个处理干净再转，曲谱识别不出来会明确报错，不会硬造旋律。"
           + "产物在 /tmp/llama_agent/gen/。限制：去摩尔纹对整幅静止的规则条纹有效，"
           + "对随位置漂移的拍屏条纹只能减弱。内存不足时会直接拒绝，避免把 3B 模型挤掉。"
     },
@@ -2846,14 +2859,18 @@
          c: '{"op":"tts","path":"/tmp/正文.txt"}'},
         {n: "asr", d: "语音转文字（中/英/日/韩/粤），结果落 .txt",
          c: '{"op":"asr","path":"/tmp/录音.mp3"}'},
-        {n: "models", d: "列出三套 TTS 模型是否已装、各占多少 MB", c: '{"op":"models"}'},
-        {n: "model_install", d: "按需下载安装模型（zh-en / kokoro）", c: '{"op":"model_install","name":"kokoro"}'},
+        {n: "models", d: "列出三套 TTS 模型（+ 自定义那份）是否已装、各占多少 MB", c: '{"op":"models"}'},
+        {n: "model_install", d: "一键下载安装：name=zh-en（中英双语）/ kokoro（男声，约 206MB）；后台下载 + 解包 + 收尾，装完即生效", c: '{"op":"model_install","name":"kokoro"}'},
+        {n: "model_install（自定义 URL）", d: "装 GitHub 上任意 tar 包（tar.bz2 / tar.gz / tar.xz），落到 /opt/tts-rk3566/custom。文件布局要和内置模型一致才用得上", c: '{"op":"model_install","name":"custom","url":"https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-melo-tts-zh_en.tar.bz2"}'},
+        {n: "model_status", d: "看下载进度（装好了没、多大）", c: '{"op":"model_status","name":"kokoro"}'},
         {n: "model_remove", d: "卸载可选模型回收空间（matcha 内置，不许删）", c: '{"op":"model_remove","name":"kokoro"}'}
       ],
       sample: '用男声念：今天气温30℃，湿度45%',
       note: "自然语言直接可用：「念：…」中文女声、「用男声念：…」男声、「念：我在用 GPU 训练模型」自动切双语；"
           + "上传 mp3/wav 会自动转文字。符号会展开成中文（30% → 百分之30、℃ → 摄氏度、￥ → 元）。"
-          + "模型管理在设置 → 语音模型，可下载/卸载（ipk 里只带 matcha 39MB）。"
+          + "模型管理就在这个说明的下方：一行一个模型，点「下载安装」就是一条龙（下载 → 解包 → 收尾 → 生效），"
+          + "下面还有「从 URL 安装」，填 GitHub 上的 tar 直链就能装第三方模型包（例如 sherpa-onnx 其它 tts-models），"
+          + "落到 /opt/tts-rk3566/custom。ipk 里只带 matcha（39MB），其余按需下。"
     }
   };
 
@@ -2884,10 +2901,31 @@
              + '<button type="button" class="vlmbtn vlmrm" data-m="' + esc(m.name) + '">卸载</button>';
         h += '</td></tr>';
       });
-      box.innerHTML = h + '</table><div class="vlmmsg dim"></div>';
+      /* 自定义包：填 GitHub 上的 tar 直链，一键下载安装到 /opt/tts-rk3566/custom */
+      h += '</table>'
+        + '<div class="vlmcust" style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">'
+        +   '<input type="text" class="vlmurl" spellcheck="false"'
+        +   ' placeholder="自定义包直链：https://github.com/…/xxx.tar.bz2（tar.bz2 / tar.gz / tar.xz）"'
+        +   ' style="flex:1;min-width:200px;padding:5px 8px;border-radius:6px;border:1px solid #33476b;background:#11161d;color:#dfe6ef">'
+        +   '<button type="button" class="vlmbtn vlmurlgo">从 URL 安装</button>'
+        + '</div>'
+        + '<div class="vlmmsg dim"></div>';
+      box.innerHTML = h;
       Array.prototype.forEach.call(box.querySelectorAll('.vlmbtn'), function(b){
         var nm = b.getAttribute('data-m');
-        if (b.className.indexOf('vlmrm') >= 0) b.onclick = function(){ removeModel(nm); };
+        if (b.className.indexOf('vlmurlgo') >= 0) {
+          b.onclick = function(){
+            var inp = box.querySelector('.vlmurl');
+            var u = (inp && inp.value || '').replace(/^\s+|\s+$/g, '');
+            if (!/^https?:\/\//.test(u)) {
+              var m0 = box.querySelector('.vlmmsg');
+              if (m0) m0.textContent = '要填 http:// 或 https:// 开头的压缩包地址';
+              return;
+            }
+            startModelInstall('custom', u);
+          };
+        }
+        else if (b.className.indexOf('vlmrm') >= 0) b.onclick = function(){ removeModel(nm); };
         else b.onclick = function(){ startModelInstall(nm); };
       });
     });
@@ -2902,17 +2940,28 @@
       renderVoiceModels(box ? box.id : 'vlmm');
     });
   }
-  function startModelInstall(name){
+  function startModelInstall(name, url){
     var box = document.getElementById('vlmmSet') || document.getElementById('vlmm');
     var msg = box.querySelector('.vlmmsg');
     if (msg) msg.textContent = '正在启动下载…';
-    plugCall({op:'model_install', name:name}).then(function(d){
-      if (msg) msg.textContent = (d && d.answer) ? d.answer : '启动失败';
+    var req = {op:'model_install', name:name};
+    if (url) req.url = url;
+    plugCall(req).then(function(d){
+      if (msg) msg.textContent = (d && (d.answer || d.error)) ? (d.answer || d.error) : '启动失败';
+      if (d && d.error) return;
       var t = setInterval(function(){
         plugCall({op:'model_status', name:name}).then(function(st){
           if (!st) return;
-          if (msg) msg.textContent = st.installed ? ('已安装 ' + st.mb + ' MB')
-                     : ('安装中… ' + (st.log ? String(st.log).split('\n').slice(-1)[0] : ''));
+          if (msg) {
+            var m2 = String(st.log || '').match(/\[[1-4]\/4\][^\r\n\\]*/g);
+            var stg = (m2 && m2.length) ? m2[m2.length - 1] : '';
+            if (st.installed) msg.textContent = '已安装 ' + st.mb + ' MB';
+            /* 先看阶段：解包时 /tmp/mdl.pkg 还在，单看 dl_mb 会一直停在“下载中 140/140” */
+            else if (stg.indexOf('[1/4]') === 0 && st.dl_mb > 0)
+              msg.textContent = '下载中 ' + st.dl_mb + ' / ' + (st.exp_mb || '?') + ' MB';
+            else if (stg) msg.textContent = stg + '（解包 1~2 分钟，没有进度条）';
+            else msg.textContent = '安装中…';
+          }
           if (st.installed) { clearInterval(t); renderVoiceModels(box ? box.id : 'vlmm'); }
         });
       }, 4000);

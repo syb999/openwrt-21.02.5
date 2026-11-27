@@ -67,6 +67,7 @@ install: all
 	install -m 755 desub_shot $(DESTDIR)/opt/llama/agent/desub_shot
 	install -m 755 $(PLUGINS:%=plugins/%.so) $(DESTDIR)/opt/llama/agent/plugins/
 	install -m 755 memstat.sh $(DESTDIR)/opt/llama/agent/
+	install -m 755 demoire.py $(DESTDIR)/opt/llama/agent/demoire.py
 
 clean:
 	rm -f agent cgi mediad desub_fill desub_shot $(PLUGINS:%=plugins/%.so) tests/test_math tests/test_json tests/test_plugin tests/test_doc

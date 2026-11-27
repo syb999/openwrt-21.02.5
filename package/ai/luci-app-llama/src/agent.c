@@ -3251,7 +3251,7 @@ int main(int argc, char **argv) {
         "  jq     : probe get query csv table keys（JSON）\n"
         "  table  : sort（文本表格排序）\n"
         "  browser: probe autologin hunt drag captcha cookie shot\n"
-        "  music  : midi render import\n"
+        "  music  : bgm midi render import omr jianpu（omr=五线谱图片→MIDI，jianpu=简谱图片→MIDI）\n"
         "  curl   : parse（吃浏览器 Copy as cURL 的整段原文，不是网址）\n"
         "注意：日志是 owrt 的 logread，不是 sys；OpenWrt 上没有 /var/log/syslog 这个文件。\n"
         "【示例】\n"

@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-llama
-PKG_VERSION:=3.1.135
+PKG_VERSION:=3.1.138
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=local
@@ -32,3 +32,4 @@ define Package/luci-app-llama/conffiles
 endef
 
 # call BuildPackage - OpenWrt buildroot signature
+
