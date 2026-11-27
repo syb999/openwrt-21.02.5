@@ -414,6 +414,21 @@ static char *run(const char *json_in) {
         return strdup("{\"error\":\"缺少 path：读文档要给 path；生成文档要用 "
                       "op=xlsx/docx/pptx/pdf+markdown\"}");
 
+    /* 文件不存在就先说清楚，别让它按格式去解析再报"结构损坏/为空" ——
+     * 模型会以为是格式问题，换个路径再来一遍（"tcl是什么调试命令"那次就是这样）。 */
+    if (access(path, R_OK) != 0) {
+        char safe[512];
+        size_t k = 0;
+        for (const char *q = path; *q && k + 1 < sizeof(safe); q++)
+            safe[k++] = (*q == '"' || *q == '\\') ? '_' : *q;
+        safe[k] = 0;
+        char msg[700];
+        snprintf(msg, sizeof(msg),
+                 "{\"error\":\"文件不存在：%s。读文档必须先有这个文件；"
+                 "如果只是想问一个知识问题，直接回答，不要调用 doc\"}", safe);
+        return strdup(msg);
+    }
+
     /* docx / xlsx / pptx 用纯 C 解（zip + xml，实测验证过）。
      *
      * PDF 例外：它要解析对象树 → 每页资源 → 字体 /Subtype → 各自的

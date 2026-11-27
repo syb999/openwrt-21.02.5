@@ -993,6 +993,20 @@ static int g_prefetched = 0;
  * 主循环据此换一套 system prompt —— 带 op 归属表和少样本的那套会被
  * 小模型当成"必须调工具"的证据，问"解释一下 NPU"它真会去调 jq。 */
 static int g_pure_chat_task = 0;
+/* 本轮真正给模型的插件名：tools_prompt 填，主 prompt 的【op 归属表】/【示例】
+ * 只列这些。表和示例以前是静态全表，连没列给模型的插件（doc/video…）都写在
+ * 提示里，3B 会照抄示例里的 {"tool":"doc",...} 去调一个它不该调的插件
+ * （实测："tcl exec 可以调试shell命令，tcl 是什么?" → 它去调 doc 读 /tcl）。 */
+#define OFFERED_MAX 16
+static char g_offered[OFFERED_MAX][24];
+static int  g_offered_n = 0;
+static int  g_offered_all = 0;
+static int plug_offered(const char *nm) {
+    if (g_offered_all) return 1;
+    for (int i = 0; i < g_offered_n; i++)
+        if (!strcmp(g_offered[i], nm)) return 1;
+    return 0;
+}
 /* 框架直连登录失败时的诊断，会注入给模型判断 */
 static char g_login_diag[1600] = {0};
 
@@ -1293,6 +1307,8 @@ static char *tools_prompt(const char *task) {
     char *s = malloc(SMALL);
     if (!s) return NULL;
     size_t off = 0;
+    g_offered_n = 0;          /* 每轮重算，别让上一轮的插件名漏进来 */
+    g_offered_all = 1;
 
     /* 框架刚刚自己试过登录但没成 —— 把原因告诉模型，让它判断该建议什么，
      * 而不是让它一头雾水地重试一遍 */
@@ -1342,6 +1358,12 @@ static char *tools_prompt(const char *task) {
         fprintf(stderr, "\n");
         fflush(stderr);      /* 重定向到文件时 stderr 可能被缓冲，调试信息会丢 */
     }
+
+    /* 记下本轮给的插件名（主 prompt 的 op 表/示例只列这些） */
+    g_offered_n = 0;
+    g_offered_all = (nsel == 0);
+    for (int i = 0; i < nsel && g_offered_n < OFFERED_MAX; i++)
+        snprintf(g_offered[g_offered_n++], sizeof(g_offered[0]), "%s", g_plug[idx[i]]->name);
 
     if (nsel > 0) {
         off += (size_t)snprintf(s + off, SMALL - off, "可用工具：\n");
@@ -3233,50 +3255,77 @@ int main(int argc, char **argv) {
             "回答用中文，简洁准确，不超过 200 字。\n"
             "只输出一个 JSON：{\"tool\":\"final\",\"answer\":\"你的回答\"}。"
             "answer 里就是最终答案本身，不要提工具、不要提 JSON。");
-    } else
+    } else {
+    /* 【op 归属表】/【示例】只列本轮真给模型的插件（plug_offered）。
+     * 以前是静态全表：任务命中 sys 时模型手里只有 sys，提示里却还写着 doc、
+     * 还有 {"tool":"doc","op":"xlsx",...} 这个示例，3B 直接照抄 —— 于是
+     * "tcl exec 可以调试shell命令" 这种问题它去调 doc 读 /tcl。 */
+    static const struct { const char *name, *ops, *ex; } OPTAB[] = {
+        {"sys", "list du grep read write shell sysinfo http_get download",
+         "用户：看看 /tmp 下最大的文件\n→ {\"tool\":\"sys\",\"op\":\"du\",\"path\":\"/tmp\",\"top\":10}\n"
+         "用户：抓 http://x/y 看看是不是 404\n→ {\"tool\":\"sys\",\"op\":\"http_get\",\"url\":\"http://x/y\"}\n"},
+        {"owrt", "uci_get uci_set uci_show uci_commit uci_revert iwinfo iw "
+                 "service logread passwd reboot opkg_list",
+         "用户：看看最近 20 行日志\n→ {\"tool\":\"owrt\",\"op\":\"logread\",\"lines\":20}\n"},
+        {"net", "ping port resolve route arp stat link wifi trace hostname", ""},
+        {"math", "calc solve system stat num（应用题给 task 让插件自己判题型）", ""},
+        {"doc", "docx xlsx pptx pdf text（Office/PDF 读写，必须有 path）",
+         "用户：把这段内容导出成 docx\n→ {\"tool\":\"doc\",\"op\":\"docx\","
+         "\"path\":\"/tmp/llama_agent/gen/a.docx\",\"content\":\"...\"}\n"},
+        {"jq", "probe get query csv table keys（JSON）", ""},
+        {"table", "sort（文本表格排序）", ""},
+        {"browser", "probe autologin hunt drag captcha cookie shot", ""},
+        {"music", "bgm midi render import omr jianpu（omr=五线谱→MIDI，jianpu=简谱→MIDI）", ""},
+        {"curl", "parse（吃浏览器 Copy as cURL 的整段原文，不是网址）", ""},
+        {"video", "portrait effects compress audio watermark crop scale concat split "
+                  "sheet convert detect trim thumb gif job sr desub",
+         "用户：把 /opt/mp4/01.mp4 转成竖屏\n→ {\"tool\":\"video\",\"op\":\"portrait\","
+         "\"path\":\"/opt/mp4/01.mp4\"}\n"},
+        {"netcap", "urls flows stats（抓包：DNS / TLS SNI / 明文 URL）",
+         "用户：抓5秒流量，看看访问了什么\n→ {\"tool\":\"netcap\",\"op\":\"urls\",\"secs\":5}\n"},
+        {"image", "fix whiten moire status（图片超分/去阴影/去摩尔纹）", ""},
+        {"voice", "tts asr probe models model_install model_status model_remove", ""},
+        {"sysmon", "snapshot（负载/内存/温度快照）", ""},
+        {"batch", "split merge（大任务分片）", ""},
+        {NULL, NULL, NULL}
+    };
+    char ops_block[2600] = {0};
+    char ex_block[1600] = {0};
+    char fmt_ex[140] = "{\"tool\":\"final\",\"answer\":\"...\"}";
+    {
+        size_t ob = 0, eb = 0;
+        int fmt_done = 0;
+        for (int i = 0; OPTAB[i].name && ob + 220 < sizeof(ops_block); i++) {
+            if (!plug_offered(OPTAB[i].name)) continue;
+            ob += (size_t)snprintf(ops_block + ob, sizeof(ops_block) - ob,
+                                   "  %-7s: %s\n", OPTAB[i].name, OPTAB[i].ops);
+            if (OPTAB[i].ex[0] && eb + 220 < sizeof(ex_block))
+                eb += (size_t)snprintf(ex_block + eb, sizeof(ex_block) - eb, "%s", OPTAB[i].ex);
+            if (!fmt_done) {
+                char firstop[40] = {0};
+                sscanf(OPTAB[i].ops, "%39s", firstop);
+                if (firstop[0])
+                    snprintf(fmt_ex, sizeof(fmt_ex), "{\"tool\":\"%s\",\"op\":\"%s\"}",
+                             OPTAB[i].name, firstop);
+                fmt_done = 1;
+            }
+        }
+    }
     snprintf(sys_raw, sizeof(sys_raw),
         "你只能输出一个 JSON 对象，不要解释、不要代码块。"
-        "**每个 JSON 都必须有 tool 字段**（比如 {\"tool\":\"doc\",\"op\":\"xlsx\",...}），"
+        "**每个 JSON 都必须有 tool 字段**（tool 只能取上面「可用工具」里列出的名字），"
         "漏了 tool 就等于没调用。\n%s"
         /* 别写 \"插件名\" 这种占位符 —— 3B 会原样照抄，输出 {"tool":"插件名",参数} */
-        "调用格式：{\"tool\":\"sys\",\"op\":\"list\",\"path\":\"/tmp\"}"
-        "（tool 用上面列表里的名字）；答完：{\"tool\":\"final\",\"answer\":\"...\"}\n"
-        "【op 归属表】op 放在哪个插件是固定的，别放错：\n"
-        "  sys    : shell list du grep read write sysinfo http_get download\n"
-        "  owrt   : uci_get uci_set uci_show uci_commit uci_revert iwinfo iw "
-        "service logread passwd reboot opkg_list\n"
-        "  net    : ping port resolve route arp stat link wifi trace hostname\n"
-        "  math   : calc solve system stat num（应用题给 task 让插件自己判题型）\n"
-        "  doc    : docx xlsx pptx pdf text（Office/PDF 读写）\n"
-        "  jq     : probe get query csv table keys（JSON）\n"
-        "  table  : sort（文本表格排序）\n"
-        "  browser: probe autologin hunt drag captcha cookie shot\n"
-        "  music  : bgm midi render import omr jianpu（omr=五线谱图片→MIDI，jianpu=简谱图片→MIDI）\n"
-        "  curl   : parse（吃浏览器 Copy as cURL 的整段原文，不是网址）\n"
+        "调用格式：%s（tool 用上面列表里的名字）；"
+        "答完：{\"tool\":\"final\",\"answer\":\"...\"}\n"
+        "【op 归属表】op 放在哪个插件是固定的，别放错：\n%s"
         "注意：日志是 owrt 的 logread，不是 sys；OpenWrt 上没有 /var/log/syslog 这个文件。\n"
-        "【示例】\n"
-        "用户：写个 shell 脚本统计日志里 404 的数量\n"
-        "→ {\"tool\":\"sys\",\"op\":\"write\",\"path\":\"/tmp/count404.sh\","
-        "\"content\":\"#!/bin/sh\\nlogread | grep -c -- 404\\n\"}\n"
-        "  然后 → {\"tool\":\"sys\",\"op\":\"shell\",\"cmd\":\"sh /tmp/count404.sh\"}\n"
-        "用户：看看最近 20 行日志\n"
-        "→ {\"tool\":\"owrt\",\"op\":\"logread\",\"lines\":20}\n"
-        "用户：把 /opt/mp4/01.mp4 转成竖屏\n"
-        "→ {\"tool\":\"video\",\"op\":\"portrait\",\"path\":\"/opt/mp4/01.mp4\"}\n"
-        "用户：把这个视频的字幕去掉（保留画面）\n"
-        "→ {\"tool\":\"video\",\"op\":\"desub\",\"path\":\"/opt/mp4/01.mp4\"}\n"
-        "用户：把视频转成黑白\n"
-        "→ {\"tool\":\"video\",\"op\":\"effects\",\"path\":\"/opt/mp4/01.mp4\",\"grayscale\":1}\n"
-        "用户：抓5秒流量，看看访问了什么\n"
-        "→ {\"tool\":\"netcap\",\"op\":\"urls\",\"secs\":5}\n"
-        "用户：看看 /tmp 下最大的文件\n"
-        "→ {\"tool\":\"sys\",\"op\":\"du\",\"path\":\"/tmp\",\"top\":10}\n"
-        "用户：抓 http://x/y 看看是不是 404\n"
-        "→ {\"tool\":\"sys\",\"op\":\"http_get\",\"url\":\"http://x/y\"}\n"
+        "【示例】\n%s"
         "凡是算式、方程、方程组、统计、数论题，一律调用 math 插件，不要心算。\n"
         "应用题（工程量、行程、相遇追及）把原题文字直接传给 math（只给 task，不要自己指定 op，"
         "也不要自己列式子）——插件会自己判断题型；列错式子算得再准也是错答案。\n",
-        tools);
+        tools, fmt_ex, ops_block, ex_block);
+    }
     size_t syscap = strlen(sys_raw) * 6 + 16;
     char *sys_esc = malloc(syscap);
     if (!sys_esc) { free(tools); return 1; }
@@ -3745,10 +3794,24 @@ int main(int argc, char **argv) {
                 fail_tool[0] = 0;
             }
         }
-        /* 记下完整结果：模型没给 final 时拿它收尾，别白算一场 */
-        free(last_result);
-        last_result = strdup(out);
-        snprintf(last_ok_tool, sizeof(last_ok_tool), "%s", tool);
+        /* 记下完整结果：模型没给 final 时拿它收尾，别白算一场。
+         * 只记成功的 —— 错误 JSON 也记进来的话，下一轮再失败就会命中上面
+         * "前面 %s 已经出结果了，按那个收尾"，拿错误里的 answer（没有）当答案，
+         * 用户最后看到的就是"见上一步的结果"。
+         * 实测：任务"tcl是什么调试命令" → doc 两次报缺 path → 最终答案就是这么来的。 */
+        if (!strstr(out, "\"error\"")) {
+            free(last_result);
+            last_result = strdup(out);
+            snprintf(last_ok_tool, sizeof(last_ok_tool), "%s", tool);
+        } else {
+            /* 工具用错/缺参数：小模型会照着原样再发一次。明确给它一条
+             * "这题不需要工具就直接答"的出口 —— 问"XX 是什么"这种知识题
+             * 本来就不读任何文件，不该因为一次误调用就答不出话。 */
+            log_append(log, BIG, "%s",
+                "（上一轮插件调用失败了。如果这个任务其实是知识问答/解释，"
+                "不需要读写设备上的文件，就不要再调用插件，"
+                "直接给 {\"tool\":\"final\",\"answer\":\"你的回答\"}。）\n", "");
+        }
         /* 记下这一轮插件算出的数值：模型 final 时若没体现，由框架补一行。
          * 3B 常把表达式原样当答案（问"根号3加2"就答 "sqrt(3)+2"），
          * 插件明明算了 3.732 却不展示，用户会以为算错了。 */
